@@ -1,0 +1,232 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {mkdtempSync,rmSync,statSync} from 'node:fs';
+import {join} from 'node:path';
+import {tmpdir} from 'node:os';
+import {DatabaseSync} from 'node:sqlite';
+import bs58 from 'bs58';
+import {WalletHistory,type WalletTradeObservation} from '../src/wallet-history.js';
+import type {WalletAnalysis,WalletRecord} from '../src/research/wallet-types.js';
+import type {Report} from '../src/types.js';
+
+const base=Date.parse('2026-10-09T00:00:00Z'),iso=(n=0)=>new Date(base+n*1_000).toISOString();
+const address=(n:number)=>'0x'+n.toString(16).padStart(40,'0'),hash=(n:number)=>'0x'+n.toString(16).padStart(64,'0');
+const token={chain:'bsc' as const,address:address(9000)};
+const trade=(patch:Partial<WalletTradeObservation>={}):WalletTradeObservation=>({chain:'bsc',wallet:address(1),tokenAddress:token.address,
+  txHash:hash(1),side:'buy',eventAt:iso(1),observedAt:iso(10),source:'gmgn_kol',amount:'10',amountUnit:'vendor_quantity',usd:'20',...patch});
+const wallet=(n=1,patch:Partial<WalletRecord>={}):WalletRecord=>({chain:'bsc',address:address(n),sources:['top_holders'],
+  vendorLabels:{provider:'gmgn',verification:'vendor_claim',platform:[],token:[]},recognizedLabels:['smart'],
+  vendorIdentity:{name:'Synthetic wallet',twitterUsername:'sample',verification:'vendor_claim'},
+  attribution:{status:'unknown',verification:'unverified'},holding:{amount:'10',usd:'20',supplyRatio:0.01,currentlyHolding:true},
+  cumulative:{scope:'vendor_token_cumulative',recentInflow:false,buyVolumeUsd:'20',sellVolumeUsd:'0',buyCount:1,sellCount:0,
+    firstAcquiredAt:iso(1),lastActiveAt:iso(1),exitedAt:null},
+  funding:{address:address(500),label:'Unverified origin',verification:'vendor_claim',source:'native_transfer',amount:'1',timestamp:iso(0),
+    txHash:hash(50),sharedService:false,conflict:false},developerLinks:['DEVELOPER_DIRECT_FUNDING'],risks:['VENDOR_SUSPICIOUS_WALLET'],
+  clusterId:'test',enrichment:{status:'complete',reasons:[],stats:{period:'7d',scope:'entire_wallet',realizedProfitUsd:'50',winRate:0.5,
+    totalBuyCostUsd:'100',buyCount:2,sellCount:1},activity:{scope:'token_activity_page',events:[{txHash:hash(n),type:'buy',timestamp:iso(1),amount:'10',usd:'20'}],
+    hasMore:true,firstAt:iso(1),lastAt:iso(1),recent:{since:iso(0),until:iso(10),coverage:'partial',buyUsd:'20',sellUsd:'0',netBuyUsd:'20',hasAccumulation:true}}},...patch});
+const analysis=(wallets:WalletRecord[]=[wallet()],checkedAt=iso(10)):WalletAnalysis=>({status:'pass',checkedAt,reasons:[],facts:{secret:'RAW_SHOULD_NEVER_PERSIST'},wallets,clusters:[],
+  summary:{token,sampleOnly:true,uniqueWalletCount:wallets.length,enrichedWalletCount:wallets.length,currentHolderCount:wallets.length,
+    smartCurrentHolderCount:wallets.length,smartFundingClusterCount:1,smartIndependenceProven:false,eligibleSmartWalletCount:0,qualifiedSmartWalletCount:0,
+    qualifiedSmartFundingClusterCount:0,recentWindowSeconds:300,recentNetBuyUsd:'20',hasRecentAccumulation:true,sampledHoldingRatio:0.01,
+    cumulativeBuyUsd:'20',cumulativeSellUsd:'0',cumulativeCoverageWalletCount:wallets.length,cumulativeIsRecentInflow:false}});
+const report=(mode:Report['mode']='live',decision:Report['decision']='WATCH'):Report=>({id:'report-1',mode,decision,buyEligible:false,
+  evaluatedAt:iso(10),wallets:analysis(),signal:{token}} as Report);
+function fixture() {
+  let now=100;const history=new WalletHistory(':memory:',{now:()=>new Date(base+now*1_000)});
+  return {history,setNow:(n:number)=>{now=n;}};
+}
+
+test('跨feed重复交易只计一次，独立来源及冲突证据保留，无索引记录明确标heuristic',()=>{
+  const {history}=fixture();
+  try {
+    history.recordTrade(trade());history.recordTrade(trade({observedAt:iso(20)}));
+    history.recordTrade(trade({source:'gmgn_smartmoney',observedAt:iso(15)}));
+    history.recordTrade(trade({source:'gmgn_activity',observedAt:iso(30),amount:'11'}));
+    const detail=history.getWallet('bsc',address(1))!;
+    assert.equal(history.stats().events,1);assert.equal(history.stats().observations,3);
+    assert.equal(detail.wallet.buyEvents,1);assert.equal(detail.timeline[0].evidence.length,3);
+    assert.equal(detail.timeline[0].scope,'transaction_wallet_token_side');assert.equal(detail.timeline[0].ambiguous,true);
+    assert.equal(detail.timeline[0].amount,'10');assert.equal(detail.timeline[0].observedAt,iso(10));
+    assert.equal(detail.coverage.exactRealizedPnl,false);
+  } finally {history.close();}
+});
+
+test('live WATCH/REJECT同样入库，重复报告跨时间幂等；旧snapshot与本地导入时间分开',()=>{
+  const {history,setNow}=fixture();
+  try {
+    history.captureReport(report('demo'));assert.equal(history.stats().wallets,0);
+    history.captureReport(report());const counts=history.stats();
+    const detail=history.getWallet('bsc',address(1))!;
+    assert.equal(detail.holdings[0].observedAt,iso(100));assert.equal(detail.holdings[0].snapshotAt,iso(10));
+    assert.equal(detail.timeline[0].eventAt,iso(1));assert.equal(detail.timeline[0].observedAt,iso(100));
+    setNow(200);history.captureReport(report());assert.equal(history.stats().observations,counts.observations);
+    history.captureReport({...report('live','REJECT'),id:'report-2'});
+    assert.equal(history.stats().observations,counts.observations); // Same original snapshot is not a fresh historical observation.
+    assert.deepEqual(detail.holdings[0].risks,['VENDOR_SUSPICIOUS_WALLET']);
+    assert.deepEqual(detail.holdings[0].developerLinks,['DEVELOPER_DIRECT_FUNDING']);
+  } finally {history.close();}
+});
+
+test('拒绝错链/错币或未来analysis，以及未来交易观察和事件时间',()=>{
+  const {history}=fixture();
+  try {
+    history.captureAnalysis({...token,address:address(9001)},analysis(),{source:'gmgn_analysis',observedAt:iso(100)});
+    history.captureAnalysis(token,analysis(undefined,iso(101)),{source:'gmgn_analysis',observedAt:iso(100)});
+    for(const patch of [{eventAt:iso(101)},{observedAt:iso(101)},{wallet:'bad'},{txHash:'bad'}]) history.recordTrade(trade(patch));
+    assert.equal(history.stats().events,0);assert.equal(history.stats().snapshots,0);
+    history.recordTrade(trade({eventAt:iso(-86_400),observedAt:iso(100)}));
+    assert.equal(history.stats().events,1);assert.equal(history.getWallet('bsc',address(1))?.timeline[0].observedAt,iso(100));
+  } finally {history.close();}
+});
+
+test('7d全钱包利润只取最新vendor snapshot，不累计；token累计利润单独保存',()=>{
+  const {history}=fixture();
+  try {
+    history.captureLeaders('bsc',[{address:address(1),period:'7d',realizedProfitUsd:'100'}],{source:'gmgn_stats',observedAt:iso(30)});
+    history.captureLeaders('bsc',[{address:address(1),period:'7d',realizedProfitUsd:'80'}],{source:'gmgn_stats',observedAt:iso(40)});
+    history.captureLeaders('bsc',[{address:address(1),period:'7d',realizedProfitUsd:'900'}],{source:'gmgn_stats',observedAt:iso(20)});
+    history.captureTokenTraders(token,[{address:address(1),rank:1,profitUsd:'5000',realizedProfitUsd:'4000',unrealizedProfitUsd:'1000'}],{source:'gmgn_top_traders',observedAt:iso(50)});
+    const detail=history.getWallet('bsc',address(1))!;
+    assert.equal(detail.wallet.profit?.realizedProfitUsd,'80');assert.equal(detail.vendorStats.length,3);
+    assert.equal(detail.tokenTraderSnapshots[0].scope,'token_cumulative');assert.equal(detail.tokenTraderSnapshots[0].profitUsd,'5000');
+    assert.equal(detail.wallet.profit?.verification,'vendor_claim');assert.equal(detail.wallet.profit?.scope,'entire_wallet');
+  } finally {history.close();}
+});
+
+test('涨幅以首次已观察买入之后的实际价格为基线，不用未知单位或倒序价伪造历史高点',()=>{
+  const {history,setNow}=fixture();
+  try {
+    history.recordTrade(trade({priceUsd:'0.01',amountUnit:'atomic'}));
+    history.recordPrice(token,0.001,iso(9),'gmgn_info');history.recordPrice(token,0.001,iso(10),'gmgn_info');
+    assert.equal(history.getWallet('bsc',address(1))?.wallet.gain,undefined);
+    history.recordPrice(token,2,iso(20),'gmgn_info');history.recordPrice(token,6,iso(30),'gmgn_info');
+    history.recordPrice(token,60,iso(25),'gmgn_info');history.recordPrice(token,3,iso(40),'gmgn_info');
+    history.recordPrice(token,-1,iso(50),'gmgn_info');history.recordPrice(token,100,iso(101),'gmgn_info');
+    const gain=history.getWallet('bsc',address(1))!.wallet.gain!;
+    assert.equal(gain.baselinePriceUsd,2);assert.equal(gain.maxGainPct,200);assert.equal(gain.peakPriceUsd,6);
+    assert.equal(gain.baselineAt,iso(20));assert.equal(gain.kind,'first_post_observed_buy_quote');
+    setNow(40*86_400);history.recordPrice(token,8,iso(40*86_400),'gmgn_info');
+    assert.equal(history.getWallet('bsc',address(1))!.wallet.gain!.maxGainPct,300);
+    assert.equal(history.stats().events,1); // No 30-day research pruning.
+  } finally {history.close();}
+});
+
+test('共同资金来源排除公共服务/冲突，协同行为至少双方各两笔独立交易且仅是线索',()=>{
+  const {history}=fixture();
+  try {
+    history.captureAnalysis(token,analysis([wallet(1),wallet(2)]),{source:'gmgn_analysis',observedAt:iso(100)});
+    history.refreshCoordination(20);assert.equal(history.getWallet('bsc',address(1))!.wallet.coordination.sharedFundingPeers,1);
+    assert.equal(history.getWallet('bsc',address(1))!.wallet.coordination.synchronizedPeers,0);
+    history.recordTrade(trade({txHash:hash(11),eventAt:iso(50),observedAt:iso(100)}));
+    history.recordTrade(trade({wallet:address(2),txHash:hash(12),eventAt:iso(51),observedAt:iso(100)}));
+    history.refreshCoordination(20);
+    const detail=history.getWallet('bsc',address(1))!;
+    assert.equal(detail.wallet.coordination.synchronizedPeers,1);assert.equal(detail.wallet.coordination.ownership,'unknown');
+    assert.equal(detail.coordinationEvidence.synchronized[0].distinctTransactions,2);
+    const publicWallet=wallet(3);publicWallet.funding.sharedService=true;
+    history.captureAnalysis(token,analysis([publicWallet]),{source:'gmgn_analysis',observedAt:iso(100)});
+    history.refreshCoordination(20);assert.equal(history.getWallet('bsc',address(1))!.wallet.coordination.sharedFundingPeers,0);
+  } finally {history.close();}
+});
+
+test('晚导入旧正常资金快照不能覆盖更晚时点的冲突证据',()=>{
+  const {history}=fixture();
+  try {
+    const conflicted=wallet(1);conflicted.funding.conflict=true;
+    history.captureAnalysis(token,analysis([conflicted],iso(50)),{source:'gmgn_analysis',observedAt:iso(60)});
+    history.captureAnalysis(token,analysis([wallet(2)],iso(50)),{source:'gmgn_analysis',observedAt:iso(60)});
+    history.refreshCoordination(20);assert.equal(history.getWallet('bsc',address(1))!.wallet.coordination.sharedFundingPeers,0);
+    history.captureAnalysis(token,analysis([wallet(1)],iso(30)),{source:'bootstrap_import',observedAt:iso(90)});
+    history.refreshCoordination(20);
+    const detail=history.getWallet('bsc',address(1))!;
+    assert.equal(detail.fundingEdges.length,2);assert.equal(detail.wallet.coordination.sharedFundingPeers,0);
+    assert.equal(detail.coordinationEvidence.sharedFunding.length,0);
+  } finally {history.close();}
+});
+
+test('协同缓存区分pending/current/stale，详情即时计算且保持数据库只读',()=>{
+  const {history,setNow}=fixture();
+  try {
+    history.captureAnalysis(token,analysis([wallet(1),wallet(2)]),{source:'gmgn_analysis',observedAt:iso(100)});
+    const cached=()=>history.listWallets({search:address(1)}).items[0].coordination;
+    const db=(history as unknown as {db:DatabaseSync}).db;
+    const changes=()=>Number(db.prepare('SELECT total_changes() AS n').get()!.n);
+    assert.equal(cached().status,'pending');assert.equal(cached().checkedAt,undefined);
+    assert.equal(history.stats().coordinationPending,2);
+    const before=changes(),detail=history.getWallet('bsc',address(1))!;
+    assert.equal(detail.wallet.coordination.status,'current');assert.equal(detail.wallet.coordination.checkedAt,iso(100));
+    assert.equal(detail.wallet.coordination.score,10);assert.equal(detail.wallet.coordination.sharedFundingPeers,1);
+    assert.equal(changes(),before);assert.equal(cached().status,'pending');assert.equal(history.stats().coordinationPending,2);
+    history.refreshCoordination(20);
+    assert.equal(cached().status,'current');assert.equal(cached().checkedAt,iso(100));assert.equal(history.stats().coordinationPending,0);
+    setNow(110);history.recordTrade(trade({txHash:hash(99),eventAt:iso(101),observedAt:iso(110)}));
+    assert.equal(cached().status,'stale');assert.equal(cached().checkedAt,iso(100));assert.equal(history.stats().coordinationPending,2);
+    const beforeSecondRead=changes();
+    assert.equal(history.getWallet('bsc',address(1))!.wallet.coordination.checkedAt,iso(110));
+    assert.equal(changes(),beforeSecondRead);assert.equal(cached().status,'stale');assert.equal(history.stats().coordinationPending,2);
+  } finally {history.close();}
+});
+
+test('持久化完整身份、风险证据和sample metadata，重启不重计事件且不保存raw payload',()=>{
+  const dir=mkdtempSync(join(tmpdir(),'wallet-history-')),path=join(dir,'research.sqlite');
+  let history=new WalletHistory(path,{now:()=>new Date(base+100_000)});
+  try {
+    history.captureReport(report());history.recordCollection({source:'gmgn_observer',chain:'bsc',startedAt:iso(90),completedAt:iso(100),
+      status:'partial',requests:3,accepted:1,coverage:'one_page_sample',hasMore:true,reason:'GMGN_RATE_LIMITED'});
+    const stats=history.stats();history.close();history=new WalletHistory(path,{now:()=>new Date(base+100_000)});
+    history.captureReport(report());assert.equal(history.stats().events,stats.events);assert.equal(history.stats().observations,stats.observations);
+    assert.equal(history.stats().collections,1);assert.equal(history.getWallet('bsc',address(1))!.wallet.address,address(1));
+    const db=new DatabaseSync(path,{readOnly:true});const data=db.prepare('SELECT data FROM wh_observations').all().map(row=>String(row.data)).join('');db.close();
+    assert.equal(data.includes('RAW_SHOULD_NEVER_PERSIST'),false);assert.equal(statSync(path).mode&0o777,0o600);
+  } finally {history.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('容量达到后停止追加并保留旧研究，重启仍报错，增大预算才恢复',()=>{
+  const dir=mkdtempSync(join(tmpdir(),'wallet-budget-')),path=join(dir,'research.sqlite');
+  let history=new WalletHistory(path,{maxBytes:1_000_000,now:()=>new Date(base+100_000)});
+  try {
+    history.recordTrade(trade());assert.equal(history.stats().events,1);
+    history.recordTrades(Array.from({length:2000},(_,n)=>trade({wallet:address(n+10),txHash:hash(n+100),amount:'9'.repeat(90),usd:'9'.repeat(90)})));
+    assert.equal(history.stats().error,'WALLET_HISTORY_CAPACITY_REACHED');assert.equal(history.stats().events,1);
+    history.recordTrade(trade({txHash:hash(2)}));assert.equal(history.stats().events,1);
+    history.close();history=new WalletHistory(path,{maxBytes:1_000_000,now:()=>new Date(base+100_000)});
+    assert.equal(history.stats().error,'WALLET_HISTORY_CAPACITY_REACHED');assert.equal(history.stats().events,1);
+    history.close();history=new WalletHistory(path,{maxBytes:8_000_000,now:()=>new Date(base+100_000)});
+    assert.equal(history.stats().error,undefined);history.recordTrade(trade({txHash:hash(2)}));assert.equal(history.stats().events,2);
+  } finally {history.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('至少1000钱包排序先SQL分页，未知利润/涨幅排最后且列表不触发图自连接',()=>{
+  const {history}=fixture();
+  try {
+    for(let start=1;start<=1000;start+=200) history.captureLeaders('bsc',Array.from({length:200},(_,i)=>({
+      address:address(start+i),period:'7d' as const,realizedProfitUsd:String(start+i)})),{source:'gmgn_stats',observedAt:iso(20)});
+    history.recordTrade(trade({wallet:address(1001),observedAt:iso(100)}));
+    // A full-graph query here would throw; listing must use the materialized cache.
+    const internals=history as unknown as {coordination:()=>never};internals.coordination=()=>{throw new Error('UNBOUNDED_GRAPH_QUERY');};
+    let result=history.listWallets({sort:'profit',limit:10,offset:10});
+    assert.equal(result.total,1001);assert.equal(result.items.length,10);assert.equal(result.items[0].address,address(990));
+    assert.equal(history.listWallets({sort:'profit',limit:1}).items[0].address,address(1000));
+    history.recordPrice(token,1,iso(101),'gmgn_info'); // future is ignored
+    result=history.listWallets({sort:'profit',offset:1000,limit:10});assert.equal(result.items[0].address,address(1001));
+    assert.equal(history.listWallets({search:"%' OR 1=1 --"}).total,0);
+  } finally {history.close();}
+});
+
+test('同链token轮询公平且链过滤不被200个BSC目标阻塞，Solana保持大小写',()=>{
+  const {history}=fixture();
+  try {
+    history.captureTokenRanks('bsc',Array.from({length:200},(_,i)=>({address:address(10000+i),rank:i+1,interval:'1h' as const,
+      changeMetric:'100',changeUnit:'vendor_unspecified' as const})),{source:'gmgn_rank',observedAt:iso(20)});
+    const sol=bs58.encode(new Uint8Array(32).fill(1)),other=sol.replace('J','j');
+    const solHash=bs58.encode(new Uint8Array(64).fill(2));
+    history.recordTrades([trade({chain:'solana',wallet:sol,tokenAddress:other,txHash:solHash}),
+      trade({chain:'solana',wallet:other,tokenAddress:sol,txHash:solHash})]);
+    assert.equal(history.watchTargets(200,new Date(base+100_000),'solana').length,2);
+    const first=history.watchTargets(1,undefined,'solana')[0];history.markTargetChecked(first,iso(100));
+    assert.notEqual(history.watchTargets(1,undefined,'solana')[0].address,first.address);
+    assert.equal(history.listWallets({chain:'solana'}).total,2);
+    assert.ok(history.getWallet('solana',sol));assert.ok(history.getWallet('solana',other));
+  } finally {history.close();}
+});

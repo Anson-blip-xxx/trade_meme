@@ -1,0 +1,14 @@
+{
+  "source": "debot",
+  "chain": "bsc",
+  "occurredAt": "2026-10-08T20:00:00+08:00",
+  "text": "虚构格式示例：CA 0x1111111111111111111111111111111111114444。替换为当时实际通知原文。",
+  "vendorNarrative": {
+    "provider": "debot",
+    "token": {"chain": "bsc", "address": "0x1111111111111111111111111111111111114444"},
+    "sourceUrl": "https://debot.ai/",
+    "text": "虚构叙事占位内容。请复制平台真实叙事全文，不填写自己编造的通过分数。",
+    "updatedAt": "2026-10-08T20:00:00+08:00",
+    "evidenceUrls": []
+  }
+}

@@ -1,0 +1,288 @@
+# Meme Signal Gate 0.2.0
+
+面向 BSC、Solana、Robinhood Chain 链上资产的信号研究与受控开单服务。当前流程：**GMGN 买入事件轮询 → DeBot 叙事和原帖 → 链上来源、安全、钱包资金行为 → 研究结论 → 可选开单**。默认 `ENTRY_MODE=off`，只研究，不提交交易。
+
+依据官方 [gmgn-skills 客户端](https://github.com/GMGNAI/gmgn-skills/blob/main/src/client/OpenApiClient.ts) 直接调用 GMGN OpenAPI，**不必安装 GMGN CLI**。正式运行需要自己的 `GMGN_API_KEY`，运行入口拒绝公开演示 Key。默认供应商叙事不需要 OpenAI Key。
+
+## 启动
+
+需要 Node.js 24 或以上。在项目目录执行：
+
+```bash
+npm ci
+npm run setup
+```
+
+`setup` 从 [.env.example](.env.example) 创建 `.env`，生成接收令牌且不打印，设置仅本人可读写；已有配置原样保留。编辑 `.env` 填写个人 `GMGN_API_KEY`，先保留：
+
+```dotenv
+ENTRY_MODE=off
+SCANNER_ENABLED=true
+SCANNER_CHAINS=bsc,solana,robinhood
+NARRATIVE_PROVIDER=vendor
+X_DATA_PROVIDER=fxembed
+```
+
+模板已有三条公共主网 RPC，适合初步只读测试；正式使用需检查额度和历史区块、日志查询能力。
+
+```bash
+npm run doctor
+npm run doctor -- --live
+npm run dev
+```
+
+`doctor` 检查配置；`--live` 只探测 RPC 网络身份和 FxEmbed 示例帖，不查询报价、不交易、不验证全部依赖。研究配置未就绪时退出码为 1，原因在输出中。缺个人 Key 仍可启动并手工导入，自动扫描等待配置，默认必需的钱包支持保持未知。补齐 Key 不意味着可开单，每个资产仍需实际通过规则和报价检查。
+
+默认服务地址 `http://127.0.0.1:8787`，另开终端运行 `curl http://127.0.0.1:8787/health`。生产构建用 `npm run build`，随后 `npm start`；修改 `.env` 后需重启。
+
+## Web 控制台
+
+界面包含扫描记录、候选表现、钱包研究、开单明细和运行状态。扫描支持链、结论、名称/完整 CA 搜索和分页；点击记录可查看来源、安全、叙事、钱包资金关联组及判定后的价格曲线。钱包研究默认展示公开钱包与前置候选的关联证据，也保留收益、采样涨幅、协同线索和最近观察排序，以及钱包活动、持仓、资金来源和历史统计。浏览器关闭后，服务仍会继续扫描和采样。页面只读，不提供启用实盘或提交交易的按钮。
+
+页面正文采用 16px、表格 14px，辅助文字至少 12px，并随浏览器字号设置缩放。每条扫描和详情均提供 GMGN 代币页快捷链接，按链和完整 CA 生成固定站点地址。顶部常驻系统状况，展示扫描、钱包归档、余额查询及服务器 CPU、内存、磁盘、服务运行时长；详细运行页补充采样时间、进程内存和归档容量。资源每 15 秒本地采样并缓存，打开页面不会触发额外 RPC；CPU 是采样间隔利用率，内存使用量在 Linux 上按 MemAvailable 计算，磁盘指数据库所在文件系统。
+
+设置 `DASHBOARD_ENABLED=true`，`DASHBOARD_ACCESS_TOKEN` 使用独立的至少 32 字符随机口令（不可复用 GMGN Key 或导入令牌）；默认在 `127.0.0.1:9528/dashboard/` 提供页面。当前服务器部署为 `https://43-133-4-231.sslip.io:9528/dashboard/`，沿用 9527 的 HTTPS 证书和登录账户，代理到本机 19538。代理只转发控制台，不能访问交易 API。代理认证后不需要另填 API Key；本机直连可以使用控制台独立口令登录，HttpOnly 会话有效 12 小时。
+
+当前已由 systemd 常驻运行并启用开机启动，单一进程同时管理扫描、采样和控制台。修改配置或静态页面后执行 `sudo systemctl restart meme-signal-gate`；修改 TypeScript 代码先 `npm run build`。查看状态用 `systemctl status meme-signal-gate`，服务定义在 [deploy/meme-signal-gate.service](deploy/meme-signal-gate.service)。已启用服务时，不要再启动第二个 `npm run dev` 扫描进程。
+
+**候选表现的基准是通过研究判断后的第一笔有效 USD 报价。** 从 GMGN `/v1/token/info` 的 `price.price` 读取当前价格，不使用代币历史 ATH。显示 `(已采样最高价 / 基准价 - 1) × 100%`；例如基准 1 美元、后续采样最高 6 美元显示 +500%。这是观测价格变化，不是实际成交利润，也不保证覆盖采样间隔内的最高成交价。界面保留判定时间、基准时间、最新/峰值报价时间、样本数、失败与限流状态。无基准价显示等待/不可用，不显示虚构的 0% 或历史涨幅。
+
+默认每轮间隔 60 秒、最多轮询 3 个候选代币，按上次尝试时间公平轮转；候选多、请求耗时或供应商限流会延长单币间隔。每个信号从首次符合条件起追踪 24 小时（`PRICE_TRACKING_HOURS`），后续复查不会重置该基准。曾经符合条件后降为观察的信号仍保留在候选表现中；判定过期不等于历史候选消失。监测重启后继续使用持久化基准，不把停机期间的价格补为实测。
+
+新增 `data/scans.sqlite` 只保存页面所需的精简摘要和报价聚合：默认保留 30 天（`SCAN_RETENTION_DAYS`）、最多 10,000 条，单条曲线最多 256 个实际采样点；下采样仍保留基准、峰值与末点。原帖、供应商全文和原始响应不落入扫描归档。钱包归属仍标明供应商/人工线索与未知边界，共同资金来源不等于同一控制人。
+
+余额正常时每 120 秒通过主网 RPC 独立刷新，失败链约 30 秒后单独重试，不提高正常链的请求频率。每次余额查询总预算 8 秒，对短暂网络或服务异常最多补试一次并尊重限流等待时间；错误链和无效数据仍拒绝。失败时有历史成功值则明确标为“上次成功 · 刷新失败”，同时显示成功时间和失败原因；从未成功则显示不可用，不伪装为零余额。这些缓存只供页面展示，实际开单仍要求新的已验证余额。金额上限显示 BSC 0.15 BNB、Solana 1 SOL、Robinhood 0.05 ETH；止盈止损展示实际本地配置和已开单的退出状态。
+
+## 自动研究
+
+| 环节 | 实际行为 |
+| --- | --- |
+| 扫描 | GMGN `/v1/user/kol`、`/v1/user/smartmoney`，每链每路一页；只接受新鲜有效 buy，使用完整 `base_address` 与原交易 `timestamp` |
+| 控制 | 默认一轮完成后等 60 秒，每轮研究最多 3 个信号。按链/交易/钱包/CA/方向去重；请求和回调串行，去重有 TTL/容量限制，429 服从共享冷却 |
+| GMGN 数据 | token info、security、pool、持币者、钱包统计和活动；平台名称、标签、代币描述均为供应商材料 |
+| 叙事 | 缺快照时 BSC/Solana 自动按 CA 读取 DeBot v2。不是 DeBot 网页/App 原生推送订阅，也不是全市场社交扫描 |
+| 原帖 | 读取选中引用，同时按完整 CA 搜一页；原帖优先，去重后总计最多 12 条。DeBot 自动取最多 8 条引用，其余来源 ID 保留在临时材料中 |
+| 来源 | 核对主网及官方 factory 创建事件，或 Solana 官方程序拥有的派生状态；后缀、Logo、同名、GMGN launchpad 标签不能代替证明 |
+| 安全 | GoPlus、Solana 原始 Mint 权限/扩展为主，GMGN 安全字段补充；局部供应商通过不能覆盖主检查缺失 |
+| 钱包支持 | 当前持仓、近期买卖和资金关联；默认至少 2 个符合条件的资金关联组支持 |
+| 结论 | `BUY_CANDIDATE` 为研究候选，必要数据缺失或模式未适配为 `WATCH`，明确阻断为 `REJECT`。实际执行结果看订单账本 |
+
+有限公开标签钱包样本不等于全市场发现。未来涨幅、`price_change`、金银铜狗、事后 10 倍不作为当前信号，不回填到历史入场特征。
+
+### 叙事与证据
+
+当前使用用户提供并匿名只读验证过的网页接口：
+
+```http
+GET https://debot.ai/api/v1/nitter/story/latest?request_id=<UUID>&ca_address=<完整CA>
+```
+
+这是观察到的网页接口，不是已确认稳定的公开开发者协议。字段变化、认证要求、限流或无结果回到未知/观察；不自动登录、取 Cookie、绕过验证、切换模型或购买服务。自动读取仅支持 BSC/Solana，Robinhood 链范围未确认。
+
+**DeBot 分数 2、负面评价或“不建议关注”不会单独拒绝，高分也不直接放行。** `rating.score/reason` 仅供参考，满分未知，不归一化、不设阈值。普通复制文字没有受支持的结构化材料时仍为 `WATCH`。
+
+结构化材料检查要求起源材料、有效生成时间、完整 CA 与链对应、引用映射及实际取得帖子覆盖。至少一名追踪作者或两名不同公开作者可满足作者覆盖；不同作者不保证独立。通过仅表示材料与资产的关联得到核对，不证明供应商观点、名人背书或收益；`claim=official` 仍需额外身份依据。
+
+证据记录 URL、数值作者 ID、发布时间、抓取时间和渠道。FxEmbed/TwitterAPI.io 标为第三方副本。`narrative.facts.evidenceDiagnostics` 区分 lookup/search 的成功、无结果、缺 Key、不可用；一页搜索不证明全网传播量，供应商来源 ID 列表不等于已经读取全部帖子。
+
+### 钱包与资金行为
+
+普通大户和 `smart_degen` 持币者各请求一页、最多 20 条，去重后默认补充 3 个钱包的 7 日统计与该币活动，可配置 1–5 个。近 1 小时净买入来自实际买卖事件，累计买入金额、历史收益、曾经买过不等于近期流入。
+
+活动仅取一页并记录分页覆盖。页已结束或已覆盖窗口起点、且金额/时间有效，才认为窗口覆盖；缺页保留未知。合格支持要求当前持有、研究完整、近期净买入为正，并排除已发现的开发者关联、捆绑/疑似内幕标签、冲突等风险组。
+
+GMGN 标签不证明真人身份；共同资金来源仅是关联线索，不证明同一持有人。交易所公共出金源不按同一操盘主体合并，关联组数只是独立参与者数量上界。`WALLET_IDENTITIES_PATH` 可指定维护者 JSON 数组，字段为 `chain/address/label/entityId/category/reference`，见 [类型定义](src/research/wallet-types.ts)。公开归属要求 HTTPS 来源，自定义用 `operator_defined`；均标记人工提供、未独立核实，不接受普通信号传入身份断言。
+
+### 长期钱包观察库
+
+`WALLET_RESEARCH_ENABLED=true` 启用独立的 `data/wallet-history.sqlite`。关闭浏览器、禁用控制台、研究结论为 `WATCH/REJECT` 或内存缓存过期，都不会停止或清除钱包归档。保存的是规范化交易证据、持仓、资金来源、供应商收益统计和报价；不复制原始接口响应、API Key、叙事全文。地址按链隔离，EVM 地址统一小写，Solana 保留大小写。交易在可用身份字段范围内去重，不把多次轮询当成多笔交易；缺事件索引时标明交易内歧义。
+
+数据入口包括：
+
+- 扫描器已取得的 KOL / smartmoney 买卖页在候选筛选之前归档，包括未进入每轮深入研究额度的交易，不额外请求这些页面。
+- 所有完成的真实研究归档持仓、资金来源、近期交易和 7 日钱包统计；演示报告不进入长期库。
+- 独立观察器读取涨幅榜，交替选择榜上代币和最久未刷新的已观察代币，查询该币盈利交易者、当前报价与钱包活动；盈利交易者不限定 `smart_degen` 标签。
+
+默认观察器每轮结束后等待 300 秒，一轮最多 9 个只读请求、轮转一条链，和扫描器共用 GMGN 请求队列与限流冷却。每条链交替执行市场研究与公开钱包关联调查；没有近期目标时继续观察已有有效关系，两者都没有时回退市场研究。市场研究在持币者页面最多深入补充 1 个钱包，再对选中的盈利钱包采集一页跨币活动和 7 日统计。三条链均启用时，关联轮次约每链 30 分钟一次，另加实际请求耗时与冷却；代币和候选钱包还会轮换，并非每个钱包都每 30 分钟覆盖。样本量、接口限流和请求耗时会影响覆盖及刷新间隔；这不是全链流水或完整历史回补。失败页面也记录采集缺口。榜单是发现观察目标的入口，不能倒推系统在涨幅发生前就已发现它。
+
+收益榜使用**最新可用的供应商整钱包 7 日已实现收益**；不同日期的滚动窗口不能相加。单币累计收益单独展示，不能与整钱包收益混排。涨幅榜使用**本系统观察到买入后，首次有效报价到后续最高采样价**的变化，基准与峰值跨重启保存，不使用历史 ATH，也不表示该钱包实际买价、卖价或实现利润。未采到报价时保持未知。
+
+协同线索记录共同非公共资金来源、相近时间同方向交易及具体对象。同步条件为 120 秒范围内至少两笔不同交易，使用有限近期样本；交易所公共来源、冲突资金来源不作为共同控制证据。列表分数只是观察优先级，不能认定“阴谋盘”或实际控制人。排名分页使用持久聚合，协同计算分批刷新；列表与详情可能存在刷新延迟。
+
+该库**不按天过期，也不为腾空间删除旧研究**。默认容量上限 512 MiB（`WALLET_HISTORY_MAX_MB`，包含数据库与 WAL 文件），接近上限时停止追加并在页面明确告警；已有记录仍可读。调整容量后重启可恢复追加。可通过 `WALLET_OBSERVER_INTERVAL_SEC`、`WALLET_OBSERVER_MAX_REQUESTS` 调整采集预算。备份运行中的 SQLite 请使用 SQLite 在线备份方式，不要只复制主文件而漏掉 WAL。
+
+当前服务器已于 2026-10-09 启用长期采集，容量配置为 4096 MiB，导入了当时尚在缓存中的规范化研究。协同索引每 10 秒处理一小批钱包，无额外网络请求；尚未计算显示“待分析”，历史结果待重算显示“待刷新”。网页关闭不影响这项工作。
+
+### 公开钱包与前置候选关联
+
+以 `gmgn_kol_feed` 的公开钱包买入为调查入口，寻找其已记录首次买入之前 24 小时内买入同币的钱包。每个公开钱包 / 代币组合最多分析 400 条买入、40 个候选；按不同代币累计重复领先，不把同币反复交易算成多次跨币验证。同一钱包、同一交易、同一时间的记录不形成领先关系。后续发现公开钱包更早买入时，会撤销不再成立的派生时序，保留原始规范化证据。这里的公开买入时间**不是已核实的 X 喊单时间**，本地首次观测也不是完整历史首买。
+
+发现新关联的轮次在原有 9 请求额度内采集两页不限制聪明钱标签的交易者（买入量、卖出量各最多 100）、代币报价，以及公开钱包和最多两个候选的活动与 7 日资料。已清仓者也可成为候选。新候选使用单币活动核查真实买卖时序；已建立关系的候选使用整钱包最近活动页，积累它在其他币上的新交易。每第三个关联轮次优先持续观察已有关系，直接读取候选与公开钱包的整钱包活动和资料，不因原代币超过 24 小时而停止；候选关系的轮换时间持久保存。交易量排名只用于候选发现，不能当成盈利排名或首买证据。当前接口没有接入全币完整流水，低交易量钱包、分页以外事件、通过多跳转移的资金关系仍可能遗漏。
+
+每条关系保留逐币 CA、交易标识、交易时间、本地取得时间及首次发现关系时间，并分开统计：
+
+- **事后回溯**：公开钱包买入后，系统才取得候选的历史买入记录。
+- **提前观测**：公开钱包买入前，候选的买入记录已经进入本地库。
+- **后续验证**：该关系在候选这次买入前就已建立，且候选交易提前被本地观察到；历史补查不能充当后续验证。
+
+附加记录公开钱包买入后 24 小时内的候选卖出，以及直接注资、共同非公共资金来源；资金联系明确标记实际取得时间和 `vendor_claim`，不追溯为历史当时已知的证据。识别为公共服务或存在冲突的来源不支持归属推断。这些是待核查关系，不证明同一控制人、内幕交易、真实盈利或未来收益。新索引在原长期库内持久化，启动及每 10 秒分批处理，不新增网络请求，也不改变开单门槛。
+
+只读 API：`/dashboard/api/wallet-associations` 支持 `chain/search/limit/offset`；`/status` 返回回填进度；`/:chain/:leader/:candidate` 返回有方向的逐币证据和资金线索。与原控制台共用认证。
+
+## 链与平台
+
+| 链 | 来源路径与边界 |
+| --- | --- |
+| BSC | Four/Flap 官方创建事件；可提供 `creationTx`，用 Etherscan Key 查创建交易，或用 GMGN 创建时间作有限 RPC 查找提示 |
+| Solana | Pump Mint 派生 bonding-curve PDA；Bonk LaunchLab PDA、独立 platform config、Mint/报价资产对应，不单看 Program ID |
+| Robinhood | 已登记官方 Flap 主网 Portal，核验 chain ID `4663`，不复用 BSC factory。自动 DeBot 叙事不支持，通常 `WATCH`；可导入明确绑定该链的材料继续核验 |
+
+EVM 查找先从最新区块向前扩大定位范围，再在范围内二分，最多读取 40 个定位区块；搜索前后 128 个区块、每段最多 64 个。近期代币不依赖远古区块数据。找到日志后仍检查完整 receipt、交易状态、CA、官方发出者、至少 12 个后续区块、规范区块及 runtime code。时间提示错误、历史 RPC 不支持或限流保持未知，不扩为全链扫描。
+
+BSC 模板使用 `https://bsc.rpc.blxrbdn.com`，已用真实代币验证创建日志与回执查询；公共节点仍可能限流。BNB 默认 dataseed 不支持 `eth_getLogs`，不能用于这里的创建日志查找，依据见 [接口核对记录](docs/sources.md)。
+
+Flap legacy/V2 非税已知模式可进入后续检查；税版本、未知扩展和未适配版本保持 `modeSupported=false`。Pump/Bonk 同样仅支持已实现布局与模式。官方来源不等于安全、项目官方身份或名人背书。见 [平台注册表](config/platforms.json)。
+
+## 手工导入
+
+格式见 [标准信号](fixtures/signal.example.json)、[通知包装](fixtures/notification.example.json)。通知解析完整 CA 和 X 原帖链接；链和原事件时间显式提供，多 CA 用 `address` 选择。人工副本不是供应商验签 Webhook。
+
+```bash
+npm run analyze -- path/to/signal.json --normalize-only
+npm run import -- path/to/notification.json --normalize-only
+npm run analyze -- path/to/signal.json --text
+npm run import -- path/to/notification.json --text
+```
+
+`--normalize-only` 只解析。普通 `analyze/import/import-debot` 会研究并执行当前开单策略，`ENTRY_MODE=live` 时也可能真实开单。其独立内存缓存退出即清空，报告 ID 不会出现在另一个已运行服务里；需持续查询和重试时，通过 HTTP 导入服务。
+
+[真实 Umi 快照](fixtures/debot-story-v2.example.json) 保留中文 13 节和 38 个推文 ID，仅移除英文、日文翻译。`generated_at=2026-10-08T06:31:41.032Z` 是叙事版本时间，不是已知告警时间。以下命令离线查看，不创建信号：
+
+```bash
+npm run inspect-debot -- fixtures/debot-story-v2.example.json bsc 0xc24f42b1e458251e3a128b74c65c4c7fa0c97777 https://debot.ai/token/bsc/248286_0xc24f42b1e458251e3a128b74c65c4c7fa0c97777
+```
+
+`POST /v1/debot/stories` 或 `import-debot` 接收包装，下面是结构模板，尖括号和注释需替换：
+
+```jsonc
+{
+  "token": {"chain": "bsc", "address": "<完整CA>"},
+  "sourceUrl": "<对应币种的DeBot HTTPS页面或受支持接口URL>",
+  "occurredAt": "<原告警真实ISO-8601时间>",
+  "payload": { /* 完整 code / success / data 响应 */ }
+}
+```
+
+```bash
+npm run import-debot -- path/to/debot-import.json --normalize-only
+npm run import-debot -- path/to/debot-import.json --text
+```
+
+不要把历史事件时间改成当前时间，`generated_at` 不能替代 `occurredAt`。手工副本标为 `user_supplied`，自动取得响应标为 `vendor_endpoint`，均不代表观点已核实。
+
+## 开单与订单状态
+
+| `ENTRY_MODE` | 行为 |
+| --- | --- |
+| `off`（默认） | 不创建新开单；扫描研究可运行 |
+| `paper` | 规则通过后取真实 GMGN 报价，记录 `paper_open`；不提交 swap，不模拟成交或盈亏 |
+| `live` | 规则、幂等、名额、时效和报价通过后提交 GMGN swap；尚未完成真实账户报价和实盘成交联调 |
+
+paper/live 均需个人 Key，以及相应链的 `ENTRY_WALLET_BSC/SOLANA/ROBINHOOD`、`ENTRY_INPUT_TOKEN_BSC/SOLANA/ROBINHOOD`、`ENTRY_AMOUNT_BSC/SOLANA/ROBINHOOD`。金额采用最小单位的正整数字符串，不是美元或人类可读币数。按 [GMGN 交易说明](https://github.com/GMGNAI/gmgn-skills/blob/main/skills/gmgn-swap/SKILL.md) 核对地址与账户权限。
+
+当前配置 `ENTRY_SIZING=balance_cap`，只使用 BSC 的 BNB、Solana 的 SOL、Robinhood Chain 的 ETH。`ENTRY_AMOUNT_*` 分别是 **0.15 BNB、1 SOL、0.05 ETH 的单笔买入本金上限**，网络费用另行预留。实际金额为 `min(单笔上限, 链上余额 - 其他订单未覆盖占用 - 本单费用缓冲)`；小于等于零则跳过。预算分配在 SQLite 事务内完成，报价和提交都使用最终金额。余额接口失败、单位不明或快照过期时跳过，不回退固定满额。
+
+`ENTRY_FEE_RESERVE_BSC/SOLANA/ROBINHOOD` 为每单费用缓冲，默认 **0.005 BNB、0.02 SOL、0.002 ETH**（配置同样使用最小单位）。这些是运营预留，不是实时费用估算或未来卖出费用保证。在途订单及结果未知订单保留本金与费用占用；仅供应商报告成交仍不释放，需 RPC 证明当前余额快照已包含该笔至少 12 块确认的 EVM 扣款，或 finalized 的 SOL 扣款。覆盖证明的快照高度记录在开单明细，下次仅对不低于该高度的余额复用。纸单不虚构链上扣款，持续占用其模拟本金与缓冲。
+
+live 在报价后、发送队列内再次读取余额并核对已预留金额；不足则停止提交，不擅自变更已报价金额。RPC 完成后重查候选时效并生成签名时间戳。钱包被其他应用同时支出仍可能影响成交，此检查不会锁住链上钱包。未设置 `ENTRY_SIZING` 的旧配置使用 `fixed`，保留原固定金额行为。
+
+live 另需 `GMGN_PRIVATE_KEY`，或用 `GMGN_PRIVATE_KEY_FILE` 指向已有本地签名文件：与 GMGN 配置配套的 Ed25519/RSA **API 请求签名 PEM**，不是钱包助记词或链上私钥，仅用于本地请求签名。非空内联 PEM 优先。报价为 `GET /v1/trade/quote`；开单和查询分别为签名的 `POST /v1/trade/swap`、`GET /v1/trade/query_order`。实际权限和目标资产可成交性仍需个人账户联调。
+
+默认 `ENTRY_MAX_OPEN=3`、`ENTRY_SLIPPAGE_PCT=5`。开单前、报价后和发送前重查时效；来源、安全、叙事、必需钱包支持未通过不下单。订单持久幂等阻止重复事件和同链同资产重复开单。发送后结果不明记 `unknown`，不自动重发 swap。
+
+个人 Key 和签名 PEM 已配置时，服务启动及每 30 秒轮转查询最多 3 条有供应商订单 ID 的待确认订单、已确认但成交金额缺失的订单，或仍需跟踪退出策略的已确认订单；`ENTRY_MODE=off` 也允许只读刷新旧订单。没有订单 ID 的 `unknown` 不猜成交、不重发，查询失败保留买单原状态，已确认买单不会因后续读取异常降级。`confirmed` 依据供应商确认，不是本地独立验证链上成交。
+
+### 已配置的止盈止损
+
+`EXIT_POLICY_PATH=config/exit-policy.json` 读取用户确认的规则；缺文件、错误格式或与授权参数不符时拒绝启动。比例采用 `hold_amount`，按触发时钱包的剩余持仓计算：
+
+| 触发 | 操作 |
+| --- | --- |
+| 涨幅 +500%（入场价 6 倍） | 卖出当时持仓的 20% |
+| 涨幅 +1000%（入场价 11 倍） | 卖出当时持仓的 10% |
+| 跌幅 40%（入场价 0.6 倍） | 卖出全部剩余持仓 |
+
+两档止盈依次执行且没有其他买卖时，原始仓位剩 72%。`hold_amount` 包含该钱包后续增加的同币持仓。当前没有追加 AI 自主择时卖出或移动止损。
+
+启用退出策略的 live 买单显式传 `condition_orders` 和 `sell_ratio_type`；网页/App 保存的预设没有公开的 API 自动继承保证。价格触发和卖出由 GMGN 服务端执行，本地每 30 秒轮转只读回查并非实时价格监控。BSC 费用字段 `ENTRY_GAS_PRICE_BSC_WEI` 使用 wei（默认 `50000000` 即 0.05 gwei），SOL 的 `ENTRY_PRIORITY_FEE_SOLANA`、`ENTRY_TIP_FEE_SOLANA` 使用 SOL（各默认 `0.00001`）；Robinhood 不套用 BSC 费用参数，其条件单尚未实盘验证。`ENTRY_MODE=off` 停止新买单，不会撤销 GMGN 已接受的退出策略。
+
+附挂是 best-effort，**买单成功不等于止损挂好**。开单明细独立保存策略 ID、授权规则、条件单状态和链上余额；查询 `GET /v1/exits` 可查看。查询核对策略 ID、链、钱包、CA、计价币、买入交易及三条规则；限于每类最多两页，缺页或缺 ID 均保持未核实，不自动补挂或重发买单。官方目前未明确子单待触发状态枚举，因此即使父策略报告 `open/running`，也仅记录参数匹配，**不会声称止损已经验证为活跃**。未核实保护会阻断后续 live 买入，需取得真实子单响应后补齐经证实的状态映射。
+
+只有已核实对应策略及全部子单终止，随后独立 RPC 确认买单已经达到确认要求且余额为零，才释放名额。买单 `confirmed` 和成交证明保持不变；策略停止但尚有余额、余额未知、没有退出策略的旧订单及 `paper_open` 继续占用名额。零余额表示不再持有，不虚构卖出成交价或盈亏。部分止盈结果记录为 GMGN 的报告，实际余仓另用 RPC 查询。
+
+2026-10-09 联调：个人 Key 可读取三链绑定钱包，本地签名文件可成功查询 BSC/Solana/Robinhood 的 `STMix` 策略列表；当时三链 open 列表均为空。真实 BSC 报价在冷却后一次重试仍返回 `429 RATE_LIMIT_EXCEEDED`，未取得报价、未发送 swap；报价和实盘成交仍未验证完成。
+
+## HTTP、查询与保留期限
+
+除 `GET /health` 外要求 `Authorization: Bearer <INGEST_TOKEN>`。导入使用 `Content-Type: application/json`，最大 64 KiB。远程部署需提供 HTTPS 和访问控制。
+
+| 接口 | 用途 |
+| --- | --- |
+| `GET /v1/exits` | 已配置的退出规则和订单退出状态；需认证，只读 |
+| `GET /v1/status` | 配置预检，不联网 |
+| `GET /v1/scanner` / `POST /v1/scanner/run` | 扫描状态诊断 / 手动执行一轮 |
+| `POST /v1/signals` | 标准信号 |
+| `POST /v1/notifications` | 通知原文包装 |
+| `POST /v1/debot/stories` | DeBot 原响应包装 |
+| `GET /v1/signals` / `GET /v1/signals/:id` | 缓存中的最近事件 / 单个事件及报告 |
+| `GET /v1/signals/:id/report` | 中文文本报告 |
+| `GET /v1/signals/:id/history` / `GET /v1/signals/:id/imports` | 缓存中的历次评估 / 人工导入原文 |
+| `POST /v1/signals/:id/retry` | 保留原事件时间重新研究，适用当前开单策略 |
+| `GET /v1/orders` / `GET /v1/orders/:id` | 持久订单明细 |
+| `POST /v1/orders/:id/reconcile` | 查询既有订单，不重新提交 |
+
+```bash
+# report/retry 依赖运行中的服务，只能访问其仍在缓存的 ID
+npm run report -- <报告ID>
+npm run report -- <报告ID> --json
+npm run report -- <报告ID> --history
+npm run retry -- <报告ID> --text
+
+# orders 直接读账本，不要求服务运行
+npm run orders
+npm run orders -- <订单ID>
+```
+
+**开单明细保存在 `data/orders.sqlite`，启用控制台时另存有上限的扫描摘要 `data/scans.sqlite`；启用长期钱包研究时另存 `data/wallet-history.sqlite`。** 正常运行要求磁盘订单路径，拒绝空值、`:memory:` 和 `file:` URI。信号原文、DeBot 全文/响应、原帖、钱包原始响应、完整报告/历史用内存数据库，默认按 30 分钟 TTL、200 个事件清理；在途研究暂保留，重启清空。规范化钱包证据已另行持久归档，不受这项 TTL 影响。订单保存地址、金额、报价、状态、交易信息和有限入场摘要/证据链接，不复制整份研究。精简扫描归档的保留策略见 Web 控制台章节。
+
+缓存内同来源/事件 ID 幂等，内容冲突拒绝；处理租约 5 分钟，新任务取得租约后旧任务不能覆盖。候选默认有效 60 秒，过期读取降为观察；重试不刷新原事件时间。订单幂等跨重启保留。
+
+旧版 `data/` 研究库或其他文件**不会自动删除或迁移成订单**，当前运行时不再写旧研究库。手工输入文件、终端重定向输出由维护者管理，不在缓存清理范围内。
+
+## 配置与验证
+
+全部变量见 [.env.example](.env.example)。模板启用扫描并选择 FxEmbed；未设置变量时，代码默认扫描关闭、X 渠道为 `x_official`。
+
+| 配置 | 默认值 / 用途 |
+| --- | --- |
+| `GMGN_MIN_INTERVAL_MS` | 350；按权重排队，429 服从供应商冷却，不保证套餐吞吐 |
+| `SCANNER_INTERVAL_SEC` / `SCANNER_MAX_SIGNALS` | 60 / 3 |
+| `WALLET_SUPPORT_REQUIRED` / `MIN_SMART_WALLET_GROUPS` | true / 2；钱包支持默认必需 |
+| `WALLET_MAX_PROFILES` | 3，可设 1–5 |
+| `RESEARCH_CACHE_MAX` / `RESEARCH_CACHE_TTL_SEC` | 200 / 1800 |
+| `ORDERS_DATABASE_PATH` | `data/orders.sqlite` |
+| `MAX_SIGNAL_AGE_SEC` / `MAX_EVIDENCE_AGE_SEC` | 600 / 21600；事件 / 叙事及帖子时效 |
+| `DECISION_TTL_SEC` / `MAX_TAX_RATE` | 60 / 0.10；候选时效 / 单侧税率初始上限，非实际成交成本 |
+| `ETHERSCAN_API_KEY` / `GOPLUS_ACCESS_TOKEN` | 可选；创建交易查找 / 安全服务权限与额度 |
+| `TRUSTED_ISSUER_X_IDS` / `TRACKED_X_IDS` | 数值作者 ID，不以展示名、蓝标代替身份 |
+
+`fxembed` 无 Key，读取公开第三方副本；`x_official` 需要 `X_BEARER_TOKEN` 及权限；`twitterapi_io` 需要付费服务自己的 `TWITTERAPI_IO_KEY`。不自动切换或购买。`NARRATIVE_PROVIDER=openai` 仅为显式可选路径，需要 Key 和模型；DeBot 不可用不会自动启用它。
+
+```bash
+npm run check
+npm run demo
+```
+
+`check` 覆盖来源伪造/错链、有限日志查找、模式/权限、叙事引用与评分隔离、钱包分组和覆盖、扫描去重/冷却、内存清理、订单幂等、报价/签名和不明状态恢复。测试使用模拟响应，不提交实盘；`demo` 使用虚构材料，不是实时机会。
+
+尚未完成真实账户端到端联调、独立成交/卖出模拟、独立池深及价格冲击模型、程序升级监控和 DeBot 原生推送接入。接口依据和实测边界见 [docs/sources.md](docs/sources.md)。

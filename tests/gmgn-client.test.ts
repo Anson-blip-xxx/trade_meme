@@ -1,0 +1,156 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {randomUUID} from 'node:crypto';
+import {GmgnClient, GmgnError} from '../src/providers/gmgn-client.js';
+
+const response = (data: unknown, status = 200, headers: Record<string, string> = {}) =>
+  new Response(JSON.stringify(data), {status, headers});
+const key = () => `test-${randomUUID()}`;
+const route = '/v1/token/info';
+const query = {chain: 'bsc', address: '0x1111111111111111111111111111111111114444'};
+const rejects = (reason: string) => (error: unknown) => error instanceof GmgnError && error.reason === reason;
+
+test('client refuses missing credentials, writes, arbitrary URLs and auth-query overrides before fetching', async () => {
+  let calls = 0;
+  const fetcher: typeof fetch = async () => { calls++; return response({code: 0, data: {}}); };
+  await assert.rejects(new GmgnClient({fetcher}).get(route, query), rejects('GMGN_API_KEY_MISSING'));
+  const client = new GmgnClient({apiKey: key(), minIntervalMs: 0, fetcher});
+  for (const path of ['/v1/trade/swap', '/v1/trade/strategy/create', '/v1/user/wallet_holdings',
+    '/v1/trade/follow_wallet', 'https://evil.test/v1/token/info', '//evil.test/v1/token/info',
+    '/v1/token/info?x=y', '/v1/user/wallet_funding']) {
+    await assert.rejects(client.get(path, query), rejects('GMGN_PATH_NOT_ALLOWED'));
+  }
+  for (const bad of [{timestamp: 123}, {client_id: 'override'}, {chain: Number.NaN}, {address: ['one']}])
+    await assert.rejects(client.get(route, bad as any), rejects('GMGN_QUERY_INVALID'));
+  assert.equal(calls, 0);
+});
+
+test('client sends fixed-host GET with fresh normal-auth fields and returns only data', async () => {
+  const requests: {url: URL; init: RequestInit | undefined}[] = [];
+  const apiKey = key();
+  const client = new GmgnClient({apiKey, minIntervalMs: 0, now: () => 1_800_000_000_000,
+    fetcher: async (input, init) => {
+      requests.push({url: new URL(String(input)), init});
+      return response({code: 0, data: {address: query.address}, message: 'ok'});
+    }});
+  for (let i = 0; i < 2; i++) assert.deepEqual(await client.get(route, query), {address: query.address});
+  for (const {url, init} of requests) {
+    assert.equal(url.origin, 'https://openapi.gmgn.ai');
+    assert.equal(url.pathname, route);
+    assert.equal(url.searchParams.get('timestamp'), '1800000000');
+    assert.equal(url.searchParams.get('address'), query.address);
+    assert.equal(new Headers(init?.headers).get('x-apikey'), apiKey);
+    assert.equal(new Headers(init?.headers).has('x-signature'), false);
+    assert.equal(init?.method, 'GET');
+    assert.equal(init?.redirect, 'error');
+    assert.equal(init?.credentials, 'omit');
+    assert.ok(init?.signal);
+  }
+  assert.notEqual(requests[0].url.searchParams.get('client_id'), requests[1].url.searchParams.get('client_id'));
+});
+
+test('read-only quote is allowed; path traversal in query stays encoded data', async () => {
+  let seen: URL | undefined;
+  const client = new GmgnClient({apiKey: key(), minIntervalMs: 0, fetcher: async input => {
+    seen = new URL(String(input)); return response({code: '0', data: {output_amount: '12'}});
+  }});
+  assert.deepEqual(await client.get('/v1/trade/quote', {chain: 'robinhood', address: 'x&timestamp=bad#fragment'}), {output_amount: '12'});
+  assert.equal(seen!.origin, 'https://openapi.gmgn.ai');
+  assert.equal(seen!.searchParams.get('address'), 'x&timestamp=bad#fragment');
+  assert.notEqual(seen!.searchParams.get('timestamp'), 'bad');
+});
+
+test('all instances serialize requests and same-key instances share pacing', async () => {
+  const apiKey = key(), starts: number[] = [];
+  let active = 0, maxActive = 0;
+  const fetcher: typeof fetch = async () => {
+    starts.push(Date.now()); active++; maxActive = Math.max(maxActive, active);
+    await new Promise(resolve => setTimeout(resolve, 15));
+    active--; return response({code: 0, data: {}});
+  };
+  const a = new GmgnClient({apiKey, minIntervalMs: 25, fetcher});
+  const b = new GmgnClient({apiKey, minIntervalMs: 25, fetcher});
+  await Promise.all([a.get(route, query, 2), b.get(route, query)]);
+  assert.equal(maxActive, 1);
+  assert.ok(starts[1] - starts[0] >= 45, `weighted pacing gap: ${starts[1] - starts[0]}`);
+});
+
+test('429 cooldown is shared, fails fast without retries, and clears after reset', async () => {
+  let now = 1_800_000_000_000, calls = 0;
+  const apiKey = key();
+  const fetcher: typeof fetch = async () => {
+    calls++;
+    return calls === 1 ? response({error: 'RATE_LIMIT_EXCEEDED'}, 429, {'X-RateLimit-Reset': String(now / 1000 + 30)})
+      : response({code: 0, data: 'recovered'});
+  };
+  const a = new GmgnClient({apiKey, minIntervalMs: 0, now: () => now, fetcher});
+  const b = new GmgnClient({apiKey, minIntervalMs: 0, now: () => now, fetcher});
+  await assert.rejects(a.get(route, query), error => {
+    assert.ok(error instanceof GmgnError);
+    assert.equal(error.reason, 'GMGN_RATE_LIMITED');
+    assert.equal(error.retryAfterMs, 30_000);
+    assert.equal(error.cooldownUntil, new Date(now + 30_000).toISOString());
+    return true;
+  });
+  assert.equal(b.cooldownUntil, now + 30_000);
+  await assert.rejects(b.get(route, query), rejects('GMGN_RATE_LIMITED'));
+  assert.equal(calls, 1);
+  now += 30_001;
+  assert.equal(await b.get(route, query), 'recovered');
+  assert.equal(calls, 2);
+});
+
+test('rate error in HTTP 200 and malformed HTTP 429 both install cooldown', async () => {
+  const now = 1_800_000_000_000;
+  const client = new GmgnClient({apiKey: key(), minIntervalMs: 0, now: () => now,
+    fetcher: async () => response({code: 429, error: 'RATE_LIMIT_BANNED', reset_at: now / 1000 + 300})});
+  await assert.rejects(client.get(route, query), rejects('GMGN_RATE_LIMITED'));
+  assert.equal(client.cooldownUntil, now + 300_000);
+  const malformed = new GmgnClient({apiKey: key(), minIntervalMs: 0, now: () => now,
+    fetcher: async () => new Response('not json', {status: 429})});
+  await assert.rejects(malformed.get(route, query), rejects('GMGN_RATE_LIMITED'));
+  assert.equal(malformed.cooldownUntil, now + 60_000);
+});
+
+test('rejects malformed/envelope errors and never reflects server or transport secrets', async () => {
+  const cases: [Response, string][] = [
+    [new Response('{broken'), 'GMGN_INVALID_JSON'],
+    [response({code: 0}), 'GMGN_RESPONSE_INVALID'],
+    [response({code: 500, message: 'secret bearer abc'}), 'GMGN_API_ERROR'],
+    [response({data: {}}), 'GMGN_RESPONSE_INVALID'],
+    [response({message: 'secret'}, 401), 'GMGN_AUTH_FAILED'],
+    [response({message: 'secret'}, 403), 'GMGN_AUTH_FAILED'],
+    [response({message: 'secret'}, 500), 'GMGN_HTTP_ERROR'],
+  ];
+  for (const [res, reason] of cases) {
+    const client = new GmgnClient({apiKey: key(), minIntervalMs: 0, fetcher: async () => res});
+    await assert.rejects(client.get(route, query), error => {
+      assert.ok(error instanceof GmgnError); assert.equal(error.message, reason); return true;
+    });
+  }
+  const client = new GmgnClient({apiKey: key(), minIntervalMs: 0,
+    fetcher: async () => { throw new Error('APIKEY=secret'); }});
+  await assert.rejects(client.get(route, query), rejects('GMGN_REQUEST_FAILED'));
+});
+
+test('streamed response limit applies even without content-length', async () => {
+  const client = new GmgnClient({apiKey: key(), minIntervalMs: 0,
+    fetcher: async () => new Response(new ReadableStream({start(controller) {
+      controller.enqueue(new Uint8Array(2 * 1024 * 1024));
+      controller.enqueue(new Uint8Array(1)); controller.close();
+    }}))});
+  await assert.rejects(client.get(route, query), rejects('GMGN_RESPONSE_TOO_LARGE'));
+});
+
+test('a fetch ignoring abort cannot hold the client queue forever', async t => {
+  t.mock.timers.enable({apis: ['setTimeout']});
+  let started = false;
+  const client = new GmgnClient({apiKey: key(), minIntervalMs: 0, fetcher: async () => {
+    started = true; return new Promise<Response>(() => {});
+  }});
+  const pending = assert.rejects(client.get(route, query), rejects('GMGN_REQUEST_TIMEOUT'));
+  for (let i = 0; i < 10 && !started; i++) await Promise.resolve();
+  assert.equal(started, true);
+  t.mock.timers.tick(12_000);
+  await pending;
+});

@@ -1,0 +1,9 @@
+{
+  "enabled": true,
+  "sellRatioType": "hold_amount",
+  "takeProfit": [
+    {"gainPct": 500, "sellPct": 20},
+    {"gainPct": 1000, "sellPct": 10}
+  ],
+  "stopLoss": {"dropPct": 40, "sellPct": 100}
+}

@@ -1,0 +1,39 @@
+{
+  "name": "meme-signal-gate",
+  "version": "0.2.0",
+  "description": "GMGN meme signals, wallet attribution research and guarded opening orders",
+  "scripts": {
+    "dev": "node --env-file-if-exists=.env --import tsx src/server.ts",
+    "analyze": "node --env-file-if-exists=.env --import tsx src/cli.ts",
+    "import": "node --env-file-if-exists=.env --import tsx src/cli.ts --notification",
+    "import-debot": "node --env-file-if-exists=.env --import tsx src/cli.ts --debot-story",
+    "inspect-debot": "node --import tsx scripts/inspect-debot.ts",
+    "retry": "node --env-file-if-exists=.env --import tsx src/cli.ts --retry",
+    "report": "node --env-file-if-exists=.env --import tsx src/report-cli.ts",
+    "orders": "node --env-file-if-exists=.env --import tsx src/orders-cli.ts",
+    "setup": "node --import tsx scripts/setup.ts",
+    "doctor": "node --env-file-if-exists=.env --import tsx src/doctor.ts",
+    "demo": "node --import tsx scripts/demo.ts",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "check": "npm run typecheck && npm test",
+    "start": "node --env-file-if-exists=.env dist/src/server.js"
+  },
+  "type": "module",
+  "dependencies": {
+    "@solana/addresses": "^8.4.0",
+    "bs58": "^6.0.0",
+    "viem": "^2.57.3",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.4",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3"
+  },
+  "private": true,
+  "engines": {
+    "node": ">=24.0.0"
+  }
+}

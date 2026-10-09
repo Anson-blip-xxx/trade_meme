@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0b1018">
+  <title>SCOUT · Meme 观察工作台</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%2364e4c0'/%3E%3Ccircle cx='16' cy='16' r='9' fill='none' stroke='%230b1018' stroke-width='2'/%3E%3Cpath d='M16 16 23 9' stroke='%230b1018' stroke-width='3'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/dashboard/styles.css">
+  <script src="/dashboard/app.js" defer></script>
+</head>
+<body>
+  <div id="login-view" class="login-view" hidden>
+    <form id="login-form" class="login-card">
+      <div class="brand-mark" aria-hidden="true"><span></span></div>
+      <div class="eyebrow">SCOUT / PRIVATE WORKSPACE</div>
+      <h1>回到你的观察工作台</h1>
+      <p class="muted">查看扫描记录、条件后的价格表现与钱包分析。</p>
+      <label for="password">访问密码</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required maxlength="512" placeholder="输入工作台访问密码">
+      <p id="login-error" class="form-error" role="alert"></p>
+      <button id="login-submit" class="primary-button" type="submit">进入工作台 <span aria-hidden="true">↗</span></button>
+      <p class="login-note">只读工作台 · 不提供交易开关</p>
+    </form>
+  </div>
+
+  <div id="boot-view" class="boot-view"><span class="loading-dot"></span><p>正在连接工作台…</p></div>
+
+  <div id="app" class="app-shell" hidden>
+    <aside class="sidebar">
+      <a class="brand" href="/dashboard/" aria-label="SCOUT 工作台首页"><div class="brand-mark" aria-hidden="true"><span></span></div><div><strong>SCOUT<span class="brand-period">.</span></strong><small>MEME OBSERVER</small></div></a>
+      <div class="workspace-tag"><span class="tiny-dot"></span> 私人观察工作台 <span class="version">V1</span></div>
+      <div class="nav-heading">工作空间</div>
+      <nav class="navigation" aria-label="主导航">
+        <button class="nav-item active" data-view="scans" aria-current="page"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 4v8l5 5M8 12a4 4 0 0 1 4-4"/></svg><span>信号扫描</span><span class="nav-dot"></span></button>
+        <button class="nav-item" data-view="candidates"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 2.7 5.5 6.1.9-4.4 4.3 1 6.1-5.4-2.9-5.4 2.9 1-6.1-4.4-4.3 6.1-.9Z"/></svg><span>条件后追踪</span><span id="candidate-count" class="nav-count">—</span></button>
+        <button class="nav-item" data-view="wallets"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="7" r="3"/><circle cx="5" cy="17" r="2"/><circle cx="19" cy="17" r="2"/><path d="m10 10-4 5m8-5 4 5M7 17h10"/></svg><span>钱包研究</span><span class="nav-count">NEW</span></button>
+        <button class="nav-item" data-view="orders"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3h10l3 3v15H4V3h3Zm1 6h8M8 13h8M8 17h5"/></svg><span>订单记录</span></button>
+        <button class="nav-item" data-view="system"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 17h16"/><circle cx="9" cy="7" r="3"/><circle cx="15" cy="17" r="3"/></svg><span>运行状态</span></button>
+      </nav>
+      <div class="sidebar-networks"><div class="nav-heading">观察网络</div><div><span class="chain-dot bsc"></span>BSC<span class="network-kind">EVM</span></div><div><span class="chain-dot solana"></span>Solana<span class="network-kind">SOL</span></div><div><span class="chain-dot robinhood"></span>Robinhood<span class="network-kind">EVM</span></div></div>
+      <div class="sidebar-bottom"><div class="read-only"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6l8-3Z"/><path d="m8 12 3 3 5-6"/></svg><div><strong>只读观察模式</strong><small>交易设置由服务端管理</small></div></div><button id="logout" class="logout-button" type="button">退出工作台 <span aria-hidden="true">↗</span></button></div>
+    </aside>
+
+    <main class="main-content">
+      <header class="topbar"><div class="breadcrumb">工作空间 <span>/</span> <strong id="breadcrumb-current">信号扫描</strong></div><div class="topbar-right"><span id="connection-status" class="connection-status"><span class="tiny-dot"></span><span>连接中</span></span><span class="topbar-divider"></span><span id="current-date" class="topbar-date"></span><div class="avatar" aria-label="私人工作空间">S</div></div></header>
+      <div class="page-content">
+        <div class="page-heading"><div><div class="eyebrow">SIGNAL INTELLIGENCE</div><h1 id="page-title">信号扫描<span class="title-dot">.</span></h1><p id="page-description">从链上信号到筛选依据，让每一次观察都有迹可循。</p></div><button id="refresh" class="secondary-button" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M6 7a7 7 0 0 1 12-1l2 6M4 12l2 6a7 7 0 0 0 12-1"/></svg><span>刷新数据</span></button></div>
+        <div id="network-warning" class="notice warning" role="status" hidden></div>
+
+        <section class="system-overview" aria-labelledby="system-overview-title">
+          <div class="system-overview-heading"><div class="system-overview-title"><h2 id="system-overview-title">系统状况</h2><span id="system-overall-status" class="badge neutral">正在读取</span></div><div class="system-overview-meta"><span id="system-uptime">运行时长 —</span><span id="system-entry-mode">开仓模式 —</span><button id="system-details" class="text-button" type="button">查看详情 ↗</button></div></div>
+          <div class="system-status-grid">
+            <article class="system-status-card"><div class="status-card-label"><span class="tiny-dot" id="status-scanner-dot"></span>信号扫描</div><strong id="status-scanner">等待运行状态</strong><p id="status-scanner-note">最近扫描 —</p></article>
+            <article class="system-status-card"><div class="status-card-label"><span class="tiny-dot" id="status-wallet-dot"></span>钱包数据积累</div><strong id="status-wallet">等待采集状态</strong><p id="status-wallet-note">档案 — · 活动 —</p></article>
+            <article class="system-status-card"><div class="status-card-label"><span class="tiny-dot" id="status-balance-dot"></span>余额查询</div><strong id="status-balance">等待网络状态</strong><p id="status-balance-note">BNB / SOL / ETH</p></article>
+            <article class="system-status-card resource-status-card"><div class="status-card-label"><span class="tiny-dot" id="status-resource-dot"></span>服务器资源</div><div class="resource-values"><div><span>CPU</span><strong id="status-cpu">—</strong></div><div><span>内存</span><strong id="status-memory">—</strong></div><div><span>磁盘</span><strong id="status-disk">—</strong></div></div><p id="status-resource-note">等待服务器采样</p></article>
+          </div>
+        </section>
+
+        <section id="scan-metrics" class="metrics-grid" aria-label="扫描概览">
+          <article class="metric-card"><div class="metric-label">扫描记录 <span class="metric-icon">⌁</span></div><div id="metric-total" class="metric-value">—</div><div id="metric-total-note" class="metric-note">保留期内的全部信号</div></article>
+          <article class="metric-card"><div class="metric-label">曾符合条件 <span class="metric-icon">◇</span></div><div id="metric-eligible" class="metric-value">—</div><div class="metric-note"><span class="tiny-dot teal"></span> 开始记录条件后的价格</div></article>
+          <article class="metric-card"><div class="metric-label">正在追踪 <span class="metric-icon">◷</span></div><div id="metric-tracking" class="metric-value">—</div><div id="metric-tracking-note" class="metric-note">等待首个有效样本 / 持续采样</div></article>
+          <article class="metric-card accent-card"><div class="metric-label">条件后采样最高涨幅 <span class="metric-icon">↗</span></div><div id="metric-peak" class="metric-value positive">—</div><div class="metric-note">已采样的最大值 · 非实际收益</div></article>
+        </section>
+
+        <section id="wallet-metrics" class="metrics-grid" aria-label="钱包研究概览" hidden>
+          <article class="metric-card"><div class="metric-label">累计发现钱包 <span class="metric-icon">◎</span></div><div id="wallet-metric-total" class="metric-value">—</div><div class="metric-note">从现在开始累积研究档案</div></article>
+          <article class="metric-card"><div class="metric-label">已记录活动 <span class="metric-icon">⌁</span></div><div id="wallet-metric-events" class="metric-value">—</div><div class="metric-note">买卖、转账与流动性事件</div></article>
+          <article class="metric-card"><div class="metric-label">观察代币 <span class="metric-icon">◇</span></div><div id="wallet-metric-tokens" class="metric-value">—</div><div class="metric-note">包含继续观察与已排除的信号</div></article>
+          <article class="metric-card accent-card"><div class="metric-label">本地观察起点 <span class="metric-icon">◷</span></div><div id="wallet-metric-since" class="metric-value metric-date">—</div><div class="metric-note">不把发现之前的历史视为完整覆盖</div></article>
+        </section>
+
+        <div id="workbench" class="workbench-grid">
+          <div class="primary-column">
+            <section id="scans-panel" class="panel scans-panel" aria-labelledby="list-title">
+              <div class="panel-heading"><div class="section-title"><span class="section-marker"></span><h2 id="list-title">全部扫描记录</h2><span id="list-count" class="count-pill">—</span></div><span class="auto-refresh"><span class="tiny-dot"></span>每 15 秒更新</span></div>
+              <div class="chain-tabs" role="group" aria-label="按网络筛选"><button class="chain-tab active" data-chain="" aria-pressed="true">全部网络</button><button class="chain-tab" data-chain="bsc" aria-pressed="false"><span class="chain-dot bsc"></span>BSC</button><button class="chain-tab" data-chain="solana" aria-pressed="false"><span class="chain-dot solana"></span>Solana</button><button class="chain-tab" data-chain="robinhood" aria-pressed="false"><span class="chain-dot robinhood"></span>Robinhood</button></div>
+              <div class="table-toolbar"><div class="search-field"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><label class="sr-only" for="search">搜索代币、合约地址</label><input id="search" type="search" placeholder="搜索代币、合约地址…" autocomplete="off" maxlength="160"></div><label class="filter-label" for="decision">筛选结果 <select id="decision"><option value="">全部状态</option><option value="BUY_CANDIDATE">买入候选</option><option value="WATCH">继续观察</option><option value="REJECT">已排除</option></select></label></div>
+              <div class="table-scroll"><table class="scan-table"><thead><tr><th scope="col">代币 / 合约地址</th><th scope="col">筛选结果</th><th scope="col">首次符合条件</th><th scope="col" class="numeric">采样最高涨幅 <span title="以符合条件后的首个有效价格为基准，计算已采样的最高涨幅">ⓘ</span></th><th scope="col" class="numeric">最新涨幅</th><th scope="col">快捷操作</th></tr></thead><tbody id="scan-rows"></tbody></table></div>
+              <div id="scan-empty" class="empty-state" hidden><div class="empty-radar" aria-hidden="true"><span></span></div><h3 id="scan-empty-title">等待第一个信号</h3><p id="scan-empty-description">扫描结果到达后，会在这里显示筛选依据与后续表现。</p></div>
+              <div class="table-footer"><span id="pagination-info">正在读取记录…</span><div class="pagination"><button id="previous-page" type="button" aria-label="上一页" disabled>←</button><span id="page-number">01</span><button id="next-page" type="button" aria-label="下一页" disabled>→</button></div></div>
+              <div class="table-footnote"><span aria-hidden="true">ⓘ</span><span id="performance-note">最高涨幅从首次符合条件后的首个有效价格开始计算；仅反映采样观测值，不代表全市场最高价或实际交易收益。缺失数据显示为 —。</span></div>
+            </section>
+
+            <section id="wallets-panel" class="panel wallets-panel" aria-labelledby="wallet-list-title" hidden>
+              <div class="panel-heading"><div class="section-title"><span class="section-marker"></span><h2 id="wallet-list-title">钱包研究档案</h2><span id="wallet-list-count" class="count-pill">—</span></div><span id="wallet-observer-badge" class="badge neutral">等待观察状态</span></div>
+              <div class="wallet-board-intro"><p>从公开钱包回查更早买入者，积累跨币时序、资金联系与后续卖出记录。</p><span>盈利榜只作为发现入口。重点验证：提前买入是否重复发生，关系是否在下一次交易前就已被观察到。</span></div>
+              <div class="wallet-rank-tabs" role="group" aria-label="钱包排名方式"><button class="wallet-rank-tab active" data-wallet-sort="associations" aria-pressed="true">前置关联</button><button class="wallet-rank-tab" data-wallet-sort="profit" aria-pressed="false"><span>01</span>收益表现</button><button class="wallet-rank-tab" data-wallet-sort="gain" aria-pressed="false"><span>02</span>捕获涨幅</button><button class="wallet-rank-tab" data-wallet-sort="coordination" aria-pressed="false"><span>03</span>协同线索</button><button class="wallet-rank-tab" data-wallet-sort="recent" aria-pressed="false"><span>04</span>最近发现</button></div>
+              <div class="table-toolbar wallet-toolbar"><div class="wallet-network-filter"><label class="sr-only" for="wallet-chain">钱包网络</label><select id="wallet-chain"><option value="">全部网络</option><option value="bsc">BSC</option><option value="solana">Solana</option><option value="robinhood">Robinhood</option></select></div><div class="search-field"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><label class="sr-only" for="wallet-search">搜索钱包地址或标签</label><input id="wallet-search" type="search" placeholder="搜索钱包地址、名称或标签…" autocomplete="off" maxlength="160"></div><span class="auto-refresh"><span class="tiny-dot"></span>每 15 秒更新</span></div>
+              <div id="wallet-ranking-note" class="wallet-ranking-note">收益表现按供应商报告的最近 7 日已实现收益排列，覆盖整个钱包；不是本地核算利润。</div>
+              <div id="wallet-history-table" class="table-scroll" hidden><table class="wallets-table"><thead><tr><th scope="col">钱包 / 归属线索</th><th scope="col" class="numeric">GMGN 7 日已实现收益</th><th scope="col" class="numeric">买入后采样最高涨幅</th><th scope="col">已观测活动</th><th scope="col">协同线索</th><th scope="col">最近观测</th><th scope="col"><span class="sr-only">打开钱包详情</span></th></tr></thead><tbody id="wallet-rows"></tbody></table></div>
+              <div id="association-status-note" class="wallet-ranking-note association-status-note"></div><div id="association-table" class="table-scroll"><table class="associations-table"><thead><tr><th scope="col">公开钱包 → 前置候选</th><th scope="col">重复时序</th><th scope="col">资金联系</th><th scope="col">观察与后续验证</th><th scope="col">证据</th></tr></thead><tbody id="association-rows"></tbody></table></div>
+              <div id="wallet-empty" class="empty-state"><div class="empty-radar" aria-hidden="true"><span></span></div><h3 id="wallet-empty-title">开始积累钱包的长期记录</h3><p id="wallet-empty-description">发现钱包后，会保存活动、持仓样本与资金线索。没有数据的排名字段显示为 —。</p></div>
+              <div class="table-footer"><span id="wallet-pagination-info">正在读取钱包档案…</span><div class="pagination"><button id="wallet-previous-page" type="button" aria-label="钱包上一页" disabled>←</button><span id="wallet-page-number">01</span><button id="wallet-next-page" type="button" aria-label="钱包下一页" disabled>→</button></div></div>
+              <div class="wallet-research-footer"><div><span class="tiny-dot teal"></span><span id="wallet-observer-note">等待观察器状态</span></div><p>捕获涨幅基于本地观测到买入后的价格样本，不是钱包实际收益；协同线索不证明共同控制或真实身份。</p></div>
+            </section>
+
+            <section id="orders-panel" class="panel" hidden><div class="panel-heading"><div class="section-title"><span class="section-marker"></span><h2>订单记录</h2><span id="orders-count" class="count-pill">—</span></div><span class="subtle-label">实际记录 · 只读</span></div><div class="table-scroll"><table class="orders-table"><thead><tr><th>资产 / 订单</th><th>创建时间</th><th>投入金额</th><th>状态</th><th>退出保护</th></tr></thead><tbody id="order-rows"></tbody></table></div><div id="orders-empty" class="empty-state" hidden><div class="empty-radar" aria-hidden="true"><span></span></div><h3>暂无订单记录</h3><p>当服务端产生订单后，这里会展示实际执行状态。</p></div><div class="table-footnote">扫描符合条件、价格表现与实际成交分别记录；模拟订单会明确标记。</div></section>
+
+            <section id="system-panel" class="system-stack" hidden><article class="panel"><div class="panel-heading"><div class="section-title"><span class="section-marker"></span><h2>运行状态</h2></div><span class="subtle-label">服务端配置</span></div><div id="system-runtime" class="system-content"></div></article><article class="panel"><div class="panel-heading"><div class="section-title"><span class="section-marker"></span><h2>资金与退出规则</h2></div></div><div id="system-policy" class="system-content"></div></article></section>
+          </div>
+
+          <aside id="scan-insights" class="insights-column" aria-label="账户与追踪概况">
+            <section class="panel balance-panel"><div class="panel-heading compact"><div class="section-title"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 8H4V5h14v3M4 8v12h16V8H4Z"/><path d="M20 12h-6v4h6"/></svg><h2>钱包余额</h2></div><span class="subtle-label">原生币</span></div><div id="balance-list" class="balance-list"><p class="panel-placeholder">正在读取余额…</p></div><div class="panel-footnote">余额独立刷新，以各网络的查询时间为准。</div></section>
+            <section class="panel tracking-panel"><div class="panel-heading compact"><div class="section-title"><h2>追踪方式</h2></div><span class="badge neutral">OBSERVE</span></div><div class="tracking-steps"><div class="tracking-step"><span class="step-number">01</span><div><strong>筛选通过</strong><p>以首次符合条件的时间为起点</p></div></div><div class="tracking-step"><span class="step-number">02</span><div><strong>记录基准价</strong><p>取此后的首个有效价格样本</p></div></div><div class="tracking-step"><span class="step-number">03</span><div><strong>持续观察表现</strong><p id="tracking-policy-note">按设定间隔采样，保留最高观测值</p></div></div></div><div class="tracking-disclaimer">价格曲线用于复盘筛选结果，未扣除交易成本，也不代表可成交收益。</div></section>
+            <section class="scanner-card"><div class="scanner-card-title"><span class="tiny-dot teal"></span><span>SCANNER STATUS</span></div><strong id="scanner-label">正在连接扫描器</strong><p id="scanner-description">等待服务端运行状态</p><div class="scanner-line"><span>最近一轮</span><span id="scanner-last">—</span></div></section>
+          </aside>
+        </div>
+        <footer class="page-footer"><span>SCOUT <span class="footer-dot">/</span> 让信号留下证据</span><span id="last-updated">尚未同步</span></footer>
+      </div>
+    </main>
+  </div>
+
+  <div id="drawer-backdrop" class="drawer-backdrop" hidden></div>
+  <aside id="detail-drawer" class="detail-drawer" role="dialog" aria-modal="true" aria-labelledby="detail-title" hidden tabindex="-1"><div class="drawer-header"><span id="detail-eyebrow" class="eyebrow">SIGNAL DETAIL</span><button id="close-drawer" class="icon-button" type="button" aria-label="关闭详情">×</button></div><div id="detail-content" class="drawer-content"></div></aside>
+  <div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>

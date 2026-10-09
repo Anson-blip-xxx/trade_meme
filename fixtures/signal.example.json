@@ -1,0 +1,13 @@
+{
+  "source": "debot",
+  "sourceEventId": "replace-with-original-event-id",
+  "occurredAt": "2026-10-08T12:00:00.000Z",
+  "token": {
+    "chain": "bsc",
+    "address": "0x1111111111111111111111111111111111114444"
+  },
+  "claimedPlatform": "four",
+  "text": "示例占位信号。请填写真实告警原文；不接受金狗标签或事后最大涨幅作为判断依据。",
+  "evidenceUrls": [],
+  "claim": "community"
+}

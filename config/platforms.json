@@ -1,0 +1,30 @@
+{
+  "reviewedAt": "2026-10-08",
+  "pump": {
+    "chain": "solana",
+    "program": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+    "source": "https://github.com/pump-fun/pump-public-docs/blob/main/docs/PUMP_PROGRAM_README.md"
+  },
+  "bonk": {
+    "chain": "solana",
+    "program": "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj",
+    "platformConfig": "8pCtbn9iatQ8493mDQax4xfEUjhoVBpUWYVQoRU18333",
+    "quoteMint": "So11111111111111111111111111111111111111112",
+    "source": "https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/launchpad/createBonkMintApi.ts"
+  },
+  "four": {
+    "chain": "bsc",
+    "factory": "0x5c952063c7fc8610FFDB798152D69F0B9550762b",
+    "source": "https://github.com/four-meme-community/fourmeme-docs/blob/main/docs/create-guide.md"
+  },
+  "flap": {
+    "chain": "bsc",
+    "factory": "0xe2cE6ab80874Fa9Fa2aAE65D277Dd6B8e65C9De0",
+    "source": "https://docs.flap.sh/flap/developers/deployed-contract-addresses"
+  },
+  "flapRobinhood": {
+    "chain": "robinhood",
+    "factory": "0x26605f322f7fF986f381bB9A6e3f5DAb0bEaEb09",
+    "source": "https://docs.flap.sh/flap/developers/deployed-contract-addresses"
+  }
+}

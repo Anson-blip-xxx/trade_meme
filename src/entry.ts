@@ -2,7 +2,7 @@ import {constants, createHash, createPrivateKey, randomUUID, sign, type KeyObjec
 import bs58 from 'bs58';
 import type {Config} from './config.js';
 import {OrderStore, type OpeningOrder, type OpeningStatus,type ExitTracking,type FundingSnapshot} from './orders.js';
-import {parseSignal, type Check, type Report, type Chain} from './types.js';
+import {parseSignal,narrativeIdentityConflict, type Check, type Report, type Chain} from './types.js';
 import {GmgnClient, GmgnError} from './providers/gmgn-client.js';
 import {buildExitConditions,parseExitPolicy} from './exit-policy.js';
 import {assessExitStrategy} from './exit-tracking.js';
@@ -52,7 +52,8 @@ function reason(error: unknown): string {
 function eligibility(report: Report, config: Config, now: Date): string | undefined {
   if (report.mode !== 'live') return 'ENTRY_DEMO_DISABLED';
   if (report.decision !== 'BUY_CANDIDATE' || report.buyEligible !== true) return 'ENTRY_NOT_CANDIDATE';
-  const checks: Check[] = [report.provenance, report.safety, report.narrative];
+  const checks: Check[] = [report.provenance, report.safety];
+  if(narrativeIdentityConflict(report.signal,report.narrative)) return 'ENTRY_NARRATIVE_TOKEN_IDENTITY_CONFLICT';
   if (config.walletSupportRequired) {
     if (!report.flow || report.flow.status !== 'pass') return 'ENTRY_FLOW_NOT_PASSED';
     checks.push(report.flow);

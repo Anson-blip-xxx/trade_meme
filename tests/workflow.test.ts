@@ -24,7 +24,8 @@ test('通知→供应商原文→证据诊断→持久化→查询/重试完整�
     assert.equal((await fetch(base+'/v1/notifications',{method:'POST',body:JSON.stringify(original)})).status,401);
     const response=await post('/v1/notifications',original);assert.equal(response.status,201);
     const r=await response.json(),id=r.id;
-    assert.equal(r.report.decision,'WATCH');assert.equal(r.report.executionEnabled,false);
+    assert.equal(r.report.decision,'BUY_CANDIDATE');assert.equal(r.report.executionEnabled,false);
+    assert.equal(r.report.narrative.status,'unknown');assert.ok(!r.report.reasons.includes('NARRATIVE_NOT_PASSED'));
     assert.equal(r.report.narrative.supplier.text,original.vendorNarrative.text);
     assert.equal(r.report.narrative.supplier.verification,'user_supplied');assert.equal(r.report.narrative.model,undefined);
     assert.equal(r.report.narrative.facts.evidenceDiagnostics[0].reason,'NO_VALID_EVIDENCE');

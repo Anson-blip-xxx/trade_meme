@@ -22,7 +22,7 @@ function stored(id='scan-1',patch:Partial<Report>={}):Stored {
       url:'https://x.com/i/web/status/1',publishedAt:iso(0),fetchedAt:iso(1_000),provider:'x_official',verification:'first_party',authority:'public'}],
       analysis:{thesis:'A compact analyst conclusion',catalyst:'SECRET_BODY',relation:'community',stage:'emerging',
         assessment:'favorable',confidence:'medium',supportingEvidenceIds:[],opposingEvidenceIds:[],reasons:[],uncertainties:[]},
-      supplier:{provider:'debot',text:'SECRET_BODY',sourceUrl:'https://debot.ai/token/bsc/'+address+'?api_key=SECRET_BODY',
+      supplier:{provider:'debot',text:'A public supplier narrative',sourceUrl:'https://debot.ai/token/bsc/'+address+'?api_key=SECRET_BODY',
         verification:'vendor_endpoint',contentType:'vendor_ai_narrative'}},
     gmgn:{token:signal.token,fetchedAt:iso(1_000),diagnostics:[],info:{address,name:'Synthetic Name',symbol:'SYNTH',
       price_usd:'9999',historical_ath:'88888',raw:'SECRET_BODY'},security:{raw:'SECRET_BODY'}},...patch};
@@ -116,7 +116,7 @@ test('摘要及价格重启可恢复，数据库只持久化允许字段并限�
     const record=archive.get('scan-1')!;
     assert.equal(record.performance?.baselinePriceUsd,2);assert.equal(record.name,'Synthetic Name');
     assert.equal(record.symbol,'SYNTH');assert.equal(record.address,address);
-    assert.equal(record.narrative?.thesis,'A compact analyst conclusion');
+    assert.equal(record.narrative?.thesis,'A compact analyst conclusion');assert.equal(record.narrative?.text,'A public supplier narrative');
     assert.equal(record.narrative?.sourceUrl,'https://debot.ai/token/bsc/'+address);
     const db=new DatabaseSync(path,{readOnly:true});
     const json=String(db.prepare('SELECT record FROM scan_summaries').get()!.record);db.close();

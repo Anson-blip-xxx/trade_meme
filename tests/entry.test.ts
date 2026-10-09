@@ -62,7 +62,8 @@ test('off/demo/noncandidate/unknown checks/stale reports never quote or reserve'
     (r: Report) => {r.buyEligible = false;},
     (r: Report) => {r.safety.status = 'unknown';},
     (r: Report) => {r.provenance.status = 'fail';},
-    (r: Report) => {r.narrative.status = 'unknown';},
+    (r: Report) => {r.narrative.facts.supplierToken = {chain: 'bsc', address: `0x${'f'.repeat(40)}`};},
+    (r: Report) => {r.narrative.facts.supplierAddressConflict = {address: `0x${'f'.repeat(40)}`,field:'data.history.ca_address'};},
     (r: Report) => {r.flow!.status = 'unknown';},
     (r: Report) => {r.validUntil = new Date(baseTime).toISOString();},
     (r: Report) => {r.evaluatedAt = 'not a timestamp';},
@@ -375,4 +376,25 @@ test('RSA request signing follows the official SHA256/PSS format', async t => {
   const message = Buffer.from(`${url.pathname}:${sorted}:${init?.body}:${url.searchParams.get('timestamp')}`);
   assert.equal(verify('sha256', message, {key: rsa.publicKey, padding: constants.RSA_PKCS1_PSS_PADDING, saltLength: 32},
     Buffer.from(new Headers(init?.headers).get('x-signature')!, 'base64')), true);
+});
+
+test('optional narrative statuses and old narrative timestamps allow paper quotes when all hard checks pass',async t=>{
+  for(const status of ['unknown','fail'] as const) {
+    const ctx=setup(t),report=candidate();
+    report.narrative.status=status; report.narrative.reasons=status==='unknown'?['VENDOR_NARRATIVE_MISSING']:['NARRATIVE_CONFLICT_OR_ADVERSE'];
+    report.narrative.checkedAt='2020-01-01T00:00:00.000Z';report.narrative.evidence=[];
+    const result=await ctx.controller.consider(report);
+    assert.equal(result.status,'created');assert.equal(result.order?.status,'paper_open');
+    assert.equal(ctx.readCalls.length,1);assert.equal(ctx.signedCalls.length,0);
+    assert.equal((result.order?.details.checks as any).narrative.status,status);
+  }
+});
+
+test('explicit narrative token mismatch remains blocked even with a full social research score',async t=>{
+  const ctx=setup(t),report=candidate();
+  report.narrative.facts.supplierToken={chain:'robinhood',address:report.signal.token.address};
+  report.social={score:30,scope:'research_priority',signals:[],endorsementVerified:false};
+  const result=await ctx.controller.consider(report);
+  assert.equal(result.reason,'ENTRY_NARRATIVE_TOKEN_IDENTITY_CONFLICT');assert.equal(ctx.readCalls.length,0);
+  assert.equal(ctx.signedCalls.length,0);assert.equal(ctx.store.list().length,0);
 });

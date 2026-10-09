@@ -2,12 +2,26 @@ import {randomUUID} from 'node:crypto';
 import bs58 from 'bs58';
 import {ZodError} from 'zod';
 import {jsonRequest,type Fetcher} from '../http.js';
-import type {Signal,VendorNarrative} from '../types.js';
+import {completeContractAddress,type Signal,type VendorNarrative,type VendorAddressConflict} from '../types.js';
 import {normalizeDebotStory} from './debot-story.js';
 
 export interface DebotNarrativeFetchResult {
   status:'ok'|'unavailable'|'unsupported';reason?:string;snapshot?:VendorNarrative;
   sourceUrl?:string;fetchedAt:string;rawResponse?:unknown;
+  identityConflict?:VendorAddressConflict;
+}
+
+const object=(value:unknown):value is Record<string,unknown>=>!!value&&typeof value==='object'&&!Array.isArray(value);
+function addressConflict(raw:unknown,target:Signal['token']):VendorAddressConflict|undefined {
+  // Only the known successful endpoint envelope supplies identity evidence.
+  // Missing prose/ratings/timestamps cannot erase a separately valid wrong CA.
+  if(!object(raw)||raw.code!==0||raw.success!==true||!object(raw.data)||raw.data.version!=='v2'||!object(raw.data.history))return;
+  const history=raw.data.history,story=object(history.story)?history.story:undefined;
+  for(const [field,address] of [['data.history.ca_address',history.ca_address],
+    ['data.history.story.contract_address',story?.contract_address]] as const) {
+    if(completeContractAddress(address)&&(target.chain==='solana'?address!==target.address:address.toLowerCase()!==target.address.toLowerCase()))
+      return {field,address};
+  }
 }
 
 function failureReason(error:unknown):string {
@@ -40,6 +54,9 @@ export async function fetchDebotNarrative(signal:Signal,fetcher:Fetcher=fetch):P
   let rawResponse:unknown;
   try {
     rawResponse=await jsonRequest(sourceUrl,{method:'GET',credentials:'omit',headers:{accept:'application/json'}},fetcher,12000);
+    const identityConflict=addressConflict(rawResponse,signal.token);
+    if(identityConflict)return {status:'unavailable',reason:'DEBOT_TOKEN_IDENTITY_CONFLICT',identityConflict,
+      sourceUrl,fetchedAt:new Date().toISOString(),rawResponse};
     const snapshot=normalizeDebotStory(rawResponse,signal.token,sourceUrl);
     return {status:'ok',snapshot,sourceUrl,fetchedAt:new Date().toISOString(),rawResponse};
   } catch(error) {

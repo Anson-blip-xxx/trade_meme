@@ -1,6 +1,6 @@
 import {randomUUID} from 'node:crypto';
 import type {Config} from './config.js';
-import {unknown,type Signal,type Report,type Provenance,type Check,type Evidence,type NarrativeReport} from './types.js';
+import {unknown,narrativeIdentityConflict,type Signal,type Report,type Provenance,type Check,type Evidence,type NarrativeReport} from './types.js';
 import {checkProvenance} from './provenance/index.js';
 import {checkSafety} from './providers/safety.js';
 import {gatherEvidenceReport,xPostId} from './providers/evidence.js';
@@ -10,6 +10,7 @@ import {analyzeVendorNarrative} from './providers/vendor-narrative.js';
 import {fetchDebotNarrative} from './providers/debot-client.js';
 import {GmgnClient} from './providers/gmgn-client.js';
 import {researchProvider,combineSafety,type GmgnResearch} from './research.js';
+import {assessSocialSignals} from './social-signals.js';
 
 type VendorFetch=Awaited<ReturnType<typeof fetchDebotNarrative>>;
 
@@ -47,14 +48,18 @@ export function decide(signal:Signal,receivedAt:string,config:Config,provenance:
   if(provenance.status!=='pass') reasons.push('PLATFORM_ORIGIN_NOT_VERIFIED');
   if(provenance.facts.modeSupported===false) reasons.push('LAUNCHPAD_MODE_NOT_SUPPORTED');
   if(safety.status!=='pass') reasons.push('TECHNICAL_SAFETY_NOT_PASSED');
-  if(narrative.status!=='pass') reasons.push('NARRATIVE_NOT_PASSED');
+  const identityConflict=narrativeIdentityConflict(signal,narrative);
+  if(identityConflict) reasons.push('NARRATIVE_TOKEN_IDENTITY_CONFLICT');
   if(config.walletSupportRequired&&research?.flow.status!=='pass') reasons.push('WALLET_SUPPORT_NOT_PASSED');
-  const fail=[provenance,safety,narrative].some(c=>c.status==='fail');
+  const fail=[provenance,safety].some(c=>c.status==='fail')||identityConflict;
   const decision=fail?'REJECT':reasons.length?'WATCH':'BUY_CANDIDATE';
-  return {id,policyVersion:'entry-gate-v5',mode,signal,receivedAt,evaluatedAt:now.toISOString(),
+  return {id,policyVersion:'entry-gate-v6',mode,signal,receivedAt,evaluatedAt:now.toISOString(),
     validUntil:new Date(Math.min(now.getTime()+config.decisionTtlSec*1000,Date.parse(signal.occurredAt)+config.maxSignalAgeSec*1000)).toISOString(),
     decision,buyEligible:decision==='BUY_CANDIDATE'&&mode==='live',executionEnabled:false,
-    reasons:[...reasons,...provenance.reasons,...safety.reasons,...narrative.reasons,...(research?.flow.reasons??[])],provenance,safety,narrative,
+    reasons:[...reasons,...provenance.reasons,...safety.reasons,...(research?.flow.reasons??[])],
+    advisoryReasons:[...new Set(narrative.reasons)],
+    social:assessSocialSignals(signal,narrative.evidence,{snapshot:research?.snapshot,now,maxAgeSec:config.maxEvidenceAgeSec}),
+    provenance,safety,narrative,
     ...(research?{gmgn:research.snapshot,wallets:research.wallets,flow:research.flow}:config.walletSupportRequired?{flow:unknown('GMGN_WALLET_RESEARCH_UNAVAILABLE')}: {})};
 }
 
@@ -94,6 +99,11 @@ export async function evaluate(signal:Signal,config:Config,providers=liveProvide
       sourceUrl:vendorFetch.sourceUrl,fetchedAt:vendorFetch.fetchedAt};
     // Invalid payloads (including wrong-CA responses) are just as important to retain for audit.
     if(vendorFetch.rawResponse!==undefined) narrative.facts.vendorResponse=vendorFetch.rawResponse;
+    if(vendorFetch.identityConflict) {
+      narrative.facts.supplierAddressConflict=vendorFetch.identityConflict;
+      if(narrativeIdentityConflict(signal,narrative))
+        narrative.reasons=[...new Set([...narrative.reasons,'VENDOR_NARRATIVE_TOKEN_MISMATCH'])];
+    }
     if(vendorFetch.status==='ok'&&vendorFetch.snapshot) {
       narrative.facts.ingestion='vendor_endpoint';
       narrative.facts.providerEndpointRetrieved=true;

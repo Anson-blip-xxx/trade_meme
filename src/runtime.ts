@@ -13,6 +13,7 @@ import {DashboardBalances,dashboardOrders,dashboardSettings} from './dashboard-d
 import {WalletHistory} from './wallet-history.js';
 import {WalletObserver} from './wallet-observer.js';
 import {SystemMonitor} from './system-monitor.js';
+import {WatchRechecker} from './watch-rechecker.js';
 import {dirname} from 'node:path';
 
 export function createRuntime(config:Config) {
@@ -20,8 +21,9 @@ export function createRuntime(config:Config) {
   if(config.gmgnApiKey?.trim()==='gmgn_solbscbaseethmonadtron') throw new Error('GMGN_DEMO_KEY_TEST_ONLY');
   const client=new GmgnClient({apiKey:config.gmgnApiKey,minIntervalMs:config.gmgnMinIntervalMs});
   const providers=liveProviders(config,client);
-  const archive=config.dashboard.enabled?new ScanArchive(config.dashboard.archivePath,{
+  const archive=config.dashboard.enabled||config.watch.enabled?new ScanArchive(config.dashboard.archivePath,{
     retentionDays:config.dashboard.retentionDays,trackingHours:config.dashboard.trackingHours}):undefined;
+  if(config.watch.enabled)archive?.configureWatch({windowSec:config.watch.windowSec,intervalSec:config.watch.intervalSec,maxSignalAgeSec:config.maxSignalAgeSec});
   const walletHistory=config.walletResearch.enabled?new WalletHistory(config.walletResearch.database,{maxBytes:config.walletResearch.maxBytes}):undefined;
   const walletObserver=walletHistory?new WalletObserver({history:walletHistory,client,config,chains:config.scannerChains,
     intervalMs:config.walletResearch.intervalSec*1000,maxRequestsPerCycle:config.walletResearch.maxRequestsPerCycle}):undefined;
@@ -58,6 +60,22 @@ export function createRuntime(config:Config) {
   const scanner=new GmgnScanner({client,chains:config.scannerChains,intervalMs:config.scannerIntervalSec*1000,
     maxAgeSec:config.maxSignalAgeSec,maxSignalsPerCycle:config.scannerMaxSignals,onSignal,
     ...(walletObserver?{onFeed:walletObserver.observeFeed.bind(walletObserver)}:{})});
+  const watchRechecker=archive&&config.watch.enabled?new WatchRechecker({archive,
+    intervalMs:config.watch.intervalSec*1000,maxPerCycle:config.watch.maxPerCycle,
+    shouldDefer:()=>closed?'SERVICE_STOPPING':!config.gmgnApiKey?.trim()?'GMGN_API_KEY_MISSING':
+      client.cooldownUntil>Date.now()?'GMGN_RATE_LIMITED':active>=4?'RESEARCH_BUSY':scanner.getStatus().inFlight?'SCANNER_BUSY':undefined,
+    evaluate:async(signal,options)=>{
+      if(closed||active>=4)throw new Error('RESEARCH_BUSY');
+      active++;
+      try {
+        const report=await evaluate(signal,config,providers,options);
+        if(walletHistory)try {walletHistory.captureReport(report);walletCaptureError=undefined;}
+        catch {walletCaptureError='WALLET_HISTORY_WRITE_FAILED';}
+        return report;
+      } finally {active--;}
+    },
+    entry:async report=>{if(!closed)await entry.consider(report);},
+  }):undefined;
   const sweep=setInterval(()=>{
     store.prune(config.researchCacheTtlSec,config.researchCacheMax);orders.recover();
     try {archive?.prune();archiveMaintenanceError=undefined;}
@@ -72,10 +90,11 @@ export function createRuntime(config:Config) {
         settings:{intervalSec:config.walletResearch.intervalSec,maxRequestsPerCycle:config.walletResearch.maxRequestsPerCycle,
           maxBytes:config.walletResearch.maxBytes,retention:'persistent_no_expiry',scope:'vendor_pages_and_observed_wallet_snapshots'}};
     };
-  return {client,providers,store,orders,entry,scanner,archive,tracking,walletHistory,walletObserver,walletResearchStatus,
+  return {client,providers,store,orders,entry,scanner,archive,tracking,walletHistory,walletObserver,walletResearchStatus,watchRechecker,
     dashboardOverview:()=>({now:new Date().toISOString(),entryMode:config.entryMode,scanner:scanner.getStatus(),
       tracking:tracking?.getStatus(),stats:archive?.stats(),archiveError:archiveCaptureError??store.observationError??archiveMaintenanceError,
-      settings:dashboardSettings(config),balances:balances?.get()??[],system:system?.get(),walletResearch:walletResearchStatus()}),
+      settings:dashboardSettings(config),balances:balances?.get()??[],system:system?.get(),walletResearch:walletResearchStatus(),
+      watchRecheck:watchRechecker?{enabled:true,...watchRechecker.getStatus()}:{enabled:false}}),
     dashboardOrders:()=>dashboardOrders(orders),
     start(){
       if(closed) return;
@@ -94,6 +113,7 @@ export function createRuntime(config:Config) {
       }
       if(config.gmgnApiKey?.trim())walletObserver?.start();
       if(config.scannerEnabled&&config.gmgnApiKey?.trim()) scanner.start();
+      watchRechecker?.start();
       if(!reconcileTimer&&config.gmgnApiKey?.trim()&&config.gmgnPrivateKey?.trim()) {
         void reconciler.runOnce();
         reconcileTimer=setInterval(()=>{void reconciler.runOnce();},30000);reconcileTimer.unref();
@@ -101,7 +121,7 @@ export function createRuntime(config:Config) {
     },
     async close(){
       if(closed) return;closed=true;scanner.stop();clearInterval(sweep);clearInterval(reconcileTimer);clearInterval(walletIndexTimer);
-      await Promise.all([tracking?.stop(),balances?.stop(),walletObserver?.stop(),system?.stop()]);
+      await Promise.all([tracking?.stop(),balances?.stop(),walletObserver?.stop(),system?.stop(),watchRechecker?.stop()]);
       await reconciler.stop();
       // Stop means no new work. Await current callback before closing its stores.
       while(active) await new Promise(resolve=>setTimeout(resolve,50));

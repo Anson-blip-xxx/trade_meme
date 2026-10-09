@@ -11,6 +11,7 @@ export interface DashboardBalance {
 }
 export function dashboardSettings(config:Config) {
   return {scanRetentionDays:config.dashboard.retentionDays,trackingHours:config.dashboard.trackingHours,
+    watchRecheck:config.watch,
     sampleIntervalSec:config.dashboard.sampleIntervalSec,balanceIntervalSec:120,balanceRetryIntervalSec:30,
     caps:chains.map(chain=>({chain,symbol:nativeCurrency(chain).symbol,
       maxPerOrder:config.entryAmounts[chain]?formatUnits(BigInt(config.entryAmounts[chain]!),nativeCurrency(chain).decimals):null,

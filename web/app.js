@@ -18,12 +18,27 @@
   const exitStatuses = {awaiting_swap: '等待成交', paper: '模拟保护', unverified: '未验证', monitoring: '监控中', attention: '需要关注', closed: '已平仓'};
   const stageNames = {emerging: '萌芽', spreading: '传播中', crowded: '拥挤', fading: '热度回落', unknown: '阶段未知'};
   const assessmentNames = {favorable: '研究判断有利', watch: '继续观察', adverse: '研究判断不利'};
-  const checkNames = {provenance: '发行来源', safety: '合约与安全', narrative: '叙事研究', wallets: '钱包样本', flow: '近期资金流'};
+  const checkNames = {provenance: '发行来源', safety: '合约与安全', narrative: '叙事参考（非必需）', wallets: '钱包样本', flow: '近期资金流'};
   const reasonNames = {
     OFFICIAL_FACTORY_CREATION_VERIFIED: '已验证来自配置中的官方发行工厂',
     SECURITY_FIELDS_UNVERIFIED: '部分安全字段尚未核实',
     GMGN_REPORTED_FLAGS_CLEAR_PARTIAL_COVERAGE: 'GMGN 已覆盖的风险项未报告异常，但覆盖不完整',
-    VENDOR_NARRATIVE_MISSING: '缺少供应商叙事材料',
+    VENDOR_NARRATIVE_MISSING: '暂无供应商叙事材料，不作为开单阻断条件',
+    SUPERSEDED: '更新的信号已接替本轮观察',
+    SIGNAL_EXPIRED: '原始信号已超过有效窗口',
+    SIGNAL_TIME_IN_FUTURE: '信号时间异常，未加入观察队列',
+    WINDOW_EXPIRED: '观察窗口已结束',
+    BUY_CANDIDATE: '已通过研究条件',
+    REJECTED: '已发现明确阻断项',
+    LEGACY_SIGNAL_UNAVAILABLE: '历史原始信号不完整，无法加入自动复评',
+    SIGNAL_UNSAFE: '信号未满足安全校验要求',
+    OBSERVATION_WINDOW_ENDED: '观察窗口已结束',
+    OBSERVATION_EXPIRED: '观察窗口已结束',
+    WATCH_WINDOW_EXPIRED: '观察窗口已结束',
+    OBSERVATION_REJECTED: '复评发现明确阻断项',
+    OBSERVATION_PASSED: '复评已通过研究条件',
+    OBSERVATION_SUPERSEDED: '已由更新的信号接续观察',
+    OBSERVATION_RECHECK_FAILED: '本次复评暂未完成，等待后续重试',
     WALLET_TAGS_ARE_VENDOR_CLAIMS: '钱包标签来自供应商，不构成身份核验',
     WALLET_OWNERSHIP_UNVERIFIED: '钱包的实际归属尚未核实',
     CUMULATIVE_VOLUMES_ARE_NOT_RECENT_FLOW: '累计交易量不能替代近期资金流',
@@ -35,6 +50,10 @@
     DECISION_EXPIRED: '本次研究判断已过期',
     GMGN_WALLET_RESEARCH_UNAVAILABLE: '暂时无法获取 GMGN 钱包研究数据',
     GMGN_RATE_LIMITED: 'GMGN 请求受到限流',
+    SERVICE_STOPPING: '服务正在停止',
+    GMGN_API_KEY_MISSING: '尚未配置 GMGN 访问凭证',
+    RESEARCH_BUSY: '等待当前研究任务完成',
+    SCANNER_BUSY: '等待当前扫描任务完成',
     NATIVE_RPC_RATE_LIMITED: '网络 RPC 请求受到限流，稍后自动重试',
     NATIVE_RPC_TIMEOUT: '网络 RPC 查询超时，稍后自动重试',
     NATIVE_RPC_UNAVAILABLE: '网络 RPC 暂不可用，稍后自动重试',
@@ -133,6 +152,101 @@
     const row = el('div', className); row.append(el('code', '', scalar(address)));
     if (typeof address === 'string' && address) row.append(copyButton(address));
     return row;
+  }
+
+
+  const narrativeData = new WeakMap();
+  let narrativePopover = null;
+  let narrativeCloseTimer;
+  let suppressNarrativeFocus = false;
+  function narrativeText(narrative) {
+    return typeof narrative?.text === 'string' && narrative.text.trim() ? narrative.text : typeof narrative?.thesis === 'string' ? narrative.thesis : '';
+  }
+  function closeNarrative(restoreFocus = false) {
+    clearTimeout(narrativeCloseTimer);
+    if (!narrativePopover) return;
+    const {trigger, panel} = narrativePopover;
+    narrativePopover = null; trigger.setAttribute('aria-expanded', 'false'); panel.remove();
+    if (restoreFocus && trigger.isConnected) { suppressNarrativeFocus = true; trigger.focus({preventScroll: true}); suppressNarrativeFocus = false; }
+  }
+  function placeNarrative() {
+    if (!narrativePopover) return;
+    const {trigger, panel} = narrativePopover;
+    if (!trigger.isConnected) { closeNarrative(); return; }
+    const rect = trigger.getBoundingClientRect();
+    const width = Math.min(500, window.innerWidth - 24);
+    panel.style.width = `${width}px`; panel.style.maxHeight = `${Math.max(120, window.innerHeight - 24)}px`;
+    const height = panel.getBoundingClientRect().height;
+    const left = Math.max(12, Math.min(rect.left, window.innerWidth - width - 12));
+    const below = rect.bottom + 8;
+    const top = below + height <= window.innerHeight - 12 ? below : Math.max(12, Math.min(rect.top - height - 8, window.innerHeight - height - 12));
+    panel.style.left = `${left}px`; panel.style.top = `${top}px`;
+  }
+  function scheduleNarrativeClose() {
+    clearTimeout(narrativeCloseTimer);
+    narrativeCloseTimer = setTimeout(() => {
+      if (!narrativePopover || narrativePopover.pinned || narrativePopover.panel.matches(':hover') || narrativePopover.trigger.matches(':hover')) return;
+      if (narrativePopover.panel.contains(document.activeElement) || document.activeElement === narrativePopover.trigger) return;
+      closeNarrative();
+    }, 180);
+  }
+  function openNarrative(trigger, pinned = false) {
+    clearTimeout(narrativeCloseTimer);
+    if (narrativePopover?.trigger === trigger) { narrativePopover.pinned ||= pinned; return; }
+    closeNarrative();
+    const n = narrativeData.get(trigger); if (!narrativeText(n)) return;
+    const panel = el('section', 'narrative-popover'); panel.id = 'narrative-popover'; panel.setAttribute('role', 'dialog'); panel.setAttribute('aria-label', '平台叙事全文');
+    const heading = el('div', 'narrative-popover-heading');
+    heading.append(el('strong', '', `${n.supplier ? scalar(n.supplier).toUpperCase() : '平台'}叙事 · AI 参考`));
+    const close = el('button', 'icon-button', '×'); close.type = 'button'; close.setAttribute('aria-label', '收起叙事全文'); close.addEventListener('click', () => closeNarrative(true)); heading.append(close);
+    const body = el('div', 'narrative-popover-body'); body.tabIndex = 0; body.setAttribute('aria-label', '完整叙事内容，可滚动'); body.append(el('p', '', narrativeText(n)));
+    if (n.textTruncated) body.append(el('p', 'narrative-disclosure-note', '平台内容较长，当前保存了部分文本；可通过来源页面继续阅读。'));
+    if (n.updatedAt) body.append(el('p', 'narrative-disclosure-note', `平台更新时间 ${date(n.updatedAt, true)}`));
+    if (n.retained) body.append(el('p', 'narrative-disclosure-note', '本次未取得新叙事，展示此前取得的参考文本；更新时间未重置。'));
+    const source = safeUrl(n.sourceUrl);
+    if (source && !new URL(source).pathname.startsWith('/api/')) { const link = el('a', 'source-link', '查看平台来源 ↗'); link.href = source; link.target = '_blank'; link.rel = 'noopener noreferrer'; body.append(link); }
+    const note = el('p', 'narrative-popover-note', '供应商生成的叙事只作参考；缺少叙事不会阻止开单。');
+    panel.append(heading, body, note); (state.detailId ? $('detail-drawer') : document.body).append(panel);
+    narrativePopover = {trigger, panel, pinned, key: trigger.dataset.narrativeKey}; trigger.setAttribute('aria-expanded', 'true');
+    panel.addEventListener('pointerenter', () => clearTimeout(narrativeCloseTimer)); panel.addEventListener('pointerleave', scheduleNarrativeClose);
+    panel.addEventListener('focusout', scheduleNarrativeClose); placeNarrative();
+  }
+  function narrativePreview(narrative, key) {
+    const content = narrativeText(narrative); if (!content) return null;
+    const origin = narrative?.supplier === 'debot' ? content.split('\n').find(line => line.startsWith('背景 / 起源：')) : '';
+    const excerpt = origin || narrative?.thesis?.trim() || content;
+    const trigger = el('button', 'narrative-preview'); trigger.type = 'button'; trigger.dataset.narrativeKey = key;
+    trigger.setAttribute('aria-expanded', 'false'); trigger.setAttribute('aria-haspopup', 'dialog'); trigger.setAttribute('aria-controls', 'narrative-popover');
+    trigger.setAttribute('aria-label', '展开或收起平台叙事全文');
+    trigger.append(el('span', 'narrative-preview-text', excerpt), el('span', 'narrative-preview-hint', 'AI 叙事参考 · 悬停 / 点击查看'));
+    narrativeData.set(trigger, narrative);
+    trigger.addEventListener('pointerenter', event => { if (event.pointerType !== 'touch') openNarrative(trigger); });
+    trigger.addEventListener('pointerleave', scheduleNarrativeClose);
+    trigger.addEventListener('focus', () => { if (!suppressNarrativeFocus && matchMedia('(hover: hover)').matches) openNarrative(trigger); });
+    trigger.addEventListener('focusout', scheduleNarrativeClose);
+    trigger.addEventListener('click', event => { event.stopPropagation(); if (narrativePopover?.trigger === trigger && narrativePopover.pinned) closeNarrative(); else { openNarrative(trigger, true); narrativePopover?.panel.querySelector('.narrative-popover-body')?.focus({preventScroll: true}); } });
+    trigger.addEventListener('keydown', event => { if (event.key === 'ArrowDown') { event.preventDefault(); openNarrative(trigger, true); narrativePopover?.panel.querySelector('.narrative-popover-body')?.focus({preventScroll: true}); } });
+    return trigger;
+  }
+  function rebindNarrative(container) {
+    if (!narrativePopover || narrativePopover.trigger.isConnected) return;
+    const next = [...container.querySelectorAll('[data-narrative-key]')].find(node => node.dataset.narrativeKey === narrativePopover.key);
+    if (!next) { closeNarrative(); return; }
+    narrativePopover.trigger = next; next.setAttribute('aria-expanded', 'true'); placeNarrative();
+  }
+  document.addEventListener('pointerdown', event => {
+    if (narrativePopover && !narrativePopover.panel.contains(event.target) && !narrativePopover.trigger.contains(event.target)) closeNarrative();
+  });
+  document.addEventListener('keydown', event => {
+    if (event.key === 'Escape' && narrativePopover) { event.preventDefault(); event.stopImmediatePropagation(); closeNarrative(true); }
+  }, true);
+  document.addEventListener('scroll', event => {
+    if (narrativePopover && !narrativePopover.panel.contains(event.target)) placeNarrative();
+  }, true);
+  window.addEventListener('resize', placeNarrative);
+  function socialBadge(social) {
+    if (!finite(social?.score) || social.score <= 0 || social.scope !== 'research_priority') return null;
+    const node = badge(`社交关注 +${social.score}`, 'social'); node.title = '增加研究优先级；项目链接不等于名人支持，也不替代安全和钱包检查'; return node;
   }
 
   class RequestError extends Error { constructor(status) { super(`HTTP_${status}`); this.status = status; } }
@@ -330,14 +444,19 @@
     return hours >= 24 ? `${Math.floor(hours / 24)} 天 ${hours % 24} 小时` : hours ? `${hours} 小时 ${minutes} 分钟` : `${minutes} 分钟`;
   }
   function entryModeLabel(mode) { return {disabled: '未启用开仓', off: '未启用开仓', paper: '模拟开仓', live: '实盘配置'}[mode] || scalar(mode); }
+  function watchRecheckLabel(watch) {
+    return !watch ? '状态暂不可用' : !watch.enabled ? '未启用' : watch.lastError ? '最近复评异常' : watch.inFlight ? '正在复评' : !watch.running ? '未运行' : watch.deferredReason ? `延后 · ${reasonNames[watch.deferredReason] || scalar(watch.deferredReason)}` : watch.queue?.due > 0 ? '等待队列调度' : '等待下一次计划';
+  }
   function statusDot(id, tone) { $(id).className = `tiny-dot status-dot ${tone}`; }
   function renderSystemOverview() {
     const data = state.overview || {}, system = data.system || {}, scanner = data.scanner || {}, research = data.walletResearch || state.walletStatus || {};
     const balances = Array.isArray(data.balances) ? data.balances : [], cycle = scanner.lastCycle || {}, observer = research.observer || {}, walletCycle = observer.lastCycle || {}, store = research.store || {};
     const cooling = scanner.cooldownUntil && Date.parse(scanner.cooldownUntil) > Date.now();
-    const scanProblem = Boolean(cooling || !scanner.running || cycle.status === 'partial' || cycle.errors > 0);
+    const watch = data.watchRecheck, watchProblem = Boolean(watch?.enabled && (watch.lastError || !watch.running || ['GMGN_API_KEY_MISSING', 'GMGN_RATE_LIMITED'].includes(watch.deferredReason)));
+    const scanProblem = Boolean(cooling || !scanner.running || cycle.status === 'partial' || cycle.errors > 0 || watchProblem);
     text('status-scanner', cooling ? '限流冷却中' : scanner.running ? scanner.inFlight ? '正在扫描' : '持续运行中' : '未运行');
     text('status-scanner-note', cooling ? `恢复时间 ${time(scanner.cooldownUntil)}` : cycle.completedAt ? `最近 ${time(cycle.completedAt)} · 接收 ${count(cycle.received)} 条` : '等待第一轮扫描完成');
+    text('status-watch-note', `复评：${watchRecheckLabel(watch)}${watch?.enabled ? ` · 待复评 ${count(watch.queue?.scheduled)} 条${watch.queue?.due > 0 ? `（到期排队 ${count(watch.queue.due)}）` : ''}` : ''}`);
     statusDot('status-scanner-dot', scanProblem ? 'watch' : 'pass');
     const walletError = store.error || research.captureError || observer.feedError;
     const walletCooling = observer.cooldownUntil && Date.parse(observer.cooldownUntil) > Date.now();
@@ -369,9 +488,32 @@
     text('scanner-last', time(cycle.completedAt));
   }
   function renderScanEmpty(title, description) { $('scan-empty').hidden = false; text('scan-empty-title', title); text('scan-empty-description', description); }
+  function decisionExpired(record) {
+    const deadline = validDate(record.validUntil); return Boolean(deadline && deadline.getTime() <= Date.now());
+  }
+  function observationEnded(record) {
+    const observation = record.observation;
+    return observation?.state === 'ended' || Boolean(validDate(observation?.endsAt) && Date.parse(observation.endsAt) <= Date.now());
+  }
   function decisionBadge(record) {
+    if (record.decision === 'WATCH') {
+      if (observationEnded(record)) return badge('观察结束', 'neutral');
+      if (record.observation?.state === 'processing') return badge('复评中', 'watch');
+      if (record.observation?.state === 'scheduled') return badge(validDate(record.observation.nextCheckAt) && Date.parse(record.observation.nextCheckAt) <= Date.now() ? '等待复评' : '待复评', 'watch');
+      return badge(decisionExpired(record) ? '历史判断已过期' : '上次判断待观察', 'neutral');
+    }
+    if (record.decision === 'BUY_CANDIDATE' && decisionExpired(record)) return badge('曾通过 · 已过期', 'neutral');
     if (decisions[record.decision]) return badge(...decisions[record.decision]);
     return record.status === 'interrupted' ? badge('研究中断', 'watch') : record.status === 'failed' || record.status === 'error' ? badge('处理异常', 'fail') : badge('研究中', 'neutral');
+  }
+  function observationSubtitle(record) {
+    const observation = record.observation;
+    if (record.decision !== 'WATCH') return record.decision === 'BUY_CANDIDATE' && decisionExpired(record) ? '需重新判断后才能作为当前候选' : null;
+    if (observationEnded(record)) return `观察截止 ${date(observation?.endsAt)}`;
+    if (observation?.state === 'processing') return `正在复评 · 截止 ${date(observation.endsAt)}`;
+    if (observation?.nextCheckAt) return Date.parse(observation.nextCheckAt) <= Date.now() ? `排队中 · 截止 ${date(observation.endsAt)}` : `计划复评 ${date(observation.nextCheckAt)}`;
+    if (observation?.endsAt) return `观察截止 ${date(observation.endsAt)}`;
+    return '历史记录未加入定时复评';
   }
   function renderScans() {
     const body = $('scan-rows'); body.replaceChildren(); text('list-count', count(state.total)); $('scan-empty').hidden = state.items.length > 0;
@@ -384,12 +526,15 @@
       top.append(el('span', `token-avatar ${chainClass(record.chain)}`, Array.from(String(displayName))[0]?.toUpperCase() || '?'));
       const heading = el('div', 'token-heading'); const button = el('button', 'token-name', displayName); button.type = 'button'; button.addEventListener('click', () => openDetail(record.id, button)); heading.append(button);
       const meta = el('div', 'token-meta'); meta.append(el('span', '', chainName(record.chain)), el('span', '', scalar(record.source).toUpperCase())); heading.append(meta); top.append(heading); token.append(top, addressNode(record.address)); const mobileLink = gmgnTokenLink(record.chain, record.address); mobileLink.classList.add('scan-mobile-link'); token.append(mobileLink); row.append(token);
-      const decision = el('td'); decision.append(decisionBadge(record)); decision.append(el('div', 'cell-subtitle', `扫描 ${date(record.receivedAt)}`)); row.append(decision);
+      const narrative = narrativePreview(record.narrative, `scan:${record.id}`); if (narrative) token.append(narrative);
+      const social = socialBadge(record.social); if (social) { const chips = el('div', 'scan-social-line'); chips.append(social); token.append(chips); }
+      const decision = el('td'); decision.append(decisionBadge(record)); decision.append(el('div', 'cell-subtitle', `上次判断 ${date(record.evaluatedAt || record.receivedAt)}`)); const observationNote = observationSubtitle(record); if (observationNote) decision.append(el('div', 'cell-subtitle observation-subtitle', observationNote)); row.append(decision);
       const p = record.performance; const when = el('td', 'cell-date', date(p?.eligibleAt)); if (p?.eligibleAt) when.append(el('div', 'cell-subtitle', p.status === 'waiting' ? '等待首个报价' : p.status === 'ended' ? '追踪已结束' : p.status === 'unavailable' ? '报价暂不可用' : `最近 ${time(p.latestAt)}`)); row.append(when);
       const max = el('td', 'numeric'); max.append(gainNode(p?.maxGainPct)); if (p?.peakAt) max.append(el('div', 'cell-subtitle', time(p.peakAt))); row.append(max);
       const current = el('td', 'numeric'); current.append(gainNode(p?.currentGainPct)); if (finite(p?.samples)) current.append(el('div', 'cell-subtitle', `${p.samples} 个样本`)); row.append(current);
       const action = el('td'); const actions = el('div', 'scan-row-actions'); actions.append(gmgnTokenLink(record.chain, record.address)); const arrow = el('button', 'row-arrow', '›'); arrow.type = 'button'; arrow.setAttribute('aria-label', `查看 ${displayName} 的扫描详情`); arrow.addEventListener('click', () => openDetail(record.id, arrow)); actions.append(arrow); action.append(actions); row.append(action); body.append(row);
     }
+    rebindNarrative(body);
     text('pagination-info', state.total ? `显示 ${state.items.length ? state.offset + 1 : 0}–${Math.min(state.offset + state.items.length, state.total)} 条，共 ${count(state.total)} 条` : '共 0 条记录');
     text('page-number', String(Math.floor(state.offset / PAGE_SIZE) + 1).padStart(2, '0')); $('previous-page').disabled = state.offset === 0; $('next-page').disabled = state.offset + PAGE_SIZE >= state.total;
   }
@@ -429,6 +574,18 @@
     }
     if (data.archiveError) runtime.append(el('p', 'detail-message detail-error', '档案写入失败，记录可能不完整。'));
     runtime.append(el('p', 'policy-caption', '工作台只展示服务端状态。通过研究门槛不代表已下单；实际开单还需报价、余额和执行检查。价格任务逐币轮询，实际间隔以最后报价时间为准。'));
+    if (settings.watchRecheck) policy.append(kv('观察定时复评', settings.watchRecheck.enabled ? '已启用' : '未启用'), kv('最长观察窗口', `${scalar(settings.watchRecheck.windowSec)} 秒（受原始信号有效期限制）`), kv('复评队列调度', `每 ${scalar(settings.watchRecheck.intervalSec)} 秒，单轮最多 ${scalar(settings.watchRecheck.maxPerCycle)} 条`));
+    const watch = data.watchRecheck;
+    if (watch) {
+      runtime.append(kv('观察复评运行状态', watchRecheckLabel(watch)));
+      if (watch.enabled) {
+        runtime.append(kv('待复评 / 到期排队', `${count(watch.queue?.scheduled)} / ${count(watch.queue?.due)}`), kv('正在复评 / 已结束观察', `${count(watch.queue?.processing)} / ${count(watch.queue?.ended)}`), kv('本次服务已完成复评', count(watch.completed)), kv('最近一轮复评调度', date(watch.lastRunAt, true)));
+        if (watch.queue?.nextCheckAt) runtime.append(kv('最近待执行计划', date(watch.queue.nextCheckAt, true)));
+        if (watch.deferredReason) runtime.append(kv('当前延后原因', reasonNames[watch.deferredReason] || scalar(watch.deferredReason)));
+        if (watch.lastError) runtime.append(kv('最近复评错误', reasonNames[watch.lastError] || scalar(watch.lastError)));
+        runtime.append(el('p', 'detail-small', '已完成复评统计执行次数，不是通过条件的数量。到期任务按队列逐条检查，调度运行中不代表每个币都已重新判断。'));
+      }
+    }
     const caps = Array.isArray(settings.caps) ? settings.caps : [];
     if (caps.length) for (const cap of caps) { policy.append(kv(`${chainName(cap.chain)} · 单笔上限`, `${scalar(cap.maxPerOrder)} ${scalar(cap.symbol, chainSymbols[cap.chain] || '')}`), kv(`${chainName(cap.chain)} · 费用预留`, `${scalar(cap.feeReserve)} ${scalar(cap.symbol, chainSymbols[cap.chain] || '')}`)); }
     else policy.append(el('p', 'panel-placeholder', '暂无可展示的开仓上限。'));
@@ -442,6 +599,7 @@
 
   async function openDetail(id, trigger, wallet) {
     if (typeof id !== 'string') return;
+    closeNarrative();
     state.returnFocus = trigger || document.activeElement; state.detailId = id; state.detailKind = wallet?.association ? 'association' : wallet ? 'wallet' : 'scan'; state.detailWallet = wallet || null; state.detailGeneration++;
     text('detail-eyebrow', wallet ? 'WALLET RESEARCH' : 'SIGNAL DETAIL');
     $('drawer-backdrop').hidden = false; $('detail-drawer').hidden = false; $('app').inert = true; document.body.classList.add('drawer-open');
@@ -463,6 +621,7 @@
     }
   }
   function closeDrawer() {
+    closeNarrative();
     const wasOpen = state.detailId !== null;
     state.detailId = null; state.detailWallet = null; state.detailGeneration++; $('detail-drawer').hidden = true; $('drawer-backdrop').hidden = true; $('app').inert = false; document.body.classList.remove('drawer-open');
     if (wasOpen && state.returnFocus?.isConnected) state.returnFocus.focus();
@@ -485,7 +644,18 @@
     const heading = el('div', 'detail-token'); heading.append(el('span', `token-avatar ${chainClass(record.chain)}`, Array.from(String(name))[0]?.toUpperCase() || '?')); const titleGroup = el('div'); const title = el('h2', '', name); title.id = 'detail-title'; titleGroup.append(title, el('div', 'token-meta', `${chainName(record.chain)} · ${scalar(record.source).toUpperCase()}`)); heading.append(titleGroup); fragment.append(heading, addressNode(record.address, 'detail-address'));
     const links = el('div', 'detail-links'); links.append(gmgnTokenLink(record.chain, record.address, '在 GMGN 查看代币 ↗')); fragment.append(links);
     const pills = el('div', 'detail-pills'); pills.append(decisionBadge(record)); if (record.performance) pills.append(badge('曾通过研究判断', 'neutral')); fragment.append(pills);
-    const meta = section('信号时间线'); meta.append(kv('信号发生', date(record.occurredAt, true)), kv('扫描接收', date(record.receivedAt, true)), kv('最近研究判断', date(record.evaluatedAt, true))); if (record.validUntil) meta.append(kv('判断有效期至', date(record.validUntil, true))); fragment.append(meta);
+    const meta = section('信号时间线'); meta.append(kv('信号发生', date(record.occurredAt, true)), kv('扫描接收', date(record.receivedAt, true)), kv('最近研究判断', date(record.evaluatedAt, true))); if (record.validUntil) meta.append(kv('判断有效期至', date(record.validUntil, true)));
+    const observation = record.observation;
+    if (observation) {
+      meta.append(kv('观察首次接收', date(observation.firstReceivedAt, true)), kv('观察截止', date(observation.endsAt, true)), kv('已尝试复评次数', count(observation.attempts)));
+      if (observation.lastCheckAt) meta.append(kv('最近复评', date(observation.lastCheckAt, true)));
+      if (!observationEnded(record) && observation.nextCheckAt) meta.append(kv('计划复评', `${date(observation.nextCheckAt, true)}${Date.parse(observation.nextCheckAt) <= Date.now() ? ' · 等待队列调度' : ''}`));
+      if (!observationEnded(record)) meta.append(el('p', 'detail-small', '复评按队列与请求预算调度，限流或排队可能延迟；到达观察截止后会结束本轮。'));
+      if (observation.endReason) meta.append(kv('结束原因', reasonNames[observation.endReason] || scalar(observation.endReason)));
+      if (observationEnded(record)) meta.append(el('p', 'detail-small', '这轮观察已结束，历史判断与已采集的钱包证据仍保留。'));
+    } else if (record.decision === 'WATCH') meta.append(el('p', 'detail-small', '这是一条历史判断，未加入定时复评。旧状态不代表系统仍在持续检查。'));
+    if (record.decision === 'BUY_CANDIDATE' && decisionExpired(record)) meta.append(el('p', 'detail-small', '此前通过的判断已过期；保留条件后价格表现，但不能直接用于当前开单。'));
+    fragment.append(meta);
     const performance = section('条件后价格表现'); const p = record.performance;
     if (!p) performance.append(el('p', 'detail-message', '这条信号尚未符合研究条件，因此没有条件后价格基准和涨幅记录。'));
     else {
@@ -501,23 +671,40 @@
     }
     fragment.append(performance);
     const checks = section('研究判断与筛选依据');
-    for (const [key, label] of Object.entries(checkNames)) { const check = record.checks?.[key]; const row = el('div', 'check-row'); const top = el('div', 'check-top'); top.append(el('span', '', label), badge(check?.status === 'pass' ? '通过' : check?.status === 'fail' ? '未通过' : '证据不足', check?.status === 'pass' ? 'pass' : check?.status === 'fail' ? 'fail' : 'watch')); row.append(top); if (check?.reasons?.length) row.append(reasonList(check.reasons)); checks.append(row); }
+    for (const [key, label] of Object.entries(checkNames)) { const check = record.checks?.[key]; const row = el('div', 'check-row'); const top = el('div', 'check-top'); top.append(el('span', '', label), key === 'narrative' ? badge(narrativeText(record.narrative) ? '仅供参考' : '暂无材料 · 不阻断', 'neutral') : badge(check?.status === 'pass' ? '通过' : check?.status === 'fail' ? '未通过' : '证据不足', check?.status === 'pass' ? 'pass' : check?.status === 'fail' ? 'fail' : 'watch')); row.append(top); if (check?.reasons?.length) row.append(reasonList(check.reasons)); checks.append(row); }
     if (record.reasons?.length) { checks.append(el('p', 'detail-small', '综合判断依据'), reasonList(record.reasons)); }
     checks.append(el('p', 'detail-small', '通过研究门槛不代表已下单；实际开单还需报价、余额和执行检查。')); fragment.append(checks);
-    const narrative = section('叙事分析'); const n = record.narrative;
-    if (n) {
-      if (n.thesis) narrative.append(el('p', 'detail-message', n.thesis));
-      if (n.stage) narrative.append(kv('叙事阶段', stageNames[n.stage] || scalar(n.stage)));
-      if (n.assessment) narrative.append(kv('叙事判断', assessmentNames[n.assessment] || scalar(n.assessment)));
-      if (n.supplier) narrative.append(kv('叙事来源', scalar(n.supplier).toUpperCase()));
-      const url = safeUrl(n.sourceUrl); if (url) { const link = el('a', 'source-link', '打开来源页面 ↗'); link.href = url; link.target = '_blank'; link.rel = 'noopener noreferrer'; narrative.append(link); }
-      if (!n.thesis && !n.stage && !n.assessment && !n.supplier) narrative.append(el('p', 'detail-message', '暂无可展示的叙事分析。'));
-    } else narrative.append(el('p', 'detail-message', '暂无可用的叙事分析，相关缺失会体现在筛选依据中。'));
-    fragment.append(narrative, renderWallets(record.wallets, openProfiles));
+    const narrative = section('叙事参考'); const n = record.narrative;
+    const preview = narrativePreview(n, `detail:${record.id}`);
+    if (preview) narrative.append(preview); else narrative.append(el('p', 'detail-message', '暂无可用的平台叙事，缺失不会阻止开单。'));
+    if (n?.stage) narrative.append(kv('平台叙事阶段', stageNames[n.stage] || scalar(n.stage)));
+    if (n?.assessment) narrative.append(kv('平台叙事判断', assessmentNames[n.assessment] || scalar(n.assessment)));
+    if (n?.supplier) narrative.append(kv('叙事来源', scalar(n.supplier).toUpperCase()));
+    if (n?.updatedAt) narrative.append(kv('平台更新时间', date(n.updatedAt, true)));
+    const narrativeUrl = safeUrl(n?.sourceUrl); if (narrativeUrl) { const link = el('a', 'source-link', '打开来源页面 ↗'); link.href = narrativeUrl; link.target = '_blank'; link.rel = 'noopener noreferrer'; narrative.append(link); }
+    narrative.append(el('p', 'detail-small', '平台 AI 的评价只用于辅助研究，不以其评分或建议单独决定是否开单。'));
+    fragment.append(narrative, renderSocial(record.social), renderWallets(record.wallets, openProfiles));
     const active = document.activeElement;
     const focusLabel = container.contains(active) ? active?.getAttribute('aria-label') : null;
     container.replaceChildren(fragment);
+    rebindNarrative(container);
     if (focusLabel) [...container.querySelectorAll('[aria-label]')].find(node => node.getAttribute('aria-label') === focusLabel)?.focus();
+  }
+  function renderSocial(social) {
+    const sectionNode = section('社交关联与研究优先级');
+    const score = socialBadge(social);
+    if (score) sectionNode.append(score);
+    const signals = Array.isArray(social?.signals) ? social.signals : [];
+    if (!signals.length) sectionNode.append(el('p', 'detail-message', '暂未取得符合规则的名人社交关联线索。'));
+    for (const signal of signals) {
+      const item = el('div', 'social-evidence');
+      const title = el('div', 'social-evidence-heading'); title.append(el('strong', '', scalar(signal.label || signal.person)), badge(finite(signal.weight) ? `+${signal.weight}` : '线索', 'neutral')); item.append(title);
+      item.append(kv('线索类型', signal.kind === 'ca_post' ? '原帖包含本币完整 CA' : '项目社交资料链接'), kv('验证级别', {project_link: '由项目填写，未核实本人支持', first_party: '本人账号来源线索', third_party: '第三方引用线索'}[signal.verification] || '尚未核实'));
+      const url = safeUrl(signal.sourceUrl); if (url) { const link = el('a', 'source-link', '查看社交来源 ↗'); link.href = url; link.target = '_blank'; link.rel = 'noopener noreferrer'; item.append(link); }
+      sectionNode.append(item);
+    }
+    sectionNode.append(el('p', 'detail-small', '项目填写名人的 X 链接不等于本人支持。本人账号原帖与完整 CA 对应的证据权重更高；社交加分仅用于研究优先级，不替代合约安全或钱包证据，也不代表已核实背书。'));
+    return sectionNode;
   }
   function svgNode(tag, attributes = {}, content) { const node = document.createElementNS('http://www.w3.org/2000/svg', tag); for (const [key, value] of Object.entries(attributes)) node.setAttribute(key, String(value)); if (content !== undefined) node.textContent = String(content); return node; }
   function priceChart(performance) {

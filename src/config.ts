@@ -40,6 +40,7 @@ export interface Config extends z.infer<typeof schema> {
   exitPolicy?:ExitPolicy;
   dashboard:{enabled:boolean;host:string;port:number;token?:string;origin?:string;archivePath:string;retentionDays:number;trackingHours:number;sampleIntervalSec:number};
   walletResearch:{enabled:boolean;database:string;maxBytes:number;intervalSec:number;maxRequestsPerCycle:number};
+  watch:{enabled:boolean;windowSec:number;intervalSec:number;maxPerCycle:number};
 }
 export function isPersistentOrderPath(value:string):boolean {
   return typeof value==='string'&&value.trim().length>0&&value.trim()!==':memory:'&&
@@ -101,5 +102,9 @@ export function readConfig(env:NodeJS.ProcessEnv=process.env): Config {
       maxBytes:z.coerce.number().int().min(16).max(16384).parse(env.WALLET_HISTORY_MAX_MB??512)*1024*1024,
       intervalSec:z.coerce.number().int().min(60).max(3600).parse(env.WALLET_OBSERVER_INTERVAL_SEC??300),
       maxRequestsPerCycle:z.coerce.number().int().min(1).max(10).parse(env.WALLET_OBSERVER_MAX_REQUESTS??9)},
+    watch:{enabled:z.enum(['true','false']).default('false').parse(env.WATCH_RECHECK_ENABLED)==='true',
+      windowSec:z.coerce.number().int().min(60).max(3600).parse(env.WATCH_WINDOW_SEC??600),
+      intervalSec:z.coerce.number().int().min(30).max(3600).parse(env.WATCH_RECHECK_INTERVAL_SEC??120),
+      maxPerCycle:z.coerce.number().int().min(1).max(3).parse(env.WATCH_RECHECK_MAX_PER_CYCLE??1)},
   };
 }

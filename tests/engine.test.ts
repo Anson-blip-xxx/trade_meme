@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {evaluate,effectiveReport,liveProviders} from '../src/engine.js';
+import {evaluate,effectiveReport,liveProviders,decide} from '../src/engine.js';
 import {unknown,parseSignal,type VendorNarrative} from '../src/types.js';
 import {analyzeVendorNarrative} from '../src/providers/vendor-narrative.js';
-import {signal,config,providers,now,pass} from './helpers.js';
+import {signal,config,providers,now,pass,narrative} from './helpers.js';
 
 test('信号驱动：不要求买在底部，不设币龄或上涨幅度门槛',async()=>{
   const r=await evaluate(signal({text:'已经上涨，但有新的可验证催化'}),config(),providers(),{now:()=>now});
@@ -15,7 +15,7 @@ test('安全未知不能被有利叙事覆盖',async()=>{
 });
 test('安全拒绝不调用模型',async()=>{
   const p=providers();p.safety=async()=>({...pass(),status:'fail'});p.narrative=async()=>{throw new Error('must not call');};
-  const r=await evaluate(signal(),config(),p,{now:()=>now});assert.equal(r.decision,'REJECT');assert.ok(r.reasons.includes('SKIPPED_BLOCKED_ASSET'));
+  const r=await evaluate(signal(),config(),p,{now:()=>now});assert.equal(r.decision,'REJECT');assert.ok(r.advisoryReasons?.includes('SKIPPED_BLOCKED_ASSET'));
 });
 test('未知发行模式不放行',async()=>{
   const p=providers();p.provenance=async()=>({...pass(),platform:'flap',facts:{modeSupported:false}});
@@ -58,7 +58,9 @@ test('自动获取的错误原响应保留审计，失败不能伪装成已获�
   assert.equal(report.narrative.facts.providerApiAuthenticated,false);
   assert.equal(report.narrative.facts.providerEndpointRetrieved,undefined);
   assert.equal(report.narrative.facts.nativeNarrativeApiStatus,'unconfirmed');
-  assert.equal(report.decision,'WATCH');assert.equal(report.narrative.supplier,undefined);
+  assert.equal(report.decision,'BUY_CANDIDATE');assert.equal(report.narrative.supplier,undefined);
+  assert.ok(report.advisoryReasons?.includes('VENDOR_NARRATIVE_MISSING'));
+  assert.equal(report.reasons.includes('VENDOR_NARRATIVE_MISSING'),false);
 });
 
 test('自动取得叙事记录已观察网页接口但保持未鉴权，原信号和生成时间不改写',async()=>{
@@ -105,4 +107,45 @@ test('原输入已有12条帖子时供应商8条优先采集，并给CA搜索保
     assert.deepEqual(posts.map(p=>p.id),[...vendorIds,'201','202','203','204'].map(id=>`x:${id}`));
     assert.deepEqual(withVendor,original);
   } finally {globalThis.fetch=oldFetch;}
+});
+
+test('missing, unknown, stale or adverse AI narrative is advisory and does not veto otherwise eligible signals',()=>{
+  for(const report of [
+    {...narrative(),status:'unknown' as const,reasons:['VENDOR_NARRATIVE_MISSING'],evidence:[]},
+    {...narrative(),status:'unknown' as const,reasons:['MODEL_CITATION_INVALID']},
+    {...narrative(),status:'fail' as const,reasons:['NARRATIVE_CONFLICT_OR_ADVERSE'],analysis:{...narrative().analysis!,assessment:'adverse' as const,relation:'conflict' as const}},
+    {...narrative(),status:'unknown' as const,reasons:['VENDOR_NARRATIVE_STALE'],checkedAt:'2020-01-01T00:00:00.000Z'},
+  ]) {
+    const result=decide(signal(),now.toISOString(),config(),pass(),pass(),report,now);
+    assert.equal(result.decision,'BUY_CANDIDATE'); assert.equal(result.buyEligible,true);
+    assert.equal(result.policyVersion,'entry-gate-v6');
+    assert.ok(report.reasons.every(reason=>result.advisoryReasons?.includes(reason)&&!result.reasons.includes(reason)));
+  }
+});
+
+test('concrete complete-CA or chain mismatch still rejects independently of supplier sentiment',()=>{
+  for(const supplierToken of [{chain:'bsc',address:`0x${'f'.repeat(40)}`},{chain:'robinhood',address:signal().token.address}]) {
+    const result=decide(signal(),now.toISOString(),config(),pass(),pass(),{...narrative(),facts:{supplierToken}},now);
+    assert.equal(result.decision,'REJECT'); assert.equal(result.buyEligible,false);
+    assert.ok(result.reasons.includes('NARRATIVE_TOKEN_IDENTITY_CONFLICT'));
+  }
+  const malformed=decide(signal(),now.toISOString(),config(),pass(),pass(),{...narrative(),status:'unknown',
+    facts:{supplierToken:{chain:'bsc',address:'missing'},supplierTokenMatches:false},reasons:['VENDOR_NARRATIVE_INVALID']},now);
+  assert.equal(malformed.decision,'BUY_CANDIDATE');
+});
+
+test('celebrity metadata adds research priority without changing safety, provenance or wallet gates',()=>{
+  const research={snapshot:{token:signal().token,fetchedAt:now.toISOString(),info:{address:signal().token.address,
+    link:{twitter_username:'cz_binance',website:'https://x.com/heyibinance'}},diagnostics:[{section:'info',status:'ok'}]},
+    flow:pass(),safety:pass()} as any;
+  const settings={...config(),walletSupportRequired:true};
+  const result=decide(signal(),now.toISOString(),settings,pass(),pass(),narrative(),now,'live',undefined,research);
+  assert.equal(result.social?.score,10); assert.equal(result.social?.scope,'research_priority');
+  assert.equal(result.social?.endorsementVerified,false); assert.equal(result.decision,'BUY_CANDIDATE');
+  for(const field of ['provenance','safety','flow']) {
+    const result=decide(signal(),now.toISOString(),settings,field==='provenance'?unknown('TEST_MISSING'):pass(),
+      field==='safety'?unknown('TEST_MISSING'):pass(),narrative(),now,'live',undefined,
+      field==='flow'?{...research,flow:unknown('TEST_MISSING')}:research);
+    assert.equal(result.social?.score,10); assert.equal(result.decision,'WATCH'); assert.equal(result.buyEligible,false);
+  }
 });

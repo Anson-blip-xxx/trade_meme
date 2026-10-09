@@ -39,7 +39,7 @@ test('DeBot 导入要求原始信号时间，生成时间只标记叙事版本�
   } finally {rmSync(directory,{recursive:true,force:true});}
 });
 
-test('HTTP 信号自动取 DeBot 叙事并持久化；低分不否决，安全失败仍拒绝，读取失败可观察',async()=>{
+test('HTTP 信号自动取 DeBot 叙事并持久化；低分及读取失败不否决，安全失败仍拒绝',async()=>{
   const c=config(),p=providers();let vendorCalls=0,safetyFails=false,unavailable=false;
   // Synthetic fresh versions are only used in this mocked integration test, not as live alerts.
   const payload=fixture();payload.data.history.generated_at=new Date().toISOString();
@@ -80,7 +80,8 @@ test('HTTP 信号自动取 DeBot 叙事并持久化；低分不否决，安全�
     assert.equal(unsafe.report.decision,'REJECT');assert.equal(unsafe.report.buyEligible,false);
     safetyFails=false;unavailable=true;
     const missing=await (await post('/v1/signals',{...input,sourceEventId:'synthetic-auto-3'})).json();
-    assert.equal(missing.report.decision,'WATCH');
+    assert.equal(missing.report.decision,'BUY_CANDIDATE');assert.equal(missing.report.narrative.status,'unknown');
+    assert.ok(!missing.report.reasons.includes('NARRATIVE_NOT_PASSED'));
     assert.equal(missing.report.narrative.facts.vendorFetch.reason,'DEBOT_HTTP_429');
 
     // Raw imports use their supplied version and are archived atomically; no extra endpoint fetch.

@@ -67,3 +67,20 @@ test('a scan archive failure does not suppress durable wallet evidence or alter 
     assert.equal(runtime.walletResearchStatus().captureError,undefined);assert.equal(runtime.dashboardOrders().items.length,0);
   } finally {await runtime.close();rmSync(dir,{recursive:true,force:true});}
 });
+
+test('persistent watch queue operates without dashboard and retains original expiry across runtime restart',async()=>{
+  const dir=mkdtempSync(join(tmpdir(),'watch-runtime-'));
+  const cfg=readConfig({DASHBOARD_ENABLED:'false',WATCH_RECHECK_ENABLED:'true',SCAN_DATABASE_PATH:join(dir,'scans.sqlite'),
+    ORDERS_DATABASE_PATH:join(dir,'orders.sqlite'),ENTRY_MODE:'off'});
+  let runtime=createRuntime(cfg);let id='';
+  try {
+    const stamp=new Date().toISOString();const r=report('watch-runtime','WATCH');r.signal.occurredAt=stamp;r.receivedAt=stamp;r.evaluatedAt=stamp;r.validUntil=new Date(Date.now()+60000).toISOString();
+    const reservation=runtime.store.reserve(r.signal);r.id=reservation.entry.id;r.receivedAt=reservation.entry.receivedAt;id=r.id;
+    r.evaluatedAt=new Date().toISOString();assert.equal(runtime.store.finish(id,r,reservation.entry.claimId!),true);
+    const before=runtime.archive!.get(id)!.observation!;assert.equal(before.state,'scheduled');assert.ok(Date.parse(before.endsAt)<=Date.parse(stamp)+600000);
+    await runtime.close();runtime=createRuntime(cfg);
+    const after=runtime.archive!.get(id)!.observation!;assert.equal(after.endsAt,before.endsAt);assert.equal(after.nextCheckAt,before.nextCheckAt);
+    await runtime.watchRechecker!.runOnce();assert.equal(runtime.watchRechecker!.getStatus().deferredReason,'GMGN_API_KEY_MISSING');
+    assert.equal(runtime.dashboardOverview().entryMode,'off');assert.equal(runtime.dashboardOrders().items.length,0);
+  }finally{await runtime.close();rmSync(dir,{recursive:true,force:true});}
+});

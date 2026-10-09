@@ -92,14 +92,53 @@ export interface NarrativeReport extends Check {
   analysis?: Narrative; evidence: Evidence[]; model?: string;
   supplier?:{provider:'gmgn'|'debot';text:string;sourceUrl:string;updatedAt?:string;verification:'user_supplied'|'vendor_endpoint';contentType:'vendor_ai_narrative'};
 }
+export interface VendorAddressConflict {
+  address:string;field:'data.history.ca_address'|'data.history.story.contract_address';
+}
+/** Complete address syntax only; this does not infer which EVM chain owns it. */
+export function completeContractAddress(value:unknown):value is string {
+  if(typeof value!=='string')return false;
+  if(/^0x[0-9a-fA-F]{40}$/.test(value))return true;
+  if(value.length<32||value.length>44)return false;
+  try{return bs58.decode(value).length===32;}catch{return false;}
+}
+export interface SocialSignal {
+  person:string;label?:string;kind:'profile_link'|'ca_post';weight:number;sourceUrl:string;
+  verification:'project_link'|'first_party'|'third_party';evidenceId?:string;
+}
+export interface SocialReport {
+  score:number;scope:'research_priority';signals:SocialSignal[];endorsementVerified:false;
+}
 export interface Report {
   id: string; policyVersion: string; mode: 'live' | 'demo';
   signal: Signal; receivedAt: string; evaluatedAt: string; validUntil: string;
   decision: 'BUY_CANDIDATE' | 'WATCH' | 'REJECT'; buyEligible: boolean;
   decisionAtEvaluation?: 'BUY_CANDIDATE' | 'WATCH' | 'REJECT';
   executionEnabled: false; reasons: string[];
+  advisoryReasons?:string[];social?:SocialReport;
   provenance: Provenance; safety: Check; narrative: NarrativeReport;
   gmgn?:GmgnTokenSnapshot;wallets?:WalletAnalysis;flow?:Check;
+}
+
+/** Only concrete token-identity contradictions are gates; narrative opinions are advisory. */
+export function narrativeIdentityConflict(signal:Signal,narrative:NarrativeReport):boolean {
+  const conflict=narrative.facts?.supplierAddressConflict;
+  if(conflict&&typeof conflict==='object'&&!Array.isArray(conflict)) {
+    const value=conflict as Record<string,unknown>;
+    if(['data.history.ca_address','data.history.story.contract_address'].includes(String(value.field))&&completeContractAddress(value.address)&&
+      (signal.token.chain==='solana'?value.address!==signal.token.address:value.address.toLowerCase()!==signal.token.address.toLowerCase()))return true;
+  }
+  const tokens:unknown[]=[signal.vendorNarrative?.token,narrative.facts?.supplierToken];
+  return tokens.some(value=>{
+    if(!value||typeof value!=='object'||Array.isArray(value)) return false;
+    const token=value as Record<string,unknown>;
+    if(!Chain.safeParse(token.chain).success||typeof token.address!=='string') return false;
+    try {
+      const valid=token.chain==='solana'?bs58.decode(token.address).length===32:/^0x[0-9a-fA-F]{40}$/.test(token.address);
+      return valid&&(token.chain!==signal.token.chain||(token.chain==='solana'?token.address!==signal.token.address:
+        token.address.toLowerCase()!==signal.token.address.toLowerCase()));
+    } catch {return false;}
+  });
 }
 export function unknown(reason: string, facts: Record<string, unknown> = {}): Check {
   return {status:'unknown', reasons:[reason], facts, checkedAt:new Date().toISOString()};

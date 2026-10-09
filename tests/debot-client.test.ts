@@ -89,13 +89,14 @@ test('无效JSON、超时、断网及任意异常不重试且不暴露异常里�
 });
 
 test('错误响应、缺字段和其他CA结果只留原响应审计，不因同名或成功状态放行',async()=>{
-  for(const modify of [(p:any)=>{p.data.history.ca_address='0x1111111111111111111111111111111111111111';},
+  for(const [index,modify] of [(p:any)=>{p.data.history.ca_address='0x1111111111111111111111111111111111111111';},
     (p:any)=>{p.data.history.story.contract_address='0x1111111111111111111111111111111111111111';},
     (p:any)=>{delete p.data.history.generated_at;},(p:any)=>{p.data.version='v3';},
-    (p:any)=>{p.code=404;p.success=false;},(p:any)=>{p.data.history={name:'Umi'};}]) {
+    (p:any)=>{p.code=404;p.success=false;},(p:any)=>{p.data.history={name:'Umi'};}].entries()) {
     const raw=fixture();modify(raw);let calls=0;
     const result=await fetchDebotNarrative(sample(),async()=>{calls++;return new Response(JSON.stringify(raw));});
-    assert.equal(calls,1);assert.equal(result.status,'unavailable');assert.equal(result.reason,'DEBOT_RESPONSE_INVALID');
+    assert.equal(calls,1);assert.equal(result.status,'unavailable');assert.equal(result.reason,index<2?'DEBOT_TOKEN_IDENTITY_CONFLICT':'DEBOT_RESPONSE_INVALID');
+    assert.equal(result.identityConflict!==undefined,index<2);
     assert.equal(result.snapshot,undefined);assert.deepEqual(result.rawResponse,raw);
   }
 });

@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "checkedAt": "2026-10-09",
+  "note": "Handles are backed by the listed organizational sources. Numeric account IDs remain unset until a primary identity source is verified; profile links are only project-supplied associations, never endorsements.",
+  "profiles": [
+    {
+      "person": "cz",
+      "label": "CZ",
+      "chains": ["bsc"],
+      "handle": "cz_binance",
+      "profileUrl": "https://x.com/cz_binance",
+      "identitySources": ["https://www.yzilabs.com/blog/yzi-labs-easy-residency-expands-to-a-year-round-program-with-season-3-demo-day-at-token2049-dubai-april-2026"],
+      "accountId": null,
+      "accountIdVerification": "unverified",
+      "accountIdSource": null
+    },
+    {
+      "person": "he_yi",
+      "label": "何一",
+      "chains": ["bsc"],
+      "handle": "heyibinance",
+      "profileUrl": "https://x.com/heyibinance",
+      "identitySources": ["https://www.yzilabs.com/blog/yzi-labs-easy-residency-expands-to-a-year-round-program-with-season-3-demo-day-at-token2049-dubai-april-2026"],
+      "accountId": null,
+      "accountIdVerification": "unverified",
+      "accountIdSource": null
+    },
+    {
+      "person": "toly",
+      "label": "toly",
+      "chains": ["solana"],
+      "handle": "aeyakovenko",
+      "profileUrl": "https://x.com/aeyakovenko",
+      "identitySources": ["https://solana.com/podcasts/lightspeed/episodes/the-solana-end-game-with-anatoly-yakovenko-kyle-samani-2025-03-25"],
+      "accountId": null,
+      "accountIdVerification": "unverified",
+      "accountIdSource": null
+    },
+    {
+      "person": "elon",
+      "label": "Elon Musk",
+      "chains": ["solana"],
+      "handle": "elonmusk",
+      "profileUrl": "https://x.com/elonmusk",
+      "identitySources": ["https://ir.tesla.com/_flysystem/s3/sec/000156459022017214/tsla-8k_20220502-gen.pdf"],
+      "accountId": null,
+      "accountIdVerification": "unverified",
+      "accountIdSource": null
+    }
+  ]
+}

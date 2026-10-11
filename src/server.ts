@@ -35,7 +35,8 @@ export function buildServer(config:Config,store:Store,providers:Providers=livePr
   const server=createServer(async(req,res)=>{
     try {
       const url=new URL(req.url??'/', 'http://localhost');
-      if(req.method==='GET'&&url.pathname==='/health') {send(res,200,{status:'ok',version:'0.2.0',executionEnabled:config.entryMode==='live'});return;}
+      if(req.method==='GET'&&url.pathname==='/health') {send(res,200,{status:'ok',version:'0.2.0',executionEnabled:false,
+        configuredEntryMode:config.entryMode,unattendedProtectionReady:false});return;}
       if(!authorized(req,config.ingestToken!)) {send(res,401,{error:'UNAUTHORIZED'});return;}
       store.prune(config.researchCacheTtlSec,config.researchCacheMax);
       if(req.method==='GET'&&url.pathname==='/v1/status') {send(res,200,await runDoctor(config));return;}
@@ -107,6 +108,7 @@ if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href) {
   const server=buildServer(config,runtime.store,runtime.providers,runtime);
   const dashboard=config.dashboard.enabled&&runtime.archive?buildDashboard(config,{
     archive:runtime.archive,overview:runtime.dashboardOverview,orders:runtime.dashboardOrders,
+    protection:runtime.dashboardProtection,protectionDetail:id=>runtime.exitShadow?.detail(id),
     walletHistory:runtime.walletHistory,walletResearchStatus:runtime.walletResearchStatus,walletAssociations:runtime.walletHistory}):undefined;
   const fatal=()=>{console.error('SERVICE_LISTEN_FAILED');process.exit(1);};
   server.on('error',fatal);dashboard?.on('error',fatal);

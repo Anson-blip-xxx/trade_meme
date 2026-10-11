@@ -8,8 +8,9 @@ import {OrderStore,type FundingSnapshot,type OpeningStatus,type ExitTracking} fr
 
 const now=new Date('2026-10-09T02:00:00Z');
 const hash='0x'+'c'.repeat(64);
+// Pure budget tests use paper reservations; live admission additionally requires proven exits.
 const input=(id=1)=>({eventKey:`funding-${id}`,chain:'bsc' as const,tokenAddress:`0x${String(id).padStart(40,'0')}`,
-  mode:'live' as const,wallet:'0x'+'a'.repeat(40),inputToken:'0x'+'0'.repeat(40),inputAmount:'100',slippagePct:5,details:{}});
+  mode:'paper' as const,wallet:'0x'+'a'.repeat(40),inputToken:'0x'+'0'.repeat(40),inputAmount:'100',slippagePct:5,details:{}});
 const snapshot=(patch:Partial<FundingSnapshot>={}):FundingSnapshot=>({balance:'100',feeReserve:'10',
   readStartedAt:new Date(now.getTime()-1_000).toISOString(),checkedAt:now.toISOString(),coveredOrderIds:[],...patch});
 
@@ -50,9 +51,18 @@ test('所有未确定开单状态都保留资金，covered IDs不能释放未知
     try {
       const mode=status==='paper_open'?'paper' as const:'live' as const;
       const old=store.reserve({...input(),mode,inputAmount:'60'},10,now,snapshot()).order!;
-      if(status!=='prepared') store.update(old.id,['prepared'],{status,...(status==='confirmed'?{}:{transactionHash:hash})},now);
+      // Seed a legacy concurrent ledger while the earlier row is temporarily failed.
+      // Once both rows exist, the original unresolved state must still reserve funds.
+      store.update(old.id,['prepared'],{status:'failed'},now);
+      const own=store.reserve({...input(3),mode,inputAmount:'20'},10,now,snapshot()).order!;
+      store.update(old.id,['failed'],{status,...(status==='confirmed'?{}:{transactionHash:hash})},now);
+      assert.deepEqual(store.checkFunding(own.id,snapshot({coveredOrderIds:[old.id]}),now),{ok:true},status);
+      assert.deepEqual(store.checkFunding(own.id,snapshot({balance:'99',coveredOrderIds:[old.id]}),now),
+        {ok:false,reason:'ENTRY_INSUFFICIENT_BALANCE'},status);
+      store.update(own.id,['prepared'],{status:'failed'},now);
       const result=store.reserve({...input(2),mode},10,now,snapshot({coveredOrderIds:[old.id]}));
-      assert.equal(result.order?.inputAmount,'20',status);
+      if(mode==='live') assert.equal(result.reason,'EXIT_PROTECTION_UNVERIFIED',status);
+      else assert.equal(result.order?.inputAmount,'20',status);
     } finally {store.close();}
   }
 });
@@ -90,7 +100,7 @@ test('已关闭持仓的买入仍需snapshot覆盖证明，防止使用买入前
 });
 
 test('按mode/chain/wallet/inputToken隔离预留，EVM地址忽略大小写',()=>{
-  for(const patch of [{mode:'paper' as const},{chain:'robinhood' as const},
+  for(const patch of [{mode:'live' as const},{chain:'robinhood' as const},
     {wallet:'0x'+'b'.repeat(40)},{inputToken:'0x'+'d'.repeat(40)}]) {
     const store=new OrderStore(':memory:');
     try {
@@ -198,7 +208,7 @@ test('资金覆盖查询不受列表50条分页限制，只返回同资金范围
     assert.equal(store.list().length,50);
     const all=store.fundingOrders(input());
     assert.equal(all.length,65);assert.deepEqual(all.map(order=>order.id),ids);
-    assert.equal(store.fundingOrders({...input(),mode:'paper'}).length,0);
+    assert.equal(store.fundingOrders({...input(),mode:'live'}).length,0);
     assert.equal(store.fundingOrders({...input(),chain:'robinhood'}).length,0);
     assert.equal(store.fundingOrders({...input(),inputToken:'0x'+'e'.repeat(40)}).length,0);
   } finally {store.close();}

@@ -84,13 +84,7 @@ export class OrderStore {
       const duplicate=this.db.prepare(`SELECT id FROM opening_orders WHERE chain=? AND token_address=? AND mode=? AND ${occupies} LIMIT 1`)
         .get(input.chain,input.tokenAddress,input.mode);
       if(duplicate) {this.db.exec('COMMIT');return {created:false,reason:'ASSET_ALREADY_OPEN'};}
-      if(input.mode==='live'&&this.db.prepare(`SELECT id FROM opening_orders WHERE mode='live' AND ${occupies}
-        AND (?=1 OR json_type(details,'$.exit')='object')
-        AND (COALESCE(json_extract(details,'$.exit.assessment.hasLiveStop'),0)<>1
-          OR COALESCE(json_extract(details,'$.exit.state'),'')<>'monitoring'
-          OR COALESCE(json_extract(details,'$.exit.checkedAt'),'')<?
-          OR COALESCE(json_extract(details,'$.exit.assessment.checkedAt'),'')<?) LIMIT 1`).get(input.exit?1:0,
-          new Date(now.getTime()-90_000).toISOString(),new Date(now.getTime()-90_000).toISOString())) {
+      if(input.mode==='live'&&this.hasUnprotectedOpening(now)) {
         this.db.exec('COMMIT');return {created:false,reason:'EXIT_PROTECTION_UNVERIFIED'};
       }
       const count=Number(this.db.prepare(`SELECT count(*) AS n FROM opening_orders WHERE mode=? AND ${occupies}`).get(input.mode)!.n);
@@ -115,6 +109,42 @@ export class OrderStore {
         .run(order.id,order.eventKey,order.chain,order.tokenAddress,order.mode,order.status,order.createdAt,order.updatedAt,JSON.stringify(order));
       this.db.exec('COMMIT');return {created:true,order};
     } catch(e) {this.db.exec('ROLLBACK');throw e;}
+  }
+  /** Recheck all other live positions atomically with the last pre-send transition. */
+  beginSubmission(id:string,now=new Date()):{order?:OpeningOrder;reason?:string} {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const previous=this.get(id);
+      if(!previous||previous.mode!=='live'||previous.status!=='prepared') {
+        this.db.exec('COMMIT');return {reason:'ENTRY_ALREADY_HANDLED'};
+      }
+      if(this.hasUnprotectedOpening(now,id)) {
+        this.db.exec('COMMIT');return {reason:'EXIT_PROTECTION_UNVERIFIED'};
+      }
+      const order:OpeningOrder={...previous,status:'submitting',updatedAt:now.toISOString()};
+      this.db.prepare('UPDATE opening_orders SET status=?,updated_at=?,details=? WHERE id=? AND status=\'prepared\'')
+        .run(order.status,order.updatedAt,JSON.stringify(order),id);
+      this.db.exec('COMMIT');return {order};
+    } catch(error) {this.db.exec('ROLLBACK');throw error;}
+  }
+  /** Missing exits and unresolved submissions block new live risk even if exits are disabled now. */
+  private hasUnprotectedOpening(now:Date,excludeId=''):boolean {
+    const current=now.getTime();
+    if(!Number.isFinite(current)) return true;
+    return !!this.db.prepare(`SELECT id FROM opening_orders WHERE mode='live' AND id<>? AND ${occupies}
+      AND (status<>'confirmed'
+        OR COALESCE(json_extract(details,'$.exit.assessment.hasLiveStop'),0)<>1
+        OR COALESCE(json_extract(details,'$.exit.assessment.status'),'')<>'verified'
+        OR COALESCE(json_extract(details,'$.exit.assessment.policyMatched'),0)<>1
+        OR COALESCE(json_extract(details,'$.exit.state'),'')<>'monitoring'
+        OR julianday(json_extract(details,'$.exit.checkedAt')) IS NULL
+        OR julianday(json_extract(details,'$.exit.assessment.checkedAt')) IS NULL
+        OR julianday(json_extract(details,'$.exit.checkedAt'))<julianday(?)
+        OR julianday(json_extract(details,'$.exit.assessment.checkedAt'))<julianday(?)
+        OR julianday(json_extract(details,'$.exit.checkedAt'))>julianday(?)
+        OR julianday(json_extract(details,'$.exit.assessment.checkedAt'))>julianday(?)) LIMIT 1`)
+      .get(excludeId,new Date(current-90_000).toISOString(),new Date(current-90_000).toISOString(),
+        new Date(current+5_000).toISOString(),new Date(current+5_000).toISOString());
   }
   /** Recheck the fixed, already quoted principal. Never resize or double-count this order. */
   checkFunding(id:string,funding:FundingSnapshot|undefined,now=new Date()):FundingCheck {

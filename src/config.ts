@@ -41,6 +41,7 @@ export interface Config extends z.infer<typeof schema> {
   dashboard:{enabled:boolean;host:string;port:number;token?:string;origin?:string;archivePath:string;retentionDays:number;trackingHours:number;sampleIntervalSec:number};
   walletResearch:{enabled:boolean;database:string;maxBytes:number;intervalSec:number;maxRequestsPerCycle:number};
   watch:{enabled:boolean;windowSec:number;intervalSec:number;maxPerCycle:number};
+  exitShadow:{enabled:boolean;database:string;maxBytes:number;staleAfterSec:number;maxPositions:number};
 }
 export function isPersistentOrderPath(value:string):boolean {
   return typeof value==='string'&&value.trim().length>0&&value.trim()!==':memory:'&&
@@ -102,6 +103,11 @@ export function readConfig(env:NodeJS.ProcessEnv=process.env): Config {
       maxBytes:z.coerce.number().int().min(16).max(16384).parse(env.WALLET_HISTORY_MAX_MB??512)*1024*1024,
       intervalSec:z.coerce.number().int().min(60).max(3600).parse(env.WALLET_OBSERVER_INTERVAL_SEC??300),
       maxRequestsPerCycle:z.coerce.number().int().min(1).max(10).parse(env.WALLET_OBSERVER_MAX_REQUESTS??9)},
+    exitShadow:{enabled:z.enum(['true','false']).default('false').parse(env.EXIT_SHADOW_ENABLED)==='true',
+      database:z.string().trim().refine(isPersistentOrderPath).parse(env.EXIT_SHADOW_DATABASE_PATH??'data/exit-shadow.sqlite'),
+      maxBytes:z.coerce.number().int().min(16).max(4096).parse(env.EXIT_SHADOW_MAX_MB??128)*1024*1024,
+      staleAfterSec:z.coerce.number().int().min(30).max(900).parse(env.EXIT_SHADOW_STALE_AFTER_SEC??180),
+      maxPositions:z.coerce.number().int().min(10).max(10000).parse(env.EXIT_SHADOW_MAX_POSITIONS??1000)},
     watch:{enabled:z.enum(['true','false']).default('false').parse(env.WATCH_RECHECK_ENABLED)==='true',
       windowSec:z.coerce.number().int().min(60).max(3600).parse(env.WATCH_WINDOW_SEC??600),
       intervalSec:z.coerce.number().int().min(30).max(3600).parse(env.WATCH_RECHECK_INTERVAL_SEC??120),

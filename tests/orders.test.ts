@@ -57,12 +57,17 @@ test('恢复只改过期未提交/提交中记录，终态不退回；确认但�
   const store=new OrderStore(':memory:'),now=new Date('2026-10-08T12:00:00Z');
   try {
     const prepared=store.reserve({...input('prepared'),mode:'live'},10,now).order!;
+    store.update(prepared.id,['prepared'],{status:'failed'},now);
     const submitting=store.reserve({...input('submitting'),tokenAddress:'0x'+'5'.repeat(40),mode:'live'},10,now).order!;
-    store.update(submitting.id,['prepared'],{status:'submitting'},now);
+    store.update(submitting.id,['prepared'],{status:'failed'},now);
     const confirmed=store.reserve({...input('confirmed'),tokenAddress:'0x'+'6'.repeat(40),mode:'live'},10,now).order!;
-    store.update(confirmed.id,['prepared'],{status:'confirmed',providerOrderId:'confirmed-id'},now);
+    store.update(confirmed.id,['prepared'],{status:'failed'},now);
     const failed=store.reserve({...input('failed'),tokenAddress:'0x'+'7'.repeat(40),mode:'live'},10,now).order!;
     store.update(failed.id,['prepared'],{status:'failed'},now);
+    // Restore a legacy concurrent ledger; new live reservations cannot create this state.
+    store.update(prepared.id,['failed'],{status:'prepared'},now);
+    store.update(submitting.id,['failed'],{status:'submitting'},now);
+    store.update(confirmed.id,['failed'],{status:'confirmed',providerOrderId:'confirmed-id'},now);
     store.recover(new Date(now.getTime()+300001));
     assert.equal(store.get(prepared.id)?.status,'failed');assert.equal(store.get(submitting.id)?.status,'unknown');
     assert.equal(store.get(confirmed.id)?.status,'confirmed');assert.equal(store.get(failed.id)?.status,'failed');
@@ -72,6 +77,36 @@ test('恢复只改过期未提交/提交中记录，终态不退回；确认但�
     assert.equal(store.update(confirmed.id,['confirmed'],{actualInputAmount:'98'}),undefined);
     assert.equal(store.update(confirmed.id,['confirmed'],{status:'unknown'}),undefined);
     assert.equal(store.get(confirmed.id)?.actualInputAmount,'99');assert.equal(store.get(confirmed.id)?.status,'confirmed');
+  } finally {store.close();}
+});
+
+test('旧账本中的未知、缺失退出及未保护已确认仓位，跨资产跨链封锁新实盘',()=>{
+  const now=new Date('2026-10-11T00:00:00Z');
+  for(const status of ['prepared','submitting','submitted','unknown','confirmed'] as const) {
+    const store=new OrderStore(':memory:');
+    try {
+      const prior=store.reserve({...input('legacy'),mode:'live'},10,now).order!;
+      if(status!=='prepared') store.update(prior.id,['prepared'],{status},now);
+      const other=store.reserve({...input('new-asset'),chain:'robinhood',tokenAddress:'0x'+'9'.repeat(40),mode:'live'},10,now);
+      assert.equal(other.reason,'EXIT_PROTECTION_UNVERIFIED',status);assert.equal(store.list().length,1);
+      assert.equal(store.reserve({...input('paper-observation'),tokenAddress:'0x'+'9'.repeat(40)},10,now).created,true);
+    } finally {store.close();}
+  }
+});
+
+test('发送前事务再次核验其他仓位，阻止报价后新增的未知风险',()=>{
+  const now=new Date('2026-10-11T00:00:00Z');
+  const store=new OrderStore(':memory:');
+  try {
+    const prior=store.reserve({...input('legacy'),mode:'live'},10,now).order!;
+    store.update(prior.id,['prepared'],{status:'failed'},now);
+    const quoted=store.reserve({...input('quoted'),tokenAddress:'0x'+'9'.repeat(40),mode:'live'},10,now).order!;
+    store.update(prior.id,['failed'],{status:'unknown'},now);
+    assert.equal(store.beginSubmission(quoted.id,now).reason,'EXIT_PROTECTION_UNVERIFIED');
+    assert.equal(store.get(quoted.id)?.status,'prepared');
+    store.update(prior.id,['unknown'],{status:'failed'},now);
+    assert.equal(store.beginSubmission(quoted.id,now).order?.status,'submitting');
+    assert.equal(store.beginSubmission(quoted.id,now).reason,'ENTRY_ALREADY_HANDLED');
   } finally {store.close();}
 });
 

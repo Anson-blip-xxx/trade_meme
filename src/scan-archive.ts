@@ -455,6 +455,18 @@ export class ScanArchive {
       .map(row=>({chain:row.chain as Chain,address:String(row.address)}));
   }
 
+  /** Public identity for forward-only exit observation; never supplies old prices or peaks. */
+  exitObservationSeed(value:ScanToken,now=this.now()):{candidateId:string;eligibleAt:string;endsAt:string;symbol?:string}|undefined {
+    const identity=token(value);if(!identity||!Number.isFinite(now.getTime()))return;
+    const row=this.db.prepare(`SELECT id,eligible_at,record FROM scan_summaries WHERE chain=? AND address=?
+      AND eligible_at>? AND eligible_at<=? ORDER BY eligible_at,id LIMIT 1`)
+      .get(identity.chain,identity.address,new Date(now.getTime()-this.trackingMs).toISOString(),now.toISOString());
+    if(!row)return;
+    const record=JSON.parse(String(row.record)) as ScanRecord;
+    return {candidateId:String(row.id),eligibleAt:String(row.eligible_at),
+      endsAt:new Date(Date.parse(String(row.eligible_at))+this.trackingMs).toISOString(),symbol:record.symbol};
+  }
+
   recordPrice(price:ScanPrice):void {
     const identity=token(price),at=timestamp(price?.observedAt),now=this.now();
     if(!identity||!at||Date.parse(at)>now.getTime()||!Number.isFinite(price.priceUsd)||price.priceUsd<=0||

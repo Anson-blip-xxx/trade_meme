@@ -85,6 +85,9 @@ function setup(t: TestCleanup, options: {
   const close = () => {if (!closed) {store.close(); closed = true;}};
   t.after(close);
   const controller = new EntryController(config, store, client, {now: () => now,
+    // This test-only provider does not authenticate real autonomous execution.
+    liveProtection: context => ({status:'verified',scope:'autonomous_exit_execution',chain:context.chain,wallet:context.wallet,
+      checkedAt:now.toISOString(),validUntil:new Date(now.getTime()+30_000).toISOString()}),
     fetcher: async (input, init) => {
       const url = new URL(String(input));
       if (url.hostname !== 'openapi.gmgn.ai') {
@@ -285,9 +288,10 @@ test('disabling current exits cannot bypass an existing unverified exit position
   assert.equal(ctx.signedCalls.filter(call => call.url.pathname === '/v1/trade/swap').length, 1);
 });
 
-test('an old monitoring timestamp or old protection evidence cannot authorize another opening', async t => {
+test('stale, future or invalid monitoring evidence cannot authorize another opening', async t => {
   const fresh = now.toISOString(), stale = new Date(now.getTime() - 90_001).toISOString();
-  for (const [checkedAt, evidenceCheckedAt] of [[stale, fresh], [fresh, stale]]) {
+  const future=new Date(now.getTime()+5_001).toISOString();
+  for (const [checkedAt, evidenceCheckedAt] of [[stale, fresh], [fresh, stale], [future,fresh], [fresh,future], ['invalid',fresh], [fresh,'invalid']]) {
     const ctx = setup(t);
     const created = await ctx.controller.consider(candidate());
     const snapshot = created.order!.exit!;

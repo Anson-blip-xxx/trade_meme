@@ -11,6 +11,8 @@ export interface DashboardServices {
   archive:ScanArchive;
   overview:()=>unknown;
   orders:()=>unknown;
+  protection?:()=>unknown;
+  protectionDetail?:(id:string)=>unknown;
   walletHistory?:Pick<WalletHistory,'listWallets'|'getWallet'>;
   walletResearchStatus?:()=>unknown;
   walletAssociations?:Pick<WalletHistory,'listAssociations'|'getAssociation'|'associationStats'>;
@@ -95,6 +97,13 @@ export function buildDashboard(config:Config,services:DashboardServices,assetDir
       if(url.pathname==='/dashboard/api/session') {send(res,200,{authenticated:true,readOnly:true,authentication:proxyAuthenticated(req)?'proxy':'session'});return;}
       if(url.pathname==='/dashboard/api/overview') {send(res,200,services.overview());return;}
       if(url.pathname==='/dashboard/api/orders') {send(res,200,services.orders());return;}
+      if(url.pathname==='/dashboard/api/protection') {
+        send(res,200,services.protection?.()??{enabled:false,mode:'shadow',liveReady:false,items:[]});return;
+      }
+      const protectionMatch=url.pathname.match(/^\/dashboard\/api\/protection\/([0-9a-f-]{36})$/);
+      if(protectionMatch) {
+        const detail=services.protectionDetail?.(protectionMatch[1]);send(res,detail?200:404,detail??{error:'NOT_FOUND'});return;
+      }
       if(url.pathname==='/dashboard/api/wallet-research/status') {
         send(res,200,services.walletResearchStatus?.()??{enabled:false});return;
       }

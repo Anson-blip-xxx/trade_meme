@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {generateKeyPairSync, randomUUID, verify} from 'node:crypto';
 import bs58 from 'bs58';
 import {readConfig, type Config} from '../src/config.js';
-import {EntryController} from '../src/entry.js';
+import {EntryController, type LiveProtectionProvider} from '../src/entry.js';
 import {OrderStore} from '../src/orders.js';
 import {GmgnClient} from '../src/providers/gmgn-client.js';
 import {NATIVE_INPUT_TOKENS} from '../src/native-balance.js';
@@ -24,6 +24,7 @@ function setup(t: {after: (fn: () => void) => void}, options: {
   chain?: Chain; config?: Partial<Config>; balances?: bigint[];
   beforeBalance?: (read: number, clock: {time: number}) => void | Promise<void>;
   rpcFailureAt?: number; unknownBalanceAt?: number; swapFails?: boolean;
+  liveProtection?: LiveProtectionProvider | null;
 } = {}) {
   const chain = options.chain ?? 'bsc', clock = {time: Date.now()};
   const config: Config = {...readConfig({}), entryMode: 'live', entrySizing: 'balance_cap',
@@ -45,6 +46,11 @@ function setup(t: {after: (fn: () => void) => void}, options: {
     }});
   const orders = new OrderStore(':memory:'); t.after(() => orders.close());
   const controller = new EntryController(config, orders, client, {now: () => new Date(clock.time),
+    // Synthetic readiness exists only to exercise the mocked transport and sizing below.
+    liveProtection: options.liveProtection === null ? undefined : options.liveProtection ?? (context => ({
+      status: 'verified', scope: 'autonomous_exit_execution', chain: context.chain, wallet: context.wallet,
+      checkedAt: new Date(clock.time).toISOString(), validUntil: new Date(clock.time + 30_000).toISOString(),
+    })),
     fetcher: async (input, init) => {
       const url = new URL(String(input));
       if (url.hostname === 'openapi.gmgn.ai') {
@@ -112,6 +118,25 @@ test('three-chain caps use exact native execution addresses and dynamic atomic a
     const funding = result.order!.details.funding as Record<string, unknown>;
     assert.equal(funding.cap, caps[chain]); assert.equal(funding.feeReserve, reserve.toString());
   }
+});
+
+test('default unavailable autonomous protection blocks before any native balance request', async t => {
+  const ctx=setup(t,{liveProtection:null});
+  const result=await ctx.controller.consider(ctx.candidate());
+  assert.equal(result.reason,'ENTRY_UNATTENDED_PROTECTION_UNVERIFIED');
+  assert.equal(ctx.rpcCalls.length,0);assert.equal(ctx.readCalls.length,0);assert.equal(ctx.signedCalls.length,0);
+  assert.equal(ctx.orders.list().length,0);
+});
+
+test('protection loss during final balance I/O prevents signing and submission', async t => {
+  let protectedNow=true;
+  const ctx=setup(t,{beforeBalance:read=>{if(read===2) protectedNow=false;},liveProtection:context=>({
+    status:protectedNow?'verified':'unverified',scope:'autonomous_exit_execution',chain:context.chain,wallet:context.wallet,
+    checkedAt:new Date(ctx.clock.time).toISOString(),validUntil:new Date(ctx.clock.time+30_000).toISOString(),
+  })});
+  const result=await ctx.controller.consider(ctx.candidate());
+  assert.equal(result.reason,'ENTRY_UNATTENDED_PROTECTION_UNVERIFIED');assert.equal(result.order?.status,'failed');
+  assert.equal(ctx.balanceReads(),2);assert.equal(ctx.readCalls.length,1);assert.equal(ctx.signedCalls.length,0);
 });
 
 test('excess wallet funds never raise any order above its configured native cap', async t => {
@@ -213,7 +238,7 @@ test('signals and vendor responses cannot choose caps, balance, fee reserves or 
   assert.equal(body.input_amount, spendable.toString()); assert.equal(body.gas_price, '60000000');
 });
 
-test('pending and ambiguous submissions retain native funding even when a valid transaction hash is known', async t => {
+test('pending and ambiguous submissions block additional live risk even with no exit and a known transaction hash', async t => {
   const cap = BigInt(caps.bsc), reserve = BigInt(readConfig({}).entryFeeReserves.bsc);
   for (const status of ['submitted', 'unknown'] as const) {
     const ctx = setup(t, {balances: [cap + 2n * reserve]});
@@ -222,25 +247,33 @@ test('pending and ambiguous submissions retain native funding even when a valid 
       details: {funding: {feeReserve: reserve.toString()}}}, 3, new Date(ctx.clock.time)).order!;
     ctx.orders.update(prior.id, ['prepared'], {status, transactionHash: hash, providerOrderId: 'prior-order'});
     const result = await ctx.controller.consider(ctx.candidate());
-    assert.equal(result.order?.status, 'submitted');
-    assert.equal(result.order?.inputAmount, (cap / 2n).toString());
+    assert.equal(result.status,'blocked');assert.equal(result.reason,'EXIT_PROTECTION_UNVERIFIED');
+    assert.equal(ctx.orders.get(prior.id)?.inputAmount,(cap/2n).toString());
     assert.equal(ctx.rpcCalls.some(call => call.method === 'eth_getTransactionReceipt'), false);
-    assert.equal((result.order!.details.funding as Record<string, unknown>).reservedBefore,
-      (cap / 2n + reserve).toString());
+    assert.equal(ctx.readCalls.length,0);assert.equal(ctx.signedCalls.length,0);
   }
 });
 
-test('parallel candidates share the same native budget and both retain their own fee buffer', async t => {
+test('parallel paper candidates share the same native budget and both retain their own fee buffer', async t => {
   const cap = BigInt(caps.bsc), reserve = BigInt(readConfig({}).entryFeeReserves.bsc);
   const balance = cap + cap / 2n + 2n * reserve;
-  const ctx = setup(t, {balances: [balance]});
+  const ctx = setup(t, {balances: [balance],config:{entryMode:'paper'}});
   const results = await Promise.all([
     ctx.controller.consider(ctx.candidate('parallel-a')),
     ctx.controller.consider(ctx.candidate('parallel-b', token('bsc', 4))),
   ]);
-  assert.ok(results.every(result => result.order?.status === 'submitted'));
+  assert.ok(results.every(result => result.order?.status === 'paper_open'));
   const amounts = results.map(result => BigInt(result.order!.inputAmount)).sort((a, b) => a < b ? -1 : 1);
   assert.deepEqual(amounts, [cap / 2n, cap]);
   assert.equal(amounts[0] + amounts[1] + 2n * reserve, balance);
-  assert.equal(ctx.signedCalls.length, 2);
+  assert.equal(ctx.signedCalls.length, 0);
+});
+
+test('parallel live candidates cannot create a second unprotected position', async t => {
+  const ctx=setup(t);
+  const results=await Promise.all([ctx.controller.consider(ctx.candidate('live-a')),
+    ctx.controller.consider(ctx.candidate('live-b',token('bsc',4)))]);
+  assert.equal(results.filter(r=>r.order?.status==='submitted').length,1);
+  assert.equal(results.filter(r=>r.reason==='EXIT_PROTECTION_UNVERIFIED').length,1);
+  assert.equal(ctx.readCalls.length,1);assert.equal(ctx.signedCalls.length,1);assert.equal(ctx.orders.list().length,1);
 });

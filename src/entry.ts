@@ -14,6 +14,18 @@ export interface EntryResult {
   reason?: string;
   order?: OpeningOrder;
 }
+/** Internal capability evidence, never a user setting, signal assertion, or shadow result. */
+export interface LiveProtectionReadiness {
+  status: 'verified' | 'unverified';
+  scope: 'autonomous_exit_execution';
+  chain: Chain;
+  wallet: string;
+  checkedAt: string;
+  validUntil: string;
+}
+export type LiveProtectionProvider = (context: Readonly<{
+  chain: Chain; wallet: string; phase: 'before_balance' | 'before_quote' | 'before_submit';
+}>) => LiveProtectionReadiness;
 interface QuoteSummary {
   inputToken: string; outputToken: string; inputAmount: string;
   expectedOutputAmount: string; minOutputAmount: string; slippagePct: number; quotedAt: string;
@@ -126,10 +138,13 @@ function quoteSummary(raw: unknown, order: OpeningOrder, now: Date): QuoteSummar
 export class EntryController {
   private readonly fetcher: typeof fetch;
   private readonly now: () => Date;
+  private readonly liveProtection?: LiveProtectionProvider;
   constructor(private readonly config: Config, private readonly orders: OrderStore,
-    private readonly client: GmgnClient, options: {fetcher?: typeof fetch; now?: () => Date} = {}) {
+    private readonly client: GmgnClient, options: {fetcher?: typeof fetch; now?: () => Date;
+      liveProtection?: LiveProtectionProvider} = {}) {
     this.fetcher = options.fetcher ?? fetch;
     this.now = options.now ?? (() => new Date());
+    this.liveProtection = options.liveProtection;
   }
 
   async consider(input: Report): Promise<EntryResult> {
@@ -143,6 +158,10 @@ export class EntryController {
     if (ineligible) return {status: 'skipped', reason: ineligible};
     const chain = report.signal.token.chain, target = report.signal.token.address;
     const wallet = this.config.entryWallets[chain], amount = this.config.entryAmounts[chain], inputToken = this.config.entryInputTokens[chain];
+    if (this.config.entryMode === 'live') {
+      try {this.requireLiveProtection(chain, wallet ?? '', 'before_balance');}
+      catch (error) {return {status: 'blocked', reason: reason(error)};}
+    }
     if (!this.config.gmgnApiKey || !wallet || !inputToken || !amount) return {status: 'blocked', reason: 'ENTRY_CONFIG_MISSING'};
     if (!address(wallet, chain) || zeroEvm.test(wallet) || !address(inputToken, chain) || !atomic(amount, chain) ||
         zeroEvm.test(target) || addressEqual(inputToken, target, chain) ||
@@ -181,6 +200,7 @@ export class EntryController {
     let order = reservation.order!;
     let attempted = false;
     try {
+      if (order.mode === 'live') this.requireLiveProtection(chain, order.wallet, 'before_quote');
       const raw = await this.client.get('/v1/trade/quote', {chain: chainName(chain), from_address: order.wallet,
         input_token: order.inputToken, output_token: target, input_amount: order.inputAmount, slippage: order.slippagePct}, 10);
       const quote = quoteSummary(raw, order, this.now());
@@ -204,6 +224,7 @@ export class EntryController {
           ...(chain==='solana'?{priority_fee:this.config.entryPriorityFeeSolana,tip_fee:this.config.entryTipFeeSolana}:{})}:{}),
         ...(chain === 'solana' || chain === 'bsc' ? {is_anti_mev: true} : {})};
       const result = await this.signedRequest('POST', '/v1/trade/swap', {}, body, signingKey!, async () => {
+        this.requireLiveProtection(order.chain, order.wallet, 'before_submit');
         if(funding) {
           const latest=await this.fundingSnapshot(order.chain,order.wallet,order.inputToken,order.mode);
           const checked=this.orders.checkFunding(order.id,latest,this.now());
@@ -212,8 +233,10 @@ export class EntryController {
         const expiredNow = eligibility(report, this.config, this.now());
         if (expiredNow) throw new EntryError(expiredNow);
         if (this.config.entryMode !== 'live') throw new EntryError('ENTRY_DISABLED_BEFORE_SUBMIT');
-        const submitting = this.orders.update(order.id, ['prepared'], {status: 'submitting'}, this.now());
-        if (!submitting) throw new EntryError('ENTRY_ALREADY_HANDLED');
+        // Balance I/O and the shared request queue can outlive the protection evidence.
+        this.requireLiveProtection(order.chain, order.wallet, 'before_submit');
+        const submitting = this.orders.beginSubmission(order.id, this.now());
+        if (!submitting.order) throw new EntryError(submitting.reason ?? 'ENTRY_ALREADY_HANDLED');
         attempted = true;
       });
       const updated = this.applyExecution(order, result);
@@ -258,6 +281,19 @@ export class EntryController {
   }
 
   private isDisabled(): boolean { return this.config.entryMode === 'off'; }
+
+  private requireLiveProtection(chain: Chain, wallet: string,
+    phase: Parameters<LiveProtectionProvider>[0]['phase']): void {
+    const fail = () => {throw new EntryError('ENTRY_UNATTENDED_PROTECTION_UNVERIFIED');};
+    try {
+      const proof = this.liveProtection?.(Object.freeze({chain, wallet, phase}));
+      const current = this.now().getTime(), checked = Date.parse(proof?.checkedAt ?? ''), until = Date.parse(proof?.validUntil ?? '');
+      if (!proof || proof.status !== 'verified' || proof.scope !== 'autonomous_exit_execution' ||
+          proof.chain !== chain || !address(proof.wallet, chain) || !addressEqual(proof.wallet, wallet, chain) ||
+          ![current, checked, until].every(Number.isFinite) || checked > current + 5_000 ||
+          current - checked > 30_000 || until <= current || until < checked || until - checked > 30_000) fail();
+    } catch {fail();}
+  }
 
   private async fundingSnapshot(chain:Chain,wallet:string,inputToken:string,mode:'live'|'paper'):Promise<FundingSnapshot> {
     const balance=await readNativeBalance(chain,wallet,this.config,this.fetcher);

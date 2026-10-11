@@ -10,6 +10,7 @@
     scans: ['信号扫描', '从链上信号到筛选依据，让每一次观察都有迹可循。'],
     candidates: ['条件后追踪', '回看曾通过研究判断的信号，观察此后的价格表现。'],
     wallets: ['钱包研究', '回查公开钱包之前的买入者，持续验证跨币时序与资金联系。'],
+    protection: ['止盈保护', '前瞻验证动态保护线与触发建议，观察利润回撤时策略会如何响应。'],
     orders: ['订单记录', '核对实际订单、执行结果与退出保护状态。'],
     system: ['运行状态', '查看扫描进度、资金上限与服务端的运行配置。'],
   };
@@ -87,9 +88,24 @@
     WALLET_ASSOCIATION_REFRESH_FAILED: '前置关联分析暂未完成',
     GMGN_ASSOCIATION_TRADERS_SCHEMA_INVALID: '关联交易者样本格式异常',
     GMGN_ASSOCIATION_TRADERS_ROWS_INVALID: '部分关联交易者记录无法核实',
+    HARD_STOP_OBSERVED: '样本价格达到硬止损线',
+    DYNAMIC_PROTECTION_OBSERVED: '样本价格回落至动态保护线',
+    PARTIAL_PROFIT_STAGE_OBSERVED: '样本涨幅达到分档止盈条件',
+    WALLET_NET_SELLING_TIGHTENED: '已覆盖钱包净卖出，保护线随之收紧',
+    SHADOW_STARTED: '首条新报价建立影子基准',
+    DYNAMIC_PROTECTION_ARMED: '样本涨幅达到动态跟踪启动条件',
+    PROTECTION_LINE_RAISED: '后续样本推动动态保护线上调',
+    PRICE_SAMPLE_UNAVAILABLE: '本次报价暂不可用，保留已有观察结果',
+    PRICE_SAMPLE_RECOVERED: '新的有效报价已恢复',
+    EXIT_SHADOW_CAPTURE_FAILED: '影子观察记录保存失败',
+    EXIT_SHADOW_READ_FAILED: '影子观察记录读取失败',
+    EXIT_SHADOW_WRITE_FAILED: '影子历史写入失败',
+    EXIT_SHADOW_CAPACITY_REACHED: '影子历史已达到存储容量上限',
+    EXIT_SHADOW_POSITION_CAPACITY_REACHED: '影子观察对象已达到容量上限',
+    EXIT_SHADOW_STATE_INVALID: '影子模型状态异常，记录可能不完整',
   };
   const state = {authenticated: false, view: 'scans', chain: '', decision: '', search: '', offset: 0, total: 0, items: [], orders: [], overview: null, refreshing: false, queued: false, queryVersion: 0, timer: null, searchTimer: null, lastSuccess: null, resourceErrors: {}, scansLoaded: false, ordersLoaded: false, detailId: null, detailKind: 'scan', detailWallet: null, detailGeneration: 0, returnFocus: null,
-    walletSort: 'associations', associationStatus: null, walletChain: '', walletSearch: '', walletOffset: 0, walletTotal: 0, walletItems: [], walletStatus: null, walletsLoaded: false, walletSearchTimer: null};
+    walletSort: 'associations', associationStatus: null, walletChain: '', walletSearch: '', walletOffset: 0, walletTotal: 0, walletItems: [], walletStatus: null, walletsLoaded: false, walletSearchTimer: null, protection: null, protectionLoaded: false};
 
   function el(tag, className, text) {
     const node = document.createElement(tag);
@@ -313,11 +329,13 @@
     const failures = Object.values(state.resourceErrors).filter(Boolean);
     const archival = state.overview?.archiveError;
     const walletError = state.walletStatus?.store?.error || state.walletStatus?.captureError || state.walletStatus?.observer?.feedError;
-    const status = $('connection-status'); status.classList.toggle('stale', failures.length > 0 || Boolean(archival) || Boolean(walletError));
-    status.lastElementChild.textContent = failures.length ? '连接异常' : archival || walletError ? '记录写入异常' : '数据已连接';
-    $('network-warning').hidden = failures.length === 0 && !archival && !walletError;
+    const protectionError = state.overview?.exitProtection?.captureError || (state.view === 'protection' && state.protection?.captureError);
+    const status = $('connection-status'); status.classList.toggle('stale', failures.length > 0 || Boolean(archival) || Boolean(walletError) || Boolean(protectionError));
+    status.lastElementChild.textContent = failures.length ? '连接异常' : archival || walletError || protectionError ? '记录读写异常' : '数据已连接';
+    $('network-warning').hidden = failures.length === 0 && !archival && !walletError && !protectionError;
     if (failures.length) text('network-warning', `部分数据暂时无法更新，已保留最近一次成功结果。${state.lastSuccess ? `最近同步 ${date(state.lastSuccess, true)}。` : ''} 页面会自动重试。`);
     else if (archival) text('network-warning', '扫描档案写入异常，页面记录可能不完整。请检查服务端运行状态。');
+    else if (protectionError) text('network-warning', `影子保护记录异常：${protectionReason(protectionError)}。已有记录可能未更新，实盘保护仍未就绪。`);
     else if (walletError) text('network-warning', walletError === 'WALLET_HISTORY_CAPACITY_REACHED' ? '钱包历史库已到容量上限，新增数据暂未保存。原有研究记录仍保留，请检查服务端存储配置。' : '钱包历史保存异常，新增数据可能不完整。请检查服务端运行状态。');
   }
   async function refresh() {
@@ -331,6 +349,7 @@
       if (version !== state.queryVersion) return;
       state.items = Array.isArray(data.items) ? data.items : []; state.total = finite(data.total) ? data.total : state.items.length; state.scansLoaded = true; renderScans();
     }});
+    if (activeView === 'protection') jobs.push({key: 'protection', run: () => api('/protection'), apply: data => { state.protection = data; state.protectionLoaded = true; renderProtection(); }});
     if (activeView === 'orders') jobs.push({key: 'orders', run: () => api('/orders'), apply: data => { state.orders = Array.isArray(data.items) ? data.items : []; state.ordersLoaded = true; renderOrders(); }});
     if (activeView === 'wallets') {
       jobs.push({key: 'walletStatus', run: () => api('/wallet-research/status'), apply: data => { state.walletStatus = data; renderWalletStatus(); }});
@@ -353,6 +372,7 @@
       if (!state.scansLoaded && state.resourceErrors.scans) renderScanEmpty('暂时无法读取扫描记录', '检查服务连接后重试。页面不会用示例数据替代真实记录。');
       if (!state.ordersLoaded && state.resourceErrors.orders) { $('orders-empty').hidden = false; $('orders-empty').querySelector('h3').textContent = '暂时无法读取订单'; $('orders-empty').querySelector('p').textContent = '服务连接恢复后会自动更新。'; }
       if (!state.walletsLoaded && state.resourceErrors.wallets) walletEmpty('暂时无法读取钱包档案', '连接恢复后会自动更新。原有研究记录不会被示例数据替代。');
+      if (state.resourceErrors.protection && state.view === 'protection') renderProtection();
       networkState();
       if (state.detailId) await loadDetail(state.detailId, true);
     } finally {
@@ -365,6 +385,7 @@
   }
   $('refresh').addEventListener('click', refresh);
   $('system-details').addEventListener('click', () => setView('system'));
+  $('system-protection-link').addEventListener('click', () => setView('protection'));
   function filtersChanged() { state.offset = 0; state.queryVersion++; void refresh(); }
   document.querySelectorAll('[data-chain]').forEach(button => button.addEventListener('click', () => {
     state.chain = button.dataset.chain;
@@ -395,12 +416,13 @@
       if (active) button.setAttribute('aria-current', 'page'); else button.removeAttribute('aria-current');
     });
     text('breadcrumb-current', views[view][0]); $('page-title').replaceChildren(document.createTextNode(views[view][0]), el('span', 'title-dot', '.')); text('page-description', views[view][1]);
-    $('scans-panel').hidden = !['scans', 'candidates'].includes(view); $('orders-panel').hidden = view !== 'orders'; $('system-panel').hidden = view !== 'system';
-    $('wallets-panel').hidden = view !== 'wallets'; $('wallet-metrics').hidden = view !== 'wallets'; $('scan-metrics').hidden = view === 'wallets'; $('scan-insights').hidden = view === 'wallets'; $('workbench').classList.toggle('wallet-mode', view === 'wallets');
+    $('scans-panel').hidden = !['scans', 'candidates'].includes(view); $('orders-panel').hidden = view !== 'orders'; $('system-panel').hidden = view !== 'system'; $('protection-panel').hidden = view !== 'protection';
+    $('wallets-panel').hidden = view !== 'wallets'; $('wallet-metrics').hidden = view !== 'wallets'; $('scan-metrics').hidden = ['wallets', 'protection'].includes(view); $('scan-insights').hidden = ['wallets', 'protection'].includes(view); $('workbench').classList.toggle('wallet-mode', ['wallets', 'protection'].includes(view));
     text('list-title', view === 'candidates' ? '曾通过研究判断的信号' : '全部扫描记录');
-    delete state.resourceErrors.scans; delete state.resourceErrors.orders; delete state.resourceErrors.wallets; delete state.resourceErrors.walletStatus; delete state.resourceErrors.associations;
+    delete state.resourceErrors.scans; delete state.resourceErrors.orders; delete state.resourceErrors.wallets; delete state.resourceErrors.walletStatus; delete state.resourceErrors.associations; delete state.resourceErrors.protection;
     if (view === 'scans' || view === 'candidates') { state.items = []; state.scansLoaded = false; $('scan-rows').replaceChildren(); text('list-count', '—'); renderScanEmpty('正在读取记录', '即将展示当前筛选条件下的真实数据。'); }
     if (view === 'system') renderSystem();
+    if (view === 'protection') renderProtection();
     if (view === 'wallets') { state.walletOffset = 0; renderWalletRankingNote(); if (state.walletStatus) renderWalletStatus(); if (!state.walletsLoaded) walletEmpty('正在读取钱包研究档案', '从真实观测记录中整理研究目标。'); }
     void refresh();
   }
@@ -475,7 +497,9 @@
     statusDot('status-resource-dot', resourceProblem ? 'watch' : system.status === 'ok' ? 'pass' : 'neutral');
     text('status-resource-note', system.sampledAt ? `采样 ${time(system.sampledAt)} · 磁盘剩余 ${bytes(system.disk?.freeBytes)}` : '等待服务器采样');
     text('system-uptime', `已运行 ${duration(system.uptimeSec)}`); text('system-entry-mode', entryModeLabel(data.entryMode));
-    const problem = scanProblem || walletProblem || balanceProblem || resourceProblem || data.archiveError;
+    const protectionError = data.exitProtection?.captureError || data.exitProtection?.status?.lastError;
+    text('system-protection-link', protectionError ? '止盈：影子记录异常 / 实盘未就绪' : data.exitProtection?.enabled ? '止盈：影子验证 / 实盘未就绪' : '止盈：实盘保护未就绪');
+    const problem = scanProblem || walletProblem || balanceProblem || resourceProblem || data.archiveError || protectionError;
     const loading = !data.system || system.status === 'loading' || balances.length === 0 || balances.some(balance => balance.status === 'loading');
     const status = $('system-overall-status'); status.className = `badge ${problem ? 'watch' : loading ? 'neutral' : 'pass'}`; status.textContent = problem ? '部分项目需关注' : loading ? '正在初始化 / 等待采样' : '运行正常';
   }
@@ -538,6 +562,98 @@
     text('pagination-info', state.total ? `显示 ${state.items.length ? state.offset + 1 : 0}–${Math.min(state.offset + state.items.length, state.total)} 条，共 ${count(state.total)} 条` : '共 0 条记录');
     text('page-number', String(Math.floor(state.offset / PAGE_SIZE) + 1).padStart(2, '0')); $('previous-page').disabled = state.offset === 0; $('next-page').disabled = state.offset + PAGE_SIZE >= state.total;
   }
+  const protectionEventNames = {
+    initialized: '建立模拟基准', protection_armed: '启动动态跟踪', partial_exit: '触发部分卖出建议', full_exit: '触发全部卖出建议',
+    price_unavailable: '报价暂不可用', price_recovered: '报价恢复', observation_ended: '影子观察结束',
+    baseline: '建立模拟基准', baseline_set: '建立模拟基准', started: '开始影子观察',
+    activated: '达到跟踪启动条件', protection_activated: '达到跟踪启动条件',
+    peak: '记录新峰值', new_peak: '记录新峰值', peak_updated: '记录新峰值',
+    protection_updated: '更新动态保护线', protection_raised: '上调动态保护线',
+    pressure_tighten: '根据样本卖压收紧保护线',
+    trailing_stop: '触发跟踪回撤建议', trail_triggered: '触发跟踪回撤建议',
+    stop_loss: '触发止损建议', take_profit: '触发止盈建议', triggered: '触发影子卖出建议',
+    stale: '报价延迟', unavailable: '报价不可用', ended: '影子观察结束',
+  };
+  function protectionReason(value) { return reasonNames[value] || protectionEventNames[value] || scalar(value, '未提供原因'); }
+  function protectionEmpty(title, description) { $('protection-empty').hidden = false; text('protection-empty-title', title); text('protection-empty-description', description); }
+  function protectionMetric(label, value, hint, tone = '') {
+    const node = el('div', 'protection-value'); node.append(el('span', '', label), el('strong', tone, value));
+    if (hint) node.append(el('small', '', hint)); return node;
+  }
+  function protectionEvent(event) {
+    const row = el('li', 'protection-event'); const head = el('div', 'protection-event-heading');
+    head.append(el('strong', '', protectionEventNames[event.kind] || scalar(event.kind, '观察事件')), el('time', '', date(event.at, true))); row.append(head);
+    row.append(el('p', '', protectionReason(event.reason)), el('span', 'protection-observation-label', '仅观察 · 未执行交易'));
+    const values = [];
+    if (finite(numeric(event.sellPct))) values.push(`影子建议卖出当时剩余的 ${plainPercent(numeric(event.sellPct))}`);
+    if (finite(numeric(event.gainPct))) values.push(`模拟浮盈 ${percent(numeric(event.gainPct))}`);
+    if (values.length) row.append(el('p', 'protection-event-values', values.join(' · ')));
+    return row;
+  }
+  function protectionCard(item, openEvents) {
+    const card = el('article', 'protection-card'); const header = el('div', 'protection-card-heading');
+    const identity = el('div', 'protection-identity'); const name = el('h3', '', item.symbol || '未命名代币');
+    identity.append(name, el('div', 'token-meta', `${chainName(item.chain)} · 影子观察`));
+    const actions = el('div', 'protection-card-actions');
+    actions.append(badge(item.phase === 'triggered' ? '已触发模拟建议' : item.phase === 'ended' ? '观察已结束' : finite(numeric(item.baselinePriceUsd)) ? '影子跟踪中' : '等待模拟基准', item.phase === 'triggered' ? 'watch' : 'neutral'), gmgnTokenLink(item.chain, item.address));
+    header.append(identity, actions); card.append(header, addressNode(item.address, 'detail-address'));
+    const data = el('div', 'protection-value-grid'); const gain = numeric(item.gainPct), peak = numeric(item.peakGainPct);
+    data.append(protectionMetric('当前模拟涨幅', percent(gain), '相对影子基准，非持仓收益', finite(gain) ? gain < 0 ? 'negative' : 'positive' : ''), protectionMetric('观察期最高涨幅', percent(peak), '包含影子退出后的新报价', finite(peak) ? peak < 0 ? 'negative' : 'positive' : ''), protectionMetric(item.protectionActive === false ? '基础止损线（影子）' : '动态保护线', usd(item.protectionPriceUsd), finite(numeric(item.protectionGainPct)) ? `相对基准 ${percent(numeric(item.protectionGainPct))}` : '尚无有效保护线', 'protection-line-value'), protectionMetric('建议剩余比例', plainPercent(numeric(item.remainingPct)), '相对模拟初始仓位，非真实持仓'));
+    card.append(data);
+    const prices = el('div', 'protection-price-grid');
+    prices.append(kv('模拟基准价', usd(item.baselinePriceUsd)), kv('最新样本价', usd(item.latestPriceUsd)), kv('峰值样本价', usd(item.peakPriceUsd)), kv('跟踪启动涨幅', percent(numeric(item.activationGainPct))), kv('当前跟踪回撤', plainPercent(numeric(item.trailPct))));
+    if (finite(numeric(item.triggerPeakGainPct))) prices.append(kv(item.phase === 'triggered' ? '触发前模型峰值涨幅' : '当前模型峰值涨幅', percent(numeric(item.triggerPeakGainPct))));
+    card.append(prices, el('p', 'protection-window-note', '当前涨幅与观察期最高涨幅均相对影子基准计算，不是实际持仓收益。触发建议不代表成交；全部影子退出后模型停止更新，观察期最高涨幅仍会记录后续新报价。'));
+    const health = el('div', `protection-health ${item.health === 'fresh' ? 'fresh' : 'attention'}`);
+    const healthLabel = {fresh: '行情样本正常', stale: '行情样本延迟', unavailable: '行情样本不可用'}[item.health] || '行情健康未知';
+    health.append(badge(healthLabel, item.health === 'fresh' ? 'pass' : 'watch'), el('span', '', `最近报价 ${date(item.lastPriceAt, true)}`));
+    if (finite(numeric(item.maxGapSec))) health.append(el('span', '', `最大报价间隔 ${count(numeric(item.maxGapSec))} 秒`));
+    if (item.health !== 'fresh') health.append(el('p', '', '显示的是最近已收到的样本与保护线，不能视为当前行情或实时可执行价格。'));
+    card.append(health);
+    const pressure = item.pressure || {}, pressureNode = el('div', 'protection-pressure');
+    const pressureHeading = el('div', 'protection-pressure-heading'); pressureHeading.append(el('strong', '', '钱包卖压证据'), badge(pressure.status === 'observed' ? '已有样本' : '未知', pressure.status === 'observed' ? 'neutral' : 'watch')); pressureNode.append(pressureHeading);
+    if (pressure.status === 'observed') {
+      const values = el('div', 'protection-pressure-values'); values.append(kv('交易样本', count(pressure.tradeCount)), kv('钱包样本', count(pressure.walletCount)), kv('样本净卖出比例', finite(numeric(pressure.netSellRatio)) ? plainPercent(numeric(pressure.netSellRatio) * 100) : '—')); pressureNode.append(values);
+      pressureNode.append(el('p', '', `来源：${scalar(pressure.source, '未提供')}。仅反映已覆盖钱包与交易，不能代表全市场卖压。`));
+    } else pressureNode.append(el('p', '', '缺少可核验的近期卖出样本，无法判断钱包卖压；未知不等于没有卖压。'));
+    card.append(pressureNode);
+    if (item.lastEvent && typeof item.lastEvent === 'object') {
+      const latest = el('div', 'protection-last-event'); latest.append(el('span', '', '最近观察事件'), el('strong', '', protectionReason(item.lastEvent.reason)), el('time', '', date(item.lastEvent.at, true)));
+      if (finite(numeric(item.lastEvent.sellPct))) latest.append(el('p', '', `影子建议卖出当时剩余的 ${plainPercent(numeric(item.lastEvent.sellPct))} · 未执行交易`)); card.append(latest);
+    }
+    const events = Array.isArray(item.events) ? item.events.filter(event => event && typeof event === 'object').slice(0, 5) : [];
+    const disclosure = el('details', 'protection-events'); disclosure.dataset.protectionId = scalar(item.id, ''); disclosure.open = openEvents.has(disclosure.dataset.protectionId);
+    disclosure.append(el('summary', '', `最近观察事件 · ${events.length} 条`));
+    if (events.length) { const list = el('ol', 'protection-event-list'); for (const event of events) list.append(protectionEvent(event)); disclosure.append(list); }
+    else disclosure.append(el('p', 'protection-event-empty', '暂无可展示的事件记录。未发生事件不代表已执行任何保护。'));
+    card.append(disclosure);
+    const times = el('div', 'protection-card-times'); times.append(el('span', '', `符合条件 ${date(item.eligibleAt, true)}`), el('span', '', `模拟起点 ${date(item.startedAt, true)}`), el('span', '', `记录更新 ${date(item.updatedAt, true)}`)); card.append(times);
+    return card;
+  }
+  function renderProtection() {
+    const data = state.protection, status = data?.status || {}, items = Array.isArray(data?.items) ? data.items.filter(item => item && typeof item === 'object') : [];
+    const container = $('protection-items'); const openEvents = new Set([...container.querySelectorAll('details[data-protection-id][open]')].map(item => item.dataset.protectionId)); container.replaceChildren();
+    text('protection-total', count(status.positions)); text('protection-active', count(status.active)); text('protection-triggered', count(status.triggered)); text('protection-stale', count(status.stale)); text('protection-count', count(items.length));
+    const marker = $('protection-status-badge'); marker.className = `badge ${data?.enabled ? 'watch' : 'neutral'}`; marker.textContent = data ? data.enabled ? '仅影子验证' : '影子验证未启用' : '正在读取';
+    text('protection-policy-note', `策略版本 ${scalar(data?.policyVersion)} · 实盘保护未就绪`);
+    text('protection-history-note', status.historyComplete === true ? '启用后成功获取的原始报价逐条保留；采样间隔内的行情仍未知。' : status.historyComplete === false ? '原始报价存档存在缺失，请结合记录异常复核。' : '原始采样保存状态尚未确认。');
+    text('protection-collection-status', data?.enabled ? `累计 ${count(status.samples)} 个价格样本 · ${count(status.events)} 条观察事件 · 最近采样 ${date(status.lastSampleAt, true)}` : data ? '尚未启用影子观察，当前页面不提供开启交易或挂单操作。' : '正在读取保护观察记录…');
+    const warnings = [];
+    if (state.resourceErrors.protection) warnings.push('保护记录暂时无法更新；下方若有数据，仍为最近一次成功读取的结果。');
+    for (const captureError of new Set([data?.captureError, state.overview?.exitProtection?.captureError].filter(Boolean))) warnings.push(`影子记录读写异常：${protectionReason(captureError)}。本页数据可能不完整或未更新。`);
+    if (status.lastError) warnings.push(`最近采样异常：${protectionReason(status.lastError)}`);
+    if (status.historyComplete === false) warnings.push('部分已获取的原始样本未完整留存，请检查采样保存状态。');
+    if (data && data.mode !== 'shadow') warnings.push('服务返回的模式与影子验证界面不一致，页面不确认任何实盘保护状态。');
+    $('protection-warning').hidden = warnings.length === 0; text('protection-warning', warnings.join(' '));
+    $('protection-empty').hidden = items.length > 0;
+    if (!items.length) {
+      if (state.resourceErrors.protection && !state.protectionLoaded) protectionEmpty('暂时无法读取保护观察记录', '连接恢复后会自动重试。页面不会补入模拟收益或历史峰值。');
+      else if (!data) protectionEmpty('正在读取影子验证状态', '读取真实观察记录后，会展示动态保护线和行情健康状况。');
+      else if (!data.enabled) protectionEmpty('影子验证尚未启用', '目前没有前瞻保护记录。实盘保护仍未就绪，页面不提供交易操作。');
+      else protectionEmpty('等待第一条前瞻保护记录', '符合条件的对象收到新的有效报价后，才建立模拟基准。已有历史高点不会回填为模拟收益。');
+    }
+    for (const item of items) container.append(protectionCard(item, openEvents));
+  }
   function renderOrders() {
     const body = $('order-rows'); body.replaceChildren(); text('orders-count', count(state.orders.length)); $('orders-empty').hidden = state.orders.length > 0;
     $('orders-empty').querySelector('h3').textContent = '暂无订单记录'; $('orders-empty').querySelector('p').textContent = '当服务端产生订单后，这里会展示实际执行状态。';
@@ -586,6 +702,9 @@
         runtime.append(el('p', 'detail-small', '已完成复评统计执行次数，不是通过条件的数量。到期任务按队列逐条检查，调度运行中不代表每个币都已重新判断。'));
       }
     }
+    const protection = data.exitProtection || {};
+    policy.append(kv('动态止盈保护', protection.enabled ? '仅影子验证 · 不发送卖单' : '影子验证未启用'), kv('实盘保护就绪', '未就绪'), kv('保护策略版本', protection.policyVersion), kv('影子观察对象 / 触发建议', `${count(protection.status?.positions)} / ${count(protection.status?.triggered)}`));
+    if (protection.captureError) policy.append(el('p', 'detail-message detail-error', `影子保护记录异常：${protectionReason(protection.captureError)}`));
     const caps = Array.isArray(settings.caps) ? settings.caps : [];
     if (caps.length) for (const cap of caps) { policy.append(kv(`${chainName(cap.chain)} · 单笔上限`, `${scalar(cap.maxPerOrder)} ${scalar(cap.symbol, chainSymbols[cap.chain] || '')}`), kv(`${chainName(cap.chain)} · 费用预留`, `${scalar(cap.feeReserve)} ${scalar(cap.symbol, chainSymbols[cap.chain] || '')}`)); }
     else policy.append(el('p', 'panel-placeholder', '暂无可展示的开仓上限。'));

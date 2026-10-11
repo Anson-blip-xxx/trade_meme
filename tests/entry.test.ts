@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {constants, generateKeyPairSync, randomUUID, verify} from 'node:crypto';
 import {readConfig, type Config} from '../src/config.js';
-import {EntryController} from '../src/entry.js';
+import {EntryController, type LiveProtectionProvider} from '../src/entry.js';
 import {OrderStore} from '../src/orders.js';
 import {GmgnClient} from '../src/providers/gmgn-client.js';
 import type {Report} from '../src/types.js';
@@ -29,6 +29,7 @@ function setup(t: {after: (fn: () => void) => void}, options: {
   mode?: 'off' | 'paper' | 'live'; config?: Partial<Config>;
   quote?: (url: URL) => unknown | Promise<unknown>;
   signed?: typeof fetch;
+  liveProtection?: LiveProtectionProvider | null;
 } = {}) {
   const apiKey = `entry-test-${randomUUID()}`;
   const config: Config = {...readConfig({}), entryMode: options.mode ?? 'paper',
@@ -44,12 +45,97 @@ function setup(t: {after: (fn: () => void) => void}, options: {
     }});
   const store = new OrderStore(':memory:'); t.after(() => store.close());
   const controller = new EntryController(config, store, client, {now: () => new Date(clock.time),
+    // Transport tests use synthetic protection evidence. Production supplies no passing provider.
+    liveProtection: options.liveProtection === null ? undefined : options.liveProtection ?? (context => ({
+      status: 'verified', scope: 'autonomous_exit_execution', chain: context.chain, wallet: context.wallet,
+      checkedAt: new Date(clock.time).toISOString(), validUntil: new Date(clock.time + 30_000).toISOString(),
+    })),
     fetcher: async (input, init) => {
       signedCalls.push({url: new URL(String(input)), init});
       return options.signed ? options.signed(input, init) : Response.json({code: 0, data: {order_id: 'order-1', status: 'pending'}});
     }});
   return {config, clock, client, store, controller, readCalls, signedCalls};
 }
+
+test('live entry has no default readiness provider and cannot be enabled by mode, config or report claims', async t => {
+  const ctx = setup(t, {mode:'live',liveProtection:null});
+  Object.assign(ctx.config,{unattendedProtectionVerified:true,shadowExit:{enabled:true,status:'verified'}});
+  const report=candidate();report.safety.facts={autonomousExitVerified:true,shadowSimulationPassed:true};
+  const result=await ctx.controller.consider(report);
+  assert.deepEqual(result,{status:'blocked',reason:'ENTRY_UNATTENDED_PROTECTION_UNVERIFIED'});
+  assert.equal(ctx.readCalls.length,0);assert.equal(ctx.signedCalls.length,0);assert.equal(ctx.store.list().length,0);
+});
+
+test('malformed, expired, mismatched or shadow-only capability evidence fails closed without exposing provider errors', async t => {
+  const baseline={status:'verified',scope:'autonomous_exit_execution',chain:'bsc',wallet,
+    checkedAt:new Date(baseTime).toISOString(),validUntil:new Date(baseTime+30_000).toISOString()};
+  const invalid:unknown[]=[undefined,true,{...baseline,status:'unverified'}, {...baseline,scope:'shadow_simulation'},
+    {...baseline,chain:'robinhood'},{...baseline,wallet:token}, {...baseline,validUntil:new Date(baseTime).toISOString()},
+    {...baseline,checkedAt:new Date(baseTime-30_001).toISOString()},
+    {...baseline,checkedAt:new Date(baseTime+5_001).toISOString()},
+    {...baseline,validUntil:new Date(baseTime+30_001).toISOString()}];
+  for(const value of invalid) {
+    const ctx=setup(t,{mode:'live',liveProtection:(()=>value) as LiveProtectionProvider});
+    assert.equal((await ctx.controller.consider(candidate())).reason,'ENTRY_UNATTENDED_PROTECTION_UNVERIFIED');
+    assert.equal(ctx.readCalls.length,0);assert.equal(ctx.signedCalls.length,0);assert.equal(ctx.store.list().length,0);
+  }
+  const thrown=setup(t,{mode:'live',liveProtection:()=>{throw new Error('PRIVATE_PROTECTION_SECRET');}});
+  assert.deepEqual(await thrown.controller.consider(candidate()),{status:'blocked',reason:'ENTRY_UNATTENDED_PROTECTION_UNVERIFIED'});
+});
+
+test('readiness is rechecked before quote and after the shared POST queue, with no retry after denial', async t => {
+  for(const stopAt of ['before_quote','after_queue'] as const) {
+    let valid=true;
+    const ctx=setup(t,{mode:'live',liveProtection:context=>({status:valid&&!(stopAt==='before_quote'&&context.phase==='before_quote')?'verified':'unverified',
+      scope:'autonomous_exit_execution',chain:context.chain,wallet:context.wallet,
+      checkedAt:new Date(baseTime).toISOString(),validUntil:new Date(baseTime+30_000).toISOString()})});
+    const schedule=ctx.client.scheduleRequest.bind(ctx.client);let calls=0;
+    ctx.client.scheduleRequest=async<T>(weight:number,execute:()=>Promise<T>)=>{
+      if(++calls===2&&stopAt==='after_queue') valid=false;
+      return schedule(weight,execute);
+    };
+    const report=candidate(),result=await ctx.controller.consider(report);
+    assert.equal(result.reason,'ENTRY_UNATTENDED_PROTECTION_UNVERIFIED');assert.equal(result.order?.status,'failed');
+    assert.equal(ctx.readCalls.length,stopAt==='before_quote'?0:1);assert.equal(ctx.signedCalls.length,0);
+    assert.equal(ctx.store.list().length,1);
+    await ctx.controller.consider(report);assert.equal(ctx.signedCalls.length,0);
+  }
+});
+
+test('paper simulation never requests live capability evidence', async t => {
+  const ctx=setup(t,{mode:'paper',liveProtection:()=>{throw new Error('PAPER_MUST_NOT_ASK_FOR_LIVE_PROTECTION');}});
+  assert.equal((await ctx.controller.consider(candidate())).order?.status,'paper_open');
+  assert.equal(ctx.signedCalls.length,0);
+});
+
+test('missing live readiness never prevents GET reconciliation of legacy accepted orders', async t => {
+  const ctx=setup(t,{mode:'live',liveProtection:null,signed:async()=>Response.json({code:0,data:{
+    order_id:'legacy-provider',status:'confirmed',hash,
+    report:{input_token:inputToken,output_token:token,input_amount:'100',output_amount:'200'},
+  }})});
+  const saved=ctx.store.reserve({eventKey:'legacy-accepted',chain:'bsc',tokenAddress:token,mode:'live',
+    wallet,inputToken,inputAmount:'100',slippagePct:5,details:{}},3,new Date(baseTime)).order!;
+  ctx.store.update(saved.id,['prepared'],{status:'unknown',providerOrderId:'legacy-provider'},new Date(baseTime));
+  const result=await ctx.controller.reconcile(saved.id);
+  assert.equal(result.order?.status,'confirmed');assert.equal(result.order?.outputAmount,'200');
+  assert.deepEqual(ctx.signedCalls.map(call=>[call.init?.method,call.url.pathname]),[['GET','/v1/trade/query_order']]);
+  assert.equal(ctx.readCalls.length,0);
+  assert.equal((await ctx.controller.consider(candidate())).reason,'ENTRY_UNATTENDED_PROTECTION_UNVERIFIED');
+  assert.equal(ctx.signedCalls.length,1);
+});
+
+test('a protection provider exception after quoting prevents POST and leaves a failed, non-retriable reservation', async t => {
+  const ctx=setup(t,{mode:'live',liveProtection:context=>{
+    if(context.phase==='before_submit') throw new Error('PRIVATE_PROTECTION_SECRET');
+    return {status:'verified',scope:'autonomous_exit_execution',chain:context.chain,wallet:context.wallet,
+      checkedAt:new Date(baseTime).toISOString(),validUntil:new Date(baseTime+30_000).toISOString()};
+  }});
+  const report=candidate(),result=await ctx.controller.consider(report);
+  assert.equal(result.reason,'ENTRY_UNATTENDED_PROTECTION_UNVERIFIED');assert.equal(result.order?.status,'failed');
+  assert.equal(ctx.signedCalls.length,0);assert.equal(ctx.readCalls.length,1);
+  assert.equal((await ctx.controller.consider(report)).status,'existing');
+  assert.equal(ctx.readCalls.length,1);assert.equal(ctx.signedCalls.length,0);
+});
 
 test('off/demo/noncandidate/unknown checks/stale reports never quote or reserve', async t => {
   const off = setup(t, {mode: 'off'});

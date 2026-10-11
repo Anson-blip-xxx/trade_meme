@@ -7,6 +7,7 @@ import {WalletAssociations,type WalletAssociationListOptions,type WalletAssociat
 export type {WalletAssociationSummary,WalletAssociationDetail,WalletAssociationStats,WalletAssociationTarget} from './wallet-associations.js';
 import type {Chain,Report} from './types.js';
 import type {WalletAnalysis,WalletRecord} from './research/wallet-types.js';
+import type {WalletPressure,WalletPressureTrade,WalletTradeSource} from './adaptive-exit.js';
 
 export interface WalletHistoryToken {chain:Chain;address:string;}
 export interface WalletHistoryOptions {maxBytes?:number;now?:()=>Date;}
@@ -127,6 +128,7 @@ export class WalletHistory {
       CREATE INDEX IF NOT EXISTS wh_events_token ON wh_events(chain,token_address,side,event_at);
       CREATE INDEX IF NOT EXISTS wh_observations_wallet ON wh_observations(chain,wallet,kind,observed_at);
       CREATE INDEX IF NOT EXISTS wh_observations_event ON wh_observations(event_id);
+      CREATE INDEX IF NOT EXISTS wh_exit_evidence ON wh_observations(chain,token_address,kind,observed_at);
       CREATE INDEX IF NOT EXISTS wh_funding_wallet ON wh_funding(chain,wallet,funding_address,observed_at);
       CREATE INDEX IF NOT EXISTS wh_funding_address ON wh_funding(chain,funding_address,observed_at);
       CREATE INDEX IF NOT EXISTS wh_wallets_recent ON wh_wallets(last_at DESC);
@@ -144,6 +146,7 @@ export class WalletHistory {
       this.error=undefined;this.db.prepare("UPDATE wh_meta SET value='' WHERE key='error'").run();
     }
     this.associations=new WalletAssociations(this.db,(evidence,write)=>this.append(evidence,write),this.now);
+    this.db.exec('CREATE INDEX IF NOT EXISTS wh_assoc_candidate ON wh_assoc_relations(chain,candidate,first_at)');
     if(this.bytes()>=this.maxBytes) this.error=CAPACITY;
   }
 
@@ -297,6 +300,55 @@ export class WalletHistory {
           .run(data.maxGainPct,JSON.stringify(data),target.chain,buyer.wallet!,data.maxGainPct);
       }
     });
+  }
+
+  /** Only evidence already locally observed at the price sample's time can influence research. */
+  recentExitPressure(value:WalletHistoryToken,sampleAt:string):WalletPressure|undefined {
+    const target=this.target(value),end=at(sampleAt);if(!target||!end||Date.parse(end)>this.now().getTime())return;
+    const start=new Date(Date.parse(end)-600_000).toISOString();
+    const allowed=new Set(['gmgn_wallet_activity','gmgn_kol_feed','gmgn_smartmoney_feed',
+      'gmgn_association_candidate_activity','gmgn_association_leader_activity','gmgn_association_wallet_activity']);
+    const rows=this.db.prepare(`SELECT id,event_id,data FROM wh_observations WHERE chain=? AND token_address=? AND kind='trade'
+      AND observed_at>=? AND observed_at<=? ORDER BY observed_at,id LIMIT 501`).all(target.chain,target.address,start,end);
+    // A truncated side of a busy window must not be presented as net flow.
+    if(rows.length>500)return;
+    const known=new Map<string,boolean>();
+    type Evidence={trade:WalletPressureTrade;eventAt:string;amount:number;conflict:boolean};
+    const groups=new Map<string,Map<string,Evidence>>();
+    for(const row of rows) {
+      const raw=JSON.parse(String(row.data)) as WalletTradeObservation;
+      if(!allowed.has(raw.source)||!['buy','sell'].includes(raw.side)||!raw.usd||!at(raw.eventAt)||
+        raw.eventAt<start||raw.eventAt>end||!at(raw.observedAt)||raw.observedAt>end||raw.eventAt>raw.observedAt)continue;
+      const usd=Number(raw.usd);if(!Number.isFinite(usd)||usd<=0||usd>1e12)continue;
+      if(!known.has(raw.wallet)) {
+        const publicEvidence=this.db.prepare(`SELECT 1 FROM wh_observations WHERE chain=? AND wallet=? AND kind='trade'
+          AND source IN ('gmgn_kol_feed','gmgn_smartmoney_feed') AND observed_at<=? LIMIT 1`).get(target.chain,raw.wallet,end);
+        const relationship=this.db.prepare(`SELECT 1 FROM wh_assoc_relations WHERE chain=? AND candidate=? AND first_at<=?
+          AND active_since<=? AND dirty=0 AND token_count>0 LIMIT 1`).get(target.chain,raw.wallet,end,end);
+        known.set(raw.wallet,!!publicEvidence||!!relationship);
+      }
+      if(!known.get(raw.wallet))continue;
+      // Keep distinct indexed events, deduplicate equivalent vendor copies, and
+      // exclude ambiguous unindexed/indexed groups rather than count either side twice.
+      const key=JSON.stringify([raw.txHash,raw.wallet,raw.side]);
+      let group=groups.get(key);if(!group){group=new Map();groups.set(key,group);}
+      const index=raw.eventIndex===undefined?'unindexed':String(raw.eventIndex);
+      const previous=group.get(index);
+      if(previous) {if(previous.eventAt!==raw.eventAt||previous.amount!==usd)previous.conflict=true;continue;}
+      group.set(index,{eventAt:raw.eventAt,amount:usd,conflict:false,trade:{evidenceId:String(row.id),wallet:raw.wallet,
+        side:raw.side as 'buy'|'sell',volumeUsd:usd,eventAt:raw.eventAt,observedAt:raw.observedAt,source:raw.source as WalletTradeSource}});
+    }
+    const trades:WalletPressureTrade[]=[];
+    for(const group of groups.values()) {
+      if([...group.values()].some(e=>e.conflict))continue;
+      const unindexed=group.get('unindexed'),indexed=[...group.entries()].filter(([key])=>key!=='unindexed').map(([,value])=>value);
+      if(unindexed&&indexed.length) {
+        if(indexed.length!==1||unindexed.amount!==indexed[0].amount||unindexed.eventAt!==indexed[0].eventAt)continue;
+        trades.push(indexed[0].trade);
+      }else trades.push(...[...group.values()].map(e=>e.trade));
+    }
+    if(!trades.length||trades.length>100)return;
+    return {chain:target.chain,address:target.address,observedAt:end,windowStartAt:start,windowEndAt:end,trades};
   }
 
   listWallets(options:WalletHistoryListOptions={}):{items:WalletHistorySummary[];total:number} {
@@ -486,8 +538,10 @@ export class WalletHistory {
       evidenceCount:evidence.sharedFunding.length+evidence.synchronized.length,ownership:'unknown',scope:'heuristic',status,checkedAt};
   }
   private coordination(chain:Chain,wallet:string):WalletHistoryDetail['coordinationEvidence'] {
+    // Keep the target wallet as the outer loop. An ordinary JOIN can start with
+    // every funding snapshot on the chain before applying the wallet constraint.
     const sharedFunding=this.db.prepare(`SELECT DISTINCT b.wallet,a.funding_address,MAX(a.observed_at,b.observed_at) AS observed
-      FROM wh_funding a JOIN wh_funding b ON a.chain=b.chain AND a.funding_address=b.funding_address AND a.wallet<>b.wallet
+      FROM wh_funding a CROSS JOIN wh_funding b ON a.chain=b.chain AND a.funding_address=b.funding_address AND a.wallet<>b.wallet
       WHERE a.chain=? AND a.wallet=? AND a.shared=0 AND b.shared=0 AND a.conflict=0 AND b.conflict=0
         AND NOT EXISTS(SELECT 1 FROM wh_funding s WHERE s.chain=a.chain AND s.funding_address=a.funding_address AND s.shared=1)
         AND NOT EXISTS(SELECT 1 FROM wh_funding x WHERE x.chain=a.chain AND x.wallet=a.wallet AND x.funding_address=a.funding_address

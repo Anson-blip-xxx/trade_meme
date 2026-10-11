@@ -281,12 +281,17 @@ test('Solana replay skips failed transactions but advances the verified newest f
   assert.equal(f.status().gap?.pending,false);
 });
 
-test('Solana replay uses until/before cursors and never advances a truncated three-page range',async t=>{
+test('Solana replay resumes a bounded three-page range across reconnect without advancing the completion cursor early',async t=>{
   const f=fixture(t,'solana',{wallets:[SW]});f.store.checkpoint('solana:'+SW,sig(999));let pages=0;
   f.setHandler(method=>{if(method==='getGenesisHash')return GENESIS;const rows=Array.from({length:50},(_,i)=>row(1+pages*50+i));pages++;return rows;});
   await f.open();assert.equal(pages,3);assert.equal(f.store.stats().events,150);assert.equal(f.store.cursor('solana:'+SW),sig(999));
-  assert.equal(f.status().gap?.pending,true);assert.equal(f.status().gap?.incomplete,true);assert.equal(f.status().gap?.lastCompletedAt,undefined);
+  assert.equal(f.status().gap?.pending,true);assert.equal(f.status().gap?.incomplete,false);assert.equal(f.status().gap?.lastCompletedAt,undefined);
+  assert.deepEqual(f.store.replayProgress('solana:'+SW),{until:sig(999),latest:sig(1),before:sig(150),lastSlot:row(150).slot});
   const calls=f.calls.filter(c=>c.method==='getSignaturesForAddress');assert.equal((calls[0].params[1] as any).until,sig(999));assert.equal((calls[1].params[1] as any).before,sig(50));
+  f.setHandler((method,params)=>{if(method==='getGenesisHash')return GENESIS;assert.equal((params[1] as any).before,sig(150));return [row(151)];});
+  f.stream.reconnect();await flush();
+  assert.equal(f.store.stats().events,151);assert.equal(f.store.cursor('solana:'+SW),sig(1));
+  assert.equal(f.store.replayProgress('solana:'+SW),undefined);assert.equal(f.status().gap?.pending,false);
 });
 
 test('Solana initial recent-history baseline is explicit when its first page is full',async t=>{
@@ -300,6 +305,9 @@ test('Solana second page failure preserves the prior cursor and prevents a false
   f.setHandler(method=>{if(method==='getGenesisHash')return GENESIS;if(++count===1)return Array.from({length:50},(_,i)=>row(i+1));throw new Error('RPC credential');});
   await f.open();assert.equal(f.store.stats().events,50);assert.equal(f.store.cursor('solana:'+SW),sig(999));
   assert.equal(f.status().gap?.pending,true);assert.equal(f.status().gap?.lastCompletedAt,undefined);assert.equal(f.status().lastError,'CHAIN_COLLECTION_FAILED');
+  assert.equal(f.store.replayProgress('solana:'+SW)?.before,sig(50));
+  f.setHandler((_method,params)=>{assert.equal((params[1] as any).before,sig(50));return [];});await f.clock.tick();
+  assert.equal(f.store.cursor('solana:'+SW),sig(1));assert.equal(f.store.replayProgress('solana:'+SW),undefined);
 });
 
 test('Solana late replay responses after stop cannot write or checkpoint',async t=>{

@@ -128,6 +128,7 @@
     RPC_UNSUBSCRIBE_FAILED: '上游取消订阅未确认',
     CHAIN_INITIAL_HISTORY_WINDOW: '首次采集仅覆盖最近一页，更早历史未纳入',
     CHAIN_BACKFILL_RANGE_EXCEEDED: '离线跨度较大，按受限批次继续补数',
+    CHAIN_BACKFILL_CONTINUING: '活动较多，已保存分页进度，下一轮接着补',
     CHAIN_BACKFILL_TRUNCATED: '补数达到单轮上限，历史尚未补全',
     CHAIN_BACKFILL_INVALID: '补数响应未通过校验，游标保持原位',
     CHAIN_PRICE_RPC_FAILED: '池状态读取失败，报价回退 GMGN',

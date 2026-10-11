@@ -238,7 +238,10 @@ export class ChainMonitor {
   }
   private async backfillSol(c:Context,wallet:string,generation:number):Promise<boolean>{
     const key=c.chain+':'+wallet,previous=this.store.cursor(key);if(previous!==undefined&&!signature(previous))throw new Error('CHAIN_CURSOR_INVALID');
-    let before:string|undefined,latest:string|undefined,complete=false,previousSlot=Infinity;const seen=new Set<string>();
+    let resume=this.store.replayProgress(key);
+    if(resume&&resume.until!==previous){this.store.clearReplayProgress(key);resume=undefined;}
+    let before=resume?.before,latest=resume?.latest,complete=false,previousSlot=resume?.lastSlot??Infinity;
+    const seen=new Set<string>(before?[before]:[]);
     for(let page=0;page<3;page++){
       const rows=await c.rpc.request('getSignaturesForAddress',[wallet,{commitment:'finalized',limit:50,...(previous?{until:previous}:{}),...(before?{before}:{})}]);
       if(!this.current(c,generation))return false;
@@ -255,8 +258,14 @@ export class ChainMonitor {
         if(rows.length===50)this.incomplete(c,'CHAIN_INITIAL_HISTORY_WINDOW');complete=true;break;
       }
       if(rows.length<50){complete=true;break;}before=rows.at(-1)?.signature;
+      // A full page is durable progress, not a completed range. Resume older pages next
+      // cycle (or after restart), while retaining the original newest signature as upper bound.
+      this.store.saveReplayProgress(key,{until:previous,latest:latest!,before:before!,lastSlot:previousSlot});
     }
-    if(!complete){this.incomplete(c,'CHAIN_BACKFILL_TRUNCATED');return false;}
-    if(!this.current(c,generation))return false;if(latest)this.store.checkpoint(key,latest);return true;
+    if(!complete){c.gap.pending=true;c.lastError='CHAIN_BACKFILL_CONTINUING';return false;}
+    if(!this.current(c,generation))return false;if(latest)this.store.checkpoint(key,latest);
+    this.store.clearReplayProgress(key);
+    if(c.lastError==='CHAIN_BACKFILL_CONTINUING')c.lastError=undefined;
+    return true;
   }
 }

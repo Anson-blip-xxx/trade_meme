@@ -22,6 +22,10 @@ export interface ChainEvent {
   blockHash?:string;eventIndex?:number;observedAt:string;eventAt?:string;source:'live'|'backfill';
   verification:'rpc_confirmed'|'rpc_observed';removed?:boolean;
 }
+export interface SolReplayProgress {until:string;latest:string;before:string;lastSlot:number;}
+function solProgress(value:unknown):value is SolReplayProgress {
+  return object(value)&&signature(value.until)&&signature(value.latest)&&signature(value.before)&&natural(value.lastSlot);
+}
 export function chainEventId(parts:unknown[]):string{return createHash('sha256').update(JSON.stringify(parts)).digest('hex');}
 /** Keep only typed evidence fields; never persist an RPC envelope or arbitrary provider metadata. */
 function validatedEvent(input:unknown):ChainEvent|undefined {
@@ -67,6 +71,7 @@ export class ChainStreamStore {
       CREATE INDEX IF NOT EXISTS chain_events_recent ON chain_events(observed_at DESC);
       CREATE INDEX IF NOT EXISTS chain_events_wallet ON chain_events(chain,wallet,observed_at);
       CREATE TABLE IF NOT EXISTS chain_cursors(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS chain_sol_replays(key TEXT PRIMARY KEY,data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS chain_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);`);
   }
   record(input:ChainEvent):boolean {
@@ -89,6 +94,21 @@ export class ChainStreamStore {
     if(this.cursor(key)===value)return;
     if(this.bytes()+16384>this.maxBytes){this.markIncomplete('CHAIN_STORE_CAPACITY');throw new Error('CHAIN_STORE_CAPACITY');}
     this.db.prepare('INSERT OR REPLACE INTO chain_cursors VALUES (?,?)').run(key,value);
+  }
+  replayProgress(key:string):SolReplayProgress|undefined {
+    if(!cursorKey(key)||!key.startsWith('solana:'))throw new Error('CHAIN_CURSOR_INVALID');
+    const row=this.db.prepare('SELECT data FROM chain_sol_replays WHERE key=?').get(key);if(!row)return;
+    const data=JSON.parse(String(row.data));if(!solProgress(data))throw new Error('CHAIN_CURSOR_INVALID');return data;
+  }
+  saveReplayProgress(key:string,value:SolReplayProgress):void {
+    if(!cursorKey(key)||!key.startsWith('solana:')||!solProgress(value)||value.until!==this.cursor(key))throw new Error('CHAIN_CURSOR_INVALID');
+    if(this.bytes()+16384>this.maxBytes){this.markIncomplete('CHAIN_STORE_CAPACITY');throw new Error('CHAIN_STORE_CAPACITY');}
+    const {until,latest,before,lastSlot}=value;
+    this.db.prepare('INSERT OR REPLACE INTO chain_sol_replays VALUES (?,?)').run(key,JSON.stringify({until,latest,before,lastSlot}));
+  }
+  clearReplayProgress(key:string):void {
+    if(!cursorKey(key)||!key.startsWith('solana:'))throw new Error('CHAIN_CURSOR_INVALID');
+    this.db.prepare('DELETE FROM chain_sol_replays WHERE key=?').run(key);
   }
   markIncomplete(code:string):void {
     if(typeof code!=='string'||!/^CHAIN_[A-Z_]{1,70}$/.test(code))throw new Error('CHAIN_STORE_REASON_INVALID');

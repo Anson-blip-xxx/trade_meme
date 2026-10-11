@@ -92,3 +92,19 @@ test('capacity exhaustion is durable missing-history state and never deletes acc
   assert.deepEqual(store.recent(),[]);assert.equal(store.stats().incomplete,true);
   assert.throws(()=>store.markIncomplete('https://private-secret.invalid'),/^Error: CHAIN_STORE_REASON_INVALID$/);
 });
+
+test('Solana replay pagination survives restart independently from the completed cursor',()=>{
+  const dir=mkdtempSync(join(tmpdir(),'chain-replay-')),path=join(dir,'events.sqlite'),key='solana:'+sol;
+  const latest=bs58.encode(Buffer.alloc(64,3)),before=bs58.encode(Buffer.alloc(64,4));
+  let store=new ChainStreamStore(path);
+  try {
+    store.checkpoint(key,sig);store.saveReplayProgress(key,{until:sig,latest,before,lastSlot:123});
+    store.close();store=new ChainStreamStore(path);
+    assert.deepEqual(store.replayProgress(key),{until:sig,latest,before,lastSlot:123});assert.equal(store.cursor(key),sig);
+    for(const patch of [{until:latest},{lastSlot:-1},{before:'fake'},{latest:'fake'}])
+      assert.throws(()=>store.saveReplayProgress(key,{until:sig,latest,before,lastSlot:123,...patch}),/CHAIN_CURSOR_INVALID/);
+    assert.throws(()=>store.replayProgress('bsc:'+from),/CHAIN_CURSOR_INVALID/);
+    store.checkpoint(key,latest);store.clearReplayProgress(key);assert.equal(store.replayProgress(key),undefined);
+    assert.equal(store.cursor(key),latest);
+  }finally{store.close();rmSync(dir,{recursive:true,force:true});}
+});

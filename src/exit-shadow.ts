@@ -1,3 +1,4 @@
+import {priceEvidence} from './price-evidence.js';
 import {DatabaseSync} from 'node:sqlite';
 import {mkdirSync,chmodSync,statSync} from 'node:fs';
 import {dirname} from 'node:path';
@@ -60,9 +61,11 @@ export class ExitShadow {
   recordPrice(price:ScanPrice,seed:ExitObservationSeed|undefined,pressure?:WalletPressure):void {
     const target=identity(price),now=this.now();
     if(!target||!Number.isFinite(price.priceUsd)||price.priceUsd<=0||!stamp(price.observedAt)||
-      price.source!=='gmgn_token_info_sample'||Date.parse(price.observedAt)>now.getTime()||
+      !['gmgn_token_info_sample','chain_pool_sample'].includes(price.source)||Date.parse(price.observedAt)>now.getTime()||
       now.getTime()-Date.parse(price.observedAt)>ADAPTIVE_SHADOW_V1.maxPriceAgeMs||
       Date.parse(price.observedAt)<Date.parse(this.meta('started_at')!))return;
+    const evidence=price.source==='chain_pool_sample'?priceEvidence(price):undefined;
+    if(price.source==='chain_pool_sample'&&!evidence)return;
     const at=new Date(price.observedAt).toISOString();
     let previous=this.current(target);
     if(previous&&at<=previous.last_price_at)return;
@@ -73,7 +76,7 @@ export class ExitShadow {
     // A finished observation is not silently reopened for the same old candidate.
     if(previous&&(previous.phase==='ended'||Date.parse(previous.ends_at)<=now.getTime()))return;
     const state=previous?JSON.parse(previous.state) as AdaptiveExitState:undefined;
-    const observation={...target,priceUsd:price.priceUsd,observedAt:at,evaluatedAt:now.toISOString(),source:price.source};
+    const observation={...target,priceUsd:price.priceUsd,observedAt:at,evaluatedAt:now.toISOString(),source:price.source,metadata:evidence};
     const result=stepAdaptiveExit(state,observation,pressure);
     if(result.status==='ignored'&&result.ignoredReason!=='SHADOW_CLOSED') {
       if(!['DUPLICATE_SAMPLE','TIME_REGRESSED','PRICE_STALE','PRICE_FROM_FUTURE'].includes(result.ignoredReason??''))
@@ -84,7 +87,7 @@ export class ExitShadow {
     // Closed simulations still collect comparison prices. Their arithmetic must
     // remain valid even though the model no longer advances its own state.
     if(!Number.isFinite((price.priceUsd/next.baselinePriceUsd-1)*100))this.fail('EXIT_SHADOW_PRICE_ARITHMETIC_INVALID');
-    const context={policyVersion:next.policyVersion,protectionPriceUsd:next.protectionPriceUsd,
+    const context={priceEvidence:evidence,policyVersion:next.policyVersion,protectionPriceUsd:next.protectionPriceUsd,
       protectionActive:next.protectionActive,activationGainPct:next.activationGainPct,trailPct:next.drawdownPct,
       remainingPct:next.remainingPctOfInitial,shadowClosed:next.shadowClosed,volatilityPctPerMinute:next.volatilityPctPerMinute,
       gapSec:previous?(Date.parse(at)-Date.parse(previous.last_price_at))/1000:0,
@@ -179,7 +182,7 @@ export class ExitShadow {
       eligibleAt:row.eligible_at,startedAt:row.started_at,updatedAt:row.updated_at,endsAt:row.ends_at,
       phase:row.phase==='triggered'?'triggered':Date.parse(row.ends_at)<=now.getTime()?'ended':row.phase,
       health:row.error?'unavailable':now.getTime()-Date.parse(row.last_price_at)>this.staleMs?'stale':'fresh',
-      lastPriceAt:row.last_price_at,maxGapSec:Number(rawGap??0),baselinePriceUsd:state.baselinePriceUsd,
+      lastPriceAt:row.last_price_at,priceSource:this.db.prepare('SELECT source FROM exit_shadow_samples WHERE position_id=? ORDER BY at DESC LIMIT 1').get(row.id)?.source,maxGapSec:Number(rawGap??0),baselinePriceUsd:state.baselinePriceUsd,
       latestPriceUsd:row.last_price,peakPriceUsd:rawPeak,gainPct:(row.last_price/state.baselinePriceUsd-1)*100,
       peakGainPct:(rawPeak/state.baselinePriceUsd-1)*100,triggerPeakGainPct:(state.peakPriceUsd/state.baselinePriceUsd-1)*100,
       protectionPriceUsd:state.protectionPriceUsd,

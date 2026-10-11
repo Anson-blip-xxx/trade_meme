@@ -1,3 +1,4 @@
+import {priceEvidence,type PriceEvidence} from './price-evidence.js';
 import {DatabaseSync} from 'node:sqlite';
 import {mkdirSync,chmodSync} from 'node:fs';
 import {dirname} from 'node:path';
@@ -21,7 +22,7 @@ export interface ScanPerformance {
   eligibleAt:string;
   baselineAt?:string;baselinePriceUsd?:number;
   latestPriceUsd?:number;latestAt?:string;peakPriceUsd?:number;peakAt?:string;
-  maxGainPct?:number;currentGainPct?:number;samples:number;source?:string;
+  maxGainPct?:number;currentGainPct?:number;samples:number;source?:string;priceEvidence?:PriceEvidence;
   status:'waiting'|'tracking'|'ended'|'unavailable';error?:string;
   errorCount?:number;lastErrorAt?:string;lastError?:string;maxSampleGapSec?:number;points:ScanPricePoint[];
 }
@@ -60,7 +61,7 @@ export interface ScanArchiveStats {
   total:number;eligible:number;tracking:number;maxGainPct?:number;
   byStatus:Record<Stored['status'],number>;byDecision:Record<Report['decision']|'PENDING',number>;
 }
-export interface ScanPrice extends ScanToken {priceUsd:number;observedAt:string;source:string;}
+export interface ScanPrice extends ScanToken {priceUsd:number;observedAt:string;source:string;metadata?:PriceEvidence;}
 
 const MAX_POINTS=256;
 interface WatchRow {
@@ -471,6 +472,8 @@ export class ScanArchive {
     const identity=token(price),at=timestamp(price?.observedAt),now=this.now();
     if(!identity||!at||Date.parse(at)>now.getTime()||!Number.isFinite(price.priceUsd)||price.priceUsd<=0||
       typeof price.source!=='string'||!/^[a-z][a-z0-9_.:-]{0,63}$/.test(price.source)) return;
+    const evidence=price.source==='chain_pool_sample'?priceEvidence(price):undefined;
+    if(price.source==='chain_pool_sample'&&!evidence)return;
     this.db.exec('BEGIN IMMEDIATE');
     try {
       this.pruneInside(now);
@@ -487,7 +490,7 @@ export class ScanArchive {
         const gap=p.latestAt?(observed-Date.parse(p.latestAt))/1_000:undefined;
         record.performance={...p,baselineAt:p.baselineAt??at,baselinePriceUsd:baseline,latestAt:at,latestPriceUsd:price.priceUsd,
           peakPriceUsd:peak,peakAt,maxGainPct:Math.max(0,(peak/baseline-1)*100),currentGainPct:gain,samples:p.samples+1,
-          source:price.source,status:'tracking',error:undefined,
+          source:price.source,priceEvidence:evidence,status:'tracking',error:undefined,
           ...(gap===undefined?{}:{maxSampleGapSec:Math.max(p.maxSampleGapSec??0,gap)}),
           points:thinPoints([...p.points,{at,priceUsd:price.priceUsd}],peakAt)};
         this.write(record,at);

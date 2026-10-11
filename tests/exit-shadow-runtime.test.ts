@@ -102,3 +102,17 @@ test('protection endpoints require authentication, return normalized audit sampl
     await runtime.close();rmSync(dir,{recursive:true,force:true});
   }
 });
+
+test('standalone chain streaming retains candidate targets and suppresses GMGN only while coverage is healthy',async()=>{
+  const {dir,env}=fixture();
+  const runtime=createRuntime(readConfig({...env,WATCH_RECHECK_ENABLED:'false',CHAIN_STREAM_ENABLED:'true',
+    CHAIN_STREAM_DATABASE_PATH:join(dir,'chain.sqlite')}));
+  try {
+    assert.ok(runtime.archive);assert.ok(runtime.chainMonitor);const r=candidate(runtime);let calls=0;
+    runtime.client.get=async(_path,query)=>{calls++;return {address:query.address,price:{price:'2'}};};
+    runtime.chainMonitor.covers=()=>true;await runtime.tracking!.runOnce();assert.equal(calls,0);
+    runtime.chainMonitor.covers=()=>false;await runtime.tracking!.runOnce();assert.equal(calls,1);
+    assert.equal(runtime.archive.get(r.id)?.performance?.baselinePriceUsd,2);
+    assert.equal(runtime.dashboardOrders().items.length,0);assert.equal(runtime.dashboardOverview().entryMode,'off');
+  }finally{await runtime.close();rmSync(dir,{recursive:true,force:true});}
+});

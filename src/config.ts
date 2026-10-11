@@ -42,6 +42,8 @@ export interface Config extends z.infer<typeof schema> {
   walletResearch:{enabled:boolean;database:string;maxBytes:number;intervalSec:number;maxRequestsPerCycle:number};
   watch:{enabled:boolean;windowSec:number;intervalSec:number;maxPerCycle:number};
   exitShadow:{enabled:boolean;database:string;maxBytes:number;staleAfterSec:number;maxPositions:number};
+  chainStream:{enabled:boolean;database:string;maxBytes:number;maxWallets:number;maxPools:number;
+    endpoints:Partial<Record<Chain,{http:string;ws:string}>>};
 }
 export function isPersistentOrderPath(value:string):boolean {
   return typeof value==='string'&&value.trim().length>0&&value.trim()!==':memory:'&&
@@ -63,6 +65,16 @@ export function readConfig(env:NodeJS.ProcessEnv=process.env): Config {
     try {gmgnPrivateKey=readFileSync(env.GMGN_PRIVATE_KEY_FILE,'utf8');}
     catch {throw new Error('GMGN_SIGNING_KEY_FILE_UNREADABLE');}
   }
+  const streamEndpoints:Config['chainStream']['endpoints']={};
+  for(const chain of ['bsc','solana','robinhood'] as const) {
+    const prefix=chain.toUpperCase(),ws=env[`${prefix}_STREAM_WS_URL`],http=env[`${prefix}_STREAM_HTTP_URL`];
+    if(!ws&&!http)continue;
+    try {
+      const w=new URL(ws!),h=new URL(http!);
+      if(w.protocol!=='wss:'||h.protocol!=='https:'||(chain==='solana'&&w.hostname!==h.hostname)||w.username||w.password||h.username||h.password)throw new Error();
+      streamEndpoints[chain]={ws:w.href,http:h.href};
+    }catch {throw new Error('CHAIN_STREAM_ENDPOINT_INVALID');}
+  }
   return {
     ...schema.parse({maxSignalAgeSec:env.MAX_SIGNAL_AGE_SEC, maxEvidenceAgeSec:env.MAX_EVIDENCE_AGE_SEC,
       decisionTtlSec:env.DECISION_TTL_SEC,maxTaxRate:env.MAX_TAX_RATE,xDataProvider:env.X_DATA_PROVIDER,narrativeProvider:env.NARRATIVE_PROVIDER,
@@ -72,6 +84,11 @@ export function readConfig(env:NodeJS.ProcessEnv=process.env): Config {
       entryMode:env.ENTRY_MODE,entrySizing:env.ENTRY_SIZING,entrySlippagePct:env.ENTRY_SLIPPAGE_PCT,entryMaxOpen:env.ENTRY_MAX_OPEN,
       entryGasPriceBsc:env.ENTRY_GAS_PRICE_BSC_WEI,entryPriorityFeeSolana:env.ENTRY_PRIORITY_FEE_SOLANA,entryTipFeeSolana:env.ENTRY_TIP_FEE_SOLANA}),
     rpc:{bsc:env.BSC_RPC_URL,solana:env.SOLANA_RPC_URL,robinhood:env.ROBINHOOD_RPC_URL},
+    chainStream:{enabled:z.enum(['true','false']).default('false').parse(env.CHAIN_STREAM_ENABLED)==='true',
+      database:z.string().trim().refine(isPersistentOrderPath).parse(env.CHAIN_STREAM_DATABASE_PATH??'data/chain-stream.sqlite'),
+      maxBytes:z.coerce.number().int().min(16).max(4096).parse(env.CHAIN_STREAM_MAX_MB??256)*1024*1024,
+      maxWallets:z.coerce.number().int().min(1).max(30).parse(env.CHAIN_STREAM_MAX_WALLETS??10),
+      maxPools:z.coerce.number().int().min(1).max(30).parse(env.CHAIN_STREAM_MAX_POOLS??8),endpoints:streamEndpoints},
     goPlusToken:env.GOPLUS_ACCESS_TOKEN,etherscanKey:env.ETHERSCAN_API_KEY,xBearer:env.X_BEARER_TOKEN,
     twitterApiIoKey:env.TWITTERAPI_IO_KEY,
     openaiKey:env.OPENAI_API_KEY,openaiModel:env.OPENAI_MODEL,

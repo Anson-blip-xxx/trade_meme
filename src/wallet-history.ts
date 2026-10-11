@@ -247,6 +247,16 @@ export class WalletHistory {
   }
   associationStats() {return this.associations.stats();}
   associationTargets(chain:Chain,limit=5,mode:'recent'|'known'='recent'):WalletAssociationTarget[] {return chainValid(chain)?this.associations.targets(chain,limit,mode):[];}
+  streamWalletTargets(chain:Chain,limit=10):string[] {
+    if(!chainValid(chain))return [];
+    const cap=Math.max(1,Math.min(30,Math.trunc(limit))),result=new Set<string>();
+    const add=(v:unknown)=>{const a=addr(v,chain);if(a&&result.size<cap)result.add(a);};
+    // Prioritize observed early-wallet / leader relationships; a relationship remains a hypothesis.
+    for(const r of this.db.prepare(`SELECT candidate,leader FROM wh_assoc_relations WHERE chain=? AND token_count>0 AND dirty=0
+      ORDER BY token_count DESC,forward_count DESC,updated_at DESC LIMIT ?`).all(chain,cap)) {add(r.candidate);add(r.leader);}
+    if(result.size<cap)for(const r of this.db.prepare('SELECT address FROM wh_wallets WHERE chain=? ORDER BY last_at DESC LIMIT ?').all(chain,cap))add(r.address);
+    return [...result];
+  }
   markAssociationTargetChecked(target:Pick<WalletAssociationTarget,'chain'|'address'|'anchorWallet'|'candidateWallet'|'historicalRelationship'>,observedAt=this.now().toISOString()):void {
     const token=this.target(target),observed=this.observed(observedAt),leader=token&&addr(target.anchorWallet,token.chain);
     if(token&&observed&&leader) this.associations.markTarget({...token,anchorWallet:leader,

@@ -1,3 +1,4 @@
+import {priceEvidence,type PriceEvidence} from './price-evidence.js';
 import type {Chain} from './types.js';
 import bs58 from 'bs58';
 
@@ -56,6 +57,7 @@ export interface PriceObservation {
   /** Injected current clock, making freshness checks deterministic and free of IO. */
   evaluatedAt: string;
   source: string;
+  metadata?:PriceEvidence;
 }
 
 export type WalletTradeSource = 'gmgn_wallet_activity' | 'gmgn_token_trades' |
@@ -299,7 +301,8 @@ export function stepAdaptiveExit(
   if (state !== undefined && !validState(state, policy)) return ignore('STATE_INVALID');
   if (state && state.policyVersion !== policy.version) return ignore('STATE_POLICY_MISMATCH');
   if (!object(observation) || !address(observation.address, observation.chain) || !positive(observation.priceUsd) ||
-      observation.source !== 'gmgn_token_info_sample') return ignore('PRICE_INVALID');
+      !['gmgn_token_info_sample','chain_pool_sample'].includes(observation.source)) return ignore('PRICE_INVALID');
+  if (observation.source==='chain_pool_sample'&&!priceEvidence(observation)) return ignore('PRICE_INVALID');
   const observed = time(observation.observedAt), evaluated = time(observation.evaluatedAt);
   if (![observed, evaluated].every(Number.isFinite)) return ignore('TIME_INVALID');
   if (observed > evaluated) return ignore('PRICE_FROM_FUTURE');

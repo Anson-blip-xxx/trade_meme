@@ -100,3 +100,16 @@ Flap 的版本枚举以专门版本说明为依据：0/1 legacy、2 permit、3 G
 [运行时](../src/runtime.ts)仅以有 TTL/容量清理的内存库保存研究，CLI 单次研究退出即清空；report/retry 读取运行服务的缓存。[订单账本](../src/orders.ts)永久保存开单明细和有限入场摘要，不保存供应商全文/原始研究。正常运行要求磁盘订单路径；旧 data 文件不自动删除。
 
 [开单控制器](../src/entry.ts)与[状态查询器](../src/reconcile.ts)保留发送不明状态，定期只读补全买单与退出策略。confirmed 在退出状态未经核实关闭前占用名额；paper_open 始终占用。测试通过只验证实现规则，不能代替真实账户和各链的报价、成交、条件单执行联调。
+
+
+## 2026-10-11 公共链上订阅与报价
+
+- [Geth Pub/Sub](https://geth.ethereum.org/docs/interacting-with-geth/rpc/pubsub)：订阅是连接内的当前事件；断线需重订阅和 HTTP 补数，日志重组有 removed 标记。
+- [Solana logsSubscribe](https://solana.com/docs/rpc/websocket/logssubscribe)、[getSignaturesForAddress](https://solana.com/docs/rpc/http/getsignaturesforaddress)：mentions 每订阅仅一个公钥；HTTP finalized 有 before/until 分页。
+- [BSC PublicNode](https://bsc.publicnode.com/)、[Solana PublicNode](https://solana.publicnode.com/)、[Robinhood PublicNode](https://robinhood.publicnode.com/)：供应商公开提供配对 HTTP 与 WSS。三个节点实际订阅已收到主网头/槽事件，短时连通不代表 SLA。PublicNode EVM HTTP eth_getLogs 实测要求 address，故钱包跨币补数使用已分别核验 chain ID 的 BSC bloXroute / Robinhood 官方 HTTP；相同查询已成功只读验证。
+- [Robinhood 官方连接说明](https://docs.robinhood.com/chain/connecting/)：主网 chain ID 4663、原生 ETH；sequencer feed 与 JSON-RPC WebSocket 是不同协议。
+- [Dexscreener API](https://docs.dexscreener.com/api/reference)：`token-pairs/v1/{chainId}/{tokenAddress}` 用于寻找池与供应商 USD 参照，结果必须匹配链和完整资产地址。它不证明池来源，更不证明当前报价可成交。
+- [Pump 公开文档与 IDL](https://github.com/pump-fun/pump-public-docs/tree/2293f9a66c654e9fe82dc5e8f4618538f24bb35f)、官方 `@pump-fun/pump-swap-sdk` 2.1.0：canonical PumpSwap 池布局、PDA、Token2022 兼容元数据及 virtual_quote_reserves 定价规则。
+- [Pancake 工厂部署](https://developer.pancakeswap.finance/contracts/v2/addresses)、[V3 部署](https://developer.pancakeswap.finance/contracts/v3/addresses)：工厂白名单，加上实际 getPair/getPool 校验，不信 CA 后缀或第三方 dexId。
+
+当前 GMGN 官方 CLI 1.6.6 对外文档/源码未找到可直接实现的公共 WS/SSE 订阅鉴权及消息协议；本功能使用链 RPC 长连接，不声称已接入 GMGN 私有推送。真实只读测试覆盖 PumpSwap、Pancake V2/V3；同步或稍后 Dexscreener 参照存在采样差异，尤其 meme 短时价格波动，不以两者价差充当收益测试。

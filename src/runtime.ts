@@ -7,7 +7,8 @@ import {GmgnClient} from './providers/gmgn-client.js';
 import {GmgnScanner} from './scanner.js';
 import {OrderReconciler} from './reconcile.js';
 import {evaluate,liveProviders} from './engine.js';
-import {ScanArchive} from './scan-archive.js';
+import {ScanArchive,type ScanPrice,type ScanToken} from './scan-archive.js';
+import {ChainMonitor} from './chain-monitor.js';
 import {PriceTracker} from './price-tracker.js';
 import {DashboardBalances,dashboardOrders,dashboardSettings} from './dashboard-data.js';
 import {WalletHistory} from './wallet-history.js';
@@ -22,7 +23,7 @@ export function createRuntime(config:Config) {
   if(config.gmgnApiKey?.trim()==='gmgn_solbscbaseethmonadtron') throw new Error('GMGN_DEMO_KEY_TEST_ONLY');
   const client=new GmgnClient({apiKey:config.gmgnApiKey,minIntervalMs:config.gmgnMinIntervalMs});
   const providers=liveProviders(config,client);
-  const archive=config.dashboard.enabled||config.watch.enabled||config.exitShadow.enabled?new ScanArchive(config.dashboard.archivePath,{
+  const archive=config.dashboard.enabled||config.watch.enabled||config.exitShadow.enabled||config.chainStream.enabled?new ScanArchive(config.dashboard.archivePath,{
     retentionDays:config.dashboard.retentionDays,trackingHours:config.dashboard.trackingHours}):undefined;
   if(config.watch.enabled)archive?.configureWatch({windowSec:config.watch.windowSec,intervalSec:config.watch.intervalSec,maxSignalAgeSec:config.maxSignalAgeSec});
   const walletHistory=config.walletResearch.enabled?new WalletHistory(config.walletResearch.database,{maxBytes:config.walletResearch.maxBytes}):undefined;
@@ -39,29 +40,33 @@ export function createRuntime(config:Config) {
     }catch {walletCaptureError='WALLET_HISTORY_WRITE_FAILED';}
   }),orders=new OrderStore(config.ordersDatabase);
   let exitCaptureError:string|undefined;
-  const tracking=archive?new PriceTracker({archive:{
-    pendingTokens:archive.pendingTokens.bind(archive),
-    recordPrice:price=>{
+  const recordPrice=(price:ScanPrice)=>{
       let archiveFailed=false;
-      try {archive.recordPrice(price);}catch {archiveFailed=true;}
+      try {archive?.recordPrice(price);}catch {archiveFailed=true;}
       if(exitShadow)try {
         // Reuse only newly returned prices. Old archive peaks cannot initialize a shadow position.
         let seed;
-        try {seed=archive.exitObservationSeed(price);}catch {archiveFailed=true;}
+        try {seed=archive?.exitObservationSeed(price);}catch {archiveFailed=true;}
         let pressure;
         try {pressure=walletHistory?.recentExitPressure(price,price.observedAt);}
         catch {walletCaptureError='WALLET_EXIT_PRESSURE_READ_FAILED';}
         exitShadow.recordPrice(price,seed,pressure);exitCaptureError=undefined;
       }catch {exitCaptureError='EXIT_SHADOW_CAPTURE_FAILED';}
       if(archiveFailed)throw new Error('PRICE_ARCHIVE_WRITE_FAILED');
-    },
-    recordPriceError:(token,reason,now)=>{
+    };
+  const recordPriceError=(token:ScanToken,reason:string,now?:Date)=>{
       let archiveFailed=false;
-      try {archive.recordPriceError(token,reason,now);}catch {archiveFailed=true;}
+      try {archive?.recordPriceError(token,reason,now);}catch {archiveFailed=true;}
       if(exitShadow)try {exitShadow.recordError(token,reason,now);}catch {exitCaptureError='EXIT_SHADOW_CAPTURE_FAILED';}
       if(archiveFailed)throw new Error('PRICE_ARCHIVE_WRITE_FAILED');
-    }
-  },client,intervalMs:config.dashboard.sampleIntervalSec*1000,maxTokensPerCycle:3}):undefined;
+    };
+  const chainMonitor=config.chainStream.enabled?new ChainMonitor({config:config.chainStream,
+    tokens:()=>archive?.pendingTokens(200)??[],wallets:(chain,limit)=>walletHistory?.streamWalletTargets(chain,limit)??[],onPrice:recordPrice}):undefined;
+  const chainStreamStatus=()=>{try{return chainMonitor?.getStatus()??{enabled:false,running:false,mode:'observation_only',chains:[],recentEvents:[]};}
+    catch{return {enabled:config.chainStream.enabled,mode:'observation_only',captureError:'CHAIN_STATUS_READ_FAILED',chains:[],recentEvents:[]};}};
+  const tracking=archive?new PriceTracker({archive:{
+    pendingTokens:(limit,now)=>archive.pendingTokens(200,now).filter(t=>!chainMonitor?.covers(t)).slice(0,limit??200),
+    recordPrice,recordPriceError},client,intervalMs:config.dashboard.sampleIntervalSec*1000,maxTokensPerCycle:3}):undefined;
   const balances=config.dashboard.enabled?new DashboardBalances(config):undefined;
   const system=config.dashboard.enabled?new SystemMonitor(dirname(config.ordersDatabase)):undefined;
   orders.recover();
@@ -120,16 +125,16 @@ export function createRuntime(config:Config) {
     try {return {...exitShadow.summary(),captureError:exitCaptureError};}
     catch {return {enabled:true,mode:'shadow',liveReady:false,captureError:'EXIT_SHADOW_READ_FAILED'};}
   };
-  return {client,providers,store,orders,entry,scanner,archive,tracking,walletHistory,walletObserver,walletResearchStatus,watchRechecker,exitShadow,
+  return {client,providers,store,orders,entry,scanner,archive,tracking,walletHistory,walletObserver,walletResearchStatus,watchRechecker,exitShadow,chainMonitor,chainStreamStatus,
     dashboardProtection:()=>exitShadow?{...exitShadow.list(),captureError:exitCaptureError}:{...protectionSummary(),items:[]},
     dashboardOverview:()=>({now:new Date().toISOString(),entryMode:config.entryMode,scanner:scanner.getStatus(),
       tracking:tracking?.getStatus(),stats:archive?.stats(),archiveError:archiveCaptureError??store.observationError??archiveMaintenanceError,
-      settings:dashboardSettings(config),balances:balances?.get()??[],system:system?.get(),walletResearch:walletResearchStatus(),exitProtection:protectionSummary(),
+      settings:dashboardSettings(config),balances:balances?.get()??[],system:system?.get(),walletResearch:walletResearchStatus(),exitProtection:protectionSummary(),chainStream:chainStreamStatus(),
       watchRecheck:watchRechecker?{enabled:true,...watchRechecker.getStatus()}:{enabled:false}}),
     dashboardOrders:()=>dashboardOrders(orders),
     start(){
       if(closed) return;
-      tracking?.start();balances?.start();system?.start();
+      chainMonitor?.start();tracking?.start();balances?.start();system?.start();
       if(walletHistory&&!walletIndexTimer) {
         // Local evidence refresh is independent of the slow vendor request budget.
         // Bound each batch so a growing feed does not stall signal processing.
@@ -152,7 +157,7 @@ export function createRuntime(config:Config) {
     },
     async close(){
       if(closed) return;closed=true;scanner.stop();clearInterval(sweep);clearInterval(reconcileTimer);clearInterval(walletIndexTimer);
-      await Promise.all([tracking?.stop(),balances?.stop(),walletObserver?.stop(),system?.stop(),watchRechecker?.stop()]);
+      await Promise.all([chainMonitor?.stop(),tracking?.stop(),balances?.stop(),walletObserver?.stop(),system?.stop(),watchRechecker?.stop()]);
       await reconciler.stop();
       // Stop means no new work. Await current callback before closing its stores.
       while(active) await new Promise(resolve=>setTimeout(resolve,50));

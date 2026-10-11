@@ -108,7 +108,7 @@ if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href) {
   const server=buildServer(config,runtime.store,runtime.providers,runtime);
   const dashboard=config.dashboard.enabled&&runtime.archive?buildDashboard(config,{
     archive:runtime.archive,overview:runtime.dashboardOverview,orders:runtime.dashboardOrders,
-    protection:runtime.dashboardProtection,protectionDetail:id=>runtime.exitShadow?.detail(id),
+    chainStream:runtime.chainStreamStatus,protection:runtime.dashboardProtection,protectionDetail:id=>runtime.exitShadow?.detail(id),
     walletHistory:runtime.walletHistory,walletResearchStatus:runtime.walletResearchStatus,walletAssociations:runtime.walletHistory}):undefined;
   const fatal=()=>{console.error('SERVICE_LISTEN_FAILED');process.exit(1);};
   server.on('error',fatal);dashboard?.on('error',fatal);

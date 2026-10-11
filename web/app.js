@@ -103,9 +103,49 @@
     EXIT_SHADOW_CAPACITY_REACHED: '影子历史已达到存储容量上限',
     EXIT_SHADOW_POSITION_CAPACITY_REACHED: '影子观察对象已达到容量上限',
     EXIT_SHADOW_STATE_INVALID: '影子模型状态异常，记录可能不完整',
+    RPC_CHAIN_IDENTITY_MISMATCH: 'RPC 网络标识与配置不一致，暂停使用该连接',
+    RPC_CONFIG_INVALID: '链上连接配置无效',
+    RPC_CONNECTION_CLOSED: '链上连接已断开，等待重连',
+    RPC_CONNECTION_ERROR: '链上连接出现异常',
+    RPC_CONNECT_FAILED: '链上连接未建立',
+    RPC_CONNECT_TIMEOUT: '链上连接超时',
+    RPC_HEARTBEAT_TIMEOUT: '链上连接心跳超时',
+    RPC_CONSUMER_ERROR: '链上事件处理暂未完成',
+    RPC_MESSAGE_INVALID: '上游链上消息格式异常',
+    RPC_MESSAGE_TOO_LARGE: '上游消息超出大小限制',
+    RPC_NOT_OPEN: '链上连接尚未就绪',
+    RPC_PENDING_LIMIT: '当前待处理请求达到上限',
+    RPC_RECONNECT_REQUESTED: '正在重新建立链上连接',
+    RPC_REMOTE_ERROR: 'RPC 服务返回请求错误',
+    RPC_REQUEST_INVALID: '链上查询参数无效',
+    RPC_REQUEST_TIMEOUT: '链上查询超时',
+    RPC_SEND_FAILED: '链上查询发送失败',
+    RPC_STOPPED: '链上连接已停止',
+    RPC_SUBSCRIBE_FAILED: '链上订阅未成功建立',
+    RPC_SUBSCRIPTION_ID_CONFLICT: '上游订阅标识冲突',
+    RPC_SUBSCRIPTION_ID_INVALID: '上游订阅标识无效',
+    RPC_SUBSCRIPTION_INVALID: '链上订阅配置无效',
+    RPC_UNSUBSCRIBE_FAILED: '上游取消订阅未确认',
+    CHAIN_INITIAL_HISTORY_WINDOW: '首次采集仅覆盖最近一页，更早历史未纳入',
+    CHAIN_BACKFILL_RANGE_EXCEEDED: '离线跨度较大，按受限批次继续补数',
+    CHAIN_BACKFILL_TRUNCATED: '补数达到单轮上限，历史尚未补全',
+    CHAIN_BACKFILL_INVALID: '补数响应未通过校验，游标保持原位',
+    CHAIN_PRICE_RPC_FAILED: '池状态读取失败，报价回退 GMGN',
+    CHAIN_PRICE_DATA_STALE: '链上池数据过旧，报价回退 GMGN',
+    CHAIN_PRICE_ANCHOR_INVALID: '美元参照无法验证，报价回退 GMGN',
+    CHAIN_HTTP_RATE_LIMITED: '公共 RPC / 市场参照限流，等待冷却',
+    CHAIN_RPC_REJECTED: 'RPC 拒绝了本次只读查询',
+    CHAIN_HTTP_FAILED: 'RPC / 市场参照请求失败',
+    CHAIN_HTTP_TIMEOUT: 'RPC / 市场参照请求超时',
+    CHAIN_USD_REFERENCE_UNAVAILABLE: '暂缺有效美元参照，报价回退 GMGN',
+    CHAIN_MARKET_REFERENCE_UNAVAILABLE: '池或美元参照暂不可用，报价回退 GMGN',
+    CHAIN_IDENTITY_MISMATCH: '节点链标识不匹配，暂停使用',
+    CHAIN_STATUS_READ_FAILED: '链上状态读取失败',
+    POOL_PROTOCOL_UNSUPPORTED: '该池协议暂未适配，使用 GMGN 报价',
+    CHAIN_STORE_CAPACITY: '链上事件档案达到容量上限，新增记录可能未保存',
   };
   const state = {authenticated: false, view: 'scans', chain: '', decision: '', search: '', offset: 0, total: 0, items: [], orders: [], overview: null, refreshing: false, queued: false, queryVersion: 0, timer: null, searchTimer: null, lastSuccess: null, resourceErrors: {}, scansLoaded: false, ordersLoaded: false, detailId: null, detailKind: 'scan', detailWallet: null, detailGeneration: 0, returnFocus: null,
-    walletSort: 'associations', associationStatus: null, walletChain: '', walletSearch: '', walletOffset: 0, walletTotal: 0, walletItems: [], walletStatus: null, walletsLoaded: false, walletSearchTimer: null, protection: null, protectionLoaded: false};
+    walletSort: 'associations', associationStatus: null, walletChain: '', walletSearch: '', walletOffset: 0, walletTotal: 0, walletItems: [], walletStatus: null, walletsLoaded: false, walletSearchTimer: null, protection: null, protectionLoaded: false, chainStream: null, chainStreamLoaded: false};
 
   function el(tag, className, text) {
     const node = document.createElement(tag);
@@ -350,6 +390,7 @@
       state.items = Array.isArray(data.items) ? data.items : []; state.total = finite(data.total) ? data.total : state.items.length; state.scansLoaded = true; renderScans();
     }});
     if (activeView === 'protection') jobs.push({key: 'protection', run: () => api('/protection'), apply: data => { state.protection = data; state.protectionLoaded = true; renderProtection(); }});
+    if (activeView === 'system') jobs.push({key: 'chainStream', run: () => api('/chain-stream'), apply: data => { state.chainStream = data; state.chainStreamLoaded = true; renderChainStream(); }});
     if (activeView === 'orders') jobs.push({key: 'orders', run: () => api('/orders'), apply: data => { state.orders = Array.isArray(data.items) ? data.items : []; state.ordersLoaded = true; renderOrders(); }});
     if (activeView === 'wallets') {
       jobs.push({key: 'walletStatus', run: () => api('/wallet-research/status'), apply: data => { state.walletStatus = data; renderWalletStatus(); }});
@@ -373,6 +414,7 @@
       if (!state.ordersLoaded && state.resourceErrors.orders) { $('orders-empty').hidden = false; $('orders-empty').querySelector('h3').textContent = '暂时无法读取订单'; $('orders-empty').querySelector('p').textContent = '服务连接恢复后会自动更新。'; }
       if (!state.walletsLoaded && state.resourceErrors.wallets) walletEmpty('暂时无法读取钱包档案', '连接恢复后会自动更新。原有研究记录不会被示例数据替代。');
       if (state.resourceErrors.protection && state.view === 'protection') renderProtection();
+      if (state.resourceErrors.chainStream && state.view === 'system') renderChainStream();
       networkState();
       if (state.detailId) await loadDetail(state.detailId, true);
     } finally {
@@ -386,6 +428,7 @@
   $('refresh').addEventListener('click', refresh);
   $('system-details').addEventListener('click', () => setView('system'));
   $('system-protection-link').addEventListener('click', () => setView('protection'));
+  $('chain-stream-summary').addEventListener('click', () => { setView('system'); $('chain-stream-panel').scrollIntoView({block: 'start'}); });
   function filtersChanged() { state.offset = 0; state.queryVersion++; void refresh(); }
   document.querySelectorAll('[data-chain]').forEach(button => button.addEventListener('click', () => {
     state.chain = button.dataset.chain;
@@ -417,11 +460,11 @@
     });
     text('breadcrumb-current', views[view][0]); $('page-title').replaceChildren(document.createTextNode(views[view][0]), el('span', 'title-dot', '.')); text('page-description', views[view][1]);
     $('scans-panel').hidden = !['scans', 'candidates'].includes(view); $('orders-panel').hidden = view !== 'orders'; $('system-panel').hidden = view !== 'system'; $('protection-panel').hidden = view !== 'protection';
-    $('wallets-panel').hidden = view !== 'wallets'; $('wallet-metrics').hidden = view !== 'wallets'; $('scan-metrics').hidden = ['wallets', 'protection'].includes(view); $('scan-insights').hidden = ['wallets', 'protection'].includes(view); $('workbench').classList.toggle('wallet-mode', ['wallets', 'protection'].includes(view));
+    $('wallets-panel').hidden = view !== 'wallets'; $('wallet-metrics').hidden = view !== 'wallets'; $('scan-metrics').hidden = ['wallets', 'protection', 'system'].includes(view); $('scan-insights').hidden = ['wallets', 'protection', 'system'].includes(view); $('workbench').classList.toggle('wallet-mode', ['wallets', 'protection', 'system'].includes(view));
     text('list-title', view === 'candidates' ? '曾通过研究判断的信号' : '全部扫描记录');
-    delete state.resourceErrors.scans; delete state.resourceErrors.orders; delete state.resourceErrors.wallets; delete state.resourceErrors.walletStatus; delete state.resourceErrors.associations; delete state.resourceErrors.protection;
+    delete state.resourceErrors.scans; delete state.resourceErrors.orders; delete state.resourceErrors.wallets; delete state.resourceErrors.walletStatus; delete state.resourceErrors.associations; delete state.resourceErrors.protection; delete state.resourceErrors.chainStream;
     if (view === 'scans' || view === 'candidates') { state.items = []; state.scansLoaded = false; $('scan-rows').replaceChildren(); text('list-count', '—'); renderScanEmpty('正在读取记录', '即将展示当前筛选条件下的真实数据。'); }
-    if (view === 'system') renderSystem();
+    if (view === 'system') { renderSystem(); renderChainStream(); }
     if (view === 'protection') renderProtection();
     if (view === 'wallets') { state.walletOffset = 0; renderWalletRankingNote(); if (state.walletStatus) renderWalletStatus(); if (!state.walletsLoaded) walletEmpty('正在读取钱包研究档案', '从真实观测记录中整理研究目标。'); }
     void refresh();
@@ -436,7 +479,7 @@
     text('tracking-policy-note', finite(settings.sampleIntervalSec) ? `每 ${settings.sampleIntervalSec} 秒轮询 · 逐币报价时间可不同` : '按服务端间隔轮询，逐币时间以报价为准');
     text('performance-note', `以首次符合条件后的首个有效价格为基准${finite(settings.trackingHours) ? `，追踪 ${settings.trackingHours} 小时` : ''}；最高涨幅仅为采样观测值，不代表全市场最高价或实际收益。通过研究门槛不代表已下单。`);
     if (data.walletResearch) { state.walletStatus = data.walletResearch; renderWalletStatus(); }
-    renderBalances(Array.isArray(data.balances) ? data.balances : []); renderScanner(data.scanner); renderSystemOverview(); renderSystem();
+    renderBalances(Array.isArray(data.balances) ? data.balances : []); renderScanner(data.scanner); renderSystemOverview(); renderSystem(); if (state.view === 'system') renderChainStream();
   }
   function renderBalances(balances) {
     const container = $('balance-list'); container.replaceChildren();
@@ -499,9 +542,79 @@
     text('system-uptime', `已运行 ${duration(system.uptimeSec)}`); text('system-entry-mode', entryModeLabel(data.entryMode));
     const protectionError = data.exitProtection?.captureError || data.exitProtection?.status?.lastError;
     text('system-protection-link', protectionError ? '止盈：影子记录异常 / 实盘未就绪' : data.exitProtection?.enabled ? '止盈：影子验证 / 实盘未就绪' : '止盈：实盘保护未就绪');
-    const problem = scanProblem || walletProblem || balanceProblem || resourceProblem || data.archiveError || protectionError;
-    const loading = !data.system || system.status === 'loading' || balances.length === 0 || balances.some(balance => balance.status === 'loading');
+    const stream = data.chainStream, streamChains = Array.isArray(stream?.chains) ? stream.chains : [];
+    const streamIssue = Boolean(stream?.enabled && (!stream.running || stream.store?.incomplete || streamChains.some(chain => ['reconnecting', 'degraded'].includes(chain.state) || chain.state === 'live' && chain.identityVerified !== true || hasGapIssue(chain.gap?.incomplete))));
+    const streamLive = streamChains.filter(chain => chain.state === 'live' && chain.identityVerified === true).length;
+    text('chain-stream-summary-text', !stream ? '链上订阅：状态未知' : !stream.enabled ? '链上订阅：未启用' : !stream.running ? '链上订阅：未运行' : `链上订阅：${streamLive} / ${streamChains.length} 个网络已连接`);
+    statusDot('chain-stream-summary-dot', streamIssue ? 'watch' : streamLive ? 'pass' : 'neutral');
+    text('chain-stream-summary-note', streamIssue ? '连接或补数需关注 · 查看各链详情；实盘保护仍需单独核实。' : '仅观察目标钱包与池，连接正常不代表实盘保护就绪。');
+    const problem = scanProblem || walletProblem || balanceProblem || resourceProblem || data.archiveError || protectionError || streamIssue;
+    const loading = !data.system || system.status === 'loading' || balances.length === 0 || balances.some(balance => balance.status === 'loading') || stream?.enabled && streamChains.some(chain => chain.state === 'connecting');
     const status = $('system-overall-status'); status.className = `badge ${problem ? 'watch' : loading ? 'neutral' : 'pass'}`; status.textContent = problem ? '部分项目需关注' : loading ? '正在初始化 / 等待采样' : '运行正常';
+  }
+  const streamStateNames = {disabled: ['未启用', 'neutral'], connecting: ['正在连接', 'neutral'], live: ['订阅在线', 'pass'], reconnecting: ['正在重连', 'watch'], degraded: ['采集受限', 'watch']};
+  const streamEventNames = {wallet_transaction: '钱包交易活动', token_transfer: '代币转账', native_transfer: '原生币转账', pool_change: '流动性池变化'};
+  function hasGapIssue(value) { return value === true || finite(value) && value > 0; }
+  function gapLabel(gap) {
+    if (!gap || typeof gap !== 'object') return '补数状态未知';
+    if (hasGapIssue(gap.incomplete)) return hasGapIssue(gap.pending) ? '补数中 · 已有缺口未覆盖' : '仍有未覆盖缺口';
+    if (hasGapIssue(gap.pending)) return finite(gap.pending) ? `待补 ${count(gap.pending)} 段` : '补数待完成';
+    return gap.pending === false || gap.pending === 0 ? '当前无待补任务' : '补数状态未知';
+  }
+  function streamErrorLabel(value) { return reasonNames[value] || scalar(value, '未提供异常原因'); }
+  function chainStreamCard(chain) {
+    const card = el('article', 'chain-stream-card'); const heading = el('div', 'chain-stream-card-heading');
+    const title = el('h3'); title.append(el('span', `chain-dot ${chainClass(chain.chain)}`), document.createTextNode(chainName(chain.chain)));
+    heading.append(title, badge(...(chain.state === 'live' && chain.identityVerified !== true ? ['连接待核验', 'watch'] : streamStateNames[chain.state] || ['状态未知', 'neutral']))); card.append(heading);
+    card.append(el('p', `chain-identity ${chain.identityVerified === true ? 'positive' : 'attention-text'}`, chain.identityVerified === true ? (chain.chain === 'solana' ? '配对 HTTP 主网已核验' : 'HTTP / WS 主网已核验') : '网络标识尚未核验'));
+    const subscriptions = el('div', 'chain-subscription-count'); subscriptions.append(el('strong', '', count(chain.activeSubscriptions)), el('span', '', `/ ${count(chain.desiredSubscriptions)} 个目标订阅`)); card.append(subscriptions);
+    card.append(kv('观察钱包 / 流动性池', `${count(chain.watchedWallets)} / ${count(chain.watchedPools)}`), kv('链上池报价覆盖', count(chain.coveredPrices)), kv('GMGN 报价回退对象', count(chain.fallbackTokens)), kv('尚未支持的池', count(chain.unsupportedPools)), kv('本次重连次数', count(chain.reconnects)), kv('最近连接消息', date(chain.lastMessageAt, true)), kv(chain.chain === 'solana' ? '最近 slot 通知' : '最近区块头通知', date(chain.lastHeadAt, true)), kv('最近链上报价', date(chain.latestPriceAt, true)));
+    const gapComplete = chain.gap && [false, 0].includes(chain.gap.pending) && [false, 0].includes(chain.gap.incomplete);
+    const gap = el('div', `chain-gap ${hasGapIssue(chain.gap?.incomplete) || hasGapIssue(chain.gap?.pending) ? 'attention' : gapComplete ? 'complete' : ''}`);
+    gap.append(el('strong', '', `断线补数：${gapLabel(chain.gap)}`), el('p', '', `最近完成 ${date(chain.gap?.lastCompletedAt, true)}`)); card.append(gap);
+    card.append(el('p', 'chain-card-counts', `${count(chain.events)} 条观察事件 · ${count(chain.poolPriceSamples)} 个池报价样本`));
+    if (chain.lastError) card.append(el('p', 'chain-error', `最近异常：${streamErrorLabel(chain.lastError)}`));
+    return card;
+  }
+  function chainEventCard(event, openEvents) {
+    const card = el('details', `chain-event${event.removed === true ? ' removed' : ''}`); card.dataset.chainEventId = scalar(event.id, ''); card.open = openEvents.has(card.dataset.chainEventId);
+    const summary = el('summary', 'chain-event-summary'); const heading = el('div', 'chain-event-title');
+    heading.append(el('strong', '', streamEventNames[event.kind] || '链上事件'), el('span', '', chainName(event.chain)));
+    const tags = el('div', 'chain-event-tags'); tags.append(badge(event.source === 'live' ? '实时订阅' : event.source === 'backfill' ? '历史补数' : '来源未知', 'neutral'));
+    tags.append(badge(event.removed === true ? '链重组撤回' : event.verification === 'rpc_confirmed' ? 'RPC 已确认' : event.verification === 'rpc_observed' ? 'RPC 已观测' : '核验状态未知', event.removed === true ? 'fail' : 'neutral'));
+    summary.append(heading, tags, el('time', '', date(event.observedAt, true))); card.append(summary);
+    const body = el('div', 'chain-event-body');
+    if (event.removed === true) body.append(el('p', 'chain-error', '该事件已被标记为链重组撤回，不作为有效转账或成交的确认依据。'));
+    for (const [label, value] of [['观察钱包', event.wallet], ['关联地址 / 池', event.address], ['代币合约', event.tokenAddress], ['转出地址', event.from], ['转入地址', event.to], ['交易哈希 / 签名', event.txHash]]) {
+      if (typeof value !== 'string' || !value) continue;
+      const row = el('div', 'chain-event-field'); row.append(el('span', '', label), addressNode(value)); body.append(row);
+    }
+    if (event.amountAtomic !== undefined) body.append(kv('原子数量（未换算）', scalar(event.amountAtomic)));
+    if (event.blockNumber !== undefined) body.append(kv('区块高度', scalar(event.blockNumber)));
+    if (event.slot !== undefined) body.append(kv('Slot', scalar(event.slot)));
+    body.append(el('p', 'chain-event-caveat', '转账或钱包交易活动本身不足以判断买卖方向、真实成交或实际控制人。'));
+    card.append(body); return card;
+  }
+  function renderChainStream() {
+    const data = state.chainStream || state.overview?.chainStream, chains = Array.isArray(data?.chains) ? data.chains.filter(chain => chain && typeof chain === 'object') : [], store = data?.store || {};
+    const cards = $('chain-stream-cards'); cards.replaceChildren(); for (const chain of chains) cards.append(chainStreamCard(chain));
+    const empty = $('chain-stream-empty'); empty.hidden = chains.length > 0;
+    empty.textContent = state.resourceErrors.chainStream && !data ? '暂时无法读取链上订阅状态，页面会自动重试。' : !data ? '正在读取链上订阅状态…' : !data.enabled ? '链上长连接尚未启用。这里不提供交易或订阅开关。' : '等待服务端返回各链的订阅状态。';
+    const mode = $('chain-stream-mode'); mode.className = `badge ${data?.enabled && !data.running ? 'watch' : 'neutral'}`; mode.textContent = !data ? '等待状态' : !data.enabled ? '观察未启用' : data.mode === 'observation_only' ? '仅链上观察 · 不发送交易' : '模式待核实';
+    const warnings = [];
+    if (state.resourceErrors.chainStream) warnings.push('链上监控详情暂时无法更新，下方保留最近成功读取的状态。');
+    if (data?.enabled && !data.running) warnings.push('链上观察进程当前未运行。');
+    if (data?.captureError) warnings.push(streamErrorLabel(data.captureError));
+    if (store.incomplete) warnings.push('链上事件存档存在缺失，不能将当前列表视为完整历史。');
+    if (chains.some(chain => hasGapIssue(chain.gap?.incomplete))) warnings.push('部分网络仍有未覆盖的历史范围，请查看各链补数状态。');
+    $('chain-stream-warning').hidden = warnings.length === 0; text('chain-stream-warning', warnings.join(' '));
+    text('chain-stream-storage-note', `已存 ${count(store.events)} 条事件 · ${bytes(store.bytes)} / ${bytes(store.maxBytes)}`);
+    text('chain-stream-coverage-note', data?.coverage === 'targeted_observation' ? '仅目标观察 · EVM 代币转账 / Solana 钱包交易提及 · 非全链覆盖' : '覆盖范围尚未确认');
+    const container = $('chain-stream-events'); const openEvents = new Set([...container.querySelectorAll('details[data-chain-event-id][open]')].map(item => item.dataset.chainEventId)); container.replaceChildren();
+    const events = Array.isArray(data?.recentEvents) ? data.recentEvents.filter(event => event && typeof event === 'object') : [];
+    text('chain-events-count', count(events.length)); $('chain-events-empty').hidden = events.length > 0;
+    text('chain-events-empty', !data?.enabled ? '监控未启用时没有新增订阅事件；已存历史以服务端返回为准。' : '暂未收到目标钱包或池的可展示事件，不代表这些目标没有活动。');
+    for (const event of events) container.append(chainEventCard(event, openEvents));
   }
   function renderScanner(scanner) {
     if (!scanner) { text('scanner-label', '状态暂不可用'); text('scanner-description', '尚未获得扫描器运行信息'); text('scanner-last', '—'); return; }
@@ -604,6 +717,8 @@
     prices.append(kv('模拟基准价', usd(item.baselinePriceUsd)), kv('最新样本价', usd(item.latestPriceUsd)), kv('峰值样本价', usd(item.peakPriceUsd)), kv('跟踪启动涨幅', percent(numeric(item.activationGainPct))), kv('当前跟踪回撤', plainPercent(numeric(item.trailPct))));
     if (finite(numeric(item.triggerPeakGainPct))) prices.append(kv(item.phase === 'triggered' ? '触发前模型峰值涨幅' : '当前模型峰值涨幅', percent(numeric(item.triggerPeakGainPct))));
     card.append(prices, el('p', 'protection-window-note', '当前涨幅与观察期最高涨幅均相对影子基准计算，不是实际持仓收益。触发建议不代表成交；全部影子退出后模型停止更新，观察期最高涨幅仍会记录后续新报价。'));
+    const priceSource = {chain_pool_sample: '链上池报价（USD 参照价）', gmgn_token_info_sample: 'GMGN 回退报价'}[item.priceSource] || '报价来源未知';
+    const priceSourceRow = el('div', 'protection-price-source'); priceSourceRow.append(badge(priceSource, item.priceSource === 'chain_pool_sample' ? 'pass' : 'neutral'), el('span', '', item.priceSource === 'chain_pool_sample' ? '池内价格按 USD 参照价换算，不代表可成交美元价格。' : item.priceSource === 'gmgn_token_info_sample' ? '当前样本来自 GMGN 代币报价。' : '供应商未明确当前样本来源，不推定为链上报价。')); card.append(priceSourceRow);
     const health = el('div', `protection-health ${item.health === 'fresh' ? 'fresh' : 'attention'}`);
     const healthLabel = {fresh: '行情样本正常', stale: '行情样本延迟', unavailable: '行情样本不可用'}[item.health] || '行情健康未知';
     health.append(badge(healthLabel, item.health === 'fresh' ? 'pass' : 'watch'), el('span', '', `最近报价 ${date(item.lastPriceAt, true)}`));

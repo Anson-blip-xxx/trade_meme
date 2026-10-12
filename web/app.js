@@ -146,7 +146,7 @@
     CHAIN_STORE_CAPACITY: '链上事件档案达到容量上限，新增记录可能未保存',
   };
   const state = {authenticated: false, view: 'scans', chain: '', decision: '', search: '', offset: 0, total: 0, items: [], orders: [], overview: null, refreshing: false, queued: false, queryVersion: 0, timer: null, searchTimer: null, lastSuccess: null, resourceErrors: {}, scansLoaded: false, ordersLoaded: false, detailId: null, detailKind: 'scan', detailWallet: null, detailGeneration: 0, returnFocus: null,
-    walletSort: 'associations', associationStatus: null, walletChain: '', walletSearch: '', walletOffset: 0, walletTotal: 0, walletItems: [], walletStatus: null, walletsLoaded: false, walletSearchTimer: null, protection: null, protectionLoaded: false, chainStream: null, chainStreamLoaded: false};
+    walletSort: 'profiles', associationStatus: null, walletProfileStatus: null, walletProfilesReady: false, walletGroup: '', walletChain: '', walletSearch: '', walletOffset: 0, walletTotal: 0, walletItems: [], walletStatus: null, walletsLoaded: false, walletSearchTimer: null, protection: null, protectionLoaded: false, chainStream: null, chainStreamLoaded: false};
 
   function el(tag, className, text) {
     const node = document.createElement(tag);
@@ -364,6 +364,7 @@
     const q = new URLSearchParams({limit: String(PAGE_SIZE), offset: String(state.walletOffset), sort: state.walletSort});
     if (state.walletChain) q.set('chain', state.walletChain);
     if (state.walletSearch) q.set('search', state.walletSearch);
+    if (state.walletSort === 'profiles' && state.walletGroup) q.set('group', state.walletGroup);
     return q.toString();
   }
   function networkState() {
@@ -395,9 +396,11 @@
     if (activeView === 'orders') jobs.push({key: 'orders', run: () => api('/orders'), apply: data => { state.orders = Array.isArray(data.items) ? data.items : []; state.ordersLoaded = true; renderOrders(); }});
     if (activeView === 'wallets') {
       jobs.push({key: 'walletStatus', run: () => api('/wallet-research/status'), apply: data => { state.walletStatus = data; renderWalletStatus(); }});
+      jobs.push({key: 'walletProfiles', run: () => api('/wallet-profiles/status'), apply: data => { state.walletProfileStatus = data; renderWalletProfileStatus(); }});
       if (state.walletSort === 'associations') jobs.push({key: 'associations', run: () => api('/wallet-associations/status'), apply: data => { state.associationStatus = data; renderAssociationStatus(); }});
-      jobs.push({key: 'wallets', run: () => api(`/${state.walletSort === 'associations' ? 'wallet-associations' : 'wallets'}?${walletQuery()}`), apply: data => {
+      jobs.push({key: 'wallets', run: () => api(`/${state.walletSort === 'profiles' ? 'wallet-profiles' : state.walletSort === 'associations' ? 'wallet-associations' : 'wallets'}?${walletQuery()}`), apply: data => {
         if (version !== state.queryVersion) return;
+        if (state.walletSort === 'profiles') state.walletProfilesReady = data.ready === true;
         state.walletItems = Array.isArray(data.items) ? data.items : []; state.walletTotal = finite(data.total) ? data.total : state.walletItems.length; state.walletsLoaded = true; renderWalletList();
       }});
     }
@@ -414,6 +417,7 @@
       if (!state.scansLoaded && state.resourceErrors.scans) renderScanEmpty('暂时无法读取扫描记录', '检查服务连接后重试。页面不会用示例数据替代真实记录。');
       if (!state.ordersLoaded && state.resourceErrors.orders) { $('orders-empty').hidden = false; $('orders-empty').querySelector('h3').textContent = '暂时无法读取订单'; $('orders-empty').querySelector('p').textContent = '服务连接恢复后会自动更新。'; }
       if (!state.walletsLoaded && state.resourceErrors.wallets) walletEmpty('暂时无法读取钱包档案', '连接恢复后会自动更新。原有研究记录不会被示例数据替代。');
+      if (state.resourceErrors.walletProfiles && state.view === 'wallets') renderWalletProfileStatus();
       if (state.resourceErrors.protection && state.view === 'protection') renderProtection();
       if (state.resourceErrors.chainStream && state.view === 'system') renderChainStream();
       networkState();
@@ -442,11 +446,12 @@
   $('next-page').addEventListener('click', () => { if (state.offset + PAGE_SIZE < state.total) { state.offset += PAGE_SIZE; state.queryVersion++; void refresh(); } });
   function walletFiltersChanged() { state.walletOffset = 0; state.queryVersion++; void refresh(); }
   document.querySelectorAll('[data-wallet-sort]').forEach(button => button.addEventListener('click', () => {
-    state.walletSort = button.dataset.walletSort; state.walletItems = []; state.walletTotal = 0; state.walletsLoaded = false; $('wallet-rows').replaceChildren(); $('association-rows').replaceChildren(); walletEmpty('正在读取研究记录', '从真实观测记录中整理研究目标。');
+    state.walletSort = button.dataset.walletSort; state.walletItems = []; state.walletTotal = 0; state.walletsLoaded = false; $('wallet-rows').replaceChildren(); $('association-rows').replaceChildren(); $('wallet-profile-list').replaceChildren(); walletEmpty('正在读取研究记录', '从真实观测记录中整理研究目标。');
     document.querySelectorAll('[data-wallet-sort]').forEach(item => { const active = item === button; item.classList.toggle('active', active); item.setAttribute('aria-pressed', String(active)); });
     renderWalletRankingNote(); walletFiltersChanged();
   }));
   $('wallet-chain').addEventListener('change', () => { state.walletChain = $('wallet-chain').value; walletFiltersChanged(); });
+  $('wallet-group').addEventListener('change', () => { state.walletGroup = $('wallet-group').value; walletFiltersChanged(); });
   $('wallet-search').addEventListener('input', () => { clearTimeout(state.walletSearchTimer); state.walletSearchTimer = setTimeout(() => { state.walletSearch = $('wallet-search').value.trim(); walletFiltersChanged(); }, 300); });
   $('wallet-previous-page').addEventListener('click', () => { state.walletOffset = Math.max(0, state.walletOffset - PAGE_SIZE); state.queryVersion++; void refresh(); });
   $('wallet-next-page').addEventListener('click', () => { if (state.walletOffset + PAGE_SIZE < state.walletTotal) { state.walletOffset += PAGE_SIZE; state.queryVersion++; void refresh(); } });
@@ -463,7 +468,7 @@
     $('scans-panel').hidden = !['scans', 'candidates'].includes(view); $('orders-panel').hidden = view !== 'orders'; $('system-panel').hidden = view !== 'system'; $('protection-panel').hidden = view !== 'protection';
     $('wallets-panel').hidden = view !== 'wallets'; $('wallet-metrics').hidden = view !== 'wallets'; $('scan-metrics').hidden = ['wallets', 'protection', 'system'].includes(view); $('scan-insights').hidden = ['wallets', 'protection', 'system'].includes(view); $('workbench').classList.toggle('wallet-mode', ['wallets', 'protection', 'system'].includes(view));
     text('list-title', view === 'candidates' ? '曾通过研究判断的信号' : '全部扫描记录');
-    delete state.resourceErrors.scans; delete state.resourceErrors.orders; delete state.resourceErrors.wallets; delete state.resourceErrors.walletStatus; delete state.resourceErrors.associations; delete state.resourceErrors.protection; delete state.resourceErrors.chainStream;
+    delete state.resourceErrors.scans; delete state.resourceErrors.orders; delete state.resourceErrors.wallets; delete state.resourceErrors.walletStatus; delete state.resourceErrors.walletProfiles; delete state.resourceErrors.associations; delete state.resourceErrors.protection; delete state.resourceErrors.chainStream;
     if (view === 'scans' || view === 'candidates') { state.items = []; state.scansLoaded = false; $('scan-rows').replaceChildren(); text('list-count', '—'); renderScanEmpty('正在读取记录', '即将展示当前筛选条件下的真实数据。'); }
     if (view === 'system') { renderSystem(); renderChainStream(); }
     if (view === 'protection') renderProtection();
@@ -835,7 +840,7 @@
   async function openDetail(id, trigger, wallet) {
     if (typeof id !== 'string') return;
     closeNarrative();
-    state.returnFocus = trigger || document.activeElement; state.detailId = id; state.detailKind = wallet?.association ? 'association' : wallet ? 'wallet' : 'scan'; state.detailWallet = wallet || null; state.detailGeneration++;
+    state.returnFocus = trigger || document.activeElement; state.detailId = id; state.detailKind = wallet?.association ? 'association' : wallet?.profile ? 'profile' : wallet ? 'wallet' : 'scan'; state.detailWallet = wallet || null; state.detailGeneration++;
     text('detail-eyebrow', wallet ? 'WALLET RESEARCH' : 'SIGNAL DETAIL');
     $('drawer-backdrop').hidden = false; $('detail-drawer').hidden = false; $('app').inert = true; document.body.classList.add('drawer-open');
     const loading = el('p', 'drawer-loading', wallet ? '正在读取研究证据…' : '正在读取信号详情…'); loading.id = 'detail-title'; $('detail-content').replaceChildren(loading); $('detail-drawer').focus();
@@ -845,9 +850,10 @@
     const generation = state.detailGeneration;
     const wallet = state.detailKind === 'wallet' ? state.detailWallet : null;
     const association = state.detailKind === 'association' ? state.detailWallet : null;
+    const profile = state.detailKind === 'profile' ? state.detailWallet : null;
     try {
-      const record = await api(association ? `/wallet-associations/${encodeURIComponent(association.chain)}/${encodeURIComponent(association.leader)}/${encodeURIComponent(association.candidate)}` : wallet ? `/wallets/${encodeURIComponent(wallet.chain)}/${encodeURIComponent(wallet.address)}` : `/scans/${encodeURIComponent(id)}`);
-      if (state.detailId === id && generation === state.detailGeneration) { if (association) renderAssociationDetail(record); else if (wallet) renderWalletResearchDetail(record); else renderDetail(record); }
+      const record = await api(profile ? `/wallet-profiles/${encodeURIComponent(profile.chain)}/${encodeURIComponent(profile.address)}` : association ? `/wallet-associations/${encodeURIComponent(association.chain)}/${encodeURIComponent(association.leader)}/${encodeURIComponent(association.candidate)}` : wallet ? `/wallets/${encodeURIComponent(wallet.chain)}/${encodeURIComponent(wallet.address)}` : `/scans/${encodeURIComponent(id)}`);
+      if (state.detailId === id && generation === state.detailGeneration) { if (profile) renderWalletProfileDetail(record.profile || record); else if (association) renderAssociationDetail(record); else if (wallet) renderWalletResearchDetail(record); else renderDetail(record); }
     } catch (error) {
       if (error.status === 401) { showLogin('会话已结束，请重新登录。'); return; }
       if (state.detailId !== id || generation !== state.detailGeneration) return;
@@ -1063,10 +1069,87 @@
     funding.append(el('p', 'wallet-sample-note', '资金联系为目前取得的补充证据，不表示在上述历史交易发生前就已知。这里不核算完整利润，也不自动触发买单。')); fragment.append(funding);
     $('detail-content').replaceChildren(fragment);
   }
+  const profileGroupNames = {public_kol: '公开 KOL 来源', early_candidate: '前置买入候选', repeated_early: '跨币重复前置', forward_validated: '已有后续验证', shared_funding: '共同资金来源', synchronized: '同步交易线索', vendor_profit_positive: '供应商报告盈利', observed_runner: '采样捕获翻倍', insufficient_evidence: '证据尚少', inactive_observed: '近期未观测活动'};
+  function profileGroupName(id) { return profileGroupNames[id] || scalar(id, '未分类'); }
+  function profileGroupTone(id) { return id === 'forward_validated' ? 'pass' : ['early_candidate', 'repeated_early', 'shared_funding', 'synchronized'].includes(id) ? 'watch' : 'neutral'; }
+  function profileIsStale(profile) { const until = validDate(profile?.freshUntil); return profile?.status === 'stale' || Boolean(until && until.getTime() < Date.now()); }
+  function profileHealth(profile) { return profileIsStale(profile) ? '待重新评估' : profile.status === 'partial' ? '部分证据待更新' : '画像已更新'; }
+  function profileGroups(profile) { return Array.isArray(profile?.groups) ? profile.groups : []; }
+  function renderWalletProfileStatus() {
+    const data = state.walletProfileStatus;
+    const failed = Boolean(state.resourceErrors.walletProfiles);
+    const enabled = data?.enabled !== false;
+    const limited = data?.capacityReached === true || Boolean(data?.error);
+    const running = enabled && data?.running === true;
+    const lastRun = validDate(data?.lastRunAt); const delayed = running && lastRun && Date.now() - lastRun.getTime() > Math.max(600000, (numeric(data.intervalSec) || 2) * 10000);
+    const label = failed ? '状态读取失败' : !enabled ? '画像未启用' : limited ? '更新需关注' : delayed ? '处理进度过旧' : running ? data?.inFlight ? '正在分析' : '持续更新中' : data?.running === false ? '后台任务已暂停' : '等待后台任务';
+    text('profile-status-badge', label); $('profile-status-badge').className = `badge ${failed || limited || delayed ? 'watch' : running ? 'pass' : 'neutral'}`;
+    text('profile-status-title', !enabled ? '钱包画像任务未启用' : failed || limited || delayed || data?.running === false ? '已有画像保留，更新状态需确认' : data?.initialComplete ? '已有画像持续重新评估' : '正在为已积累钱包建立画像');
+    text('profile-built-count', count(data?.profiles)); text('profile-source-count', count(data?.sourceWallets));
+    const sourceProfiles = finite(data?.profiledSourceWallets) ? data.profiledSourceWallets : data?.profiles;
+    text('profile-pending-count', finite(sourceProfiles) && finite(data?.sourceWallets) ? count(Math.max(0, data.sourceWallets - sourceProfiles)) : '—');
+    const coverage = finite(sourceProfiles) && finite(data?.sourceWallets) && data.sourceWallets > 0 ? Math.min(100, sourceProfiles / data.sourceWallets * 100) : 0;
+    $('profile-build-progress').value = coverage;
+    $('profile-build-progress').setAttribute('aria-valuetext', `${Math.floor(coverage)}% 的已积累钱包已有画像`);
+    text('profile-status-note', `${data?.lastRunAt ? `最近处理 ${date(data.lastRunAt, true)}。` : '等待首次后台处理。'}${finite(data?.staleProfiles) ? `${count(data.staleProfiles)} 个画像已到期等待重评。` : ''}${running && !failed && !limited && !delayed ? `${finite(data?.intervalSec) ? `后台每 ${data.intervalSec} 秒调度一批，` : ''}新增证据和到期画像会分批重新评估；页面关闭后仍继续。` : '当前不能确认画像正在正常更新。'}覆盖率只表示已建档，不代表全部交易历史已覆盖。`);
+    const warning = failed ? '状态暂时无法更新，以下保留最近成功读取的数据。' : data?.capacityReached ? '画像库已达容量上限，更新暂停；已有画像保留，请检查服务端存储。' : data?.error ? '后台画像处理异常，已有画像可能未更新。' : delayed ? '较长时间未完成画像处理，已有结果可能过时，请查看后台任务状态。' : '';
+    $('profile-status-warning').hidden = !warning; text('profile-status-warning', warning);
+    const groups = $('profile-group-counts'); const active = document.activeElement?.dataset.profileGroup; groups.replaceChildren();
+    const groupCounts = Array.isArray(data?.groupCounts) ? data.groupCounts.map(item => [item.id || item.group, item.count]) : Object.entries(data?.groupCounts || {});
+    for (const [id, size] of groupCounts.filter(([id, size]) => Object.hasOwn(profileGroupNames, id) && finite(size) && size > 0)) {
+      const button = el('button', 'profile-group-count'); button.type = 'button'; button.dataset.profileGroup = id; button.setAttribute('aria-pressed', String(state.walletGroup === id)); button.append(el('span', '', profileGroupName(id)), el('strong', '', count(size)));
+      button.addEventListener('click', () => { state.walletGroup = state.walletGroup === id ? '' : id; $('wallet-group').value = state.walletGroup; renderWalletProfileStatus(); walletFiltersChanged(); }); groups.append(button);
+    }
+    if (active) [...groups.children].find(item => item.dataset.profileGroup === active)?.focus();
+  }
+  function openWalletProfile(profile, trigger) { return openDetail(`profile:${profile.chain}:${profile.address}`, trigger, {profile: true, chain: profile.chain, address: profile.address}); }
+  function profilePagination() {
+    text('wallet-pagination-info', state.walletTotal ? `显示 ${state.walletOffset + 1}–${Math.min(state.walletOffset + state.walletItems.length, state.walletTotal)} 条，共 ${count(state.walletTotal)} 个画像` : '当前筛选下共 0 个画像');
+    text('wallet-page-number', String(Math.floor(state.walletOffset / PAGE_SIZE) + 1).padStart(2, '0')); $('wallet-previous-page').disabled = state.walletOffset === 0; $('wallet-next-page').disabled = state.walletOffset + PAGE_SIZE >= state.walletTotal;
+  }
+  function renderWalletProfileList() {
+    const list = $('wallet-profile-list'); list.replaceChildren(); text('wallet-list-count', count(state.walletTotal)); $('wallet-empty').hidden = state.walletItems.length > 0;
+    if (!state.walletItems.length) walletEmpty(state.walletProfileStatus?.enabled === false ? '画像任务尚未启用' : !state.walletProfilesReady ? '画像正在等待首次处理' : '当前筛选暂无画像', state.walletProfileStatus?.enabled === false ? '尚无可显示的画像，已有钱包采样档案可在其他研究视图查看。' : !state.walletProfilesReady ? '后台任务就绪后会分批整理已经积累的钱包，首批完成后自动显示。' : '可以切换行为分组、网络或搜索条件。数据补建期间，尚未建档的钱包还不会出现在这里。');
+    for (const profile of state.walletItems) {
+      const card = el('article', 'wallet-profile-card'); const heading = el('div', 'profile-card-heading'); const identity = el('div', 'profile-card-identity'); identity.append(badge(chainName(profile.chain), 'neutral'), addressNode(profile.address));
+      const action = el('button', 'association-evidence-button', '查看画像'); action.type = 'button'; action.setAttribute('aria-label', `查看钱包画像 ${profile.address}`); action.addEventListener('click', () => openWalletProfile(profile, action)); heading.append(identity, action); card.append(heading);
+      const groups = el('div', 'profile-memberships'); for (const group of profileGroups(profile)) { const tag = badge(profileGroupName(group.id), profileGroupTone(group.id)); tag.title = `${scalar(group.reason, '')} · 首次入组 ${date(group.firstObservedAt, true)}`; groups.append(tag); } if (!groups.childNodes.length) groups.append(badge('暂无当前分组', 'neutral')); card.append(groups);
+      const metrics = profile.metrics || {}, associations = metrics.associations || {}, chain = metrics.chain || {};
+      const values = el('div', 'profile-card-values'); values.append(profileValue('已观测买 / 卖', `${count(metrics.buyEvents)} / ${count(metrics.sellEvents)}`, `${count(metrics.distinctTokens)} 个代币 · ${count(metrics.observedEvents)} 条活动`), profileValue('前置关联', `${count(associations.leaders)} 个公开钱包`, `${count(associations.distinctTokens)} 个代币 · ${count(associations.forwardTokens)} 个后续验证`), profileValue('供应商 7 日已实现收益', usd(metrics.vendorProfit?.realizedProfitUsd), metrics.vendorProfit ? `供应商快照 · ${date(metrics.vendorProfit.observedAt)}` : '暂无有效快照'), profileValue('买入后采样最高涨幅', percent(metrics.observedGain?.maxGainPct), '基于报价样本 · 非钱包收益')); card.append(values);
+      const footer = el('div', 'profile-card-footer'); footer.append(badge(profileHealth(profile), profileIsStale(profile) || profile.status === 'partial' ? 'watch' : 'neutral'), el('time', '', `画像更新 ${date(profile.computedAt, true)}`), el('span', '', `RPC 交易参与 ${count(chain.transactions)} · 转账 ${count(chain.transfers)}`)); card.append(footer); list.append(card);
+    }
+    profilePagination();
+  }
+  function profileValue(label, value, note) { const item = el('div', 'profile-card-value'); item.append(el('span', '', label), el('strong', '', value), el('small', '', note)); return item; }
+  function profileEvidenceSection(profile) {
+    const content = section('持续行为画像');
+    content.append(kv('更新状态', profileHealth(profile)), kv('画像最近计算', date(profile.computedAt, true)), kv('最近证据观测', date(profile.evidenceThroughAt, true)), kv('下次到期评估', date(profile.freshUntil, true)), el('p', 'wallet-section-note', '同一钱包可以属于多个组。分组依据已有样本持续更新，证据变化或过期后可能退出；首次入组是系统建立该标签的时间，不回填成交易发生时间。'));
+    for (const group of profileGroups(profile)) { const card = evidenceCard(profileGroupName(group.id), badge('行为研究分组', profileGroupTone(group.id))); card.append(el('p', 'profile-group-reason', scalar(group.reason, '尚无可展示的入组说明')), kv('首次入组', date(group.firstObservedAt, true)), kv('支持证据数', count(group.evidenceCount))); content.append(card); }
+    if (!profileGroups(profile).length) walletEmptyDetail(content, '当前没有有效行为分组，等待进一步证据。');
+    const limitationNames = {HISTORICAL_ASSOCIATION_EVIDENCE: '前置关联依据包含历史样本，不代表这些钱包当前仍在协同。', HISTORICAL_COORDINATION_EVIDENCE: '同步或资金联系依据包含历史样本，不能据此判断当前活跃程度。', SAMPLED_OBSERVATIONS_NOT_COMPLETE_HISTORY: '只覆盖已采集样本，交易历史可能不完整。', ASSOCIATIONS_DO_NOT_PROVE_COMMON_OWNERSHIP: '关联行为不能证明共同控制或实际身份。', VENDOR_PROFIT_IS_NOT_LOCAL_REALIZED_PNL: '供应商收益数据不是本系统核算的已实现利润。', EVENT_SAMPLE_LIMIT_500: '本轮画像只分析最近 500 条活动，完整采样档案另行保留。', PUBLIC_ANCHOR_SAMPLE_LIMIT_100: '公开来源仅取前 100 个入口样本。', RELATION_SAMPLE_LIMIT_20: '本轮前置关联分析最多涵盖 20 对关系。', RELATION_CACHE_PENDING_OR_STALE: '部分前置关联等待重算，尚未用于当前分组。', EPISODE_SAMPLE_LIMIT_100: '每对关联最多分析最近 100 条时序证据。', VENDOR_PROFIT_MISSING_STALE_OR_INVALID: '供应商利润快照缺失、过期或未通过校验，未用于当前盈利分组。', COORDINATION_CACHE_PENDING_OR_STALE: '部分协同线索等待重算，尚未用于当前分组。', CHAIN_EVENT_SAMPLE_LIMIT_500: '本轮链上依据最多使用最近 500 条活动。', CHAIN_PARTICIPATION_OR_TRANSFER_IS_NOT_A_BUY_SELL_OR_HOLDING: 'RPC 交易参与、转账记录不直接等于买卖或持仓。', CHAIN_EVENT_TIME_UNKNOWN: '部分链上记录只有采集时间，缺少事件发生时间。'};
+    const limitations = Array.isArray(profile.limitations) ? profile.limitations.filter(item => Object.hasOwn(limitationNames, item)) : [];
+    if (limitations.length) { const list = el('ul', 'profile-limitations'); for (const item of limitations) list.append(el('li', '', limitationNames[item])); content.append(list); }
+    return content;
+  }
+  function renderWalletProfileDetail(profile) {
+    const fragment = document.createDocumentFragment(); const title = el('h2', '', '钱包行为画像'); title.id = 'detail-title'; fragment.append(title, el('p', 'association-detail-note', `${chainName(profile.chain)} · 持续更新的研究记录 · 归属未知`), addressNode(profile.address, 'detail-address'), profileEvidenceSection(profile));
+    const metrics = profile.metrics || {}, associations = metrics.associations || {}, chain = metrics.chain || {};
+    const summary = section('观测依据'); summary.append(kv('买入 / 卖出活动', `${count(metrics.buyEvents)} / ${count(metrics.sellEvents)}`), kv('已观测活动 / 代币', `${count(metrics.observedEvents)} / ${count(metrics.distinctTokens)}`), kv('最近交易事件时间', date(metrics.lastEventAt, true)), kv('关联公开钱包 / 代币', `${count(associations.leaders)} / ${count(associations.distinctTokens)}`), kv('后续验证代币', count(associations.forwardTokens)), kv('供应商 7 日已实现收益', usd(metrics.vendorProfit?.realizedProfitUsd)), kv('买入后采样最高涨幅', percent(metrics.observedGain?.maxGainPct)), el('p', 'wallet-section-note', '供应商收益不是本地核算利润；采样涨幅以观测到买入后的报价为基准，不是钱包实际收益。'));
+    if (metrics.observedGain?.tokenAddress) summary.append(el('p', 'detail-small', '采样涨幅对应代币'), addressNode(metrics.observedGain.tokenAddress), gmgnTokenLink(profile.chain, metrics.observedGain.tokenAddress)); fragment.append(summary);
+    const raw = section('链上原始活动'); raw.append(kv('RPC 交易参与', count(chain.transactions)), kv('RPC 转账记录', count(chain.transfers)), kv('最近取得链上记录', date(chain.lastObservedAt, true)), el('p', 'wallet-section-note', 'RPC 交易参与与转账只表示已观测链上事实，未直接归类为买卖。当前仅覆盖被选中监测的钱包，缺少记录不代表没有活动。')); fragment.append(raw);
+    const peers = section('关联研究对象'); const counterparties = Array.isArray(profile.counterparties) ? profile.counterparties : [];
+    for (const peer of counterparties.slice(0, 20)) { const card = evidenceCard({leader: '前置时序对应的公开钱包', shared_funding: '共同资金来源线索', synchronized: '同步交易线索'}[peer.kind] || '关联线索', badge('归属未知', 'watch')); card.append(addressNode(peer.address), kv('支持证据数', count(peer.evidenceCount))); if (peer.kind === 'leader') { const action = el('button', 'association-evidence-button', '查看这对关系的证据'); action.type = 'button'; action.addEventListener('click', () => openDetail(`association:${profile.chain}:${peer.address}:${profile.address}`, action, {association: true, chain: profile.chain, leader: peer.address, candidate: profile.address})); card.append(action); } peers.append(card); }
+    if (!counterparties.length) walletEmptyDetail(peers, '暂未形成可展示的关联对象，不能据此判断不存在关联。'); peers.append(el('p', 'wallet-disclaimer', '共同资金来源、同步交易或前置买入不能单独证明同一人控制，也不直接认定“阴谋钱包”。')); fragment.append(peers);
+    const changes = section('分组变化记录'); const events = Array.isArray(profile.changes) ? profile.changes : [];
+    for (const change of events) { const card = evidenceCard(date(change.at || change.changedAt || change.computedAt, true), badge('本地画像变化', 'neutral')); const added = change.added || change.addedGroups || []; const removed = change.removed || change.removedGroups || []; if (added.length) card.append(el('p', 'profile-group-reason', `加入：${added.map(id => profileGroupName(typeof id === 'string' ? id : id.id)).join('、')}`)); if (removed.length) card.append(el('p', 'profile-group-reason', `退出：${removed.map(id => profileGroupName(typeof id === 'string' ? id : id.id)).join('、')}`)); if (!added.length && !removed.length) card.append(el('p', 'profile-group-reason', scalar(change.reason, '画像依据更新'))); changes.append(card); }
+    if (!events.length) walletEmptyDetail(changes, '尚无可展示的变化记录。后续入组与退出会保留历史。'); fragment.append(changes);
+    const full = el('button', 'association-evidence-button profile-full-history', '查看完整采样档案'); full.type = 'button'; full.addEventListener('click', () => openWallet(profile, full)); fragment.append(full); $('detail-content').replaceChildren(fragment);
+  }
   function renderWalletRankingNote() {
-    const associations = state.walletSort === 'associations'; $('association-table').hidden = !associations; $('wallet-history-table').hidden = associations; $('association-status-note').hidden = !associations;
-    $('wallet-search').placeholder = associations ? '搜索公开钱包或候选钱包地址…' : '搜索钱包地址、名称或标签…'; renderAssociationStatus();
+    const associations = state.walletSort === 'associations', profiles = state.walletSort === 'profiles'; $('association-table').hidden = !associations; $('wallet-history-table').hidden = associations || profiles; $('association-status-note').hidden = !associations; $('wallet-profile-list').hidden = !profiles; $('wallet-profile-status').hidden = !profiles; $('wallet-group-filter').hidden = !profiles;
+    $('wallet-search').placeholder = profiles ? '搜索钱包地址…' : associations ? '搜索公开钱包或候选钱包地址…' : '搜索钱包地址、名称或标签…'; renderAssociationStatus(); if (profiles) renderWalletProfileStatus();
     text('wallet-ranking-note', {
+      profiles: '行为分组允许重叠，人数不能相加。前置买入、资金同源与同步交易是研究线索，钱包归属仍待验证。画像建立、证据更新和到期重评均由后台持续进行。',
       associations: '以 GMGN KOL 买入记录为入口，寻找其之前 24 小时内买入同币的钱包。按重复代币数排列；链上买入时间不等于已核实的喊单时间，首次观测买入也不等于该钱包真正首买。',
       profit: '供应商报告的最近 7 日已实现收益，仅用于发现研究目标；榜单不证明可跟单能力，也不是本地核算利润。',
       gain: '捕获涨幅按首次观测到买入后的价格样本排列。基准是此后的首个报价，不是钱包真实买入成本。',
@@ -1089,6 +1172,7 @@
   function walletMoney(value) { const n = numeric(value); return el('span', `gain ${n === undefined ? 'missing' : n >= 0 ? 'positive' : 'negative'}`, usd(value)); }
   function openWallet(wallet, trigger) { return openDetail(`wallet:${wallet.chain}:${wallet.address}`, trigger, {chain: wallet.chain, address: wallet.address}); }
   function renderWalletList() {
+    if (state.walletSort === 'profiles') { renderWalletProfileList(); return; }
     if (state.walletSort === 'associations') { renderAssociationList(); return; }
     const body = $('wallet-rows'); body.replaceChildren(); text('wallet-list-count', count(state.walletTotal)); $('wallet-empty').hidden = state.walletItems.length > 0;
     if (!state.walletItems.length) walletEmpty(state.walletChain || state.walletSearch ? '没有匹配的钱包档案' : '开始积累钱包的长期记录', state.walletChain || state.walletSearch ? '调整网络或搜索关键词，查看其他已发现的钱包。' : '发现钱包后，会保存活动、持仓样本与资金线索。没有数据的排名字段显示为 —。');
@@ -1118,6 +1202,7 @@
     const wallet = data.wallet || {}; const fragment = document.createDocumentFragment(); const name = wallet.name || '未标记钱包';
     const heading = el('div', 'detail-token'); heading.append(el('span', `token-avatar ${chainClass(wallet.chain)}`, wallet.name ? Array.from(String(wallet.name))[0]?.toUpperCase() : 'W')); const titleGroup = el('div'); const title = el('h2', '', name); title.id = 'detail-title'; titleGroup.append(title, el('div', 'token-meta', `${chainName(wallet.chain)} · 本地钱包研究档案`)); heading.append(titleGroup); fragment.append(heading, addressNode(wallet.address, 'detail-address'));
     const labels = el('div', 'detail-pills'); labels.append(badge('GMGN 线索 · 归属未核实', 'watch')); for (const label of Array.isArray(wallet.labels) ? wallet.labels : []) labels.append(badge(walletLabel(label), 'neutral')); fragment.append(labels);
+    if (data.behaviorProfile) fragment.append(profileEvidenceSection(data.behaviorProfile));
     const metrics = el('div', 'detail-metrics wallet-research-detail'); metrics.append(detailStat('GMGN 7 日已实现收益', usd(wallet.profit?.realizedProfitUsd), '整个钱包 · 供应商报告', numeric(wallet.profit?.realizedProfitUsd) < 0 ? 'negative' : 'positive'), detailStat('买入后采样最高涨幅', percent(wallet.gain?.maxGainPct), '样本观测值 · 非实际收益', 'positive'), detailStat('已观测活动', count(wallet.observedEventCount), `买 ${count(wallet.buyEvents)} / 卖 ${count(wallet.sellEvents)}`)); fragment.append(metrics);
     const coverage = data.coverage || {}; const observed = section('观察范围与身份线索');
     observed.append(el('p', 'wallet-section-note', '从本地首次发现开始累积样本。首次发现前、来源未覆盖或采集失败期间的交易可能缺失，不能据此核算完整已实现利润。'), kv('本地首次观测', date(coverage.firstObservedAt || wallet.firstObservedAt, true)), kv('最近观测', date(coverage.lastObservedAt || wallet.lastObservedAt, true)), kv('已记录事件 / 观测证据', `${count(coverage.eventCount)} / ${count(coverage.observationCount)}`), kv('涉及代币', count(wallet.tokenCount)), kv('GMGN 名称线索', wallet.name), kv('GMGN 社交账号线索', wallet.twitter), kv('本地完整已实现利润', '未核算 · 覆盖不完整'));

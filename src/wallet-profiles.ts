@@ -1,0 +1,281 @@
+import {DatabaseSync, type StatementSync} from 'node:sqlite';
+import {chmodSync,existsSync,mkdirSync,realpathSync,statSync} from 'node:fs';
+import {dirname,resolve} from 'node:path';
+import {chainAddress} from './chain-stream-store.js';
+import type {Chain} from './types.js';
+
+export const WALLET_PROFILE_GROUPS=['public_kol','early_candidate','repeated_early','forward_validated','shared_funding','synchronized','vendor_profit_positive','observed_runner','insufficient_evidence','inactive_observed'] as const;
+export type WalletProfileGroupId=typeof WALLET_PROFILE_GROUPS[number];
+export interface WalletProfileGroup {id:WalletProfileGroupId;firstObservedAt:string;evidenceCount:number;reason:string;}
+export interface WalletProfile {
+  chain:Chain;address:string;version:1;computedAt:string;evidenceThroughAt?:string;freshUntil:string;status:'current'|'partial'|'stale';
+  source:'wallet_history'|'chain_only';sampleOnly:true;ownership:'unknown';groups:WalletProfileGroup[];
+  metrics:{observedEvents:number;buyEvents:number;sellEvents:number;distinctTokens:number;lastEventAt?:string;
+    vendorProfit?:{realizedProfitUsd:string;period:'7d';observedAt:string;snapshotAt:string;verification:'vendor_claim'};
+    observedGain?:{maxGainPct:number;tokenAddress:string;baselineAt:string;peakAt:string;source:string};
+    associations:{leaders:number;distinctTokens:number;forwardTokens:number};chain:{transactions:number;transfers:number;lastObservedAt?:string}};
+  counterparties:{address:string;kind:'leader'|'shared_funding'|'synchronized';evidenceCount:number}[];
+  limitations:string[];changes?:{at:string;added:WalletProfileGroupId[];removed:WalletProfileGroupId[]}[];
+}
+export interface WalletProfileStatus {ready:boolean;profiles:number;sourceWallets:number;profiledSourceWallets:number;initialComplete:boolean;processed:number;lastRunAt?:string;
+  groupCounts:Partial<Record<WalletProfileGroupId,number>>;bytes:number;maxBytes:number;capacityReached:boolean;error?:string;sampleOnly:true;staleProfiles:number;}
+export interface WalletProfileListOptions {chain?:Chain;group?:string;search?:string;limit?:number;offset?:number;}
+export interface WalletProfilesOptions {database:string;historyDatabase:string;chainDatabase?:string;maxBytes?:number;now?:()=>Date;refreshAfterSec?:number;}
+type Row=Record<string,any>;
+const DAY=86_400_000,CAPACITY='WALLET_PROFILES_CAPACITY_REACHED',SERVICES=new Set(['exchange_or_pool','exchange','pool','router','bridge','cex']);
+const parse=(value:unknown):any=>{try{return typeof value==='string'?JSON.parse(value):undefined;}catch{return undefined;}};
+const stamp=(value:unknown):value is string=>typeof value==='string'&&/^\d{4}-\d\d-\d\dT/.test(value)&&Number.isFinite(Date.parse(value));
+const validTime=(value:unknown,now:string):value is string=>stamp(value)&&value<=now;
+const num=(value:unknown):number=>typeof value==='number'&&Number.isFinite(value)&&value>=0?value:0;
+const bounded=(value:unknown,fallback:number,max:number)=>typeof value==='number'&&Number.isSafeInteger(value)?Math.max(1,Math.min(max,value)):fallback;
+const canonicalPath=(path:string)=>path===':memory:'?path:existsSync(path)?realpathSync(path):resolve(path);
+const filesBytes=(path:string,db?:DatabaseSync)=>path===':memory:'&&db?Number(db.prepare('PRAGMA page_count').get()!.page_count)*Number(db.prepare('PRAGMA page_size').get()!.page_size):
+  [path,path+'-wal',path+'-shm'].reduce((n,p)=>{try{return n+statSync(p).size;}catch{return n;}},0);
+const emptyStatus=():WalletProfileStatus=>({ready:false,profiles:0,sourceWallets:0,profiledSourceWallets:0,initialComplete:false,processed:0,groupCounts:{},bytes:0,maxBytes:0,capacityReached:false,sampleOnly:true,staleProfiles:0});
+
+/** Independently persisted research classifications. Every source database is opened read-only. */
+export class WalletProfiles {
+  private readonly history:DatabaseSync;private chain?:DatabaseSync;private readonly db:DatabaseSync;
+  private readonly now:()=>Date;private readonly maxBytes:number;private readonly refreshMs:number;
+  private readonly sourceStatements=new Map<string,StatementSync>();private readonly outputStatements=new Map<string,StatementSync>();
+  private sourceCount=0;private countedAt=0;
+  constructor(private readonly options:WalletProfilesOptions) {
+    this.now=options.now??(()=>new Date());this.maxBytes=options.maxBytes??256*1024*1024;this.refreshMs=(options.refreshAfterSec??1800)*1000;
+    if(!Number.isSafeInteger(this.maxBytes)||this.maxBytes<16_384||!Number.isFinite(this.refreshMs)||this.refreshMs<1000||canonicalPath(options.database)===canonicalPath(options.historyDatabase)||
+      options.chainDatabase&&canonicalPath(options.database)===canonicalPath(options.chainDatabase))throw new Error('WALLET_PROFILES_CONFIG_INVALID');
+    this.history=new DatabaseSync(options.historyDatabase,{readOnly:true});this.history.exec('PRAGMA busy_timeout=1000; PRAGMA query_only=ON');
+    if(options.chainDatabase&&existsSync(options.chainDatabase)){this.chain=new DatabaseSync(options.chainDatabase,{readOnly:true});this.chain.exec('PRAGMA busy_timeout=1000; PRAGMA query_only=ON');}
+    if(options.database!==':memory:')mkdirSync(dirname(options.database),{recursive:true,mode:0o700});
+    this.db=new DatabaseSync(options.database);if(options.database!==':memory:')chmodSync(options.database,0o600);
+    this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=1000; PRAGMA wal_autocheckpoint=64;
+      CREATE TABLE IF NOT EXISTS wp_profiles(chain TEXT,address TEXT,computed_at TEXT NOT NULL,fresh_until TEXT NOT NULL,data TEXT NOT NULL,source_wallet INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(chain,address));
+      CREATE INDEX IF NOT EXISTS wp_profiles_due ON wp_profiles(fresh_until);
+      CREATE INDEX IF NOT EXISTS wp_profiles_recent ON wp_profiles(computed_at DESC,chain,address);
+      CREATE TABLE IF NOT EXISTS wp_groups(chain TEXT,address TEXT,group_id TEXT,first_at TEXT NOT NULL,PRIMARY KEY(chain,address,group_id));
+      CREATE INDEX IF NOT EXISTS wp_groups_filter ON wp_groups(group_id,chain,address);
+      CREATE TABLE IF NOT EXISTS wp_group_first(chain TEXT,address TEXT,group_id TEXT,first_at TEXT NOT NULL,PRIMARY KEY(chain,address,group_id));
+      CREATE TABLE IF NOT EXISTS wp_changes(id INTEGER PRIMARY KEY,chain TEXT,address TEXT,observed_at TEXT NOT NULL,data TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS wp_changes_wallet ON wp_changes(chain,address,id DESC);
+      CREATE TABLE IF NOT EXISTS wp_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);`);
+    if(!this.db.prepare('PRAGMA table_info(wp_profiles)').all().some(column=>column.name==='source_wallet'))this.db.exec('ALTER TABLE wp_profiles ADD COLUMN source_wallet INTEGER NOT NULL DEFAULT 0');
+    this.db.exec('CREATE INDEX IF NOT EXISTS wp_profiles_source ON wp_profiles(source_wallet)');
+    const oldLimit=Number(this.meta('max_bytes'));this.setMeta('max_bytes',String(this.maxBytes));
+    if(this.meta('error')===CAPACITY&&this.maxBytes>oldLimit&&filesBytes(options.database,this.db)+32768<this.maxBytes)this.setMeta('error','');
+    // Historical coverage belongs to the rowid pass. Start update watermarks at
+    // worker creation so live changes never queue behind the entire old corpus.
+    if(!this.meta('changed_at'))this.setMeta('changed_at',this.now().toISOString());
+    if(!this.meta('coordination_at'))this.setMeta('coordination_at',this.now().toISOString());
+  }
+  private hs(sql:string):StatementSync {let statement=this.sourceStatements.get(sql);if(!statement){statement=this.history.prepare(sql);this.sourceStatements.set(sql,statement);}return statement;}
+  private os(sql:string):StatementSync {let statement=this.outputStatements.get(sql);if(!statement){statement=this.db.prepare(sql);this.outputStatements.set(sql,statement);}return statement;}
+  private meta(key:string):string{return String(this.os('SELECT value FROM wp_meta WHERE key=?').get(key)?.value??'');}
+  private setMeta(key:string,value:string):void {this.os('INSERT INTO wp_meta VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key,value);}
+  runBatch(limit=100):WalletProfileStatus {
+    if(this.meta('error')===CAPACITY)return this.status();
+    if(!this.chain&&this.options.chainDatabase&&existsSync(this.options.chainDatabase)){this.chain=new DatabaseSync(this.options.chainDatabase,{readOnly:true});this.chain.exec('PRAGMA busy_timeout=1000; PRAGMA query_only=ON');}
+    let historyTransaction=false,chainTransaction=false;
+    try {
+      this.history.exec('BEGIN');historyTransaction=true;
+      if(this.chain){this.chain.exec('BEGIN');chainTransaction=true;}
+      return this.runSnapshot(limit);
+    }finally{
+      // Read snapshots must close even when malformed evidence, capacity or an
+      // output failure interrupts a batch. The sources are never mutated.
+      try{if(chainTransaction)this.chain!.exec('ROLLBACK');}finally{if(historyTransaction)this.history.exec('ROLLBACK');}
+    }
+  }
+  private runSnapshot(limit:number):WalletProfileStatus {
+    const now=this.now().toISOString(),n=bounded(limit,100,1000),targets=new Map<string,{chain:Chain;address:string}>();
+    if(this.meta('error')===CAPACITY)return this.status();
+    const add=(row:Row)=>{const chain=row.chain as Chain,address=chainAddress(chain,row.address??row.wallet);if(address)targets.set(chain+':'+address,{chain,address});};
+    const initialCursor=Number(this.meta('initial_cursor')||0),initialLimit=Math.max(1,Math.ceil(n*0.6));
+    const initial=this.hs('SELECT rowid AS cursor,chain,address FROM wh_wallets WHERE rowid>? ORDER BY rowid LIMIT ?').all(initialCursor,initialLimit);
+    initial.forEach(add);
+    // Stable timestamp/rowid cursor consumes changed wallets fairly; new rows have an independent cursor.
+    const changedAt=this.meta('changed_at'),changedRow=Number(this.meta('changed_row')||0),changedLimit=Math.max(1,Math.ceil(n*0.1));
+    const changed=this.hs('SELECT rowid AS cursor,chain,address,last_at FROM wh_wallets WHERE last_at>=? AND last_at<=? AND (last_at>? OR (last_at=? AND rowid>?)) ORDER BY last_at,rowid LIMIT ?').all(changedAt,now,changedAt,changedAt,changedRow,changedLimit);
+    changed.forEach(add);
+    const coordinationAt=this.meta('coordination_at'),coordinationRow=Number(this.meta('coordination_row')||0);
+    const coordination=this.hs(`SELECT rowid AS cursor,chain,address,coordination_checked_at FROM wh_metrics WHERE coordination_dirty=0
+      AND coordination_checked_at>=? AND coordination_checked_at<=? AND (coordination_checked_at>? OR (coordination_checked_at=? AND rowid>?))
+      ORDER BY coordination_checked_at,rowid LIMIT ?`).all(coordinationAt,now,coordinationAt,coordinationAt,coordinationRow,changedLimit);
+    coordination.forEach(add);
+    const due=this.os('SELECT chain,address FROM wp_profiles WHERE fresh_until<=? ORDER BY fresh_until LIMIT ?').all(now,Math.max(1,n-targets.size));due.forEach(add);
+    const chainCursor=Number(this.meta('chain_cursor')||0);
+    const chainRows=this.chain?.prepare('SELECT rowid AS cursor,chain,wallet FROM chain_events WHERE rowid>? ORDER BY rowid LIMIT ?').all(chainCursor,Math.max(1,Math.min(200,Math.floor(n*0.2))))??[];
+    chainRows.forEach(add);
+    this.db.exec('BEGIN');
+    let processed=0,full=false;
+    try {
+      for(const target of targets.values()){
+        const profile=this.compute(target.chain,target.address,now);if(!profile)continue;
+        const size=Buffer.byteLength(JSON.stringify(profile));
+        const logical=Number(this.os('PRAGMA page_count').get()!.page_count)*Number(this.os('PRAGMA page_size').get()!.page_size);
+        if(Math.max(logical,filesBytes(this.options.database,this.db))+size*4+32768>this.maxBytes){full=true;break;}
+        this.save(profile);processed++;
+      }
+      // Never advance input cursors over a capacity-truncated batch.
+      if(!full){if(initial.length)this.setMeta('initial_cursor',String(initial.at(-1)!.cursor));
+        this.setMeta('initial_complete',initial.length<initialLimit?'1':'0');
+        if(changed.length){this.setMeta('changed_at',String(changed.at(-1)!.last_at));this.setMeta('changed_row',String(changed.at(-1)!.cursor));}
+        if(coordination.length){this.setMeta('coordination_at',String(coordination.at(-1)!.coordination_checked_at));this.setMeta('coordination_row',String(coordination.at(-1)!.cursor));}
+        if(chainRows.length)this.setMeta('chain_cursor',String(chainRows.at(-1)!.cursor));}
+      this.setMeta('processed',String(Number(this.meta('processed')||0)+processed));this.setMeta('last_run_at',now);
+      if(full)this.setMeta('error',CAPACITY);this.db.exec('COMMIT');
+    }catch(error){this.db.exec('ROLLBACK');throw error;}
+    if(!this.countedAt||this.now().getTime()-this.countedAt>=60_000){this.sourceCount=Number(this.hs('SELECT count(*) AS n FROM wh_wallets').get()!.n);this.countedAt=this.now().getTime();this.setMeta('source_wallets',String(this.sourceCount));}
+    return this.status();
+  }
+  private compute(chain:Chain,address:string,now:string):WalletProfile|undefined {
+    const wallet=this.hs('SELECT * FROM wh_wallets WHERE chain=? AND address=?').get(chain,address);
+    const rawMetrics=this.hs('SELECT * FROM wh_metrics WHERE chain=? AND address=?').get(chain,address);
+    const chainRows=this.chain?.prepare('SELECT data FROM chain_events WHERE chain=? AND wallet=? AND observed_at<=? ORDER BY observed_at DESC LIMIT 501').all(chain,address,now)??[];
+    if(!wallet&&!chainRows.length)return;
+    const limitations=['SAMPLED_OBSERVATIONS_NOT_COMPLETE_HISTORY','ASSOCIATIONS_DO_NOT_PROVE_COMMON_OWNERSHIP','VENDOR_PROFIT_IS_NOT_LOCAL_REALIZED_PNL'];
+    const profile:WalletProfile={chain,address,version:1,computedAt:now,freshUntil:new Date(Date.parse(now)+this.refreshMs).toISOString(),status:'current',source:wallet?'wallet_history':'chain_only',sampleOnly:true,ownership:'unknown',groups:[],
+      metrics:{observedEvents:0,buyEvents:0,sellEvents:0,distinctTokens:0,associations:{leaders:0,distinctTokens:0,forwardTokens:0},chain:{transactions:0,transfers:0}},counterparties:[],limitations};
+    const group=(id:WalletProfileGroupId,evidenceCount:number,reason:string)=>{if(!profile.groups.some(g=>g.id===id))profile.groups.push({id,firstObservedAt:now,evidenceCount,reason});};
+    const seen=(value:unknown)=>{if(validTime(value,now)&&(!profile.evidenceThroughAt||value>profile.evidenceThroughAt))profile.evidenceThroughAt=value;};
+    const partial=(reason:string)=>{profile.status='partial';if(!limitations.includes(reason))limitations.push(reason);};
+    const addCounterparty=(other:unknown,kind:WalletProfile['counterparties'][number]['kind'],evidenceCount:number)=>{const value=chainAddress(chain,other);if(value&&value!==address&&profile.counterparties.length<50&&!profile.counterparties.some(p=>p.address===value&&p.kind===kind))profile.counterparties.push({address:value,kind,evidenceCount});};
+    if(validTime(wallet?.last_at,now))seen(wallet!.last_at);
+    const events=this.hs('SELECT data FROM wh_events WHERE chain=? AND wallet=? AND event_at<=? AND observed_at<=? ORDER BY event_at DESC LIMIT 501').all(chain,address,now,now);
+    if(events.length>500)partial('EVENT_SAMPLE_LIMIT_500');
+    const tokens=new Set<string>();
+    for(const row of events.slice(0,500)){
+      const event=parse(row.data);if(!event||!validTime(event.eventAt,now)||!validTime(event.observedAt,now)||event.eventAt>event.observedAt||event.chain!==chain||event.wallet!==address)continue;
+      profile.metrics.observedEvents++;if(event.side==='buy')profile.metrics.buyEvents++;if(event.side==='sell')profile.metrics.sellEvents++;
+      const token=chainAddress(chain,event.tokenAddress);if(token)tokens.add(token);seen(event.observedAt);
+      if(!profile.metrics.lastEventAt||event.eventAt>profile.metrics.lastEventAt)profile.metrics.lastEventAt=event.eventAt;
+    }
+    profile.metrics.distinctTokens=tokens.size;
+    const anchors=this.hs('SELECT public_observed_at FROM wh_assoc_anchors WHERE chain=? AND leader=? AND public_observed_at<=? LIMIT 101').all(chain,address,now);
+    if(anchors.length)group('public_kol',Math.min(100,anchors.length),'供应商 KOL 信号曾公开标记此钱包；标签不等于身份已验证');
+    anchors.forEach(a=>seen(a.public_observed_at));if(anchors.length>100)partial('PUBLIC_ANCHOR_SAMPLE_LIMIT_100');
+    const relations=this.hs('SELECT * FROM wh_assoc_relations WHERE chain=? AND candidate=? AND token_count>0 LIMIT 21').all(chain,address);
+    const earlyTokens=new Set<string>(),forwardTokens=new Set<string>();let leaders=0;
+    if(relations.length>20)partial('RELATION_SAMPLE_LIMIT_20');
+    for(const relation of relations.slice(0,20)){
+      if(Number(relation.dirty)!==0||!validTime(relation.updated_at,now)){partial('RELATION_CACHE_PENDING_OR_STALE');continue;}
+      if(Date.parse(now)-Date.parse(String(relation.updated_at))>DAY&&!limitations.includes('HISTORICAL_ASSOCIATION_EVIDENCE'))limitations.push('HISTORICAL_ASSOCIATION_EVIDENCE');
+      const episodes=this.hs('SELECT data FROM wh_assoc_episodes WHERE chain=? AND leader=? AND candidate=? AND active=1 ORDER BY updated_at DESC LIMIT 101').all(chain,relation.leader!,address);
+      let evidence=0;if(episodes.length>100)partial('EPISODE_SAMPLE_LIMIT_100');
+      for(const row of episodes.slice(0,100)){
+        const e=parse(row.data),token=e&&chainAddress(chain,e.tokenAddress);
+        if(!token||!validTime(e.updatedAt,now)||!validTime(e.firstDiscoveredAt,now)||!validTime(e.leaderPublicObservedAt,now)||
+          !e.candidateBuy||!e.leaderBuy||e.candidateBuy.wallet!==address||e.leaderBuy.wallet!==relation.leader||
+          !validTime(e.candidateBuy.eventAt,now)||!validTime(e.candidateBuy.observedAt,now)||!validTime(e.leaderBuy.eventAt,now)||!validTime(e.leaderBuy.observedAt,now)||
+          e.candidateBuy.eventAt>=e.leaderBuy.eventAt||e.candidateBuy.eventAt>e.candidateBuy.observedAt||e.leaderBuy.eventAt>e.leaderBuy.observedAt)continue;
+        earlyTokens.add(token);evidence++;seen(e.candidateBuy.observedAt);seen(e.leaderBuy.observedAt);
+        if(e.forwardValidated===true&&e.candidateBuy.observedAt<e.leaderBuy.eventAt&&validTime(relation.active_since,now)&&String(relation.active_since)<e.candidateBuy.eventAt)forwardTokens.add(token);
+      }
+      if(evidence){leaders++;addCounterparty(relation.leader,'leader',evidence);}
+      const funding=parse(relation.funding_data);
+      for(const evidence of (Array.isArray(funding)?funding:[]).slice(0,10)){
+        if(evidence.kind!=='common'||!validTime(evidence.observedAt,now)||!Array.isArray(evidence.edges)||evidence.edges.length<2||!this.funderUsable(chain,evidence.address,now))continue;
+        if(!evidence.edges.every((e:any)=>!e.sharedService&&!e.conflict&&validTime(e.observedAt,now)&&(!e.snapshotAt||validTime(e.snapshotAt,e.observedAt))))continue;
+        group('shared_funding',1,'关联钱包存在共同资金来源线索，已排除已知交易所、桥、路由及公共池；不能据此认定同一控制人');addCounterparty(evidence.address,'shared_funding',1);seen(evidence.observedAt);
+      }
+    }
+    profile.metrics.associations={leaders,distinctTokens:earlyTokens.size,forwardTokens:forwardTokens.size};
+    if(earlyTokens.size)group('early_candidate',earlyTokens.size,'在采样交易中早于公开 KOL 钱包买入；历史回看与前向验证分开');
+    if(earlyTokens.size>=2)group('repeated_early',earlyTokens.size,'至少两个不同合约出现早于公开 KOL 买入的线索');
+    if(forwardTokens.size)group('forward_validated',forwardTokens.size,'关系先被记录，再观察到候选钱包买入，随后公开 KOL 买入');
+    if(rawMetrics){
+      const profit=parse(rawMetrics.profit_data),profitAt=profit?.snapshotAt??profit?.observedAt;
+      if(profit?.period==='7d'&&profit.scope==='entire_wallet'&&profit.verification==='vendor_claim'&&profit.chain===chain&&profit.wallet===address&&
+        typeof profit.realizedProfitUsd==='string'&&/^-?(0|[1-9]\d*)(\.\d+)?$/.test(profit.realizedProfitUsd)&&Number.isFinite(Number(profit.realizedProfitUsd))&&
+        validTime(profit.observedAt,now)&&validTime(profitAt,profit.observedAt)&&Date.parse(now)-Date.parse(profitAt)<=DAY){
+        profile.metrics.vendorProfit={realizedProfitUsd:profit.realizedProfitUsd,period:'7d',observedAt:profit.observedAt,snapshotAt:profitAt,verification:'vendor_claim'};seen(profit.observedAt);
+        if(Number(profit.realizedProfitUsd)>0)group('vendor_profit_positive',1,'最近 24 小时内供应商报告的全钱包 7 日已实现利润为正；非本系统核算');
+        profile.freshUntil=new Date(Math.min(Date.parse(profile.freshUntil),Date.parse(profitAt)+DAY+1)).toISOString();
+      }else if(profit)limitations.push('VENDOR_PROFIT_MISSING_STALE_OR_INVALID');
+      const gain=parse(rawMetrics.gain_data);
+      if(gain?.kind==='first_post_observed_buy_quote'&&chainAddress(chain,gain.tokenAddress)&&typeof gain.maxGainPct==='number'&&Number.isFinite(gain.maxGainPct)&&gain.maxGainPct>=0&&
+        validTime(gain.baselineAt,now)&&validTime(gain.peakAt,now)&&validTime(gain.latestAt,now)&&gain.baselineAt<=gain.peakAt&&gain.peakAt<=gain.latestAt&&
+        typeof gain.source==='string'&&/^[a-z][a-z0-9_.:-]{0,79}$/.test(gain.source)){
+        profile.metrics.observedGain={maxGainPct:gain.maxGainPct,tokenAddress:gain.tokenAddress,baselineAt:gain.baselineAt,peakAt:gain.peakAt,source:gain.source};seen(gain.latestAt);
+        if(gain.maxGainPct>=100)group('observed_runner',1,'钱包买入被观察后，该币本地采样报价曾上涨至少 100%；不是该钱包实际盈利');
+      }
+      const coordination=parse(rawMetrics.coordination_data);
+      if(coordination&&Number(rawMetrics.coordination_dirty)===0&&validTime(rawMetrics.coordination_checked_at,now)){
+        if(Date.parse(now)-Date.parse(String(rawMetrics.coordination_checked_at))>DAY)limitations.push('HISTORICAL_COORDINATION_EVIDENCE');
+        const shared=(Array.isArray(coordination.sharedFunding)?coordination.sharedFunding:[]).slice(0,50).filter((e:any)=>validTime(e.observedAt,now)&&this.funderUsable(chain,e.address,now));
+        if(shared.length){group('shared_funding',shared.length,'采样资金来源重合，已排除已知公共服务；仅为关联线索');shared.forEach((e:any)=>{addCounterparty(e.address,'shared_funding',1);seen(e.observedAt);});}
+        const sync=(Array.isArray(coordination.synchronized)?coordination.synchronized:[]).slice(0,50).filter((e:any)=>chainAddress(chain,e.wallet)&&chainAddress(chain,e.tokenAddress)&&Number.isSafeInteger(e.distinctTransactions)&&e.distinctTransactions>=2&&e.windowSeconds===120);
+        if(sync.length){group('synchronized',sync.length,'至少两笔不同交易在相同代币、相同方向的 120 秒窗口内与其他钱包同步；不是身份概率');sync.forEach((e:any)=>addCounterparty(e.wallet,'synchronized',e.distinctTransactions));}
+      }else if(coordination)partial('COORDINATION_CACHE_PENDING_OR_STALE');
+    }
+    if(chainRows.length>500)partial('CHAIN_EVENT_SAMPLE_LIMIT_500');
+    let unknownChainEventTime=false;const txs=new Set<string>();
+    for(const row of chainRows.slice(0,500)){
+      const event=parse(row.data);if(!event||event.removed===true||event.chain!==chain||event.wallet!==address||!validTime(event.observedAt,now)||!['rpc_confirmed','rpc_observed'].includes(event.verification)||!['wallet_transaction','token_transfer','native_transfer'].includes(event.kind))continue;
+      if(event.eventAt&&!validTime(event.eventAt,now))continue;
+      txs.add(event.txHash);if(event.kind==='token_transfer'||event.kind==='native_transfer')profile.metrics.chain.transfers++;
+      seen(event.observedAt);if(!profile.metrics.chain.lastObservedAt||event.observedAt>profile.metrics.chain.lastObservedAt)profile.metrics.chain.lastObservedAt=event.observedAt;
+      if(event.eventAt){if(!profile.metrics.lastEventAt||event.eventAt>profile.metrics.lastEventAt)profile.metrics.lastEventAt=event.eventAt;}else if(Date.parse(now)-Date.parse(event.observedAt)<7*DAY)unknownChainEventTime=true;
+    }
+    profile.metrics.chain.transactions=txs.size;
+    if(txs.size)limitations.push('CHAIN_PARTICIPATION_OR_TRANSFER_IS_NOT_A_BUY_SELL_OR_HOLDING');
+    if(unknownChainEventTime)limitations.push('CHAIN_EVENT_TIME_UNKNOWN');
+    if(profile.metrics.lastEventAt&&Date.parse(now)-Date.parse(profile.metrics.lastEventAt)>=7*DAY&&!unknownChainEventTime)group('inactive_observed',1,'已采样交易的最后事件距今至少 7 天；数据覆盖不完整，不能认定钱包实际停止活动');
+    if(!profile.groups.some(g=>g.id!=='inactive_observed'))group('insufficient_evidence',profile.metrics.observedEvents+profile.metrics.chain.transactions,'当前采样尚不足以归入行为分组；不会把链上参与或供应商标签当作收益证明');
+    profile.groups.sort((a,b)=>WALLET_PROFILE_GROUPS.indexOf(a.id)-WALLET_PROFILE_GROUPS.indexOf(b.id));
+    return profile;
+  }
+  private funderUsable(chain:Chain,address:unknown,now:string):boolean {
+    const value=chainAddress(chain,address);if(!value)return false;
+    const wallet=this.hs('SELECT profile FROM wh_wallets WHERE chain=? AND address=?').get(chain,value),labels=parse(wallet?.profile)?.labels;
+    if(Array.isArray(labels)&&labels.some((v:unknown)=>SERVICES.has(String(v))))return false;
+    return !this.hs('SELECT 1 FROM wh_funding WHERE chain=? AND funding_address=? AND shared=1 AND observed_at<=? LIMIT 1').get(chain,value,now);
+  }
+  private save(profile:WalletProfile):void {
+    const old=parse(this.os('SELECT data FROM wp_profiles WHERE chain=? AND address=?').get(profile.chain,profile.address)?.data) as WalletProfile|undefined;
+    const previous=new Set(old?.groups.map(g=>g.id)??[]),current=new Set(profile.groups.map(g=>g.id));
+    for(const group of profile.groups){this.os('INSERT OR IGNORE INTO wp_group_first VALUES (?,?,?,?)').run(profile.chain,profile.address,group.id,profile.computedAt);
+      group.firstObservedAt=String(this.os('SELECT first_at FROM wp_group_first WHERE chain=? AND address=? AND group_id=?').get(profile.chain,profile.address,group.id)!.first_at);}
+    const added=profile.groups.map(g=>g.id).filter(id=>!previous.has(id)),removed=(old?.groups.map(g=>g.id)??[]).filter(id=>!current.has(id));
+    if(added.length||removed.length)this.os('INSERT INTO wp_changes(chain,address,observed_at,data) VALUES (?,?,?,?)').run(profile.chain,profile.address,profile.computedAt,JSON.stringify({at:profile.computedAt,added,removed}));
+    this.os(`INSERT INTO wp_profiles(chain,address,computed_at,fresh_until,data,source_wallet) VALUES (?,?,?,?,?,?) ON CONFLICT(chain,address)
+      DO UPDATE SET computed_at=excluded.computed_at,fresh_until=excluded.fresh_until,data=excluded.data,source_wallet=excluded.source_wallet`)
+      .run(profile.chain,profile.address,profile.computedAt,profile.freshUntil,JSON.stringify(profile),profile.source==='wallet_history'?1:0);
+    this.os('DELETE FROM wp_groups WHERE chain=? AND address=?').run(profile.chain,profile.address);
+    for(const group of profile.groups)this.os('INSERT INTO wp_groups VALUES (?,?,?,?)').run(profile.chain,profile.address,group.id,group.firstObservedAt);
+  }
+  status():WalletProfileStatus{return readStatus(this.db,this.options.database,this.now().toISOString());}
+  close():void {this.chain?.close();this.history.close();this.db.close();}
+}
+function readStatus(db:DatabaseSync,path:string,now:string):WalletProfileStatus {
+  const meta=Object.fromEntries(db.prepare('SELECT key,value FROM wp_meta').all().map(r=>[String(r.key),String(r.value)]));
+  const groupCounts:WalletProfileStatus['groupCounts']={};for(const row of db.prepare('SELECT group_id,count(*) AS n FROM wp_groups GROUP BY group_id').all())groupCounts[row.group_id as WalletProfileGroupId]=Number(row.n);
+  return {ready:true,profiles:Number(db.prepare('SELECT count(*) AS n FROM wp_profiles').get()!.n),sourceWallets:Number(meta.source_wallets||0),
+    profiledSourceWallets:Number(db.prepare('SELECT count(*) AS n FROM wp_profiles WHERE source_wallet=1').get()!.n),initialComplete:meta.initial_complete==='1',processed:Number(meta.processed||0),
+    lastRunAt:meta.last_run_at||undefined,groupCounts,bytes:filesBytes(path,db),maxBytes:Number(meta.max_bytes||0),capacityReached:meta.error===CAPACITY,error:meta.error||undefined,sampleOnly:true,
+    staleProfiles:Number(db.prepare('SELECT count(*) AS n FROM wp_profiles WHERE fresh_until<=?').get(now)!.n)};
+}
+/** The web process reads only this compact derived database, never the full research graph. */
+export class WalletProfileReader {
+  private db?:DatabaseSync;
+  constructor(private readonly database:string,private readonly now:()=>Date=()=>new Date()){}
+  private open():DatabaseSync|undefined {
+    if(this.db)return this.db;if(!existsSync(this.database))return;
+    try {const db=new DatabaseSync(this.database,{readOnly:true});db.exec('PRAGMA busy_timeout=500; PRAGMA query_only=ON');
+      if(!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='wp_profiles'").get()){db.close();return;}this.db=db;return db;
+    }catch{return;}
+  }
+  status():WalletProfileStatus {const db=this.open();return db?readStatus(db,this.database,this.now().toISOString()):emptyStatus();}
+  private profile(data:unknown):WalletProfile {const profile=parse(data) as WalletProfile;if(profile.freshUntil<=this.now().toISOString())profile.status='stale';return profile;}
+  list(options:WalletProfileListOptions={}):{ready:boolean;items:WalletProfile[];total:number} {
+    const db=this.open();if(!db)return {ready:false,items:[],total:0};const where:string[]=[],args:(string|number)[]=[];
+    if(options.chain){where.push('p.chain=?');args.push(options.chain);}if(options.group){where.push('EXISTS(SELECT 1 FROM wp_groups g WHERE g.chain=p.chain AND g.address=p.address AND g.group_id=?)');args.push(options.group);}
+    if(options.search){where.push('instr(lower(p.address),?)>0');args.push(String(options.search).toLowerCase().slice(0,160));}
+    const sql=where.length?' WHERE '+where.join(' AND '):'',limit=bounded(options.limit,50,200),offset=typeof options.offset==='number'&&Number.isSafeInteger(options.offset)?Math.max(0,options.offset):0;
+    const total=Number(db.prepare('SELECT count(*) AS n FROM wp_profiles p'+sql).get(...args)!.n);
+    const rows=db.prepare('SELECT p.data FROM wp_profiles p'+sql+' ORDER BY p.computed_at DESC,p.chain,p.address LIMIT ? OFFSET ?').all(...args,limit,offset);
+    return {ready:true,items:rows.map(row=>this.profile(row.data)),total};
+  }
+  get(chain:Chain,address:string):WalletProfile|undefined {const db=this.open(),wallet=chainAddress(chain,address);if(!db||!wallet)return;const row=db.prepare('SELECT data FROM wp_profiles WHERE chain=? AND address=?').get(chain,wallet);if(!row)return;
+    return {...this.profile(row.data),changes:db.prepare('SELECT data FROM wp_changes WHERE chain=? AND address=? ORDER BY id DESC LIMIT 20').all(chain,wallet).map(r=>parse(r.data))};}
+  getMany(targets:{chain:Chain;address:string}[]):WalletProfile[]{const db=this.open();if(!db)return [];const statement=db.prepare('SELECT data FROM wp_profiles WHERE chain=? AND address=?');return targets.slice(0,200).flatMap(t=>{const wallet=chainAddress(t.chain,t.address);if(!wallet)return [];const row=statement.get(t.chain,wallet);return row?[this.profile(row.data)]:[];});}
+  close():void {this.db?.close();this.db=undefined;}
+}

@@ -13,6 +13,7 @@ import {PriceTracker} from './price-tracker.js';
 import {DashboardBalances,dashboardOrders,dashboardSettings} from './dashboard-data.js';
 import {WalletHistory} from './wallet-history.js';
 import {WalletObserver} from './wallet-observer.js';
+import {WalletProfileRunner} from './wallet-profile-runner.js';
 import {SystemMonitor} from './system-monitor.js';
 import {WatchRechecker} from './watch-rechecker.js';
 import {ExitShadow} from './exit-shadow.js';
@@ -27,6 +28,10 @@ export function createRuntime(config:Config) {
     retentionDays:config.dashboard.retentionDays,trackingHours:config.dashboard.trackingHours}):undefined;
   if(config.watch.enabled)archive?.configureWatch({windowSec:config.watch.windowSec,intervalSec:config.watch.intervalSec,maxSignalAgeSec:config.maxSignalAgeSec});
   const walletHistory=config.walletResearch.enabled?new WalletHistory(config.walletResearch.database,{maxBytes:config.walletResearch.maxBytes}):undefined;
+  const walletProfiles=walletHistory&&config.walletProfiles.enabled?new WalletProfileRunner({
+    ...config.walletProfiles,historyDatabase:config.walletResearch.database,
+    ...(config.chainStream.enabled?{chainDatabase:config.chainStream.database}:{})}):undefined;
+  const walletProfilesStatus=()=>walletProfiles?.status()??{enabled:false,running:false,ready:false};
   const exitShadow=config.exitShadow.enabled?new ExitShadow(config.exitShadow.database,config.exitShadow):undefined;
   const walletObserver=walletHistory?new WalletObserver({history:walletHistory,client,config,chains:config.scannerChains,
     intervalMs:config.walletResearch.intervalSec*1000,maxRequestsPerCycle:config.walletResearch.maxRequestsPerCycle}):undefined;
@@ -113,10 +118,39 @@ export function createRuntime(config:Config) {
   },60000);sweep.unref();
   let reconcileTimer:ReturnType<typeof setInterval>|undefined;
   let walletIndexTimer:ReturnType<typeof setInterval>|undefined;
+  let walletIndexWork:Promise<void>|undefined;
+  let walletStats:unknown,walletStatsAt=0;
+  const walletIndexTimings={coordinationMs:0,associationMs:0};
+  const refreshWalletIndexes=()=>{
+    if(closed||!walletHistory||walletIndexWork)return;
+    // Preserve the per-cycle quota, but return control between wallets so HTTP,
+    // heartbeat and websocket callbacks are not held behind a whole graph batch.
+    walletIndexWork=(async()=>{
+      for(let i=0;i<10&&!closed;i++) {
+        const started=performance.now();
+        try {walletHistory.refreshCoordination(1);walletIndexError=undefined;}
+        catch {walletIndexError='WALLET_COORDINATION_REFRESH_FAILED';}
+        walletIndexTimings.coordinationMs=Math.round(performance.now()-started);
+        await new Promise<void>(resolve=>setImmediate(resolve));
+      }
+      for(let i=0;i<3&&!closed;i++) {
+        const started=performance.now();
+        try {walletHistory.refreshAssociations(1);associationIndexError=undefined;}
+        catch {associationIndexError='WALLET_ASSOCIATION_REFRESH_FAILED';}
+        walletIndexTimings.associationMs=Math.round(performance.now()-started);
+        await new Promise<void>(resolve=>setImmediate(resolve));
+      }
+    })().finally(()=>{walletIndexWork=undefined;});
+  };
   const walletResearchStatus=()=>{
-      let stats:unknown;
-      try {stats=walletHistory?.stats();}catch {stats={error:'WALLET_HISTORY_READ_FAILED'};}
-      return {enabled:config.walletResearch.enabled,store:stats,observer:walletObserver?.getStatus(),captureError:walletCaptureError??walletIndexError??associationIndexError,
+      // Overview and wallet panels request the same aggregate in parallel.
+      // Count the large historical tables once per interval, not for every view.
+      if(Date.now()-walletStatsAt>=30000) {
+        try {walletStats=walletHistory?.stats();}catch {walletStats={error:'WALLET_HISTORY_READ_FAILED'};}
+        walletStatsAt=Date.now();
+      }
+      return {enabled:config.walletResearch.enabled,store:walletStats,statsComputedAt:new Date(walletStatsAt).toISOString(),observer:walletObserver?.getStatus(),profiles:walletProfilesStatus(),
+        localIndex:{inFlight:!!walletIndexWork,...walletIndexTimings},captureError:walletCaptureError??walletIndexError??associationIndexError,
         settings:{intervalSec:config.walletResearch.intervalSec,maxRequestsPerCycle:config.walletResearch.maxRequestsPerCycle,
           maxBytes:config.walletResearch.maxBytes,retention:'persistent_no_expiry',scope:'vendor_pages_and_observed_wallet_snapshots'}};
     };
@@ -125,7 +159,7 @@ export function createRuntime(config:Config) {
     try {return {...exitShadow.summary(),captureError:exitCaptureError};}
     catch {return {enabled:true,mode:'shadow',liveReady:false,captureError:'EXIT_SHADOW_READ_FAILED'};}
   };
-  return {client,providers,store,orders,entry,scanner,archive,tracking,walletHistory,walletObserver,walletResearchStatus,watchRechecker,exitShadow,chainMonitor,chainStreamStatus,
+  return {client,providers,store,orders,entry,scanner,archive,tracking,walletHistory,walletObserver,walletResearchStatus,walletProfiles,walletProfilesStatus,watchRechecker,exitShadow,chainMonitor,chainStreamStatus,
     dashboardProtection:()=>exitShadow?{...exitShadow.list(),captureError:exitCaptureError}:{...protectionSummary(),items:[]},
     dashboardOverview:()=>({now:new Date().toISOString(),entryMode:config.entryMode,scanner:scanner.getStatus(),
       tracking:tracking?.getStatus(),stats:archive?.stats(),archiveError:archiveCaptureError??store.observationError??archiveMaintenanceError,
@@ -134,18 +168,10 @@ export function createRuntime(config:Config) {
     dashboardOrders:()=>dashboardOrders(orders),
     start(){
       if(closed) return;
-      chainMonitor?.start();tracking?.start();balances?.start();system?.start();
+      chainMonitor?.start();tracking?.start();balances?.start();system?.start();walletProfiles?.start();
       if(walletHistory&&!walletIndexTimer) {
-        // Local evidence refresh is independent of the slow vendor request budget.
-        // Bound each batch so a growing feed does not stall signal processing.
-        try {walletHistory.refreshAssociations(3);associationIndexError=undefined;}
-        catch {associationIndexError='WALLET_ASSOCIATION_REFRESH_FAILED';}
-        walletIndexTimer=setInterval(()=>{
-          try {walletHistory.refreshCoordination(10);walletIndexError=undefined;}
-          catch {walletIndexError='WALLET_COORDINATION_REFRESH_FAILED';}
-          try {walletHistory.refreshAssociations(3);associationIndexError=undefined;}
-          catch {associationIndexError='WALLET_ASSOCIATION_REFRESH_FAILED';}
-        },10000);walletIndexTimer.unref();
+        setImmediate(refreshWalletIndexes);
+        walletIndexTimer=setInterval(refreshWalletIndexes,10000);walletIndexTimer.unref();
       }
       if(config.gmgnApiKey?.trim())walletObserver?.start();
       if(config.scannerEnabled&&config.gmgnApiKey?.trim()) scanner.start();
@@ -157,7 +183,8 @@ export function createRuntime(config:Config) {
     },
     async close(){
       if(closed) return;closed=true;scanner.stop();clearInterval(sweep);clearInterval(reconcileTimer);clearInterval(walletIndexTimer);
-      await Promise.all([chainMonitor?.stop(),tracking?.stop(),balances?.stop(),walletObserver?.stop(),system?.stop(),watchRechecker?.stop()]);
+      await Promise.all([chainMonitor?.stop(),tracking?.stop(),balances?.stop(),walletObserver?.stop(),system?.stop(),watchRechecker?.stop(),walletProfiles?.stop()]);
+      await walletIndexWork;
       await reconciler.stop();
       // Stop means no new work. Await current callback before closing its stores.
       while(active) await new Promise(resolve=>setTimeout(resolve,50));

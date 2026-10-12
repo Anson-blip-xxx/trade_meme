@@ -182,6 +182,68 @@ test('持久化完整身份、风险证据和sample metadata，重启不重计�
   } finally {history.close();rmSync(dir,{recursive:true,force:true});}
 });
 
+test('旧库重启补齐统计窄索引，计数与筛选走覆盖索引且保留原记录',()=>{
+  const dir=mkdtempSync(join(tmpdir(),'wallet-stats-index-')),path=join(dir,'research.sqlite');
+  let history=new WalletHistory(path,{now:()=>new Date(base+100_000)});
+  try {
+    history.captureReport(report());
+    history.recordCollection({source:'gmgn_observer',chain:'bsc',startedAt:iso(90),completedAt:iso(100),
+      status:'partial',requests:3,accepted:1,coverage:'one_page_sample',hasMore:true,reason:'GMGN_RATE_LIMITED'});
+    const {bytes:beforeBytes,...before}=history.stats();
+    history.close();
+    const legacy=new DatabaseSync(path);
+    legacy.exec('DROP INDEX wh_events_side; DROP INDEX wh_observations_kind;');legacy.close();
+    history=new WalletHistory(path,{now:()=>new Date(base+100_000)});
+    const {bytes:afterBytes,...after}=history.stats();
+    assert.deepEqual(after,before);
+    const db=(history as unknown as {db:DatabaseSync}).db;
+    for(const [sql,index] of [
+      ['SELECT count(*) AS n FROM wh_events','wh_events_side'],
+      ['SELECT count(*) AS n FROM wh_observations','wh_observations_kind'],
+      ["SELECT count(*) AS n FROM wh_observations WHERE kind IN ('holding','stats','token_trader','token_rank')",'wh_observations_kind'],
+      ["SELECT count(*) AS n FROM wh_observations WHERE kind='collection'",'wh_observations_kind']
+    ]) {
+      const plan=db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all().map(row=>String(row.detail)).join('\n');
+      assert.match(plan,new RegExp(`USING COVERING INDEX ${index}\\b`));
+    }
+  } finally {history.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('统计窄索引不能抢占逐事件证据、关联冲突及逐币买入聚合查询',()=>{
+  const {history}=fixture();
+  try {
+    history.recordTrade(trade({eventAt:iso(10),observedAt:iso(15)}));
+    history.recordTrade(trade({wallet:address(2),txHash:hash(2),eventAt:iso(30),observedAt:iso(35),source:'gmgn_kol_feed'}));
+    const db=(history as unknown as {db:DatabaseSync}).db;
+    const prepare=db.prepare.bind(db),queries:{sql:string;plan:string}[]=[];
+    // Inspect statements actually issued by the history and association paths,
+    // so removing their event index constraint is detected by this regression.
+    db.prepare=(sql:string)=>{
+      if(sql.includes('wh_observations')&&/\bevent_id\s*=\s*(?:\?|e\.id)/.test(sql)||sql.startsWith('SELECT wallet,MIN(observed_at)')) {
+        const plan=prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...Array((sql.match(/\?/g)||[]).length).fill(null))
+          .map(row=>String(row.detail)).join('\n');
+        queries.push({sql,plan});
+      }
+      return prepare(sql);
+    };
+    try {
+      history.refreshAssociations(1);
+      history.getWallet('bsc',address(1));
+      history.recordPrice(token,1,iso(50),'gmgn_token_info');
+    } finally {db.prepare=prepare;}
+    assert.ok(queries.some(({sql})=>sql.includes('event_id=?')),'direct event evidence lookup was exercised');
+    assert.ok(queries.some(({sql})=>sql.includes('event_id=e.id')),'correlated timestamp conflict lookup was exercised');
+    for(const {plan} of queries.filter(({sql})=>sql.includes('wh_observations'))) {
+      assert.match(plan,/USING INDEX wh_observations_event \(event_id=\?\)/);
+      assert.doesNotMatch(plan,/USING INDEX wh_observations_kind/);
+    }
+    const buyerQuery=queries.find(({sql})=>sql.startsWith('SELECT wallet,MIN(observed_at)'));
+    assert.ok(buyerQuery,'actual per-token price attribution aggregation was exercised');
+    assert.match(buyerQuery.plan,/USING INDEX wh_events_token \(chain=\? AND token_address=\? AND side=\?\)/);
+    assert.doesNotMatch(buyerQuery.plan,/USING INDEX wh_events_wallet/);
+  } finally {history.close();}
+});
+
 test('容量达到后停止追加并保留旧研究，重启仍报错，增大预算才恢复',()=>{
   const dir=mkdtempSync(join(tmpdir(),'wallet-budget-')),path=join(dir,'research.sqlite');
   let history=new WalletHistory(path,{maxBytes:1_000_000,now:()=>new Date(base+100_000)});

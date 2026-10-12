@@ -1069,7 +1069,7 @@
     funding.append(el('p', 'wallet-sample-note', '资金联系为目前取得的补充证据，不表示在上述历史交易发生前就已知。这里不核算完整利润，也不自动触发买单。')); fragment.append(funding);
     $('detail-content').replaceChildren(fragment);
   }
-  const profileGroupNames = {public_kol: '公开 KOL 来源', early_candidate: '前置买入候选', repeated_early: '跨币重复前置', forward_validated: '已有后续验证', shared_funding: '共同资金来源', synchronized: '同步交易线索', vendor_profit_positive: '供应商报告盈利', observed_runner: '采样捕获翻倍', insufficient_evidence: '证据尚少', inactive_observed: '近期未观测活动'};
+  const profileGroupNames = {follower_pattern: '跟随模式样本', precursor_pattern: '前置模式样本', mixed_pattern: '方向混合', public_kol: '公开 KOL 来源', early_candidate: '前置买入候选', repeated_early: '历史重复提前', forward_validated: '已有后续验证', shared_funding: '共同资金来源', synchronized: '同步交易线索', vendor_profit_positive: '供应商报告盈利', observed_runner: '采样捕获翻倍', insufficient_evidence: '证据尚少', inactive_observed: '近期未观测活动'};
   function profileGroupName(id) { return profileGroupNames[id] || scalar(id, '未分类'); }
   function profileGroupTone(id) { return id === 'forward_validated' ? 'pass' : ['early_candidate', 'repeated_early', 'shared_funding', 'synchronized'].includes(id) ? 'watch' : 'neutral'; }
   function profileIsStale(profile) { const until = validDate(profile?.freshUntil); return profile?.status === 'stale' || Boolean(until && until.getTime() < Date.now()); }
@@ -1094,6 +1094,7 @@
     text('profile-status-note', `${data?.lastRunAt ? `最近处理 ${date(data.lastRunAt, true)}。` : '等待首次后台处理。'}${finite(data?.staleProfiles) ? `${count(data.staleProfiles)} 个画像已到期等待重评。` : ''}${running && !failed && !limited && !delayed ? `${finite(data?.intervalSec) ? `后台每 ${data.intervalSec} 秒调度一批，` : ''}新增证据和到期画像会分批重新评估；页面关闭后仍继续。` : '当前不能确认画像正在正常更新。'}覆盖率只表示已建档，不代表全部交易历史已覆盖。`);
     const warning = failed ? '状态暂时无法更新，以下保留最近成功读取的数据。' : data?.capacityReached ? '画像库已达容量上限，更新暂停；已有画像保留，请检查服务端存储。' : data?.error ? '后台画像处理异常，已有画像可能未更新。' : delayed ? '较长时间未完成画像处理，已有结果可能过时，请查看后台任务状态。' : '';
     $('profile-status-warning').hidden = !warning; text('profile-status-warning', warning);
+    text('profile-role-progress', finite(data?.roleProfiles) ? `有向行为比较：已处理 ${count(data.roleProfiles)} 个画像${finite(data.rolePending) ? ` · 尚待 ${count(data.rolePending)} 个` : ''}${data.roleLastRunAt ? ` · 最近 ${date(data.roleLastRunAt, true)}` : ''}。按每一对钱包分别比较先后方向。` : '有向行为比较尚未取得处理状态；已有历史分组不等于已完成角色辨别。');
     const groups = $('profile-group-counts'); const active = document.activeElement?.dataset.profileGroup; groups.replaceChildren();
     const groupCounts = Array.isArray(data?.groupCounts) ? data.groupCounts.map(item => [item.id || item.group, item.count]) : Object.entries(data?.groupCounts || {});
     for (const [id, size] of groupCounts.filter(([id, size]) => Object.hasOwn(profileGroupNames, id) && finite(size) && size > 0)) {
@@ -1113,7 +1114,8 @@
     for (const profile of state.walletItems) {
       const card = el('article', 'wallet-profile-card'); const heading = el('div', 'profile-card-heading'); const identity = el('div', 'profile-card-identity'); identity.append(badge(chainName(profile.chain), 'neutral'), addressNode(profile.address));
       const action = el('button', 'association-evidence-button', '查看画像'); action.type = 'button'; action.setAttribute('aria-label', `查看钱包画像 ${profile.address}`); action.addEventListener('click', () => openWalletProfile(profile, action)); heading.append(identity, action); card.append(heading);
-      const groups = el('div', 'profile-memberships'); for (const group of profileGroups(profile)) { const tag = badge(profileGroupName(group.id), profileGroupTone(group.id)); tag.title = `${scalar(group.reason, '')} · 首次入组 ${date(group.firstObservedAt, true)}`; groups.append(tag); } if (!groups.childNodes.length) groups.append(badge('暂无当前分组', 'neutral')); card.append(groups);
+      card.append(walletRoleSummary(profile));
+      const groups = el('div', 'profile-memberships'); for (const group of profileGroups(profile).filter(item => !['follower_pattern', 'precursor_pattern', 'mixed_pattern'].includes(item.id))) { const tag = badge(profileGroupName(group.id), profileGroupTone(group.id)); tag.title = `${scalar(group.reason, '')} · 首次入组 ${date(group.firstObservedAt, true)}`; groups.append(tag); } if (!groups.childNodes.length) groups.append(badge('暂无其他历史线索', 'neutral')); card.append(groups);
       const metrics = profile.metrics || {}, associations = metrics.associations || {}, chain = metrics.chain || {};
       const values = el('div', 'profile-card-values'); values.append(profileValue('已观测买 / 卖', `${count(metrics.buyEvents)} / ${count(metrics.sellEvents)}`, `${count(metrics.distinctTokens)} 个代币 · ${count(metrics.observedEvents)} 条活动`), profileValue('前置关联', `${count(associations.leaders)} 个公开钱包`, `${count(associations.distinctTokens)} 个代币 · ${count(associations.forwardTokens)} 个后续验证`), profileValue('供应商 7 日已实现收益', usd(metrics.vendorProfit?.realizedProfitUsd), metrics.vendorProfit ? `供应商快照 · ${date(metrics.vendorProfit.observedAt)}` : '暂无有效快照'), profileValue('买入后采样最高涨幅', percent(metrics.observedGain?.maxGainPct), '基于报价样本 · 非钱包收益')); card.append(values);
       const footer = el('div', 'profile-card-footer'); footer.append(badge(profileHealth(profile), profileIsStale(profile) || profile.status === 'partial' ? 'watch' : 'neutral'), el('time', '', `画像更新 ${date(profile.computedAt, true)}`), el('span', '', `RPC 交易参与 ${count(chain.transactions)} · 转账 ${count(chain.transfers)}`)); card.append(footer); list.append(card);
@@ -1121,9 +1123,61 @@
     profilePagination();
   }
   function profileValue(label, value, note) { const item = el('div', 'profile-card-value'); item.append(el('span', '', label), el('strong', '', value), el('small', '', note)); return item; }
+  const roleNames = {follower_pattern: '跟随模式样本', precursor_pattern: '前置模式样本', mixed_pattern: '方向混合', insufficient: '样本不足'};
+  const roleDirections = {lead: '候选先买', follow: '候选后买', ambiguous: '先后不清', unmatched: '未匹配', outsideWindow: '超出比较窗口', outside_window: '超出比较窗口'};
+  function roleName(value) { return roleNames[value] || '判别待确认'; }
+  function roleTone(value) { return value === 'precursor_pattern' ? 'pass' : value === 'follower_pattern' ? 'follower' : 'neutral'; }
+  function rolePeers(profile) { return Array.isArray(profile?.roleAnalysis?.peers) ? profile.roleAnalysis.peers : []; }
+  function walletRoleSummary(profile) {
+    const area = el('div', 'wallet-role-summary'); area.append(el('span', 'wallet-role-label', '行为判别 · 逐对比较'));
+    if (!profile.roleAnalysis) { area.append(badge('待比较', 'neutral')); return area; }
+    const peers = rolePeers(profile), classifications = [...new Set(peers.map(peer => peer.classification).filter(value => Object.hasOwn(roleNames, value)))];
+    for (const classification of classifications) { const label = badge(roleName(classification), roleTone(classification)); label.title = `与 ${peers.filter(peer => peer.classification === classification).length} 个公开标记钱包的比较结果；不同对手钱包的次数不合并判断。`; area.append(label); }
+    if (!classifications.length) area.append(badge(peers.length ? '判别待确认' : '样本不足', 'neutral'));
+    if (profile.roleAnalysis.status === 'partial') area.append(el('span', 'wallet-role-coverage', '样本覆盖有限'));
+    return area;
+  }
+  function roleTextList(label, values, className = '') {
+    const items = Array.isArray(values) ? values.filter(value => typeof value === 'string').slice(0, 12) : [];
+    if (!items.length) return null;
+    const block = el('div', `role-explanation ${className}`); block.append(el('h4', '', label)); const list = el('ul'); for (const item of items) list.append(el('li', '', item)); block.append(list); return block;
+  }
+  function walletRoleSection(profile) {
+    const content = section('有向行为比较：谁跟随谁'); content.classList.add('wallet-role-section');
+    content.append(el('p', 'wallet-section-note', '每一对钱包独立比较，同一钱包可以跟随 A、领先 B。公开钱包仅指供应商标记来源，未验证 KOL 本人或喊单时间；这里判断采样行为，不判断真实身份。'));
+    const role = profile.roleAnalysis;
+    if (!role) { content.append(badge('待比较', 'neutral'), el('p', 'wallet-detail-empty', '这份画像尚未完成有向比较。已有“历史重复提前”分组保留为线索，暂不据此认定前置模式或关联小钱包。')); return content; }
+    content.append(kv('最近比较', date(role.computedAt, true)), kv('覆盖状态', profileIsStale(profile) ? '画像待重评 · 以下为已保存结果' : role.status === 'partial' ? '部分样本受限' : '本轮样本已比较'), kv('钱包归属', '未知 · 行为模式不能证明共同控制'));
+    const peers = rolePeers(profile);
+    if (!peers.length) content.append(badge('样本不足', 'neutral'), el('p', 'wallet-detail-empty', '本轮尚未形成可比较的钱包对。未匹配到样本不能解释为互不关联。'));
+    for (const peer of peers) {
+      const card = el('article', 'wallet-role-peer'); const heading = el('div', 'wallet-evidence-heading'); heading.append(el('span', '', '与这个公开标记钱包比较'), badge(roleName(peer.classification), roleTone(peer.classification))); card.append(heading, addressNode(peer.address));
+      const counts = peer.directionalTokens || {}, directions = el('div', 'role-direction-counts');
+      for (const [key, label] of [['lead', '候选先买'], ['follow', '候选后买'], ['ambiguous', '先后不清'], ['unmatched', '未匹配'], ['outsideWindow', '超出窗口']]) { const value = el('div', `role-direction-count ${key}`); value.append(el('strong', '', count(counts[key])), el('span', '', label)); directions.append(value); } card.append(directions);
+      card.append(kv('已匹配 CA / 候选采样 CA', `${count(peer.matchedTokens)} / ${count(peer.totalCandidateTokens)}`));
+      if (finite(peer.leadShare)) card.append(kv('先买占已匹配 CA', percent(peer.leadShare * 100).replace(/^\+/, '')));
+      if (finite(peer.followShare)) card.append(kv('后买占已匹配 CA', percent(peer.followShare * 100).replace(/^\+/, '')));
+      card.append(el('p', 'role-denominator-note', '占比只描述这对钱包已匹配到的代币样本，不是预测命中率。已匹配包含方向不清和超出窗口的共同代币；同一方向至少 3 个代币且占比达到 75% 才形成对应模式，不跨对手钱包拼接次数。这是初版研究门槛，尚未校准置信度。'));
+      if (finite(peer.pendingTokens) || finite(peer.unobservedTokens)) card.append(kv('未匹配：近期待观察 / 更早未覆盖', `${count(peer.pendingTokens)} / ${count(peer.unobservedTokens)}`), el('p', 'role-denominator-note', '未匹配不等于对方没有买入，也不计作预测失败。'));
+      const counter = roleTextList('反向与不确定证据', peer.counterEvidence, 'role-counter-evidence'); if (counter) card.append(counter);
+      const reasons = roleTextList('本轮判断依据', peer.reasons); if (reasons) card.append(reasons);
+      const alternatives = roleTextList('其他可能解释', peer.alternativeExplanations); if (alternatives) card.append(alternatives);
+      if (finite(peer.forwardObservedTokens)) card.append(kv('关系已知后的前向观察代币', count(peer.forwardObservedTokens)));
+      if (finite(peer.medianLagSeconds)) card.append(kv('买入时间差中位数', `${peer.medianLagSeconds > 0 ? '+' : ''}${scalar(peer.medianLagSeconds)} 秒`), el('p', 'role-denominator-note', '时间差 = 当前候选买入 − 公开标记钱包买入；正数为候选后买，负数为先买。'));
+      if (finite(peer.lagMadSeconds)) card.append(kv('时间差离散度（中位绝对偏差）', `${scalar(peer.lagMadSeconds)} 秒`));
+      const funding = peer.funding || {}; const fundingBox = el('div', 'role-funding-note'); fundingBox.append(el('strong', '', '资金联系单独看'), el('p', '', `直接联系 ${count(funding.direct)} · 共同来源 ${count(funding.common)} · 已排除 ${count(funding.excluded)}`), el('p', '', '公共服务或冲突线索会被排除；有效资金联系也不能证明 KOL 本人或同一控制人。')); card.append(fundingBox);
+      const events = Array.isArray(peer.evidence) ? peer.evidence.slice(0, 6) : [];
+      if (events.length) {
+        const evidence = el('details', 'role-evidence'); const key = `${profile.chain}:${profile.address}:${peer.address}`; evidence.dataset.roleEvidence = key; evidence.open = [...$('detail-content').querySelectorAll('details[data-role-evidence][open]')].some(node => node.dataset.roleEvidence === key); const toggle = el('summary', '', `逐币核对 · ${events.length} 条代表样本`); toggle.setAttribute('aria-label', `核对与 ${peer.address} 的逐币角色证据`); evidence.append(toggle);
+        for (const event of events) { const item = evidenceCard(roleDirections[event.direction] || '方向待确认', badge('交易时序样本', 'neutral')); item.append(addressNode(event.tokenAddress), gmgnTokenLink(profile.chain, event.tokenAddress)); if (typeof event.reason === 'string') item.append(el('p', 'association-detail-note', event.reason)); if (event.candidateBuy) item.append(associationEvent('当前候选钱包买入', event.candidateBuy)); else item.append(el('p', 'association-detail-note', '候选买入证据不完整或存在冲突，当前不能确定先后。')); if (event.leaderBuy) item.append(associationEvent('公开标记钱包买入', event.leaderBuy)); else item.append(el('p', 'association-detail-note', '未取得公开标记钱包在该币的可用买入记录。')); if (event.candidateSellAfterLeader) item.append(associationEvent('候选钱包随后卖出', event.candidateSellAfterLeader), el('p', 'association-detail-note', '观察到卖出不等于已获利。')); evidence.append(item); } card.append(evidence);
+      }
+      content.append(card);
+    }
+    const limits = roleTextList('本轮比较的覆盖边界', role.limitations); if (limits) content.append(limits); return content;
+  }
   function profileEvidenceSection(profile) {
     const content = section('持续行为画像');
-    content.append(kv('更新状态', profileHealth(profile)), kv('画像最近计算', date(profile.computedAt, true)), kv('最近证据观测', date(profile.evidenceThroughAt, true)), kv('下次到期评估', date(profile.freshUntil, true)), el('p', 'wallet-section-note', '同一钱包可以属于多个组。分组依据已有样本持续更新，证据变化或过期后可能退出；首次入组是系统建立该标签的时间，不回填成交易发生时间。'));
+    content.append(kv('更新状态', profileHealth(profile)), kv('画像最近计算', date(profile.computedAt, true)), kv('最近证据观测', date(profile.evidenceThroughAt, true)), kv('下次到期评估', date(profile.freshUntil, true)), el('p', 'wallet-section-note', '以下保留历史研究线索。“历史重复提前”可合并跨对手钱包的历史次数，不代表对同一个钱包的领先方向占多数，也不等于稳定角色。同一钱包可属于多个组，证据变化或过期后会重新评估；首次入组是系统建立标签的时间。'));
     for (const group of profileGroups(profile)) { const card = evidenceCard(profileGroupName(group.id), badge('行为研究分组', profileGroupTone(group.id))); card.append(el('p', 'profile-group-reason', scalar(group.reason, '尚无可展示的入组说明')), kv('首次入组', date(group.firstObservedAt, true)), kv('支持证据数', count(group.evidenceCount))); content.append(card); }
     if (!profileGroups(profile).length) walletEmptyDetail(content, '当前没有有效行为分组，等待进一步证据。');
     const limitationNames = {HISTORICAL_ASSOCIATION_EVIDENCE: '前置关联依据包含历史样本，不代表这些钱包当前仍在协同。', HISTORICAL_COORDINATION_EVIDENCE: '同步或资金联系依据包含历史样本，不能据此判断当前活跃程度。', SAMPLED_OBSERVATIONS_NOT_COMPLETE_HISTORY: '只覆盖已采集样本，交易历史可能不完整。', ASSOCIATIONS_DO_NOT_PROVE_COMMON_OWNERSHIP: '关联行为不能证明共同控制或实际身份。', VENDOR_PROFIT_IS_NOT_LOCAL_REALIZED_PNL: '供应商收益数据不是本系统核算的已实现利润。', EVENT_SAMPLE_LIMIT_500: '本轮画像只分析最近 500 条活动，完整采样档案另行保留。', PUBLIC_ANCHOR_SAMPLE_LIMIT_100: '公开来源仅取前 100 个入口样本。', RELATION_SAMPLE_LIMIT_20: '本轮前置关联分析最多涵盖 20 对关系。', RELATION_CACHE_PENDING_OR_STALE: '部分前置关联等待重算，尚未用于当前分组。', EPISODE_SAMPLE_LIMIT_100: '每对关联最多分析最近 100 条时序证据。', VENDOR_PROFIT_MISSING_STALE_OR_INVALID: '供应商利润快照缺失、过期或未通过校验，未用于当前盈利分组。', COORDINATION_CACHE_PENDING_OR_STALE: '部分协同线索等待重算，尚未用于当前分组。', CHAIN_EVENT_SAMPLE_LIMIT_500: '本轮链上依据最多使用最近 500 条活动。', CHAIN_PARTICIPATION_OR_TRANSFER_IS_NOT_A_BUY_SELL_OR_HOLDING: 'RPC 交易参与、转账记录不直接等于买卖或持仓。', CHAIN_EVENT_TIME_UNKNOWN: '部分链上记录只有采集时间，缺少事件发生时间。'};
@@ -1132,7 +1186,7 @@
     return content;
   }
   function renderWalletProfileDetail(profile) {
-    const fragment = document.createDocumentFragment(); const title = el('h2', '', '钱包行为画像'); title.id = 'detail-title'; fragment.append(title, el('p', 'association-detail-note', `${chainName(profile.chain)} · 持续更新的研究记录 · 归属未知`), addressNode(profile.address, 'detail-address'), profileEvidenceSection(profile));
+    const fragment = document.createDocumentFragment(); const title = el('h2', '', '钱包行为画像'); title.id = 'detail-title'; fragment.append(title, el('p', 'association-detail-note', `${chainName(profile.chain)} · 持续更新的研究记录 · 归属未知`), addressNode(profile.address, 'detail-address'), walletRoleSection(profile), profileEvidenceSection(profile));
     const metrics = profile.metrics || {}, associations = metrics.associations || {}, chain = metrics.chain || {};
     const summary = section('观测依据'); summary.append(kv('买入 / 卖出活动', `${count(metrics.buyEvents)} / ${count(metrics.sellEvents)}`), kv('已观测活动 / 代币', `${count(metrics.observedEvents)} / ${count(metrics.distinctTokens)}`), kv('最近交易事件时间', date(metrics.lastEventAt, true)), kv('关联公开钱包 / 代币', `${count(associations.leaders)} / ${count(associations.distinctTokens)}`), kv('后续验证代币', count(associations.forwardTokens)), kv('供应商 7 日已实现收益', usd(metrics.vendorProfit?.realizedProfitUsd)), kv('买入后采样最高涨幅', percent(metrics.observedGain?.maxGainPct)), el('p', 'wallet-section-note', '供应商收益不是本地核算利润；采样涨幅以观测到买入后的报价为基准，不是钱包实际收益。'));
     if (metrics.observedGain?.tokenAddress) summary.append(el('p', 'detail-small', '采样涨幅对应代币'), addressNode(metrics.observedGain.tokenAddress), gmgnTokenLink(profile.chain, metrics.observedGain.tokenAddress)); fragment.append(summary);
@@ -1149,7 +1203,7 @@
     const associations = state.walletSort === 'associations', profiles = state.walletSort === 'profiles'; $('association-table').hidden = !associations; $('wallet-history-table').hidden = associations || profiles; $('association-status-note').hidden = !associations; $('wallet-profile-list').hidden = !profiles; $('wallet-profile-status').hidden = !profiles; $('wallet-group-filter').hidden = !profiles;
     $('wallet-search').placeholder = profiles ? '搜索钱包地址…' : associations ? '搜索公开钱包或候选钱包地址…' : '搜索钱包地址、名称或标签…'; renderAssociationStatus(); if (profiles) renderWalletProfileStatus();
     text('wallet-ranking-note', {
-      profiles: '行为分组允许重叠，人数不能相加。前置买入、资金同源与同步交易是研究线索，钱包归属仍待验证。画像建立、证据更新和到期重评均由后台持续进行。',
+      profiles: '先看“行为判别”中的逐对比较，再看历史分组。同一钱包可跟随 A、早于 B；“历史重复提前”可合并不同对象的次数，不代表对同一钱包持续领先。分组可重叠，资金同源或时序相近均不证明共同控制。',
       associations: '以 GMGN KOL 买入记录为入口，寻找其之前 24 小时内买入同币的钱包。按重复代币数排列；链上买入时间不等于已核实的喊单时间，首次观测买入也不等于该钱包真正首买。',
       profit: '供应商报告的最近 7 日已实现收益，仅用于发现研究目标；榜单不证明可跟单能力，也不是本地核算利润。',
       gain: '捕获涨幅按首次观测到买入后的价格样本排列。基准是此后的首个报价，不是钱包真实买入成本。',
@@ -1202,7 +1256,7 @@
     const wallet = data.wallet || {}; const fragment = document.createDocumentFragment(); const name = wallet.name || '未标记钱包';
     const heading = el('div', 'detail-token'); heading.append(el('span', `token-avatar ${chainClass(wallet.chain)}`, wallet.name ? Array.from(String(wallet.name))[0]?.toUpperCase() : 'W')); const titleGroup = el('div'); const title = el('h2', '', name); title.id = 'detail-title'; titleGroup.append(title, el('div', 'token-meta', `${chainName(wallet.chain)} · 本地钱包研究档案`)); heading.append(titleGroup); fragment.append(heading, addressNode(wallet.address, 'detail-address'));
     const labels = el('div', 'detail-pills'); labels.append(badge('GMGN 线索 · 归属未核实', 'watch')); for (const label of Array.isArray(wallet.labels) ? wallet.labels : []) labels.append(badge(walletLabel(label), 'neutral')); fragment.append(labels);
-    if (data.behaviorProfile) fragment.append(profileEvidenceSection(data.behaviorProfile));
+    if (data.behaviorProfile) fragment.append(walletRoleSection(data.behaviorProfile), profileEvidenceSection(data.behaviorProfile));
     const metrics = el('div', 'detail-metrics wallet-research-detail'); metrics.append(detailStat('GMGN 7 日已实现收益', usd(wallet.profit?.realizedProfitUsd), '整个钱包 · 供应商报告', numeric(wallet.profit?.realizedProfitUsd) < 0 ? 'negative' : 'positive'), detailStat('买入后采样最高涨幅', percent(wallet.gain?.maxGainPct), '样本观测值 · 非实际收益', 'positive'), detailStat('已观测活动', count(wallet.observedEventCount), `买 ${count(wallet.buyEvents)} / 卖 ${count(wallet.sellEvents)}`)); fragment.append(metrics);
     const coverage = data.coverage || {}; const observed = section('观察范围与身份线索');
     observed.append(el('p', 'wallet-section-note', '从本地首次发现开始累积样本。首次发现前、来源未覆盖或采集失败期间的交易可能缺失，不能据此核算完整已实现利润。'), kv('本地首次观测', date(coverage.firstObservedAt || wallet.firstObservedAt, true)), kv('最近观测', date(coverage.lastObservedAt || wallet.lastObservedAt, true)), kv('已记录事件 / 观测证据', `${count(coverage.eventCount)} / ${count(coverage.observationCount)}`), kv('涉及代币', count(wallet.tokenCount)), kv('GMGN 名称线索', wallet.name), kv('GMGN 社交账号线索', wallet.twitter), kv('本地完整已实现利润', '未核算 · 覆盖不完整'));

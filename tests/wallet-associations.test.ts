@@ -22,6 +22,35 @@ function funding(history:WalletHistory,wallet:string,funder:string,patch:{shared
     {source:'gmgn_funding',observedAt:iso(patch.observedAt??80),snapshotAt:iso(patch.snapshotAt??70)});
 }
 
+test('existing histories gain the token invalidation covering index without changing evidence',()=>{
+  const directory=mkdtempSync(join(tmpdir(),'wallet-association-index-')),file=join(directory,'history.sqlite');
+  let history:WalletHistory|undefined;
+  try {
+    history=new WalletHistory(file,{now:()=>new Date(base+100000)});
+    pair(history);history.refreshAssociations();
+    const original=history.getAssociation(chain,leader,candidate)!;
+    history.close();history=undefined;
+    const legacy=new DatabaseSync(file);
+    legacy.exec('DROP INDEX wh_assoc_episode_token');legacy.close();
+    history=new WalletHistory(file,{now:()=>new Date(base+100000)});
+    assert.deepEqual(history.getAssociation(chain,leader,candidate),original);
+    const reader=new DatabaseSync(file,{readOnly:true});
+    try {
+      assert.deepEqual(reader.prepare('PRAGMA index_info(wh_assoc_episode_token)').all().map(row=>row.name),
+        ['chain','token_address','active','leader','candidate']);
+      const lookup='SELECT leader,candidate FROM wh_assoc_episodes WHERE chain=? AND token_address=? AND active=1';
+      const plan=reader.prepare(`EXPLAIN QUERY PLAN ${lookup}`).all(chain,token).map(row=>String(row.detail));
+      assert.ok(plan.some(detail=>detail.includes('COVERING INDEX wh_assoc_episode_token')&&detail.includes('chain=? AND token_address=? AND active=?')));
+      const updatePlan=reader.prepare(`EXPLAIN QUERY PLAN UPDATE wh_assoc_relations SET dirty=1 WHERE chain=? AND (leader,candidate) IN (${lookup})`)
+        .all(chain,chain,token).map(row=>String(row.detail));
+      assert.ok(updatePlan.some(detail=>detail.includes('COVERING INDEX wh_assoc_episode_token')));
+    } finally {reader.close();}
+    history.recordTrade(trade({wallet:address(8),eventAt:iso(40),observedAt:iso(80),txHash:hash(800)}));
+    assert.equal(history.getAssociation(chain,leader,candidate)!.association.status,'stale');
+    assert.equal(history.getAssociation(chain,leader,candidate)!.episodes.length,original.episodes.length);
+  } finally {history?.close();rmSync(directory,{recursive:true,force:true});}
+});
+
 test('KOL-directed lead episodes deduplicate feeds and same token, exclude same tx/time, retain full evidence',()=>{
   const {history}=fixture();try {
     pair(history);

@@ -5,7 +5,7 @@ import {resolve} from 'node:path';
 import type {Config} from './config.js';
 import type {ScanArchive} from './scan-archive.js';
 import type {WalletHistory} from './wallet-history.js';
-import type {WalletProfileReader} from './wallet-profiles.js';
+import {WALLET_PROFILE_GROUPS,type WalletProfileReader} from './wallet-profiles.js';
 import bs58 from 'bs58';
 
 export interface DashboardServices {
@@ -119,9 +119,7 @@ export function buildDashboard(config:Config,services:DashboardServices,assetDir
         const chain=url.searchParams.get('chain')||undefined,group=url.searchParams.get('group')||undefined,search=url.searchParams.get('search')??'';
         const bounded=(name:string,def:number,max:number)=>{const raw=url.searchParams.get(name);if(raw===null)return def;
           if(!/^\d{1,8}$/.test(raw)||Number(raw)>max)throw new Error('INVALID_FILTER');return Number(raw);};
-        if(chain&&!['bsc','solana','robinhood'].includes(chain)||search.length>160||group&&!['public_kol','early_candidate',
-          'repeated_early','forward_validated','shared_funding','synchronized','vendor_profit_positive','observed_runner',
-          'insufficient_evidence','inactive_observed'].includes(group))throw new Error('INVALID_FILTER');
+        if(chain&&!['bsc','solana','robinhood'].includes(chain)||search.length>160||group&&!(WALLET_PROFILE_GROUPS as readonly string[]).includes(group))throw new Error('INVALID_FILTER');
         const limit=bounded('limit',25,100),offset=bounded('offset',0,1000000);if(limit<1)throw new Error('INVALID_FILTER');
         send(res,200,services.walletProfiles?.list({chain:chain as any,group:group as any,search,limit,offset})??{ready:false,items:[],total:0});return;
       }

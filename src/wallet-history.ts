@@ -126,8 +126,11 @@ export class WalletHistory {
       INSERT OR IGNORE INTO wh_meta VALUES ('capacity_limit','0');
       CREATE INDEX IF NOT EXISTS wh_events_wallet ON wh_events(chain,wallet,event_at);
       CREATE INDEX IF NOT EXISTS wh_events_token ON wh_events(chain,token_address,side,event_at);
+      -- Compact covering indexes keep status counts from scanning long hashes and event IDs.
+      CREATE INDEX IF NOT EXISTS wh_events_side ON wh_events(side);
       CREATE INDEX IF NOT EXISTS wh_observations_wallet ON wh_observations(chain,wallet,kind,observed_at);
       CREATE INDEX IF NOT EXISTS wh_observations_event ON wh_observations(event_id);
+      CREATE INDEX IF NOT EXISTS wh_observations_kind ON wh_observations(kind);
       CREATE INDEX IF NOT EXISTS wh_exit_evidence ON wh_observations(chain,token_address,kind,observed_at);
       CREATE INDEX IF NOT EXISTS wh_funding_wallet ON wh_funding(chain,wallet,funding_address,observed_at);
       CREATE INDEX IF NOT EXISTS wh_funding_address ON wh_funding(chain,funding_address,observed_at);
@@ -292,7 +295,7 @@ export class WalletHistory {
       const id=digest([target.chain,target.address,observed,provider,priceUsd]);
       const inserted=this.db.prepare('INSERT OR IGNORE INTO wh_prices VALUES (?,?,?,?,?,?)').run(id,target.chain,target.address,observed,priceUsd,provider);
       if(!Number(inserted.changes)) return;
-      const buyers=this.db.prepare("SELECT wallet,MIN(observed_at) AS observed FROM wh_events WHERE chain=? AND token_address=? AND side='buy' GROUP BY wallet")
+      const buyers=this.db.prepare("SELECT wallet,MIN(observed_at) AS observed FROM wh_events INDEXED BY wh_events_token WHERE chain=? AND token_address=? AND side='buy' GROUP BY wallet")
         .all(target.chain,target.address);
       for(const buyer of buyers) {
         if(observed<=String(buyer.observed)) continue;
@@ -382,7 +385,7 @@ export class WalletHistory {
     const coordinationEvidence=this.coordination(chain,wallet);
     summary.coordination=this.coordinationSummary(coordinationEvidence,'current',this.now().toISOString());
     const timeline=this.db.prepare('SELECT * FROM wh_events WHERE chain=? AND wallet=? ORDER BY event_at DESC LIMIT 100').all(chain,wallet).map(event=>{
-      const evidence=this.db.prepare("SELECT data FROM wh_observations WHERE event_id=? AND kind='trade' ORDER BY observed_at LIMIT 20").all(event.id!).map(r=>JSON.parse(String(r.data)) as WalletTradeObservation);
+      const evidence=this.db.prepare("SELECT data FROM wh_observations INDEXED BY wh_observations_event WHERE event_id=? AND kind='trade' ORDER BY observed_at LIMIT 20").all(event.id!).map(r=>JSON.parse(String(r.data)) as WalletTradeObservation);
       const first=JSON.parse(String(event.data)) as WalletTradeObservation;
       const contents=new Set(evidence.map(e=>JSON.stringify([e.eventAt,e.amount,e.amountUnit,e.usd,e.priceUsd])));
       return {...first,id:String(event.id),scope:first.eventIndex===undefined?'transaction_wallet_token_side' as const:'indexed_event' as const,

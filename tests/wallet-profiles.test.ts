@@ -138,3 +138,95 @@ test('capacity stops derived writes without deleting source evidence, and expand
     f.restart();assert.equal(f.reader.status().capacityReached,false);f.batch();assert.equal(f.reader.list().total,1);assert.equal(f.history.stats().events,1);
   }finally{f.close();}
 });
+
+test('directional role backfill counts late buys as counterexamples instead of selecting only early winners',()=>{
+  const f=fixture();try {
+    f.setNow(1000);
+    for(let i=0;i<23;i++){
+      const at=100+i*20,tokenAddress=address(100+i);
+      f.trade(2,{tokenAddress,txHash:hash(1000+i*2),eventAt:iso(at),observedAt:iso(at+1),source:'gmgn_kol_feed'});
+      f.trade(1,{tokenAddress,txHash:hash(1001+i*2),eventAt:iso(at+(i<3?-5:5)),observedAt:iso(at+6)});
+    }
+    f.batch();const profile=f.reader.get('bsc',address(1))!,peer=profile.roleAnalysis!.peers[0];
+    assert.equal(peer.address,address(2));assert.equal(peer.classification,'follower_pattern');
+    assert.equal(peer.directionalTokens.lead,3);assert.equal(peer.directionalTokens.follow,20);assert.equal(peer.matchedTokens,23);
+    assert.ok(f.groups().includes('follower_pattern'));assert.ok(!f.groups().includes('precursor_pattern'));
+    assert.equal(f.reader.list({group:'follower_pattern'}).total,1);assert.equal(f.reader.status().rolePending,0);
+    assert.equal(f.reader.status().roleProfiles,2);assert.ok(peer.counterEvidence.length>0);assert.equal(peer.ownership,'unknown');
+  } finally {f.close();}
+});
+
+test('role analysis reads earlier local buys and conflicting source timestamps rather than trusting the recent winner snapshot',()=>{
+  const f=fixture();try {
+    f.setNow(1000);
+    for(let i=0;i<3;i++){
+      const tokenAddress=address(100+i),at=100+i*20;
+      f.trade(1,{tokenAddress,txHash:hash(1000+i*3),eventAt:iso(at),observedAt:iso(at+1)});
+      f.trade(2,{tokenAddress,txHash:hash(1001+i*3),eventAt:iso(at+10),observedAt:iso(at+11),source:'gmgn_kol_feed'});
+    }
+    f.batch();assert.ok(f.groups().includes('precursor_pattern'));
+    f.setNow(1601);
+    for(let i=0;i<3;i++)f.trade(2,{tokenAddress:address(100+i),txHash:hash(2000+i),eventAt:iso(90+i*20),observedAt:iso(1600)});
+    f.batch();assert.ok(f.groups().includes('follower_pattern'));assert.ok(!f.groups().includes('precursor_pattern'));
+    assert.ok(f.reader.get('bsc',address(1))!.changes!.some(c=>c.removed.includes('precursor_pattern')));
+    // Canonical event still has its original timestamp; a different source has
+    // a conflicting timestamp and must make that contract ambiguous.
+    f.trade(1,{tokenAddress:address(100),txHash:hash(1000),eventAt:iso(95),observedAt:iso(1601),source:'gmgn_smartmoney_feed'});
+    f.setNow(2202);f.batch();const peer=f.reader.get('bsc',address(1))!.roleAnalysis!.peers[0];
+    assert.equal(peer.directionalTokens.ambiguous,1);assert.equal(peer.classification,'insufficient');
+  } finally {f.close();}
+});
+
+test('different event indexes in the same transaction cannot hide canonical timing conflicts on either wallet',()=>{
+  for(const conflictedWallet of [1,2]){
+    const f=fixture();try {
+      f.setNow(1000);
+      for(let i=0;i<3;i++){
+        const tokenAddress=address(100+i),at=100+i*100;
+        f.trade(1,{tokenAddress,txHash:hash(1000+i*2),eventIndex:0,eventAt:iso(at),observedAt:iso(at+1)});
+        f.trade(2,{tokenAddress,txHash:hash(1001+i*2),eventIndex:0,eventAt:iso(at+10),observedAt:iso(at+11),source:'gmgn_kol_feed'});
+      }
+      const conflictedHash=hash(conflictedWallet===1?1000:1001),originalAt=conflictedWallet===1?100:110;
+      // Equal timestamps at different indexes, another wallet, another CA and
+      // another transaction are not contradictory timing evidence for this buy.
+      f.trade(conflictedWallet,{txHash:conflictedHash,eventIndex:1,eventAt:iso(originalAt),observedAt:iso(500)});
+      f.trade(3,{txHash:conflictedHash,eventIndex:2,eventAt:iso(originalAt+30),observedAt:iso(500)});
+      f.trade(conflictedWallet,{tokenAddress:address(999),txHash:conflictedHash,eventIndex:2,eventAt:iso(originalAt+30),observedAt:iso(500)});
+      f.trade(conflictedWallet,{txHash:hash(9000),eventIndex:2,eventAt:iso(originalAt+30),observedAt:iso(500)});
+      f.batch();assert.ok(f.groups().includes('precursor_pattern'));
+      // This is a distinct wh_events row, so looking only at the earliest
+      // canonical row's observation ID would miss the time disagreement.
+      f.setNow(1601);
+      f.trade(conflictedWallet,{txHash:conflictedHash,eventIndex:3,eventAt:iso(originalAt+20),observedAt:iso(1600)});
+      f.batch();const role=f.reader.get('bsc',address(1))!.roleAnalysis!.peers.find(peer=>peer.address===address(2))!;
+      assert.equal(role.directionalTokens.lead,2);assert.equal(role.directionalTokens.ambiguous,1);
+      assert.equal(role.classification,'insufficient');assert.ok(!f.groups().includes('precursor_pattern'));
+      assert.ok(role.evidence.some(row=>row.tokenAddress===address(100)&&row.direction==='ambiguous'));
+    } finally {f.close();}
+  }
+});
+
+test('old profiles acquire role analysis without new trades and common high-degree funders are excluded',()=>{
+  const f=fixture();try {
+    f.trade();f.batch();
+    const output=new DatabaseSync(f.database);
+    output.prepare('UPDATE wp_profiles SET role_computed_at=NULL,role_input_key=NULL,data=json_remove(data,?)').run('$.roleAnalysis');output.close();
+    assert.equal(f.reader.status().rolePending,1);f.batch(5);assert.ok(f.reader.get('bsc',address(1))!.roleAnalysis);
+    assert.equal(f.reader.status().rolePending,0);
+    for(let i=1;i<=21;i++)f.raw.prepare('INSERT INTO wh_funding(id,chain,wallet,funding_address,observed_at,shared,conflict,snapshot_at,data) VALUES (?,?,?,?,?,?,?,?,?)')
+      .run('hub-'+i,'bsc',address(i),address(500),iso(30),0,0,iso(30),'{}');
+    f.raw.prepare('UPDATE wh_metrics SET coordination_dirty=0,coordination_checked_at=?,coordination_data=? WHERE chain=? AND address=?')
+      .run(iso(90),JSON.stringify({sharedFunding:[{wallet:address(2),address:address(500),observedAt:iso(30)}],synchronized:[]}),'bsc',address(1));
+    f.setNow(102);f.batch();assert.ok(!f.groups().includes('shared_funding'));
+  } finally {f.close();}
+});
+
+test('existing profile databases migrate role columns without dropping profiles or first-recognition history',()=>{
+  const f=fixture();try {
+    f.trade();f.batch();const first=f.reader.get('bsc',address(1))!.groups[0].firstObservedAt;
+    const output=new DatabaseSync(f.database);output.exec('DROP INDEX wp_profiles_roles; ALTER TABLE wp_profiles DROP COLUMN role_computed_at; ALTER TABLE wp_profiles DROP COLUMN role_input_key');output.close();
+    f.restart();assert.equal(f.reader.status().profiles,1);assert.equal(f.reader.status().rolePending,1);
+    f.batch();assert.equal(f.reader.status().rolePending,0);assert.equal(f.reader.get('bsc',address(1))!.groups[0].firstObservedAt,first);
+    assert.equal(f.reader.get('bsc',address(1))!.changes!.length,1);assert.equal(f.history.stats().events,1);
+  } finally {f.close();}
+});

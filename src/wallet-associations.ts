@@ -62,6 +62,7 @@ export class WalletAssociations {
       CREATE INDEX IF NOT EXISTS wh_assoc_relation_candidate ON wh_assoc_relations(chain,candidate);
       CREATE INDEX IF NOT EXISTS wh_assoc_episode_pair ON wh_assoc_episodes(chain,leader,candidate,active,updated_at DESC);
       CREATE INDEX IF NOT EXISTS wh_assoc_episode_anchor ON wh_assoc_episodes(chain,leader,token_address,active);
+      CREATE INDEX IF NOT EXISTS wh_assoc_episode_token ON wh_assoc_episodes(chain,token_address,active,leader,candidate);
       CREATE INDEX IF NOT EXISTS wh_assoc_source_index ON wh_observations(source,kind);
       CREATE INDEX IF NOT EXISTS wh_assoc_wallet_buy ON wh_events(chain,wallet,token_address,side,event_at);
       CREATE INDEX IF NOT EXISTS wh_assoc_funding_latest ON wh_funding(chain,wallet,snapshot_at DESC,observed_at DESC);
@@ -176,7 +177,7 @@ export class WalletAssociations {
     const leaderBuy=event(leaderRow),leaderUsable=leaderBuy.eventAt<=now&&leaderBuy.observedAt<=now&&!this.timestampConflict(leaderBuy.eventId,leaderBuy.eventAt);
     const start=new Date(Date.parse(leaderBuy.eventAt)-LEAD_SECONDS*1000).toISOString();
     const candidates=leaderUsable?this.db.prepare(`SELECT e.* FROM wh_events e WHERE e.chain=? AND e.token_address=? AND e.side='buy' AND e.event_at>=? AND e.event_at<?
-      AND e.wallet<>? AND e.tx_hash<>? AND NOT EXISTS(SELECT 1 FROM wh_observations o WHERE o.event_id=e.id AND o.kind='trade' AND json_extract(o.data,'$.eventAt')<>e.event_at)
+      AND e.wallet<>? AND e.tx_hash<>? AND NOT EXISTS(SELECT 1 FROM wh_observations o INDEXED BY wh_observations_event WHERE o.event_id=e.id AND o.kind='trade' AND json_extract(o.data,'$.eventAt')<>e.event_at)
       ORDER BY e.event_at,e.id LIMIT 400`).all(chain,token,start,leaderBuy.eventAt,leader,leaderBuy.txHash):[];
     const byWallet=new Map<string,Row>();for(const row of candidates) {if(!byWallet.has(String(row.wallet))&&byWallet.size<40) byWallet.set(String(row.wallet),row);}
     const priorCandidates=this.db.prepare('SELECT DISTINCT candidate FROM wh_assoc_episodes WHERE chain=? AND leader=? AND token_address=? AND active=1 LIMIT 40').all(chain,leader,token).map(row=>String(row.candidate));
@@ -190,7 +191,7 @@ export class WalletAssociations {
         const relation=this.db.prepare('SELECT first_at,token_count,active_since FROM wh_assoc_relations WHERE chain=? AND leader=? AND candidate=?').get(chain,leader,candidate);
         const sell=this.db.prepare(`SELECT e.* FROM wh_events e WHERE e.chain=? AND e.wallet=? AND e.token_address=? AND e.side='sell' AND e.event_at>? AND e.event_at<=?
           AND e.observed_at<=? AND e.tx_hash<>? AND e.tx_hash<>?
-          AND NOT EXISTS(SELECT 1 FROM wh_observations o WHERE o.event_id=e.id AND o.kind='trade' AND json_extract(o.data,'$.eventAt')<>e.event_at)
+          AND NOT EXISTS(SELECT 1 FROM wh_observations o INDEXED BY wh_observations_event WHERE o.event_id=e.id AND o.kind='trade' AND json_extract(o.data,'$.eventAt')<>e.event_at)
           ORDER BY e.event_at,e.id LIMIT 1`).get(chain,candidate,token,leaderBuy.eventAt,
             new Date(Math.min(Date.parse(now),Date.parse(leaderBuy.eventAt)+LEAD_SECONDS*1000)).toISOString(),now,leaderBuy.txHash,candidateBuy.txHash);
         const prospective=candidateBuy.observedAt<leaderBuy.eventAt;
@@ -248,7 +249,7 @@ export class WalletAssociations {
     return result.slice(0,10);
   }
   private timestampConflict(id:string,eventAt:string):boolean {
-    return !!this.db.prepare("SELECT 1 FROM wh_observations WHERE event_id=? AND kind='trade' AND json_extract(data,'$.eventAt')<>? LIMIT 1").get(id,eventAt);
+    return !!this.db.prepare("SELECT 1 FROM wh_observations INDEXED BY wh_observations_event WHERE event_id=? AND kind='trade' AND json_extract(data,'$.eventAt')<>? LIMIT 1").get(id,eventAt);
   }
   private summary(row:Row):WalletAssociationSummary {return {...JSON.parse(String(row.data)),status:Number(row.dirty)?'stale':'current'};}
 }

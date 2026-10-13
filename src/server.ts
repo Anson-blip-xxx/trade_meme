@@ -110,7 +110,7 @@ if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href) {
     archive:runtime.archive,overview:runtime.dashboardOverview,orders:runtime.dashboardOrders,
     chainStream:runtime.chainStreamStatus,protection:runtime.dashboardProtection,protectionDetail:id=>runtime.exitShadow?.detail(id),
     walletHistory:runtime.walletHistory,walletResearchStatus:runtime.walletResearchStatus,walletAssociations:runtime.walletHistory,
-    walletProfiles:runtime.walletProfiles?.reader,walletProfilesStatus:runtime.walletProfilesStatus}):undefined;
+    walletProfiles:runtime.walletProfiles?.reader,walletProfilesStatus:runtime.walletProfilesStatus,walletScreening:runtime.walletScreening?.ledger}):undefined;
   const fatal=()=>{console.error('SERVICE_LISTEN_FAILED');process.exit(1);};
   server.on('error',fatal);dashboard?.on('error',fatal);
   dashboard?.listen(config.dashboard.port,config.dashboard.host,()=>console.log(`Dashboard listening at http://${config.dashboard.host}:${config.dashboard.port}/dashboard/`));

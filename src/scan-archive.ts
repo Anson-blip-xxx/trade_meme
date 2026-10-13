@@ -7,6 +7,7 @@ import bs58 from 'bs58';
 import {PROCESSING_LEASE_MS,type Stored} from './store.js';
 import type {Chain,Report,Signal,Status,Narrative} from './types.js';
 import type {WalletAnalysis} from './research/wallet-types.js';
+import {compactWalletScreening} from './wallet-screening-summary.js';
 
 export interface ScanToken {chain:Chain;address:string;}
 export interface ScanCheck {status:Status;reasons:string[];}
@@ -51,6 +52,7 @@ export interface ScanRecord extends ScanToken {
   narrative?:{thesis?:string;stage?:Narrative['stage'];assessment?:Narrative['assessment'];supplier?:'gmgn'|'debot';sourceUrl?:string;
     text?:string;textTruncated?:boolean;updatedAt?:string;retained?:boolean};
   social?:Report['social'];
+  walletScreening?:Report['walletScreening'];
   wallets?:{sampleOnly:true;smartIndependenceProven:false;summary:ScanWalletSummary;groups:ScanWalletGroup[];profiles?:ScanWalletProfile[]};
   performance?:ScanPerformance;
   observation?:ScanObservation;
@@ -299,6 +301,7 @@ export class ScanArchive {
             result.narrative={...previous.narrative,retained:true};
         }
         result.social=compactSocial(report.social);
+        result.walletScreening=compactWalletScreening(report.walletScreening,identity,evaluated);
         result.wallets=compactWallets(report.wallets,identity.chain);
         const snapshot=report.gmgn,info=snapshot?.info,snapshotToken=snapshot&&token(snapshot.token);
         const infoToken=object(info)&&typeof info.address==='string'?token({chain:identity.chain,address:info.address}):undefined;
@@ -358,7 +361,7 @@ export class ScanArchive {
       const row=this.db.prepare(`SELECT j.* FROM watch_jobs j JOIN scan_summaries s ON s.id=j.id
         JOIN watch_heads h ON h.chain=j.chain AND h.address=j.address AND h.id=j.id
         WHERE j.state='scheduled' AND j.next_check_at<=? AND j.ends_at>? AND j.signal IS NOT NULL
-        ORDER BY (julianday(j.next_check_at)*86400000-MIN(30,MAX(0,COALESCE(json_extract(s.record,'$.social.score'),0)))*1000),
+        ORDER BY (julianday(j.next_check_at)*86400000-MIN(30,MAX(0,COALESCE(json_extract(s.record,'$.social.score'),0))+MAX(0,COALESCE(json_extract(s.record,'$.walletScreening.priorityScore'),0)))*1000),
         j.next_check_at,j.first_received_at,j.id LIMIT 1`).get(now.toISOString(),now.toISOString()) as unknown as WatchRow|undefined;
       if(!row){this.db.exec('COMMIT');return;}
       const claimId=randomUUID(),lease=new Date(Math.min(now.getTime()+PROCESSING_LEASE_MS,Date.parse(row.ends_at))).toISOString();

@@ -14,6 +14,7 @@ import {DashboardBalances,dashboardOrders,dashboardSettings} from './dashboard-d
 import {WalletHistory} from './wallet-history.js';
 import {WalletObserver} from './wallet-observer.js';
 import {WalletProfileRunner} from './wallet-profile-runner.js';
+import {WalletScreeningService} from './wallet-screening-service.js';
 import {SystemMonitor} from './system-monitor.js';
 import {WatchRechecker} from './watch-rechecker.js';
 import {ExitShadow} from './exit-shadow.js';
@@ -32,6 +33,10 @@ export function createRuntime(config:Config) {
     ...config.walletProfiles,historyDatabase:config.walletResearch.database,
     ...(config.chainStream.enabled?{chainDatabase:config.chainStream.database}:{})}):undefined;
   const walletProfilesStatus=()=>walletProfiles?.status()??{enabled:false,running:false,ready:false};
+  const walletScreening=walletHistory&&walletProfiles&&config.walletScreening.enabled?new WalletScreeningService(walletHistory,walletProfiles.reader,
+    {...config.walletScreening,sourcePaths:[config.walletResearch.database,config.walletProfiles.database,config.ordersDatabase,config.dashboard.archivePath,
+      config.chainStream.database,config.exitShadow.database]}):undefined;
+  if(walletScreening)providers.walletScreening=(s,r,now)=>walletScreening.assess(s,r,now);
   const exitShadow=config.exitShadow.enabled?new ExitShadow(config.exitShadow.database,config.exitShadow):undefined;
   const walletObserver=walletHistory?new WalletObserver({history:walletHistory,client,config,chains:config.scannerChains,
     intervalMs:config.walletResearch.intervalSec*1000,maxRequestsPerCycle:config.walletResearch.maxRequestsPerCycle}):undefined;
@@ -75,7 +80,7 @@ export function createRuntime(config:Config) {
   const balances=config.dashboard.enabled?new DashboardBalances(config):undefined;
   const system=config.dashboard.enabled?new SystemMonitor(dirname(config.ordersDatabase)):undefined;
   orders.recover();
-  const entry=new EntryController(config,orders,client);
+  const entry=new EntryController(config,orders,client,walletScreening?{walletEvidence:(report,now)=>walletScreening.revalidate(report,now)}:{});
   const reconciler=new OrderReconciler(orders,entry);
   let closed=false,active=0,archiveMaintenanceError:string|undefined;
   const onSignal=async(signal:Signal)=>{
@@ -149,7 +154,7 @@ export function createRuntime(config:Config) {
         try {walletStats=walletHistory?.stats();}catch {walletStats={error:'WALLET_HISTORY_READ_FAILED'};}
         walletStatsAt=Date.now();
       }
-      return {enabled:config.walletResearch.enabled,store:walletStats,statsComputedAt:new Date(walletStatsAt).toISOString(),observer:walletObserver?.getStatus(),profiles:walletProfilesStatus(),
+      return {enabled:config.walletResearch.enabled,store:walletStats,statsComputedAt:new Date(walletStatsAt).toISOString(),observer:walletObserver?.getStatus(),profiles:walletProfilesStatus(),screening:walletScreening?.status(),
         localIndex:{inFlight:!!walletIndexWork,...walletIndexTimings},captureError:walletCaptureError??walletIndexError??associationIndexError,
         settings:{intervalSec:config.walletResearch.intervalSec,maxRequestsPerCycle:config.walletResearch.maxRequestsPerCycle,
           maxBytes:config.walletResearch.maxBytes,retention:'persistent_no_expiry',scope:'vendor_pages_and_observed_wallet_snapshots'}};
@@ -159,7 +164,7 @@ export function createRuntime(config:Config) {
     try {return {...exitShadow.summary(),captureError:exitCaptureError};}
     catch {return {enabled:true,mode:'shadow',liveReady:false,captureError:'EXIT_SHADOW_READ_FAILED'};}
   };
-  return {client,providers,store,orders,entry,scanner,archive,tracking,walletHistory,walletObserver,walletResearchStatus,walletProfiles,walletProfilesStatus,watchRechecker,exitShadow,chainMonitor,chainStreamStatus,
+  return {client,providers,store,orders,entry,scanner,archive,tracking,walletHistory,walletObserver,walletResearchStatus,walletProfiles,walletProfilesStatus,walletScreening,watchRechecker,exitShadow,chainMonitor,chainStreamStatus,
     dashboardProtection:()=>exitShadow?{...exitShadow.list(),captureError:exitCaptureError}:{...protectionSummary(),items:[]},
     dashboardOverview:()=>({now:new Date().toISOString(),entryMode:config.entryMode,scanner:scanner.getStatus(),
       tracking:tracking?.getStatus(),stats:archive?.stats(),archiveError:archiveCaptureError??store.observationError??archiveMaintenanceError,
@@ -168,7 +173,10 @@ export function createRuntime(config:Config) {
     dashboardOrders:()=>dashboardOrders(orders),
     start(){
       if(closed) return;
-      chainMonitor?.start();tracking?.start();balances?.start();system?.start();walletProfiles?.start();
+      chainMonitor?.start();tracking?.start();balances?.start();system?.start();walletProfiles?.start();walletScreening?.start(async signal=>{
+        if(closed||active>=4||!config.gmgnApiKey?.trim()||client.cooldownUntil>Date.now()||scanner.getStatus().inFlight)return false;
+        await onSignal(signal);
+      });
       if(walletHistory&&!walletIndexTimer) {
         setImmediate(refreshWalletIndexes);
         walletIndexTimer=setInterval(refreshWalletIndexes,10000);walletIndexTimer.unref();
@@ -183,11 +191,13 @@ export function createRuntime(config:Config) {
     },
     async close(){
       if(closed) return;closed=true;scanner.stop();clearInterval(sweep);clearInterval(reconcileTimer);clearInterval(walletIndexTimer);
-      await Promise.all([chainMonitor?.stop(),tracking?.stop(),balances?.stop(),walletObserver?.stop(),system?.stop(),watchRechecker?.stop(),walletProfiles?.stop()]);
+      await Promise.all([chainMonitor?.stop(),tracking?.stop(),balances?.stop(),walletObserver?.stop(),system?.stop(),watchRechecker?.stop()]);
       await walletIndexWork;
       await reconciler.stop();
       // Stop means no new work. Await current callback before closing its stores.
       while(active) await new Promise(resolve=>setTimeout(resolve,50));
+      await walletScreening?.close();
+      await walletProfiles?.stop();
       store.close();orders.close();archive?.close();walletHistory?.close();exitShadow?.close();
     }};
 }

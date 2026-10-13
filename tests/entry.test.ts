@@ -5,7 +5,7 @@ import {readConfig, type Config} from '../src/config.js';
 import {EntryController, type LiveProtectionProvider} from '../src/entry.js';
 import {OrderStore} from '../src/orders.js';
 import {GmgnClient} from '../src/providers/gmgn-client.js';
-import type {Report} from '../src/types.js';
+import type {Report,Check} from '../src/types.js';
 import {signal, token, pass, narrative} from './helpers.js';
 
 const baseTime = Date.parse('2026-10-08T12:00:00.000Z');
@@ -21,6 +21,15 @@ function candidate(): Report {
     executionEnabled: false, reasons: [], provenance: {...pass(), platform: 'flap'}, safety: pass(),
     narrative: narrative(), flow: pass()};
 }
+function profiledCandidate():Report {
+  const report=candidate();report.flow!.reasons=['PROFILED_WALLET_SETUP_SUPPORTED'];
+  report.walletScreening={version:1,token:report.signal.token,checkedAt:report.evaluatedAt,validUntil:report.validUntil,
+    status:'supported',priorityScore:18,scope:'research_priority',ownership:'unknown',sampleOnly:true,reasons:[],setups:[{
+      id:'test-route',route:'public_entry',wallet,leader:wallet,status:'supported',stage:'direct_entry',priorityScore:18,
+      trigger:{chain:'bsc',wallet,tokenAddress:token,txHash:hash,side:'buy',eventAt:new Date(baseTime-20_000).toISOString(),observedAt:new Date(baseTime-10_000).toISOString(),source:'test'},
+      reasons:[],counterEvidence:[],followers:2,ownership:'unknown'}]};
+  return report;
+}
 function quote(amount = '1000000000000000', output = '123456789012345678901') {
   return {input_token: inputToken, output_token: token, input_amount: amount,
     output_amount: output, min_output_amount: (BigInt(output) * 95n / 100n).toString(), slippage: 5};
@@ -30,6 +39,7 @@ function setup(t: {after: (fn: () => void) => void}, options: {
   quote?: (url: URL) => unknown | Promise<unknown>;
   signed?: typeof fetch;
   liveProtection?: LiveProtectionProvider | null;
+  walletEvidence?:(report:Report,now:Date)=>Check;
 } = {}) {
   const apiKey = `entry-test-${randomUUID()}`;
   const config: Config = {...readConfig({}), entryMode: options.mode ?? 'paper',
@@ -45,6 +55,7 @@ function setup(t: {after: (fn: () => void) => void}, options: {
     }});
   const store = new OrderStore(':memory:'); t.after(() => store.close());
   const controller = new EntryController(config, store, client, {now: () => new Date(clock.time),
+    walletEvidence:options.walletEvidence,
     // Transport tests use synthetic protection evidence. Production supplies no passing provider.
     liveProtection: options.liveProtection === null ? undefined : options.liveProtection ?? (context => ({
       status: 'verified', scope: 'autonomous_exit_execution', chain: context.chain, wallet: context.wallet,
@@ -106,6 +117,107 @@ test('paper simulation never requests live capability evidence', async t => {
   const ctx=setup(t,{mode:'paper',liveProtection:()=>{throw new Error('PAPER_MUST_NOT_ASK_FOR_LIVE_PROTECTION');}});
   assert.equal((await ctx.controller.consider(candidate())).order?.status,'paper_open');
   assert.equal(ctx.signedCalls.length,0);
+});
+
+test('profile-supported entry rechecks its own expiry after a quote and refuses missing or withdrawn evidence',async t=>{
+  const ctx=setup(t,{walletEvidence:(_report,now)=>({...pass(),checkedAt:now.toISOString()}),quote:()=>{ctx.clock.time+=20_000;return quote(ctx.config.entryAmounts.bsc);}});
+  const r=candidate();r.flow!.reasons=['PROFILED_WALLET_SETUP_SUPPORTED'];
+  r.walletScreening={version:1,token:r.signal.token,checkedAt:r.evaluatedAt,validUntil:new Date(baseTime+10_000).toISOString(),
+    status:'supported',priorityScore:18,scope:'research_priority',ownership:'unknown',sampleOnly:true,reasons:[],setups:[{
+      id:'test-route',route:'public_entry',wallet,leader:wallet,status:'supported',stage:'direct_entry',priorityScore:18,
+      trigger:{chain:'bsc',wallet,tokenAddress:token,txHash:hash,side:'buy',eventAt:new Date(baseTime-20_000).toISOString(),observedAt:new Date(baseTime-10_000).toISOString(),source:'test'},
+      reasons:[],counterEvidence:[],followers:2,ownership:'unknown'}]};
+  const result=await ctx.controller.consider(r);assert.equal(result.reason,'ENTRY_CANDIDATE_EXPIRED');assert.equal(ctx.readCalls.length,1);assert.equal(ctx.signedCalls.length,0);
+  const missing=setup(t),m=candidate();m.flow!.reasons=['PROFILED_WALLET_SETUP_SUPPORTED'];
+  assert.equal((await missing.controller.consider(m)).reason,'ENTRY_FLOW_NOT_PASSED');assert.equal(missing.readCalls.length,0);
+  const withdrawn=setup(t,{config:{walletSupportRequired:false}}),w=candidate();w.flow!.reasons=['WALLET_SETUP_SUPPORT_WITHDRAWN'];
+  assert.equal((await withdrawn.controller.consider(w)).reason,'ENTRY_FLOW_NOT_PASSED');assert.equal(withdrawn.readCalls.length,0);
+});
+
+test('profile-supported entries require a local wallet-evidence provider before any quote or reservation',async t=>{
+  const ctx=setup(t),result=await ctx.controller.consider(profiledCandidate());
+  assert.equal(result.status,'blocked');assert.equal(result.reason,'ENTRY_WALLET_EVIDENCE_UNAVAILABLE');
+  assert.equal(ctx.readCalls.length,0);assert.equal(ctx.signedCalls.length,0);assert.equal(ctx.store.list().length,0);
+});
+
+test('a local sell observed during the quote withdraws paper entry while the original report remains unexpired',async t=>{
+  let reduced=false,checks=0;
+  const ctx=setup(t,{walletEvidence:(_report,now)=>{checks++;return {...pass(),checkedAt:now.toISOString(),status:reduced?'unknown':'pass',
+      reasons:reduced?['WALLET_SETUP_SUPPORT_WITHDRAWN']:[]};},
+    quote:()=>{reduced=true;ctx.clock.time+=10_000;return quote(ctx.config.entryAmounts.bsc);}});
+  const report=profiledCandidate(),result=await ctx.controller.consider(report);
+  assert.equal(result.status,'blocked');assert.equal(result.reason,'ENTRY_FLOW_NOT_PASSED');assert.equal(result.order?.status,'failed');
+  assert.equal(ctx.readCalls.length,1);assert.equal(ctx.signedCalls.length,0);assert.ok(checks>=3);
+  assert.equal(report.walletScreening!.status,'supported');assert.ok(Date.parse(report.validUntil)>ctx.clock.time);
+});
+
+test('fresh local wallet evidence permits paper entry without modifying its original decision snapshot',async t=>{
+  const ctx=setup(t,{walletEvidence:(report,now)=>{
+    report.walletScreening!.setups[0].leader=token;report.flow!.reasons=[];
+    return {...pass(),checkedAt:now.toISOString()};
+  }});
+  const report=profiledCandidate(),before=JSON.stringify(report),result=await ctx.controller.consider(report);
+  assert.equal(result.order?.status,'paper_open');assert.equal(JSON.stringify(report),before);
+  assert.equal((result.order?.details.walletScreening as Report['walletScreening'])?.setups[0].leader,wallet);
+  assert.equal(ctx.signedCalls.length,0);
+});
+
+test('wallet-evidence failures before or after quoting fail closed without leaking provider exception text',async t=>{
+  for(const late of [false,true]){
+    let quoted=false;
+    const ctx=setup(t,{walletEvidence:(_report,now)=>{
+      if(!late||quoted)throw new Error('PRIVATE_WALLET_REVALIDATION_SECRET');return {...pass(),checkedAt:now.toISOString()};
+    },quote:()=>{quoted=true;return quote(ctx.config.entryAmounts.bsc);}});
+    const result=await ctx.controller.consider(profiledCandidate());assert.equal(result.status,'blocked');assert.equal(result.reason,'ENTRY_WALLET_EVIDENCE_UNAVAILABLE');
+    assert.equal(ctx.readCalls.length,late?1:0);assert.equal(ctx.signedCalls.length,0);assert.ok(!JSON.stringify(result).includes('PRIVATE_WALLET_REVALIDATION_SECRET'));
+    if(late)assert.equal(result.order?.status,'failed');else assert.equal(ctx.store.list().length,0);
+  }
+});
+
+test('local wallet evidence must be current and cannot pass with a withdrawal reason',async t=>{
+  for(const checkedAt of [new Date(baseTime-30_001).toISOString(),new Date(baseTime+1).toISOString(),'bad-time']){
+    const ctx=setup(t,{walletEvidence:()=>({...pass(),checkedAt})}),result=await ctx.controller.consider(profiledCandidate());
+    assert.equal(result.reason,'ENTRY_CANDIDATE_EXPIRED');assert.equal(ctx.readCalls.length,0);
+  }
+  for(const status of ['unknown','fail','pass'] as const){
+    const ctx=setup(t,{walletEvidence:()=>({...pass(),status,reasons:['WALLET_SETUP_SUPPORT_WITHDRAWN']})});
+    assert.equal((await ctx.controller.consider(profiledCandidate())).reason,'ENTRY_FLOW_NOT_PASSED');assert.equal(ctx.readCalls.length,0);
+  }
+  const malformed=setup(t,{walletEvidence:(()=>undefined) as unknown as (report:Report,now:Date)=>Check});
+  assert.equal((await malformed.controller.consider(profiledCandidate())).reason,'ENTRY_WALLET_EVIDENCE_UNAVAILABLE');
+});
+
+test('a configured wallet revalidator can revoke legacy smart-wallet support even when the optional support gate is disabled',async t=>{
+  for(const required of [false,true]){
+    let reduced=false;
+    const ctx=setup(t,{config:{walletSupportRequired:required},walletEvidence:(_report,now)=>({...pass(),checkedAt:now.toISOString(),
+      status:reduced?'unknown':'pass',reasons:reduced?['WALLET_SETUP_SUPPORT_WITHDRAWN']:[]}),
+      quote:()=>{reduced=true;return quote(ctx.config.entryAmounts.bsc);}});
+    const result=await ctx.controller.consider(candidate());assert.equal(result.reason,'ENTRY_FLOW_NOT_PASSED');assert.equal(result.order?.status,'failed');
+    assert.equal(ctx.signedCalls.length,0);
+  }
+});
+
+test('wallet evidence is revalidated after the signed request queue before submission begins',async t=>{
+  let reduced=false;
+  const ctx=setup(t,{mode:'live',walletEvidence:(_report,now)=>({...pass(),checkedAt:now.toISOString(),status:reduced?'unknown':'pass',
+    reasons:reduced?['WALLET_SETUP_SUPPORT_WITHDRAWN']:[]})});
+  const schedule=ctx.client.scheduleRequest.bind(ctx.client);let calls=0;
+  ctx.client.scheduleRequest=async<T>(weight:number,execute:()=>Promise<T>)=>{if(++calls===2)reduced=true;return schedule(weight,execute);};
+  const result=await ctx.controller.consider(profiledCandidate());assert.equal(result.reason,'ENTRY_FLOW_NOT_PASSED');assert.equal(result.order?.status,'failed');
+  assert.equal(ctx.readCalls.length,1);assert.equal(ctx.signedCalls.length,0);
+});
+
+test('a blocking local wallet revalidation cannot carry an expired candidate past the final submission gate',async t=>{
+  let afterQueue=false;
+  const ctx=setup(t,{mode:'live',walletEvidence:(_report,now)=>{
+    if(afterQueue)ctx.clock.time+=61_000;
+    return {...pass(),checkedAt:now.toISOString()};
+  }});
+  const schedule=ctx.client.scheduleRequest.bind(ctx.client);let calls=0;
+  ctx.client.scheduleRequest=async<T>(weight:number,execute:()=>Promise<T>)=>{if(++calls===2)afterQueue=true;return schedule(weight,execute);};
+  const result=await ctx.controller.consider(profiledCandidate());assert.equal(result.reason,'ENTRY_CANDIDATE_EXPIRED');assert.equal(result.order?.status,'failed');
+  assert.equal(ctx.readCalls.length,1);assert.equal(ctx.signedCalls.length,0);
 });
 
 test('missing live readiness never prevents GET reconciliation of legacy accepted orders', async t => {

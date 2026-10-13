@@ -7,6 +7,7 @@ import type {ScanArchive} from './scan-archive.js';
 import type {WalletHistory} from './wallet-history.js';
 import {WALLET_PROFILE_GROUPS,type WalletProfileReader} from './wallet-profiles.js';
 import bs58 from 'bs58';
+import type {WalletSetupLedger} from './wallet-setup-ledger.js';
 
 export interface DashboardServices {
   archive:ScanArchive;
@@ -20,6 +21,7 @@ export interface DashboardServices {
   walletAssociations?:Pick<WalletHistory,'listAssociations'|'getAssociation'|'associationStats'>;
   walletProfiles?:Pick<WalletProfileReader,'list'|'get'>;
   walletProfilesStatus?:()=>unknown;
+  walletScreening?:Pick<WalletSetupLedger,'list'|'status'>;
 }
 function same(a:string,b:string):boolean {
   const left=createHash('sha256').update(a).digest(),right=createHash('sha256').update(b).digest();
@@ -114,6 +116,14 @@ export function buildDashboard(config:Config,services:DashboardServices,assetDir
       }
       if(url.pathname==='/dashboard/api/wallet-profiles/status') {
         send(res,200,services.walletProfilesStatus?.()??{enabled:false,running:false,ready:false});return;
+      }
+      if(url.pathname==='/dashboard/api/wallet-screening/status') {send(res,200,services.walletScreening?.status()??{enabled:false});return;}
+      if(url.pathname==='/dashboard/api/wallet-screening') {
+        const chain=url.searchParams.get('chain')||undefined,address=url.searchParams.get('address')||undefined,raw=url.searchParams.get('limit')??'20';
+        if(chain&&!['bsc','solana','robinhood'].includes(chain)||!/^\d{1,3}$/.test(raw)||Number(raw)<1||Number(raw)>100)throw new Error('INVALID_FILTER');
+        if(address){if(!chain)throw new Error('INVALID_FILTER');try{if(chain==='solana'){if(address.length>44||bs58.decode(address).length!==32)throw new Error();}
+          else if(!/^0x[0-9a-fA-F]{40}$/.test(address))throw new Error();}catch{throw new Error('INVALID_FILTER');}}
+        send(res,200,services.walletScreening?.list({chain:chain as any,address,limit:Number(raw)})??{items:[],sampleOnly:true});return;
       }
       if(url.pathname==='/dashboard/api/wallet-profiles') {
         const chain=url.searchParams.get('chain')||undefined,group=url.searchParams.get('group')||undefined,search=url.searchParams.get('search')??'';

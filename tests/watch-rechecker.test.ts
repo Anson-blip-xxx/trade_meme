@@ -236,6 +236,29 @@ test('social score only prioritizes due tasks with bounded boost and one task pe
   } finally {other.archive.close();}
 });
 
+test('profile priority joins social priority with a 30-second cap and cannot run an undued task',()=>{
+  for(const delay of [9000,31000]){
+    const f=fixture();try{
+      capture(f.archive);const at=1000+delay;f.set(at);
+      const s=signal('profile',{token:{chain:'bsc',address:second},occurredAt:iso(delay)});
+      capture(f.archive,s,'profile',iso(delay),iso(at),{
+        social:{score:20,scope:'research_priority',endorsementVerified:false,signals:[]},
+        walletScreening:{version:1,token:s.token,checkedAt:iso(at),validUntil:iso(at+60000),status:'watch',priorityScore:20,
+          scope:'research_priority',ownership:'unknown',sampleOnly:true,reasons:[],setups:[]}});
+      f.set(121000);assert.equal(f.archive.claimWatch()?.id,'one');
+    }finally{f.archive.close();}
+    const both=fixture();try{
+      capture(both.archive);const at=1000+delay;both.set(at);
+      const s=signal('profile',{token:{chain:'bsc',address:second},occurredAt:iso(delay)});
+      capture(both.archive,s,'profile',iso(delay),iso(at),{
+        social:{score:20,scope:'research_priority',endorsementVerified:false,signals:[]},
+        walletScreening:{version:1,token:s.token,checkedAt:iso(at),validUntil:iso(at+60000),status:'watch',priorityScore:20,
+          scope:'research_priority',ownership:'unknown',sampleOnly:true,reasons:[],setups:[]}});
+      both.set(121000+delay);assert.equal(both.archive.claimWatch()?.id,delay<30000?'profile':'one');
+    }finally{both.archive.close();}
+  }
+});
+
 test('durable recheck signals exclude raw text, narrative bodies, copied credentials and arbitrary URLs',()=>{
   const dir=mkdtempSync(join(tmpdir(),'watch-minimal-')),path=join(dir,'scans.sqlite'),f=fixture({},path);
   try {

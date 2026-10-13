@@ -2,6 +2,7 @@ import { z } from 'zod';
 import bs58 from 'bs58';
 import type {WalletAnalysis} from './research/wallet-types.js';
 import type {GmgnTokenSnapshot} from './providers/gmgn-safety.js';
+import type {WalletScreeningReport} from './wallet-screening.js';
 
 export const Chain = z.enum(['bsc', 'solana', 'robinhood']);
 export type Chain = z.infer<typeof Chain>;
@@ -116,6 +117,7 @@ export interface Report {
   decisionAtEvaluation?: 'BUY_CANDIDATE' | 'WATCH' | 'REJECT';
   executionEnabled: false; reasons: string[];
   advisoryReasons?:string[];social?:SocialReport;
+  walletScreening?:WalletScreeningReport;
   provenance: Provenance; safety: Check; narrative: NarrativeReport;
   gmgn?:GmgnTokenSnapshot;wallets?:WalletAnalysis;flow?:Check;
 }

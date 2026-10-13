@@ -340,6 +340,18 @@ export class WalletProfileReader {
     }catch{return;}
   }
   status():WalletProfileStatus {const db=this.open();return db?readStatus(db,this.database,this.now().toISOString()):emptyStatus();}
+  /** The cohort is local sampled public wallets, never a global profit leaderboard. */
+  profitCohort(chain:Chain,now=new Date()):number[] {
+    const db=this.open();if(!db)return [];
+    return db.prepare(`SELECT json_extract(p.data,'$.chain') AS chain,json_extract(p.data,'$.metrics.vendorProfit') AS profit
+      FROM wp_groups g INDEXED BY wp_groups_filter CROSS JOIN wp_profiles p ON p.chain=g.chain AND p.address=g.address
+      WHERE g.group_id='public_kol' AND g.chain=? ORDER BY p.computed_at DESC LIMIT 2000`).all(chain).flatMap(row=>{
+      const v=parse(row.profit) as WalletProfile['metrics']['vendorProfit'],n=Number(v?.realizedProfitUsd);
+      return row.chain===chain&&v?.verification==='vendor_claim'&&v.period==='7d'&&Number.isFinite(n)&&n>0&&
+        stamp(v.snapshotAt)&&stamp(v.observedAt)&&v.snapshotAt<=v.observedAt&&Date.parse(v.observedAt)<=now.getTime()&&
+        now.getTime()-Date.parse(v.snapshotAt)<=86_400_000?[n]:[];
+    });
+  }
   private profile(data:unknown):WalletProfile {const profile=parse(data) as WalletProfile;if(profile.freshUntil<=this.now().toISOString())profile.status='stale';return profile;}
   list(options:WalletProfileListOptions={}):{ready:boolean;items:WalletProfile[];total:number} {
     const db=this.open();if(!db)return {ready:false,items:[],total:0};const where:string[]=[],args:(string|number)[]=[];

@@ -8,6 +8,7 @@ import {buildExitConditions,parseExitPolicy} from './exit-policy.js';
 import {assessExitStrategy} from './exit-tracking.js';
 import {readPositionBalance} from './position-balance.js';
 import {readNativeBalance,nativeBalanceCoversOrder,NATIVE_INPUT_TOKENS} from './native-balance.js';
+import {compactWalletScreening} from './wallet-screening-summary.js';
 
 export interface EntryResult {
   status: 'skipped' | 'created' | 'existing' | 'blocked';
@@ -64,6 +65,14 @@ function reason(error: unknown): string {
 function eligibility(report: Report, config: Config, now: Date): string | undefined {
   if (report.mode !== 'live') return 'ENTRY_DEMO_DISABLED';
   if (report.decision !== 'BUY_CANDIDATE' || report.buyEligible !== true) return 'ENTRY_NOT_CANDIDATE';
+  if(report.flow?.reasons.includes('WALLET_SETUP_SUPPORT_WITHDRAWN'))return 'ENTRY_FLOW_NOT_PASSED';
+  if(report.flow?.reasons.includes('PROFILED_WALLET_SETUP_SUPPORTED')) {
+    const screening=report.walletScreening;
+    if(!screening||screening.status!=='supported'||screening.token.chain!==report.signal.token.chain||
+      screening.token.address!==report.signal.token.address||!screening.setups.some(s=>s.status==='supported'&&s.priorityScore>0))return 'ENTRY_FLOW_NOT_PASSED';
+    if(!Number.isFinite(Date.parse(screening.checkedAt))||Date.parse(screening.checkedAt)>now.getTime()||
+      !Number.isFinite(Date.parse(screening.validUntil))||Date.parse(screening.validUntil)<=now.getTime())return 'ENTRY_CANDIDATE_EXPIRED';
+  }
   const checks: Check[] = [report.provenance, report.safety];
   if(narrativeIdentityConflict(report.signal,report.narrative)) return 'ENTRY_NARRATIVE_TOKEN_IDENTITY_CONFLICT';
   if (config.walletSupportRequired) {
@@ -102,6 +111,7 @@ function entryDetails(report: Report): Record<string, unknown> {
     reportId: report.id.slice(0, 200), policyVersion: report.policyVersion.slice(0, 100),
     signal: {source: report.signal.source, eventId: report.signal.sourceEventId, occurredAt: report.signal.occurredAt},
     evaluatedAt: report.evaluatedAt, validUntil: report.validUntil,
+    walletScreening:compactWalletScreening(report.walletScreening,report.signal.token,report.evaluatedAt),
     checks: {provenance: briefCheck(report.provenance), safety: briefCheck(report.safety),
       narrative: briefCheck(report.narrative), flow: briefCheck(report.flow)},
     evidenceLinks: links,
@@ -139,12 +149,32 @@ export class EntryController {
   private readonly fetcher: typeof fetch;
   private readonly now: () => Date;
   private readonly liveProtection?: LiveProtectionProvider;
+  private readonly walletEvidence?: (report:Report,now:Date)=>Check;
   constructor(private readonly config: Config, private readonly orders: OrderStore,
     private readonly client: GmgnClient, options: {fetcher?: typeof fetch; now?: () => Date;
-      liveProtection?: LiveProtectionProvider} = {}) {
+      liveProtection?: LiveProtectionProvider;walletEvidence?:(report:Report,now:Date)=>Check} = {}) {
     this.fetcher = options.fetcher ?? fetch;
     this.now = options.now ?? (() => new Date());
     this.liveProtection = options.liveProtection;
+    this.walletEvidence = options.walletEvidence;
+  }
+
+  private checkEligibility(report:Report):string|undefined {
+    const now=this.now(),ineligible=eligibility(report,this.config,now);if(ineligible)return ineligible;
+    if(!this.walletEvidence)return report.flow?.reasons.includes('PROFILED_WALLET_SETUP_SUPPORTED')?'ENTRY_WALLET_EVIDENCE_UNAVAILABLE':undefined;
+    let check:Check;
+    // Preserve the frozen decision evidence. A local revalidator may read newer
+    // observations but cannot rewrite the report used to size or audit an order.
+    try {check=this.walletEvidence(structuredClone(report),new Date(now.getTime()));}catch{return 'ENTRY_WALLET_EVIDENCE_UNAVAILABLE';}
+    if(!check||typeof check!=='object'||!['pass','fail','unknown'].includes(check.status)||!Array.isArray(check.reasons)||typeof check.checkedAt!=='string')
+      return 'ENTRY_WALLET_EVIDENCE_UNAVAILABLE';
+    if(check.status!=='pass'||check.reasons.includes('WALLET_SETUP_SUPPORT_WITHDRAWN'))return 'ENTRY_FLOW_NOT_PASSED';
+    // Local database reads can still block. Do not submit using the clock from
+    // before the revalidation if that work outlived the candidate or evidence.
+    const after=this.now(),expired=eligibility(report,this.config,after);if(expired)return expired;
+    const checked=Date.parse(check.checkedAt),current=after.getTime();
+    if(!Number.isFinite(checked)||checked>current||current-checked>Math.min(30,this.config.decisionTtlSec)*1000)return 'ENTRY_CANDIDATE_EXPIRED';
+    return;
   }
 
   async consider(input: Report): Promise<EntryResult> {
@@ -153,9 +183,9 @@ export class EntryController {
     try { report = structuredClone(input); report.signal = parseSignal(report.signal); }
     catch { return {status: 'blocked', reason: 'ENTRY_REPORT_INVALID'}; }
     let ineligible: string | undefined;
-    try { ineligible = eligibility(report, this.config, this.now()); }
+    try { ineligible = this.checkEligibility(report); }
     catch { return {status: 'blocked', reason: 'ENTRY_REPORT_INVALID'}; }
-    if (ineligible) return {status: 'skipped', reason: ineligible};
+    if (ineligible) return {status: ineligible==='ENTRY_WALLET_EVIDENCE_UNAVAILABLE'?'blocked':'skipped', reason: ineligible};
     const chain = report.signal.token.chain, target = report.signal.token.address;
     const wallet = this.config.entryWallets[chain], amount = this.config.entryAmounts[chain], inputToken = this.config.entryInputTokens[chain];
     if (this.config.entryMode === 'live') {
@@ -187,8 +217,8 @@ export class EntryController {
       if(!addressEqual(inputToken,NATIVE_INPUT_TOKENS[chain],chain)) return {status:'blocked',reason:'ENTRY_NATIVE_INPUT_REQUIRED'};
       try {funding=await this.fundingSnapshot(chain,wallet,inputToken,this.config.entryMode);}
       catch(error) {return {status:'blocked',reason:reason(error)};}
-      const expired=eligibility(report,this.config,this.now());
-      if(expired) return {status:'skipped',reason:expired};
+      const expired=this.checkEligibility(report);
+      if(expired) return {status:expired==='ENTRY_WALLET_EVIDENCE_UNAVAILABLE'?'blocked':'skipped',reason:expired};
       if(this.isDisabled()) return {status:'skipped',reason:'ENTRY_DISABLED_BEFORE_SUBMIT'};
     }
     const reservation = this.orders.reserve({eventKey, chain, tokenAddress: target, mode: this.config.entryMode,
@@ -201,10 +231,11 @@ export class EntryController {
     let attempted = false;
     try {
       if (order.mode === 'live') this.requireLiveProtection(chain, order.wallet, 'before_quote');
+      const beforeQuote=this.checkEligibility(report);if(beforeQuote)throw new EntryError(beforeQuote);
       const raw = await this.client.get('/v1/trade/quote', {chain: chainName(chain), from_address: order.wallet,
         input_token: order.inputToken, output_token: target, input_amount: order.inputAmount, slippage: order.slippagePct}, 10);
       const quote = quoteSummary(raw, order, this.now());
-      const expired = eligibility(report, this.config, this.now());
+      const expired = this.checkEligibility(report);
       if (expired) throw new EntryError(expired);
       if (this.isDisabled()) throw new EntryError('ENTRY_DISABLED_BEFORE_SUBMIT');
       const prepared = this.orders.update(order.id, ['prepared'], {details: {...order.details, quote}}, this.now());
@@ -230,7 +261,7 @@ export class EntryController {
           const checked=this.orders.checkFunding(order.id,latest,this.now());
           if(!checked.ok) throw new EntryError(checked.reason??'ENTRY_INSUFFICIENT_BALANCE');
         }
-        const expiredNow = eligibility(report, this.config, this.now());
+        const expiredNow = this.checkEligibility(report);
         if (expiredNow) throw new EntryError(expiredNow);
         if (this.config.entryMode !== 'live') throw new EntryError('ENTRY_DISABLED_BEFORE_SUBMIT');
         // Balance I/O and the shared request queue can outlive the protection evidence.

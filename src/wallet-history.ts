@@ -245,6 +245,22 @@ export class WalletHistory {
 
   refreshAssociations(limit=3):void {this.associations.refresh(limit);}
   listAssociations(options:WalletAssociationListOptions={}) {return this.associations.list(options);}
+  /** Bounded raw observations preserve contrary vendor copies for the screening model. */
+  screeningEvidence(value:WalletHistoryToken,now=new Date()):{trades:WalletTradeObservation[];truncated:boolean} {
+    const target=this.target(value),end=this.observed(now.toISOString());if(!target||!end)return {trades:[],truncated:true};
+    const start=new Date(Date.parse(end)-3_600_000).toISOString();
+    const rows=this.db.prepare(`SELECT data FROM wh_observations INDEXED BY wh_exit_evidence
+      WHERE chain=? AND token_address=? AND kind='trade' AND observed_at>=? AND observed_at<=?
+      ORDER BY observed_at DESC LIMIT 501`).all(target.chain,target.address,start,end);
+    return {trades:rows.slice(0,500).flatMap(row=>{try{return [JSON.parse(String(row.data)) as WalletTradeObservation];}catch{return [];}}),truncated:rows.length>500};
+  }
+  screeningWalletCandidates(now=new Date(),offset=0):WalletTradeObservation[] {
+    const end=now.toISOString(),start=new Date(now.getTime()-600000).toISOString();
+    const wallets=this.db.prepare('SELECT chain,address FROM wh_wallets INDEXED BY wh_wallets_recent WHERE last_at>=? AND last_at<=? ORDER BY last_at DESC LIMIT 40 OFFSET ?').all(start,end,Math.max(0,Math.min(2000,offset)));
+    const buy=this.db.prepare(`SELECT data FROM wh_events INDEXED BY wh_events_wallet WHERE chain=? AND wallet=? AND side='buy'
+      AND event_at>=? AND event_at<=? AND observed_at<=? ORDER BY event_at DESC LIMIT 2`);
+    return wallets.flatMap(w=>buy.all(w.chain!,w.address!,start,end,end).flatMap(row=>{try{return [JSON.parse(String(row.data)) as WalletTradeObservation];}catch{return [];}}));
+  }
   getAssociation(chain:Chain,leader:string,candidate:string) {
     if(!chainValid(chain)) return;const a=addr(leader,chain),b=addr(candidate,chain);return a&&b?this.associations.detail(chain,a,b):undefined;
   }

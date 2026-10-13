@@ -11,6 +11,7 @@ import {fetchDebotNarrative} from './providers/debot-client.js';
 import {GmgnClient} from './providers/gmgn-client.js';
 import {researchProvider,combineSafety,type GmgnResearch} from './research.js';
 import {assessSocialSignals} from './social-signals.js';
+import {qualifiedWalletWithdrawal,type WalletScreeningReport} from './wallet-screening.js';
 
 type VendorFetch=Awaited<ReturnType<typeof fetchDebotNarrative>>;
 
@@ -21,6 +22,7 @@ export interface Providers {
   narrative:(signal:Signal,evidence:Evidence[],now:Date)=>Promise<NarrativeReport>;
   vendor?:(signal:Signal)=>Promise<VendorFetch>;
   research?:(signal:Signal)=>Promise<GmgnResearch>;
+  walletScreening?:(signal:Signal,research:GmgnResearch|undefined,now:Date)=>WalletScreeningReport|Promise<WalletScreeningReport>;
 }
 function prioritizeVendorEvidence(signal:Signal):Signal {
   if(!signal.vendorNarrative) return signal;
@@ -40,8 +42,9 @@ export function liveProviders(config:Config,client=new GmgnClient({apiKey:config
 }
 
 export function decide(signal:Signal,receivedAt:string,config:Config,provenance:Provenance,safety:Check,narrative:NarrativeReport,
-  now:Date,mode:'live'|'demo'='live',id:string=randomUUID(),research?:GmgnResearch):Report {
+  now:Date,mode:'live'|'demo'='live',id:string=randomUUID(),research?:GmgnResearch,walletScreening?:WalletScreeningReport):Report {
   const reasons:string[]=[];
+  const flow=mergeWalletSupport(research?.flow,walletScreening,signal,now);
   const age=now.getTime()-Date.parse(signal.occurredAt);
   if(age< -30_000) reasons.push('SIGNAL_TIME_IN_FUTURE');
   if(age>config.maxSignalAgeSec*1000) reasons.push('SIGNAL_STALE');
@@ -50,17 +53,36 @@ export function decide(signal:Signal,receivedAt:string,config:Config,provenance:
   if(safety.status!=='pass') reasons.push('TECHNICAL_SAFETY_NOT_PASSED');
   const identityConflict=narrativeIdentityConflict(signal,narrative);
   if(identityConflict) reasons.push('NARRATIVE_TOKEN_IDENTITY_CONFLICT');
-  if(config.walletSupportRequired&&research?.flow.status!=='pass') reasons.push('WALLET_SUPPORT_NOT_PASSED');
+  if(config.walletSupportRequired&&flow?.status!=='pass') reasons.push('WALLET_SUPPORT_NOT_PASSED');
+  if(flow?.reasons.includes('WALLET_SETUP_SUPPORT_WITHDRAWN'))reasons.push('WALLET_SETUP_SUPPORT_WITHDRAWN');
   const fail=[provenance,safety].some(c=>c.status==='fail')||identityConflict;
   const decision=fail?'REJECT':reasons.length?'WATCH':'BUY_CANDIDATE';
-  return {id,policyVersion:'entry-gate-v6',mode,signal,receivedAt,evaluatedAt:now.toISOString(),
-    validUntil:new Date(Math.min(now.getTime()+config.decisionTtlSec*1000,Date.parse(signal.occurredAt)+config.maxSignalAgeSec*1000)).toISOString(),
+  return {id,policyVersion:walletScreening?'entry-gate-v7':'entry-gate-v6',mode,signal,receivedAt,evaluatedAt:now.toISOString(),
+    validUntil:new Date(Math.min(now.getTime()+config.decisionTtlSec*1000,Date.parse(signal.occurredAt)+config.maxSignalAgeSec*1000,
+      flow?.reasons.includes('PROFILED_WALLET_SETUP_SUPPORTED')?Date.parse(walletScreening!.validUntil):Infinity)).toISOString(),
     decision,buyEligible:decision==='BUY_CANDIDATE'&&mode==='live',executionEnabled:false,
-    reasons:[...reasons,...provenance.reasons,...safety.reasons,...(research?.flow.reasons??[])],
+    reasons:[...reasons,...provenance.reasons,...safety.reasons,...(flow?.reasons??[])],
     advisoryReasons:[...new Set(narrative.reasons)],
     social:assessSocialSignals(signal,narrative.evidence,{snapshot:research?.snapshot,now,maxAgeSec:config.maxEvidenceAgeSec}),
     provenance,safety,narrative,
-    ...(research?{gmgn:research.snapshot,wallets:research.wallets,flow:research.flow}:config.walletSupportRequired?{flow:unknown('GMGN_WALLET_RESEARCH_UNAVAILABLE')}: {})};
+    ...(walletScreening?{walletScreening}:{}),
+    ...(research?{gmgn:research.snapshot,wallets:research.wallets}:{}),
+    ...(flow?{flow}:config.walletSupportRequired?{flow:unknown('GMGN_WALLET_RESEARCH_UNAVAILABLE')}: {})};
+}
+
+/** A route is an alternative source of wallet support, never an alternative safety check. */
+export function mergeWalletSupport(primary:Check|undefined,screening:WalletScreeningReport|undefined,signal:Signal,now:Date):Check|undefined {
+  if(!screening||screening.token.chain!==signal.token.chain||screening.token.address!==signal.token.address||
+    !Number.isFinite(Date.parse(screening.checkedAt))||Date.parse(screening.checkedAt)>now.getTime()||
+    !Number.isFinite(Date.parse(screening.validUntil))||Date.parse(screening.validUntil)<=now.getTime())return primary;
+  if(primary?.status==='fail')return primary;
+  const relevant=screening.setups.filter(s=>s.priorityScore>0),supported=relevant.filter(s=>s.status==='supported');
+  const withdrawn=!supported.length&&screening.setups.some(qualifiedWalletWithdrawal);
+  if(withdrawn)return {status:'unknown',reasons:['WALLET_SETUP_SUPPORT_WITHDRAWN'],checkedAt:screening.checkedAt,
+    facts:{primary,scope:'wallet_setup_risk',walletScreening:screening,ownershipProven:false}};
+  if(screening.status==='supported'&&supported.length)return {status:'pass',reasons:['PROFILED_WALLET_SETUP_SUPPORTED'],checkedAt:screening.checkedAt,
+    facts:{primary,scope:'sampled_profiled_wallet_setup',routes:supported.map(s=>({id:s.id,route:s.route,wallet:s.wallet,leader:s.leader})),ownershipProven:false,independenceProven:false}};
+  return primary;
 }
 
 export async function evaluate(signal:Signal,config:Config,providers=liveProviders(config),options:{id?:string;receivedAt?:string;now?:()=>Date;mode?:'live'|'demo'}={}):Promise<Report> {
@@ -113,7 +135,11 @@ export async function evaluate(signal:Signal,config:Config,providers=liveProvide
     }
   }
   // Re-evaluate freshness after RPC/model latency; a fresh arrival can become stale during analysis.
-  return decide(signal,receivedAt,config,provenance,safety,narrative,clock(),options.mode,options.id,research);
+  let walletScreening:WalletScreeningReport|undefined;
+  if(providers.walletScreening&&options.mode!=='demo')try {walletScreening=await providers.walletScreening(signal,research,clock());}
+  catch {const at=clock();walletScreening={version:1,token:signal.token,checkedAt:at.toISOString(),validUntil:new Date(at.getTime()+60000).toISOString(),
+    status:'unavailable',priorityScore:0,scope:'research_priority',ownership:'unknown',sampleOnly:true,setups:[],reasons:['WALLET_SCREENING_UNAVAILABLE']};}
+  return decide(signal,receivedAt,config,provenance,safety,narrative,clock(),options.mode,options.id,research,walletScreening);
 }
 
 export function effectiveReport(report:Report,now=new Date()):Report {

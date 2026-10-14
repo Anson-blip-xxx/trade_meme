@@ -1,4 +1,5 @@
 import type {Chain, Signal} from '../types.js';
+import type {WalletResearchTargets} from './wallet-targets.js';
 
 /** Local operator configuration only. Never accept these assertions from a signal. */
 export interface WalletIdentity {
@@ -21,7 +22,7 @@ export interface WalletActivity {
 export interface WalletRecord {
   chain: Chain;
   address: string;
-  sources: ('top_holders' | 'smart_holders')[];
+  sources: ('top_holders' | 'smart_holders' | 'targeted_balance')[];
   vendorLabels: {provider: 'gmgn'; verification: 'vendor_claim'; platform: string[]; token: string[]};
   recognizedLabels: ('smart' | 'kol' | 'bundler' | 'rat_trader' | 'developer' | 'exchange_or_pool')[];
   vendorIdentity: {name?: string; twitterUsername?: string; verification: 'vendor_claim'};
@@ -105,4 +106,5 @@ export interface WalletAnalysisOptions {
   identities?: readonly WalletIdentity[];
   recentWindowSec?: number;
   now?: () => Date;
+  researchTargets?: WalletResearchTargets;
 }

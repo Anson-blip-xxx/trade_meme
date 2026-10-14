@@ -1,0 +1,231 @@
+{
+  "asOf": "2026-10-14T01:18:24.201Z",
+  "timezone": "Asia/Shanghai",
+  "scope": "retained_latest_evaluations_per_chain_and_ca",
+  "limitations": [
+    "Duplicate scans are not independent samples.",
+    "Watch rechecks overwrite prior report snapshots.",
+    "Historical price tracking covers eligible tokens only; missing controls prevent profitability claims about relaxed gates.",
+    "Observed peaks and horizon quotes exclude execution costs and are not realized returns."
+  ],
+  "records": 9679,
+  "uniqueTokens": 4175,
+  "everEligibleTokens": 21,
+  "latest": {
+    "tokens": 4174,
+    "latestArchivedDecisions": {
+      "WATCH": 3970,
+      "REJECT": 196,
+      "BUY_CANDIDATE": 8
+    },
+    "currentEligible": 0,
+    "onlyWalletSupportMissing": 986,
+    "qualifiedGroupsWhenOnlyWalletMissing": {
+      "0": 905,
+      "1": 79,
+      "2": 2
+    },
+    "modeUnsupported": 1475,
+    "checks": {
+      "provenance": {
+        "pass": 2501,
+        "unknown": 1673
+      },
+      "safety": {
+        "pass": 2080,
+        "unknown": 1901,
+        "fail": 193
+      },
+      "flow": {
+        "unknown": 4134,
+        "pass": 40
+      }
+    }
+  },
+  "last24hLatest": {
+    "tokens": 1019,
+    "latestArchivedDecisions": {
+      "WATCH": 959,
+      "REJECT": 58,
+      "BUY_CANDIDATE": 2
+    },
+    "currentEligible": 0,
+    "onlyWalletSupportMissing": 241,
+    "qualifiedGroupsWhenOnlyWalletMissing": {
+      "0": 223,
+      "1": 17,
+      "2": 1
+    },
+    "modeUnsupported": 342,
+    "checks": {
+      "provenance": {
+        "pass": 609,
+        "unknown": 410
+      },
+      "safety": {
+        "pass": 521,
+        "unknown": 441,
+        "fail": 57
+      },
+      "flow": {
+        "unknown": 1015,
+        "pass": 4
+      }
+    }
+  },
+  "chains": {
+    "bsc": {
+      "tokens": 1220,
+      "latestArchivedDecisions": {
+        "WATCH": 1189,
+        "REJECT": 31
+      },
+      "currentEligible": 0,
+      "onlyWalletSupportMissing": 14,
+      "qualifiedGroupsWhenOnlyWalletMissing": {
+        "0": 11,
+        "1": 3
+      },
+      "modeUnsupported": 775,
+      "checks": {
+        "provenance": {
+          "pass": 794,
+          "unknown": 426
+        },
+        "safety": {
+          "unknown": 899,
+          "pass": 290,
+          "fail": 31
+        },
+        "flow": {
+          "unknown": 1217,
+          "pass": 3
+        }
+      }
+    },
+    "solana": {
+      "tokens": 1899,
+      "latestArchivedDecisions": {
+        "WATCH": 1757,
+        "REJECT": 134,
+        "BUY_CANDIDATE": 8
+      },
+      "currentEligible": 0,
+      "onlyWalletSupportMissing": 972,
+      "qualifiedGroupsWhenOnlyWalletMissing": {
+        "0": 894,
+        "1": 76,
+        "2": 2
+      },
+      "modeUnsupported": 698,
+      "checks": {
+        "provenance": {
+          "pass": 1705,
+          "unknown": 194
+        },
+        "safety": {
+          "pass": 1763,
+          "fail": 131,
+          "unknown": 5
+        },
+        "flow": {
+          "unknown": 1886,
+          "pass": 13
+        }
+      }
+    },
+    "robinhood": {
+      "tokens": 1055,
+      "latestArchivedDecisions": {
+        "WATCH": 1024,
+        "REJECT": 31
+      },
+      "currentEligible": 0,
+      "onlyWalletSupportMissing": 0,
+      "qualifiedGroupsWhenOnlyWalletMissing": {},
+      "modeUnsupported": 2,
+      "checks": {
+        "provenance": {
+          "unknown": 1053,
+          "pass": 2
+        },
+        "safety": {
+          "unknown": 997,
+          "fail": 31,
+          "pass": 27
+        },
+        "flow": {
+          "unknown": 1031,
+          "pass": 24
+        }
+      }
+    }
+  },
+  "counterfactualCoverageOnly": {
+    "oneGroupKeepingOtherGuards": 65,
+    "minNetBuyUsd": [
+      {
+        "usd": 0,
+        "tokens": 65
+      },
+      {
+        "usd": 25,
+        "tokens": 53
+      },
+      {
+        "usd": 50,
+        "tokens": 38
+      },
+      {
+        "usd": 100,
+        "tokens": 24
+      },
+      {
+        "usd": 200,
+        "tokens": 14
+      },
+      {
+        "usd": 500,
+        "tokens": 4
+      }
+    ]
+  },
+  "eligibleSamplePeaks": {
+    "tokens": 21,
+    "atLeast100Pct": 8,
+    "latestNegative": 18
+  },
+  "fixedHorizon": {
+    "available": true,
+    "uniqueTokens": 19,
+    "horizons": [
+      {
+        "seconds": 3600,
+        "matured": 19,
+        "covered": 13,
+        "lateOrMissing": 6,
+        "medianSampleGainPct": -74.55528808160621,
+        "positive": 2,
+        "largestSampleGapSec": 130.619
+      },
+      {
+        "seconds": 21600,
+        "matured": 19,
+        "covered": 13,
+        "lateOrMissing": 6,
+        "medianSampleGainPct": -85.36153036669303,
+        "positive": 1,
+        "largestSampleGapSec": 454.593
+      },
+      {
+        "seconds": 86400,
+        "matured": 14,
+        "covered": 0,
+        "lateOrMissing": 14,
+        "medianSampleGainPct": null,
+        "positive": 0,
+        "largestSampleGapSec": null
+      }
+    ]
+  }
+}

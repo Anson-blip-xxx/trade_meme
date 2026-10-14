@@ -165,9 +165,11 @@ test('role analysis reads earlier local buys and conflicting source timestamps r
       f.trade(2,{tokenAddress,txHash:hash(1001+i*3),eventAt:iso(at+10),observedAt:iso(at+11),source:'gmgn_kol_feed'});
     }
     f.batch();assert.ok(f.groups().includes('precursor_pattern'));
+    assert.equal(f.reader.get('bsc',address(1))!.roleAnalysis!.peers[0].qualification!.knownAt,iso(1000));
     f.setNow(1601);
     for(let i=0;i<3;i++)f.trade(2,{tokenAddress:address(100+i),txHash:hash(2000+i),eventAt:iso(90+i*20),observedAt:iso(1600)});
     f.batch();assert.ok(f.groups().includes('follower_pattern'));assert.ok(!f.groups().includes('precursor_pattern'));
+    assert.equal(f.reader.get('bsc',address(1))!.roleAnalysis!.peers[0].qualification,undefined);
     assert.ok(f.reader.get('bsc',address(1))!.changes!.some(c=>c.removed.includes('precursor_pattern')));
     // Canonical event still has its original timestamp; a different source has
     // a conflicting timestamp and must make that contract ambiguous.
@@ -175,6 +177,93 @@ test('role analysis reads earlier local buys and conflicting source timestamps r
     f.setNow(2202);f.batch();const peer=f.reader.get('bsc',address(1))!.roleAnalysis!.peers[0];
     assert.equal(peer.directionalTokens.ambiguous,1);assert.equal(peer.classification,'insufficient');
   } finally {f.close();}
+});
+
+test('peer screening qualification persists independently of current profile refresh time and survives restart',()=>{
+  const f=fixture();try {
+    f.setNow(1000);
+    for(let i=0;i<4;i++){
+      f.trade(1,{tokenAddress:address(100+i),txHash:hash(5000+i*2),eventAt:iso(100+i*20),observedAt:iso(101+i*20)});
+      f.trade(2,{tokenAddress:address(100+i),txHash:hash(5001+i*2),eventAt:iso(110+i*20),observedAt:iso(111+i*20),source:'gmgn_kol_feed'});
+    }
+    f.batch();const frozen=structuredClone(f.reader.get('bsc',address(1))!.roleAnalysis!.peers[0].qualification);
+    assert.equal(frozen!.knownAt,iso(1000));assert.equal(frozen!.evidence.length,4);
+    f.setNow(1002);f.batch();let updated=f.reader.get('bsc',address(1))!;
+    assert.equal(updated.computedAt,iso(1002));assert.equal(updated.roleAnalysis!.computedAt,iso(1002));
+    assert.deepEqual(updated.roleAnalysis!.peers[0].qualification,frozen);
+    f.restart();f.setNow(1004);f.batch();updated=f.reader.get('bsc',address(1))!;
+    assert.equal(updated.computedAt,iso(1004));assert.deepEqual(updated.roleAnalysis!.peers[0].qualification,frozen);
+  }finally{f.close();}
+});
+
+test('legacy roles without screening certificates are migrated at the actual new computation time, even with an unchanged cache key',()=>{
+  const f=fixture({refreshAfterSec:3600});try {
+    f.setNow(1000);
+    for(let i=0;i<3;i++){
+      f.trade(1,{tokenAddress:address(100+i),txHash:hash(6000+i*2),eventAt:iso(100+i*20),observedAt:iso(101+i*20)});
+      f.trade(2,{tokenAddress:address(100+i),txHash:hash(6001+i*2),eventAt:iso(110+i*20),observedAt:iso(111+i*20),source:'gmgn_kol_feed'});
+    }
+    f.batch();const output=new DatabaseSync(f.database);
+    output.prepare('UPDATE wp_profiles SET data=json_remove(data,?,?,?) WHERE chain=? AND address=?').run(
+      '$.roleAnalysis.method.screeningEvidenceLimitPerPeer','$.roleAnalysis.peers[0].qualification','$.roleAnalysis.peers[0].screeningEvidence','bsc',address(1));output.close();
+    f.setNow(1002);f.history.captureLeaders('bsc',[{address:address(1),period:'7d',realizedProfitUsd:'2000'}],{source:'gmgn_stats',observedAt:iso(1002)});f.batch();
+    const role=f.reader.get('bsc',address(1))!.roleAnalysis!;
+    assert.equal(role.computedAt,iso(1002));assert.equal(role.peers[0].qualification!.knownAt,iso(1002));
+    assert.equal(role.peers[0].screeningEvidence,undefined);assert.equal(role.peers[0].qualification!.evidence.length,3);
+  }finally{f.close();}
+});
+
+test('frozen leading proofs outside the current 30-token frame are rechecked before retaining the old qualification',()=>{
+  const f=fixture();try {
+    const pair=(token:number,at:number)=>{
+      f.trade(1,{tokenAddress:address(token),txHash:hash(token*2),eventAt:iso(at),observedAt:iso(at+1)});
+      f.trade(2,{tokenAddress:address(token),txHash:hash(token*2+1),eventAt:iso(at+10),observedAt:iso(at+11),source:'gmgn_kol_feed'});
+    };
+    f.setNow(1000);for(let i=0;i<3;i++)pair(100+i,100+i*20);f.batch();
+    assert.equal(f.reader.get('bsc',address(1))!.roleAnalysis!.peers[0].qualification!.knownAt,iso(1000));
+    f.setNow(2000);for(let i=0;i<30;i++)pair(200+i,1100+i*20);f.batch();
+    let peer=f.reader.get('bsc',address(1))!.roleAnalysis!.peers[0];assert.equal(peer.totalCandidateTokens,30);
+    assert.equal(peer.screeningEvidence,undefined);assert.equal(peer.qualification!.knownAt,iso(1000));
+    f.setNow(2700);f.trade(2,{tokenAddress:address(100),txHash:hash(90000),eventAt:iso(90),observedAt:iso(2699)});f.batch();
+    peer=f.reader.get('bsc',address(1))!.roleAnalysis!.peers[0];assert.equal(peer.classification,'precursor_pattern');
+    assert.equal(peer.qualification!.knownAt,iso(2700));assert.ok(!peer.qualification!.evidence.some(row=>row.tokenAddress===address(100)));
+  }finally{f.close();}
+});
+
+test('leader-only counterevidence inside the old role-cache window cannot preserve an invalid frozen qualification',()=>{
+  const f=fixture({refreshAfterSec:3600});try {
+    f.setNow(1000);
+    for(let i=0;i<4;i++){
+      f.trade(1,{tokenAddress:address(100+i),txHash:hash(7000+i*2),eventAt:iso(100+i*20),observedAt:iso(101+i*20)});
+      f.trade(2,{tokenAddress:address(100+i),txHash:hash(7001+i*2),eventAt:iso(110+i*20),observedAt:iso(111+i*20),source:'gmgn_kol_feed'});
+    }
+    f.batch();assert.equal(f.reader.get('bsc',address(1))!.roleAnalysis!.peers[0].qualification!.knownAt,iso(1000));
+    f.setNow(1002);f.trade(2,{tokenAddress:address(100),txHash:hash(99999),eventAt:iso(90),observedAt:iso(1001)});
+    f.history.captureLeaders('bsc',[{address:address(1),period:'7d',realizedProfitUsd:'2000'}],{source:'gmgn_stats',observedAt:iso(1002)});f.batch();
+    const peer=f.reader.get('bsc',address(1))!.roleAnalysis!.peers[0];
+    assert.equal(peer.directionalTokens.lead,3);assert.equal(peer.directionalTokens.follow,1);assert.equal(peer.classification,'precursor_pattern');
+    assert.equal(peer.qualification!.knownAt,iso(1002));
+  }finally{f.close();}
+});
+
+test('new qualifications use actual batch completion time while transaction proofs remain bounded by the earlier read snapshot',()=>{
+  const f=fixture();let engine:WalletProfiles|undefined;try {
+    f.setNow(1020);
+    for(let i=0;i<3;i++){
+      f.trade(1,{tokenAddress:address(100+i),txHash:hash(8000+i*2),eventAt:iso(100+i*20),observedAt:iso(101+i*20)});
+      f.trade(2,{tokenAddress:address(100+i),txHash:hash(8001+i*2),eventAt:iso(110+i*20),observedAt:iso(111+i*20),source:'gmgn_kol_feed'});
+    }
+    f.trade(1,{tokenAddress:address(999),txHash:hash(8998),eventAt:iso(1005),observedAt:iso(1006)});
+    f.trade(2,{tokenAddress:address(999),txHash:hash(8999),eventAt:iso(1007),observedAt:iso(1008),source:'gmgn_kol_feed'});
+    let calls=0,advancing=false;
+    engine=new WalletProfiles({database:f.database,historyDatabase:f.historyPath,now:()=>new Date(iso(advancing&&calls++>0?1010:1000))});
+    advancing=true;engine.runBatch(100);
+    const profile=f.reader.get('bsc',address(1))!,role=profile.roleAnalysis!,qualification=role.peers[0].qualification!;
+    assert.equal(qualification.knownAt,iso(1010));assert.equal(profile.computedAt,iso(1010));assert.equal(role.computedAt,iso(1010));
+    assert.ok(qualification.knownAt>iso(1005),'a buy during computation cannot become a pre-known relationship trigger');
+    assert.equal(qualification.evidence.length,3);assert.ok(!qualification.evidence.some(row=>row.tokenAddress===address(999)));
+    assert.ok(qualification.evidence.every(row=>row.candidateBuy!.observedAt<=iso(1000)&&row.leaderBuy!.observedAt<=iso(1000)));
+  }finally{engine?.close();f.close();}
 });
 
 test('different event indexes in the same transaction cannot hide canonical timing conflicts on either wallet',()=>{

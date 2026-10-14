@@ -79,18 +79,35 @@ test('a cohort is mandatory and positive profit alone is not a high-profit quali
   for(const [label,edit] of cases){const input=fixture();edit(input);assert.equal(setup(input).status,'watch',label);}
 });
 
-test('profile and directional computation must both predate the current precursor buy',()=>{
-  for(const field of ['profile','role'] as const){const input=fixture('precursor');if(field==='profile')input.profiles[0].computedAt=iso(900);else input.profiles[0].roleAnalysis!.computedAt=iso(901);
-    const s=setup(input,'precursor');assert.equal(s.status,'watch');assert.ok(s.reasons.includes('PRECURSOR_RELATION_NOT_KNOWN_BEFORE_BUY'));}
+test('a frozen peer qualification survives profile refresh after the trigger, while a newly learned relation does not',()=>{
+  const input=fixture('precursor');input.profiles[0].computedAt=iso(995);input.profiles[0].roleAnalysis!.computedAt=iso(994);
+  assert.equal(setup(input,'precursor').status,'supported');assert.equal(setup(input,'precursor').relationKnownAt,iso(850));
+  for(const knownAt of [iso(900),iso(950)]){const value=structuredClone(input);value.profiles[0].roleAnalysis!.peers[0].qualification!.knownAt=knownAt;
+    const s=setup(value,'precursor');assert.equal(s.status,'watch');assert.ok(s.reasons.includes('PRECURSOR_RELATION_NOT_KNOWN_BEFORE_BUY'));}
+  delete input.profiles[0].roleAnalysis!.peers[0].qualification;
+  assert.equal(setup(input,'precursor').status,'watch');
+});
+
+test('display examples and aggregate lead counts cannot replace frozen transaction proofs',()=>{
+  const input=fixture('precursor'),peer=input.profiles[0].roleAnalysis!.peers[0];
+  peer.evidence=peer.evidence.slice(0,1);assert.equal(setup(input,'precursor').status,'supported');
+  peer.qualification!.evidence=peer.qualification!.evidence.slice(0,2);peer.directionalTokens.lead=100;
+  assert.equal(setup(input,'precursor').status,'watch');
+});
+
+test('role computation and qualification cannot be later than the persisted current profile',()=>{
+  const input=fixture('precursor');input.profiles[0].roleAnalysis!.computedAt=iso(901);
+  assert.ok(setup(input,'precursor').reasons.includes('PRECURSOR_RELATION_NOT_KNOWN_BEFORE_BUY'));
 });
 
 test('three distinct other-token lead examples are required; current-token, duplicates, late observations and reversed order do not count',()=>{
   const edits:((i:WalletScreeningInput)=>void)[]=[
-    i=>{i.profiles[0].roleAnalysis!.peers[0].evidence[0].tokenAddress=token.address;},
-    i=>{const e=i.profiles[0].roleAnalysis!.peers[0].evidence;e[1].tokenAddress=e[0].tokenAddress;},
-    i=>{i.profiles[0].roleAnalysis!.peers[0].evidence[0].leaderBuy!.observedAt=iso(905);},
-    i=>{const e=i.profiles[0].roleAnalysis!.peers[0].evidence[0];e.candidateBuy!.eventAt=e.leaderBuy!.eventAt;},
-    i=>{const e=i.profiles[0].roleAnalysis!.peers[0].evidence[0];e.candidateBuy!.txHash=e.leaderBuy!.txHash;},
+    i=>{i.profiles[0].roleAnalysis!.peers[0].qualification!.evidence[0].tokenAddress=token.address;},
+    i=>{const e=i.profiles[0].roleAnalysis!.peers[0].qualification!.evidence;e[1].tokenAddress=e[0].tokenAddress;},
+    i=>{i.profiles[0].roleAnalysis!.peers[0].qualification!.evidence[0].leaderBuy!.observedAt=iso(905);},
+    i=>{const e=i.profiles[0].roleAnalysis!.peers[0].qualification!.evidence[0];e.candidateBuy!.eventAt=e.leaderBuy!.eventAt;},
+    i=>{const e=i.profiles[0].roleAnalysis!.peers[0].qualification!.evidence[0];e.candidateBuy!.txHash=e.leaderBuy!.txHash;},
+    i=>{i.profiles[0].roleAnalysis!.peers[0].qualification!.evidence[0].leaderBuy!.observedAt=iso(875);},
   ];
   for(const edit of edits){const input=fixture('precursor');edit(input);const s=setup(input,'precursor');assert.equal(s.status,'watch');assert.ok(s.reasons.includes('PRECURSOR_PRIOR_LEAD_EVIDENCE_INSUFFICIENT'));}
 });
@@ -206,7 +223,7 @@ test('a qualifying public trigger conflict withdraws the original setup and veto
 test('a precursor trigger conflict creates a withdrawal only for a fully qualified pre-existing relation',()=>{
   const input=fixture('precursor'),original=setup(input,'precursor');input.trades.push({...input.trades[0],priceUsd:'2',source:'screening_current_analysis'});
   const s=setup(input,'precursor');assert.equal(s.id,original.id);assert.equal(s.status,'withdrawn');assert.equal(s.relationKnownAt,iso(850));
-  input.profiles[0].roleAnalysis!.peers[0].evidence.pop();assert.equal(analyzeWalletScreening(input).setups.length,0);
+  input.profiles[0].roleAnalysis!.peers[0].qualification!.evidence.pop();assert.equal(analyzeWalletScreening(input).setups.length,0);
 });
 
 test('low-qualification trigger conflicts never veto an otherwise valid smart-wallet flow',()=>{

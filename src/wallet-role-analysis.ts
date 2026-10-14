@@ -15,6 +15,8 @@ export interface WalletRolePeerInput {
 }
 export interface AnalyzeWalletRolesInput {
   chain:Chain;wallet:string;asOf:string;walletEvents:readonly WalletRoleEvent[];peers:readonly WalletRolePeerInput[];truncated?:boolean;
+  /** Only the previously persisted analysis for this same wallet. Never reconstruct a past qualification from old trades. */
+  previous?:WalletRoleAnalysis;
 }
 export interface WalletRoleEventReference {
   wallet:string;txHash:string;eventAt:string;observedAt:string;source:string;eventIndex?:number;
@@ -23,6 +25,11 @@ export interface WalletRoleEvidence {
   tokenAddress:string;direction:WalletRoleDirection;candidateBuy?:WalletRoleEventReference;leaderBuy?:WalletRoleEventReference;
   candidateSellAfterLeader?:WalletRoleEventReference;lagSeconds?:number;reason:string;
 }
+export interface WalletRoleQualification {
+  version:1;knownAt:string;
+  /** Frozen bounded sampling frame, including opposing and uncertain directions. Separate from UI examples. */
+  evidence:WalletRoleEvidence[];
+}
 export interface WalletRolePeerAnalysis {
   address:string;classification:WalletRolePattern;directionalPattern:WalletRolePattern;ownership:'unknown';
   directionalTokens:Record<WalletRoleDirection,number>;matchedTokens:number;totalCandidateTokens:number;
@@ -30,11 +37,13 @@ export interface WalletRolePeerAnalysis {
   forwardObservedTokens:number;pendingTokens:number;unobservedTokens:number;evidence:WalletRoleEvidence[];
   reasons:string[];counterEvidence:string[];alternativeExplanations:string[];
   funding:{direct:number;common:number;excluded:number;ownership:'unknown'};
+  screeningEvidence?:WalletRoleEvidence[];
+  qualification?:WalletRoleQualification;
 }
 export interface WalletRoleAnalysis {
   version:1;computedAt:string;status:'current'|'partial';ownership:'unknown';sampleOnly:true;
   peers:WalletRolePeerAnalysis[];limitations:string[];
-  method:{minimumDirectionalTokens:3;minimumDirectionShare:0.75;nearTimeSeconds:2;maximumLagSeconds:86400;evidenceLimitPerPeer:6};
+  method:{minimumDirectionalTokens:3;minimumDirectionShare:0.75;nearTimeSeconds:2;maximumLagSeconds:86400;evidenceLimitPerPeer:6;screeningEvidenceLimitPerPeer?:30};
 }
 
 const WINDOW=86_400,DEAD_ZONE=2;
@@ -82,12 +91,57 @@ function examples(rows:WalletRoleEvidence[]):WalletRoleEvidence[]{
   return chosen.slice(0,6);
 }
 
+/** Validate the original sampled qualification from its transaction proofs, not aggregate counts. */
+export function qualifiedRoleEvidence(value:WalletRoleQualification|undefined,chain:Chain,wallet:string,peer:string,asOf:string):boolean {
+  const known=time(value?.knownAt),now=time(asOf),candidateWallet=address(chain,wallet),leaderWallet=address(chain,peer);
+  if(!value||value.version!==1||!candidateWallet||!leaderWallet||known===undefined||now===undefined||known>now||!Array.isArray(value.evidence)||value.evidence.length>30)return false;
+  const tokens=new Set<string>();let lead=0,matched=0;
+  for(const row of value.evidence){
+    if(!row)return false;
+    const token=address(chain,row.tokenAddress);if(!token||tokens.has(token)||!['lead','follow','ambiguous','unmatched','outsideWindow'].includes(row.direction))return false;
+    tokens.add(token);
+    for(const [event,who] of [[row.candidateBuy,candidateWallet],[row.leaderBuy,leaderWallet]] as const){
+      if(!event)continue;
+      const at=time(event.eventAt),observed=time(event.observedAt);
+      if(address(chain,event.wallet)!==who||!tx(chain,event.txHash)||at===undefined||observed===undefined||at>observed||observed>known)return false;
+    }
+    if(row.direction!=='unmatched')matched++;
+    if(row.direction==='lead'){
+      const candidate=row.candidateBuy,leader=row.leaderBuy;
+      if(!candidate||!leader||candidate.txHash===leader.txHash)return false;
+      const lag=(time(leader.eventAt)!-time(candidate.eventAt)!)/1000;
+      if(lag<=DEAD_ZONE||lag>WINDOW)return false;
+      lead++;
+    }
+  }
+  return lead>=3&&matched>0&&lead/matched>=0.75;
+}
+
+function qualification(input:AnalyzeWalletRolesInput,peer:string,rows:WalletRoleEvidence[],asOf:string):WalletRoleQualification|undefined {
+  // The caller's full selected sampling frame must fit. A display slice may never establish a qualification.
+  if(rows.length>30)return;
+  const fresh:WalletRoleQualification={version:1,knownAt:asOf,evidence:structuredClone(rows)};
+  if(!qualifiedRoleEvidence(fresh,input.chain,input.wallet,peer,asOf))return;
+  const previous=input.previous,old=previous?.peers.find(row=>row.address===peer);
+  if(old?.classification!=='precursor_pattern'||!qualifiedRoleEvidence(old.qualification,input.chain,input.wallet,peer,asOf)||
+    time(previous?.computedAt)===undefined||time(previous!.computedAt)!>time(asOf)!||time(old.qualification!.knownAt)!>time(previous!.computedAt)!)return fresh;
+  // Repeated observation timestamps may change, but a different earliest buy,
+  // opposing direction or a timestamp conflict retracts the original proof.
+  const same=(a:WalletRoleEventReference|undefined,b:WalletRoleEventReference|undefined)=>!!a&&!!b&&
+    a.wallet===b.wallet&&a.txHash===b.txHash&&a.eventAt===b.eventAt&&a.eventIndex===b.eventIndex;
+  for(const evidence of old.qualification!.evidence.filter(row=>row.direction==='lead')){
+    const current=rows.find(row=>row.tokenAddress===evidence.tokenAddress);
+    if(current&&(current.direction!=='lead'||!same(current.candidateBuy,evidence.candidateBuy)||!same(current.leaderBuy,evidence.leaderBuy)))return fresh;
+  }
+  return structuredClone(old.qualification!);
+}
+
 /** Directional research only. It never asserts common control, actual copying, or a trading recommendation. */
 export function analyzeWalletRoles(input:AnalyzeWalletRolesInput):WalletRoleAnalysis {
   const asOf=time(input.asOf),wallet=address(input.chain,input.wallet);
   if(asOf===undefined||!wallet||!['bsc','solana','robinhood'].includes(input.chain))throw new Error('WALLET_ROLE_INPUT_INVALID');
   const output:WalletRoleAnalysis={version:1,computedAt:new Date(asOf).toISOString(),status:input.truncated?'partial':'current',ownership:'unknown',sampleOnly:true,peers:[],
-    method:{minimumDirectionalTokens:3,minimumDirectionShare:0.75,nearTimeSeconds:2,maximumLagSeconds:86400,evidenceLimitPerPeer:6},
+    method:{minimumDirectionalTokens:3,minimumDirectionShare:0.75,nearTimeSeconds:2,maximumLagSeconds:86400,evidenceLimitPerPeer:6,screeningEvidenceLimitPerPeer:30},
     limitations:['只比较已采样的最早已知买入，不能保证是钱包真实首次买入。','公开标签与同步交易不能证明 KOL 身份、实际跟单或共同控制。','近时 2 秒是研究参数，不代表链上时间戳精度；未使用完整区块内交易顺序。','前向观察次数仅描述已有记录，没有完整预测分母，不是命中率。']};
   if(input.truncated)output.limitations.push('输入样本已截断；方向比例仅覆盖本次可比较的采样合约。');
   const candidate=prepare(input.walletEvents,input.chain,wallet,asOf),seenPeers=new Set<string>();
@@ -148,7 +202,9 @@ export function analyzeWalletRoles(input:AnalyzeWalletRolesInput):WalletRoleAnal
     for(const item of raw.fundingEvidence??[]){const observed=time(item.observedAt);if(!['direct','common'].includes(item.kind)||observed===undefined||observed>asOf||item.sharedService||item.conflict||item.address&&!address(input.chain,item.address)){relation.funding.excluded++;continue;}relation.funding[item.kind]++;}
     if(relation.funding.direct||relation.funding.common)relation.reasons.push('资金联系作为独立线索保留，不改变先后方向，也不证明同一控制人。');
     if(relation.funding.excluded)relation.counterEvidence.push('公共服务、冲突或无效资金证据已排除。');
-    relation.evidence=examples(rows);output.peers.push(relation);
+    relation.evidence=examples(rows);relation.screeningEvidence=structuredClone(rows.slice(0,30));
+    if(relation.classification==='precursor_pattern')relation.qualification=qualification(input,peer,rows,output.computedAt);
+    output.peers.push(relation);
   }
   return output;
 }

@@ -128,6 +128,19 @@ test('service combines local history and current analysis into a durable public-
   }finally{await f.close();}
 });
 
+test('research target nomination reads local recent trade evidence without creating a setup or accepting signal text',async()=>{
+  const f=fixture();try{
+    assert.deepEqual(f.service.researchTargets({...signal,text:`KOL ${address(2)} bought this token`}).targets,[]);
+    f.history.recordTrades([trade(2,900),trade(3,910)]);
+    const targets=f.service.researchTargets(signal);
+    assert.equal(targets.source,'local_observations');assert.deepEqual(targets.token,signal.token);
+    assert.deepEqual(targets.targets.map(t=>t.address),[address(2)]);assert.equal(targets.targets[0].txHash,hash(20900));
+    assert.equal(f.service.status().records,0,'nominating a request does not register a supported trading setup');
+    assert.deepEqual(f.service.researchTargets({...signal,token:{...token,address:address(999)}}).targets,[]);
+    f.advance(1601);assert.deepEqual(f.service.researchTargets(signal).targets,[]);
+  }finally{await f.close();}
+});
+
 test('new current-analysis sell withdraws an existing registration without rewriting first proof',async()=>{
   const f=fixture();try{
     f.history.recordTrades([trade(2,900),trade(3,910),trade(4,920)]);f.service.assess(signal,research());

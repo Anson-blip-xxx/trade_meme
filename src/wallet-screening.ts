@@ -5,7 +5,7 @@ import type {WalletTradeObservation} from './wallet-history.js';
 import type {WalletProfile} from './wallet-profiles.js';
 import type {WalletAnalysis,WalletRecord} from './research/wallet-types.js';
 import type {GmgnTokenSnapshot} from './providers/gmgn-safety.js';
-import type {WalletRolePeerAnalysis} from './wallet-role-analysis.js';
+import {qualifiedRoleEvidence,type WalletRolePeerAnalysis} from './wallet-role-analysis.js';
 
 export interface WalletScreeningInput {
   token:Signal['token'];now:string;trades:WalletTradeObservation[];profiles:WalletProfile[];
@@ -101,7 +101,8 @@ function normalize(input:WalletScreeningInput,now:number,target:string):Normaliz
 }
 function historicalLeads(peer:WalletRolePeerAnalysis,wallet:string,chain:Chain,target:string,triggerAt:number):number {
   const tokens=new Set<string>();
-  for(const row of peer.evidence??[]){
+  if(!qualifiedRoleEvidence(peer.qualification,chain,wallet,peer.address,new Date(triggerAt).toISOString()))return 0;
+  for(const row of peer.qualification!.evidence){
     const token=address(chain,row.tokenAddress),candidate=row.candidateBuy,leader=row.leaderBuy;
     if(row.direction!=='lead'||!token||token===target||!candidate||!leader||address(chain,candidate.wallet)!==wallet||address(chain,leader.wallet)!==peer.address||
       !address(chain,candidate.txHash,true)||!address(chain,leader.txHash,true)||candidate.txHash===leader.txHash)continue;
@@ -198,10 +199,11 @@ export function analyzeWalletScreening(input:WalletScreeningInput):WalletScreeni
       else {setup.reasons.push('PUBLIC_WALLET_PROFIT_TOP_QUARTILE');setup.priorityScore+=4;}
     }else stop('PUBLIC_WALLET_PROFIT_MISSING_OR_STALE');
     if(route==='precursor'){
-      const role=profile?.roleAnalysis,roleAt=time(role?.computedAt),profileAt=time(profile?.computedAt);
-      if(!peer||peer.classification!=='precursor_pattern'||roleAt===undefined||profileAt===undefined||roleAt>=triggerAt||profileAt>=triggerAt)
+      const role=profile?.roleAnalysis,roleAt=time(role?.computedAt),profileAt=time(profile?.computedAt),knownAt=time(peer?.qualification?.knownAt);
+      if(!peer||peer.classification!=='precursor_pattern'||roleAt===undefined||profileAt===undefined||roleAt>profileAt||
+        knownAt===undefined||knownAt>=triggerAt||knownAt>roleAt)
         stop('PRECURSOR_RELATION_NOT_KNOWN_BEFORE_BUY');
-      else {setup.relationKnownAt=role!.computedAt;
+      else {setup.relationKnownAt=peer.qualification!.knownAt;
         if(historicalLeads(peer,trigger.wallet,chain,target!,triggerAt)<3)stop('PRECURSOR_PRIOR_LEAD_EVIDENCE_INSUFFICIENT');
         else {setup.reasons.push('PRECURSOR_PRIOR_PATTERN_SUPPORTED');setup.priorityScore+=4;}}
       if(peer){
@@ -273,8 +275,9 @@ export function analyzeWalletScreening(input:WalletScreeningInput):WalletScreeni
     if(isPublic(profile,now))routes.push({route:'public_entry',leader:trigger.wallet});
     for(const peer of (profile.roleAnalysis?.peers??[]).slice(0,4)){
       const leader=address(chain,peer.address),at=time(trigger.eventAt)!;
-      if(peer.classification!=='precursor_pattern'||!leader||leader===trigger.wallet||time(profile.computedAt)!>=at||
-        time(profile.roleAnalysis?.computedAt)===undefined||time(profile.roleAnalysis?.computedAt)!>=at||historicalLeads(peer,trigger.wallet,chain,target,at)<3)continue;
+      const roleAt=time(profile.roleAnalysis?.computedAt),knownAt=time(peer.qualification?.knownAt);
+      if(peer.classification!=='precursor_pattern'||!leader||leader===trigger.wallet||roleAt===undefined||roleAt>time(profile.computedAt)!||
+        knownAt===undefined||knownAt>=at||knownAt>roleAt||historicalLeads(peer,trigger.wallet,chain,target,at)<3)continue;
       routes.push({route:'precursor',leader,peer});
     }
     for(const {route,leader,peer} of routes){
@@ -284,7 +287,7 @@ export function analyzeWalletScreening(input:WalletScreeningInput):WalletScreeni
       if(report.setups.some(s=>s.id===id))continue;
       report.setups.push({id,route,wallet:trigger.wallet,leader,trigger:{...trigger},status:'withdrawn',
         stage:route==='public_entry'?'direct_entry':'awaiting_public_entry',priorityScore:0,followers:0,ownership:'unknown',profit,
-        profileComputedAt:profile.computedAt,...(peer?{relationKnownAt:profile.roleAnalysis!.computedAt}:{}),
+        profileComputedAt:profile.computedAt,...(peer?{relationKnownAt:peer.qualification!.knownAt}:{}),
         reasons:['WALLET_TRIGGER_BUY_CONFLICT','WALLET_SETUP_WITHDRAWN'],
         counterEvidence:['WALLET_TRIGGER_BUY_CONFLICT','WALLET_SCREENING_COVERAGE_NOT_COMPLETE']});
       deadlines.push(time(trigger.eventAt)!+WINDOW,time(profile.freshUntil)!,time(leaderProfile.freshUntil)!,time(leaderProfile.metrics.vendorProfit!.snapshotAt)!+DAY);

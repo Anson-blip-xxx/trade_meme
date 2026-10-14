@@ -36,6 +36,28 @@ test('profile worker continuously processes new evidence without web requests an
   } finally {await runner.stop();history.close();rmSync(directory,{recursive:true,force:true});}
 });
 
+test('background worker persists frozen peer qualification and retains it when a later buy refreshes the current profile',async()=>{
+  const directory=mkdtempSync(join(tmpdir(),'wallet-profile-qualification-worker-'));
+  const history=new WalletHistory(join(directory,'history.sqlite'));
+  const options={database:join(directory,'profiles.sqlite'),historyDatabase:join(directory,'history.sqlite'),maxBytes:16*1024*1024,intervalSec:1,batchSize:10};
+  const runner=new WalletProfileRunner(options),base=Date.now()-120000;
+  const pair=(wallet:number,token:number,when:number,source:string)=>history.recordTrade({chain:'bsc',wallet:address(wallet),tokenAddress:address(token),
+    txHash:'0x'+(wallet*1000+token).toString(16).padStart(64,'0'),side:'buy',eventAt:new Date(when).toISOString(),observedAt:new Date(when+1).toISOString(),source});
+  try {
+    for(let i=0;i<3;i++){pair(1,100+i,base+i*20000,'gmgn_wallet_activity');pair(2,100+i,base+i*20000+10000,'gmgn_kol_feed');}
+    runner.start();await until(()=>!!runner.reader.get('bsc',address(1))?.roleAnalysis?.peers[0]?.qualification);
+    const frozen=structuredClone(runner.reader.get('bsc',address(1))!.roleAnalysis!.peers[0].qualification!);
+    assert.equal(frozen.evidence.length,3);assert.ok(Date.parse(frozen.knownAt)>base+120000-1000);
+    await new Promise(r=>setTimeout(r,5));pair(1,900,Date.now()-2,'gmgn_wallet_activity');
+    await until(()=>runner.reader.get('bsc',address(1))?.metrics.buyEvents===4);
+    const updated=runner.reader.get('bsc',address(1))!;assert.ok(updated.computedAt>frozen.knownAt);
+    assert.deepEqual(updated.roleAnalysis!.peers[0].qualification,frozen);
+    assert.equal(updated.roleAnalysis!.peers[0].totalCandidateTokens,4);
+    assert.equal(updated.roleAnalysis!.peers[0].screeningEvidence,undefined,'temporary comparison frames are not duplicated in durable profiles');
+    assert.equal(runner.status().error,undefined);assert.equal(runner.status().tradingEnabled,false);
+  }finally{await runner.stop();history.close();rmSync(directory,{recursive:true,force:true});}
+});
+
 test('derived profile APIs require authentication, bound filters and never allow writes',async()=>{
   const directory=mkdtempSync(join(tmpdir(),'wallet-profile-api-')),password='independent-profile-api-test-access-123456';
   const config=readConfig({DASHBOARD_ACCESS_TOKEN:password});

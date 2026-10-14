@@ -4,7 +4,7 @@ import {dirname,resolve} from 'node:path';
 import {createHash} from 'node:crypto';
 import {chainAddress} from './chain-stream-store.js';
 import type {Chain} from './types.js';
-import {analyzeWalletRoles,type WalletRoleAnalysis,type WalletRoleEvent,type WalletRolePeerInput} from './wallet-role-analysis.js';
+import {analyzeWalletRoles,type WalletRoleAnalysis,type WalletRoleEvent,type WalletRoleEventReference,type WalletRolePeerInput} from './wallet-role-analysis.js';
 
 export const WALLET_PROFILE_GROUPS=['public_kol','early_candidate','repeated_early','forward_validated','shared_funding','synchronized','follower_pattern','precursor_pattern','mixed_pattern','vendor_profit_positive','observed_runner','insufficient_evidence','inactive_observed'] as const;
 export type WalletProfileGroupId=typeof WALLET_PROFILE_GROUPS[number];
@@ -45,6 +45,7 @@ export class WalletProfiles {
   private sourceCount=0;private countedAt=0;
   private readonly roleKeys=new Map<string,string>();
   private readonly funderCache=new Map<string,boolean>();
+  private readonly newQualifications=new Map<string,{profile:WalletProfile;peers:Set<string>}>();
   constructor(private readonly options:WalletProfilesOptions) {
     this.now=options.now??(()=>new Date());this.maxBytes=options.maxBytes??256*1024*1024;this.refreshMs=(options.refreshAfterSec??1800)*1000;
     if(!Number.isSafeInteger(this.maxBytes)||this.maxBytes<16_384||!Number.isFinite(this.refreshMs)||this.refreshMs<1000||canonicalPath(options.database)===canonicalPath(options.historyDatabase)||
@@ -93,7 +94,7 @@ export class WalletProfiles {
     }
   }
   private runSnapshot(limit:number):WalletProfileStatus {
-    this.roleKeys.clear();this.funderCache.clear();
+    this.roleKeys.clear();this.funderCache.clear();this.newQualifications.clear();
     const now=this.now().toISOString(),n=bounded(limit,100,1000),targets=new Map<string,{chain:Chain;address:string}>();
     if(this.meta('error')===CAPACITY)return this.status();
     const add=(row:Row)=>{const chain=row.chain as Chain,address=chainAddress(chain,row.address??row.wallet);if(address)targets.set(chain+':'+address,{chain,address});};
@@ -132,7 +133,18 @@ export class WalletProfiles {
         if(changed.length){this.setMeta('changed_at',String(changed.at(-1)!.last_at));this.setMeta('changed_row',String(changed.at(-1)!.cursor));}
         if(coordination.length){this.setMeta('coordination_at',String(coordination.at(-1)!.coordination_checked_at));this.setMeta('coordination_row',String(coordination.at(-1)!.cursor));}
         if(chainRows.length)this.setMeta('chain_cursor',String(chainRows.at(-1)!.cursor));}
-      this.setMeta('processed',String(Number(this.meta('processed')||0)+processed));this.setMeta('last_run_at',now);
+      // No reader can see any row until this transaction commits. Newly formed
+      // peer qualifications therefore start at batch completion, never at the
+      // earlier read-snapshot time or an intermediate per-wallet calculation.
+      const registeredAt=this.now().toISOString();
+      if(!validTime(now,registeredAt))throw new Error('WALLET_PROFILE_REGISTRATION_CLOCK_INVALID');
+      for(const {profile,peers} of this.newQualifications.values()){
+        profile.computedAt=registeredAt;profile.roleAnalysis!.computedAt=registeredAt;
+        for(const peer of profile.roleAnalysis!.peers)if(peers.has(peer.address))peer.qualification!.knownAt=registeredAt;
+        this.os('UPDATE wp_profiles SET computed_at=?,role_computed_at=?,data=? WHERE chain=? AND address=?')
+          .run(registeredAt,registeredAt,JSON.stringify(profile),profile.chain,profile.address);
+      }
+      this.setMeta('processed',String(Number(this.meta('processed')||0)+processed));this.setMeta('last_run_at',registeredAt);
       if(full)this.setMeta('error',CAPACITY);this.db.exec('COMMIT');
     }catch(error){this.db.exec('ROLLBACK');throw error;}
     if(!this.countedAt||this.now().getTime()-this.countedAt>=60_000){this.sourceCount=Number(this.hs('SELECT count(*) AS n FROM wh_wallets').get()!.n);this.countedAt=this.now().getTime();this.setMeta('source_wallets',String(this.sourceCount));}
@@ -237,6 +249,9 @@ export class WalletProfiles {
     if(profile.metrics.lastEventAt&&Date.parse(now)-Date.parse(profile.metrics.lastEventAt)>=7*DAY&&!unknownChainEventTime)group('inactive_observed',1,'已采样交易的最后事件距今至少 7 天；数据覆盖不完整，不能认定钱包实际停止活动');
     if(!profile.groups.some(g=>g.id!=='inactive_observed'))group('insufficient_evidence',profile.metrics.observedEvents+profile.metrics.chain.transactions,'当前采样尚不足以归入行为分组；不会把链上参与或供应商标签当作收益证明');
     profile.groups.sort((a,b)=>WALLET_PROFILE_GROUPS.indexOf(a.id)-WALLET_PROFILE_GROUPS.indexOf(b.id));
+    // Full current frames are needed while computing/rechecking, not as a
+    // second durable copy. Persist UI examples plus qualified frozen proofs.
+    for(const peer of profile.roleAnalysis.peers)delete peer.screeningEvidence;
     return profile;
   }
   private roles(chain:Chain,address:string,events:WalletRoleEvent[],truncated:boolean,relations:Row[],now:string):WalletRoleAnalysis {
@@ -245,7 +260,8 @@ export class WalletProfiles {
     this.roleKeys.set(key,inputKey);
     const cached=this.os('SELECT role_input_key,data FROM wp_profiles WHERE chain=? AND address=?').get(chain,address);
     const old=parse(cached?.data)?.roleAnalysis as WalletRoleAnalysis|undefined;
-    if(cached?.role_input_key===inputKey&&old?.version===1&&validTime(old.computedAt,now)&&
+    if(cached?.role_input_key===inputKey&&old?.version===1&&old.method?.screeningEvidenceLimitPerPeer===30&&
+      !old.peers.some(peer=>peer.qualification)&&validTime(old.computedAt,now)&&
       Date.parse(now)-Date.parse(old.computedAt)<Math.min(600000,this.refreshMs))return old;
     // Choose recent candidate contracts before looking at the other wallet's
     // direction. The sampling frame cannot cherry-pick winning early trades.
@@ -257,8 +273,8 @@ export class WalletProfiles {
     const discovery=this.hs(`SELECT leader,MIN(public_observed_at) AS public_at,COUNT(DISTINCT token_address) AS shared_tokens
       FROM wh_assoc_anchors WHERE chain=? AND token_address IN (${placeholders}) AND public_observed_at<=? AND leader<>?
       GROUP BY leader ORDER BY shared_tokens DESC,leader LIMIT 5`).all(chain,...selected,now,address);
-    const firstBuys=(wallet:string):WalletRoleEvent[]=>{
-      const rows=this.hs(`WITH tokens(token) AS (VALUES ${selected.map(()=>'(?)').join(',')})
+    const firstBuys=(wallet:string,selection=selected):WalletRoleEvent[]=>{
+      const rows=this.hs(`WITH tokens(token) AS (VALUES ${selection.map(()=>'(?)').join(',')})
         SELECT e.data,(SELECT o.data FROM wh_observations o INDEXED BY wh_observations_event WHERE o.event_id=e.id AND o.kind='trade'
           AND o.observed_at<=? AND json_extract(o.data,'$.eventAt')<>e.event_at LIMIT 1) AS conflict_data,
           (SELECT c.data FROM wh_events c INDEXED BY wh_assoc_wallet_buy
@@ -266,7 +282,7 @@ export class WalletProfiles {
               AND c.tx_hash=e.tx_hash AND c.event_at<>e.event_at AND c.event_at<=? AND c.observed_at<=? LIMIT 1) AS canonical_conflict_data
         FROM tokens t CROSS JOIN wh_events e ON e.id=(SELECT x.id FROM wh_events x WHERE x.chain=? AND x.wallet=?
           AND x.token_address=t.token AND x.side='buy' AND x.event_at<=? AND x.observed_at<=? ORDER BY x.event_at,x.id LIMIT 1)`)
-        .all(...selected,now,now,now,chain,wallet,now,now);
+        .all(...selection,now,now,now,chain,wallet,now,now);
       // Event indexes produce separate canonical IDs. Pass one contradictory
       // row from the same wallet/token/transaction too, so choosing its earliest
       // row cannot hide incompatible timestamps from the pure timing analysis.
@@ -285,8 +301,24 @@ export class WalletProfiles {
           conflict:!Array.isArray(e.edges)||!e.edges.length||e.edges.some((v:any)=>v.conflict===true||!validTime(v.observedAt,now)||
             v.snapshotAt&&!validTime(v.snapshotAt,v.observedAt)||v.eventAt&&!validTime(v.eventAt,v.snapshotAt??v.observedAt))}))}];
     });
+    const previous=old?structuredClone(old):undefined;
+    // Frozen proofs can outlive the moving 30-token comparison frame. Re-read
+    // only those old leading contracts, so a newly discovered contradiction
+    // cannot survive merely because that contract fell outside the UI sample.
+    for(const peer of previous?.peers??[]){
+      if(!peer.qualification||!peers.some(row=>row.address===peer.address))continue;
+      const outside=peer.qualification.evidence.filter(row=>row.direction==='lead'&&!selected.includes(row.tokenAddress));
+      const oldTokens=[...new Set(outside.map(row=>chainAddress(chain,row.tokenAddress)).filter((value):value is string=>!!value))].slice(0,30);
+      if(!oldTokens.length)continue;
+      const rechecked=analyzeWalletRoles({chain,wallet:address,asOf:now,walletEvents:firstBuys(address,oldTokens),
+        peers:[{address:peer.address,events:firstBuys(peer.address,oldTokens)}]}).peers[0]?.screeningEvidence??[];
+      const same=(a:WalletRoleEventReference|undefined,b:WalletRoleEventReference|undefined)=>!!a&&!!b&&
+        a.wallet===b.wallet&&a.txHash===b.txHash&&a.eventAt===b.eventAt&&a.eventIndex===b.eventIndex;
+      if(outside.some(prior=>{const current=rechecked.find(row=>row.tokenAddress===prior.tokenAddress);
+        return !current||current.direction!=='lead'||!same(current.candidateBuy,prior.candidateBuy)||!same(current.leaderBuy,prior.leaderBuy);}))delete peer.qualification;
+    }
     const own=[...firstBuys(address),...events.filter(e=>e.side==='sell'&&selected.includes(e.tokenAddress))];
-    const result=analyzeWalletRoles({chain,wallet:address,asOf:now,walletEvents:own,peers,truncated:truncated||tokens.length>30||discovery.length>4});
+    const result=analyzeWalletRoles({chain,wallet:address,asOf:now,walletEvents:own,peers,previous,truncated:truncated||tokens.length>30||discovery.length>4});
     result.limitations.push('先按本钱包最近采样买入选取最多 30 个合约，再按共同合约数选取最多 4 个公开标记钱包；双方最早买入从本地档案重新读取，不按提前结果筛选。');
     result.limitations.push('方向门槛是研究筛选参数，未校准为置信概率；真实预测能力仍需独立登记未来机会及覆盖缺口。');
     if(!peers.length)result.limitations.push('当前采样合约未找到可比较的公开标记钱包，不表示没有上游来源。');
@@ -303,6 +335,9 @@ export class WalletProfiles {
   }
   private save(profile:WalletProfile):void {
     const old=parse(this.os('SELECT data FROM wp_profiles WHERE chain=? AND address=?').get(profile.chain,profile.address)?.data) as WalletProfile|undefined;
+    const peers=new Set((profile.roleAnalysis?.peers??[]).filter(peer=>peer.qualification&&
+      JSON.stringify(peer.qualification)!==JSON.stringify(old?.roleAnalysis?.peers.find(previous=>previous.address===peer.address)?.qualification)).map(peer=>peer.address));
+    if(peers.size)this.newQualifications.set(profile.chain+':'+profile.address,{profile,peers});
     const previous=new Set(old?.groups.map(g=>g.id)??[]),current=new Set(profile.groups.map(g=>g.id));
     for(const group of profile.groups){this.os('INSERT OR IGNORE INTO wp_group_first VALUES (?,?,?,?)').run(profile.chain,profile.address,group.id,profile.computedAt);
       group.firstObservedAt=String(this.os('SELECT first_at FROM wp_group_first WHERE chain=? AND address=? AND group_id=?').get(profile.chain,profile.address,group.id)!.first_at);}

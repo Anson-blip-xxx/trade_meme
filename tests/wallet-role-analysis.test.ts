@@ -110,6 +110,57 @@ test('profile evidence remains bounded and preserves opposing cases as well as u
   assert.deepEqual(new Set(r.evidence.map(item=>item.direction)),new Set(['lead','follow','ambiguous','outsideWindow','unmatched']));assert.equal(r.totalCandidateTokens,45);
 });
 
+test('screening retains the full bounded frame when UI examples omit enough leading cases',()=>{
+  const input=fixture([30,0,86401,...Array.from({length:9},()=>-20)]);
+  input.walletEvents=[...input.walletEvents,event(900,wallet,1000)];
+  const r=relation(input);assert.equal(r.classification,'precursor_pattern');assert.equal(r.evidence.length,6);
+  assert.ok(r.evidence.filter(row=>row.direction==='lead').length<3);
+  assert.equal(r.screeningEvidence!.length,13);assert.equal(r.qualification!.knownAt,input.asOf);
+  assert.equal(r.qualification!.evidence.filter(row=>row.direction==='lead').length,9);
+  assert.deepEqual(new Set(r.qualification!.evidence.map(row=>row.direction)),new Set(['lead','follow','ambiguous','outsideWindow','unmatched']));
+  r.evidence[0].reason='display changed';assert.notEqual(r.qualification!.evidence[0].reason,'display changed');
+});
+
+test('persisted peer qualification keeps its actual discovery time across current refreshes and a restart',()=>{
+  const input=fixture([-20,-20,-20,-20]),first=analyzeWalletRoles(input);
+  const original=JSON.stringify(first.peers[0].qualification);
+  const updated=analyzeWalletRoles({...input,asOf:iso(500100),previous:JSON.parse(JSON.stringify(first)),
+    walletEvents:[...input.walletEvents,event(900,wallet,500050)]});
+  assert.equal(JSON.stringify(updated.peers[0].qualification),original);assert.equal(updated.computedAt,iso(500100));
+  assert.notEqual(updated.peers[0].qualification,first.peers[0].qualification);
+  const oldWithoutProof=structuredClone(first);delete oldWithoutProof.peers[0].qualification;
+  assert.equal(analyzeWalletRoles({...input,asOf:iso(500100),previous:oldWithoutProof}).peers[0].qualification!.knownAt,iso(500100));
+});
+
+test('a changed frozen earliest-buy proof resets discovery time even if the current pair still qualifies',()=>{
+  const input=fixture(Array.from({length:9},()=>-20)),first=analyzeWalletRoles(input);
+  const fresh=analyzeWalletRoles({...input,asOf:iso(500100),previous:first,peers:[{...input.peers[0],events:[...input.peers[0].events,
+    event(100,peer,900,{txHash:tx(999999),observedAt:iso(500050)})]}]});
+  assert.equal(fresh.peers[0].classification,'precursor_pattern');assert.equal(fresh.peers[0].directionalTokens.follow,1);
+  assert.equal(fresh.peers[0].qualification!.knownAt,iso(500100));
+  assert.ok(fresh.peers[0].qualification!.evidence.some(row=>row.tokenAddress===addr(100)&&row.direction==='follow'));
+});
+
+test('disqualification drops the prior certificate and requalification starts from the new observation time',()=>{
+  const input=fixture([-20,-20,-20]),first=analyzeWalletRoles(input);
+  const follow=analyzeWalletRoles({...fixture([20,20,20]),asOf:iso(500100),previous:first});
+  assert.equal(follow.peers[0].qualification,undefined);
+  const recovered=analyzeWalletRoles({...input,asOf:iso(500200),previous:follow});
+  assert.equal(recovered.peers[0].qualification!.knownAt,iso(500200));
+  const absent=analyzeWalletRoles({...input,asOf:iso(500100),previous:first,peers:[]});
+  assert.equal(analyzeWalletRoles({...input,asOf:iso(500200),previous:absent}).peers[0].qualification!.knownAt,iso(500200));
+});
+
+test('future or wrong-wallet frozen certificates cannot backdate a current relationship',()=>{
+  const input=fixture([-20,-20,-20]),first=analyzeWalletRoles(input);
+  for(const edit of [(p:typeof first)=>{p.peers[0].qualification!.knownAt=iso(600000);},
+    (p:typeof first)=>{p.peers[0].qualification!.evidence[0].candidateBuy!.wallet=addr(99);},
+    (p:typeof first)=>{p.peers[0].qualification!.evidence[0].leaderBuy!.observedAt=iso(500010);}]){
+    const previous=structuredClone(first);edit(previous);
+    assert.equal(analyzeWalletRoles({...input,asOf:iso(500100),previous}).peers[0].qualification!.knownAt,iso(500100));
+  }
+});
+
 test('truncated samples explicitly remain partial without inventing a confidence or ownership score',()=>{
   const result=analyzeWalletRoles(fixture([-20,-20,-20],{truncated:true}));assert.equal(result.status,'partial');assert.ok(result.limitations.some(text=>text.includes('截断')));assert.equal('confidence' in result,false);assert.equal(result.peers[0].ownership,'unknown');
 });

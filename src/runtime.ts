@@ -19,6 +19,7 @@ import {SystemMonitor} from './system-monitor.js';
 import {WatchRechecker} from './watch-rechecker.js';
 import {ExitShadow} from './exit-shadow.js';
 import {dirname} from 'node:path';
+import {researchProvider} from './research.js';
 
 export function createRuntime(config:Config) {
   if(!isPersistentOrderPath(config.ordersDatabase)) throw new Error('PERSISTENT_ORDER_DATABASE_REQUIRED');
@@ -36,7 +37,10 @@ export function createRuntime(config:Config) {
   const walletScreening=walletHistory&&walletProfiles&&config.walletScreening.enabled?new WalletScreeningService(walletHistory,walletProfiles.reader,
     {...config.walletScreening,sourcePaths:[config.walletResearch.database,config.walletProfiles.database,config.ordersDatabase,config.dashboard.archivePath,
       config.chainStream.database,config.exitShadow.database]}):undefined;
-  if(walletScreening)providers.walletScreening=(s,r,now)=>walletScreening.assess(s,r,now);
+  if(walletScreening){
+    providers.walletScreening=(s,r,now)=>walletScreening.assess(s,r,now);
+    providers.research=researchProvider(config,client,undefined,{walletTargets:signal=>walletScreening.researchTargets(signal)});
+  }
   const exitShadow=config.exitShadow.enabled?new ExitShadow(config.exitShadow.database,config.exitShadow):undefined;
   const walletObserver=walletHistory?new WalletObserver({history:walletHistory,client,config,chains:config.scannerChains,
     intervalMs:config.walletResearch.intervalSec*1000,maxRequestsPerCycle:config.walletResearch.maxRequestsPerCycle}):undefined;
@@ -75,7 +79,7 @@ export function createRuntime(config:Config) {
   const chainStreamStatus=()=>{try{return chainMonitor?.getStatus()??{enabled:false,running:false,mode:'observation_only',chains:[],recentEvents:[]};}
     catch{return {enabled:config.chainStream.enabled,mode:'observation_only',captureError:'CHAIN_STATUS_READ_FAILED',chains:[],recentEvents:[]};}};
   const tracking=archive?new PriceTracker({archive:{
-    pendingTokens:(limit,now)=>archive.pendingTokens(200,now).filter(t=>!chainMonitor?.covers(t)).slice(0,limit??200),
+    pendingTokens:(limit,now)=>archive.trackingTokens(3,now,t=>!!chainMonitor?.covers(t)).slice(0,limit??3),
     recordPrice,recordPriceError},client,intervalMs:config.dashboard.sampleIntervalSec*1000,maxTokensPerCycle:3}):undefined;
   const balances=config.dashboard.enabled?new DashboardBalances(config):undefined;
   const system=config.dashboard.enabled?new SystemMonitor(dirname(config.ordersDatabase)):undefined;

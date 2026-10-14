@@ -8,6 +8,7 @@ import {WalletHistory,type WalletTradeObservation} from './wallet-history.js';
 import {WalletProfileReader} from './wallet-profiles.js';
 import {analyzeWalletScreening,qualifiedWalletWithdrawal,type WalletScreeningReport} from './wallet-screening.js';
 import {WalletSetupLedger} from './wallet-setup-ledger.js';
+import {selectWalletResearchTargets,type WalletResearchTargets} from './research/wallet-targets.js';
 
 /** No vendor requests: combines already collected current evidence with bounded local profiles. */
 export class WalletScreeningService {
@@ -30,6 +31,18 @@ export class WalletScreeningService {
     };
     if(options.sourcePaths.some(p=>sameFile(p,options.database)))throw new Error('WALLET_SCREENING_DATABASE_MUST_BE_SEPARATE');
     this.ledger=new WalletSetupLedger(options.database,{maxBytes:options.maxBytes,now});
+  }
+  /** Local-only nomination, supplied before collection so current holding evidence can be requested within its existing budget. */
+  researchTargets(signal:Signal,now=this.now()):WalletResearchTargets {
+    const raw=this.history.screeningEvidence(signal.token,now);
+    const addresses=[...new Set(raw.trades.filter(t=>t.side==='buy'&&t.chain===signal.token.chain&&
+      chainAddress(t.chain,t.tokenAddress)===chainAddress(signal.token.chain,signal.token.address)&&Date.parse(t.eventAt)>=now.getTime()-600000&&
+      Date.parse(t.eventAt)<=Date.parse(t.observedAt)&&Date.parse(t.observedAt)<=now.getTime())
+      .map(t=>chainAddress(signal.token.chain,t.wallet)).filter((a):a is string=>!!a))];
+    const first=this.profiles.getMany(addresses.slice(0,64).map(address=>({chain:signal.token.chain,address})));
+    const peers=[...new Set(first.flatMap(p=>(p.roleAnalysis?.peers??[]).filter(r=>r.classification==='precursor_pattern').map(r=>r.address)))];
+    const profiles=[...first,...this.profiles.getMany(peers.slice(0,128).map(address=>({chain:signal.token.chain,address})))];
+    return selectWalletResearchTargets({token:signal.token,now,trades:raw.trades,profiles,truncated:raw.truncated||addresses.length>64||peers.length>128});
   }
   assess(signal:Signal,research:Pick<GmgnResearch,'wallets'|'snapshot'>|undefined,now=this.now()):WalletScreeningReport {
     const raw=this.history.screeningEvidence(signal.token,now),analysis=research?.wallets;

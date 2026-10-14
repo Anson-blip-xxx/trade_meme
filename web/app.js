@@ -859,6 +859,16 @@
     }
     runtime.append(kv('服务端开仓模式', mode), kv('扫描任务', scanner.running ? '运行中' : '未运行'), kv('当前扫描', scanner.inFlight ? '正在处理' : '等待下一轮'), kv('最近扫描结束', date(cycle.completedAt, true)), kv('最近一轮接收 / 输出', finite(cycle.received) ? `${cycle.received} / ${scalar(cycle.emitted)}` : '—'), kv('最近一轮错误数', cycle.errors), kv('档案保留', finite(settings.scanRetentionDays) ? `${settings.scanRetentionDays} 天` : '—'), kv('条件后追踪窗口', finite(settings.trackingHours) ? `${settings.trackingHours} 小时` : '—'), kv('价格轮询间隔', finite(settings.sampleIntervalSec) ? `${settings.sampleIntervalSec} 秒 / 轮` : '—'));
     if (tracking.lastCycle?.completedAt || tracking.lastAt) runtime.append(kv('最近价格轮询', date(tracking.lastCycle?.completedAt || tracking.lastAt, true)));
+    const comparison = data.stats?.comparison;
+    if (comparison) {
+      runtime.append(kv('近门槛对照观察 · 已登记 / 正在采样', `${count(comparison.registered)} / ${count(comparison.active)}`), kv('已有价格的对照币', count(comparison.sampled)));
+      const groups = {one_smart_group: '一组资金支持', profile_pending: '画像证据待补全', no_confirmed_group: '资金支持未确认'};
+      for (const group of comparison.groups || []) {
+        const horizon = group.horizons?.find(h => h.seconds === 3600);
+        runtime.append(kv(`对照 · ${groups[group.group] || scalar(group.group)}`, `${count(group.registered)} 币 · 1 小时有效样本 ${count(horizon?.covered)} · 涨幅中位数 ${percent(horizon?.medianGainPct)}`));
+      }
+      runtime.append(el('p', 'detail-small', '对照对象已通过来源与安全检查，尚缺钱包支持。每组最多同时观察 2 币，沿用原有报价额度；按登记后的实际报价记录 1 / 6 / 24 小时表现。容量与报价缺口会影响样本覆盖，数值不代表成交收益。'));
+    }
     if (Array.isArray(cycle.diagnostics) && cycle.diagnostics.length) {
       runtime.append(el('p', 'policy-caption', '各来源最近状态'));
       for (const item of cycle.diagnostics) runtime.append(kv(`${chainName(item.chain)} · ${scalar(item.kind)}`, {ok: '正常', empty: '暂无新记录', invalid_response: '响应异常', unavailable: '暂不可用', rate_limited: '限流'}[item.status] || scalar(item.status)));

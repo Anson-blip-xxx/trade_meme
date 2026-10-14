@@ -5,6 +5,7 @@ import {z} from 'zod';
 import {analyzeWallets, parseWalletIdentities} from '../src/research/wallets.js';
 import type {WalletIdentity} from '../src/research/wallet-types.js';
 import {GmgnClient, GmgnError} from '../src/providers/gmgn-client.js';
+import {assessWalletSupport} from '../src/research.js';
 import {signal, now, token} from './helpers.js';
 
 const ca = (n: number) => `0x${n.toString(16).padStart(40, '0')}`;
@@ -317,4 +318,85 @@ test('contradictory funding aliases and wrong activity wallet cannot qualify', a
   const wrongWallet = await analyzeWallets(signal(), info(), clientFor([holder(a)], {activity: () => ({activities: [event('buy', '10', -60, {wallet: b})], next: ''})}), opts);
   assert.equal(wrongWallet.status, 'unknown');
   assert.equal(wrongWallet.summary.qualifiedSmartWalletCount, 0);
+});
+
+test('activity received after research starts uses its own receipt clock; genuinely future rows stay invalid', async () => {
+  for(const future of [false,true]) {
+    let clockMs=now.getTime();
+    const client=new FakeClient((path)=>{
+      clockMs+=2_000;
+      if(path.endsWith('token_top_holders'))return {list:[holder()]};
+      if(path.endsWith('wallet_stats'))return {realized_profit:'20'};
+      if(path.endsWith('wallet_activity'))return {activities:[event('buy','10',0,{timestamp:(clockMs+(future?1_000:-1_000))/1_000})],next:null};
+      throw new Error('unexpected route');
+    });
+    const result=await analyzeWallets(signal(),info(),client,{now:()=>new Date(clockMs)});
+    assert.equal(result.checkedAt,new Date(now.getTime()+8_000).toISOString());
+    assert.equal(result.facts.collectionStartedAt,now.toISOString());
+    assert.equal(result.wallets[0].enrichment.activity?.recent.until,result.checkedAt);
+    assert.equal(result.summary.qualifiedSmartFundingClusterCount,future?0:1);
+    assert.equal(result.reasons.includes('GMGN_WALLET_ACTIVITY_DATA_INVALID'),future);
+  }
+});
+
+test('launch activity is retained as a vendor developer link, excluded from flow and contaminates its funding group', async () => {
+  for(const shared of [false,true]) {
+    const rows=[holder(a),holder(b,shared?{native_transfer:{address:funder}}:{}),holder(c,{native_transfer:{address:funder}})];
+    const client=clientFor(rows,{activity:(_,query)=>({activities:query.wallet_address===c?[event('buy'),event('launch','900000',-100)]:[event('buy')],next:null})});
+    const result=await analyzeWallets(signal(),info(),client,opts),launched=result.wallets.find(w=>w.address===c)!;
+    assert.equal(result.status,'pass');
+    assert.deepEqual(launched.developerLinks,['VENDOR_TOKEN_LAUNCH_ACTIVITY']);
+    assert.equal(launched.enrichment.activity?.events.length,1);
+    assert.equal(launched.enrichment.activity?.recent.netBuyUsd,'10');
+    assert.equal(result.summary.qualifiedSmartFundingClusterCount,shared?1:2);
+    assert.equal(assessWalletSupport(result,2,now).status,shared?'unknown':'pass');
+    assert.equal((result.facts.rawResponses as Record<string,any>)[`activity:${c}`].activities[1].event_type,'launch');
+  }
+});
+
+test('two complete safe groups can support despite a third missing enrichment, without changing sample availability', async () => {
+  const result=await analyzeWallets(signal(),info(),clientFor([holder(a),holder(b),holder(c)],{
+    stats:(_,query)=>query.wallet_address===c?{}:{realized_profit:'20'}}),opts);
+  assert.equal(result.status,'unknown');
+  assert.equal(result.summary.qualifiedSmartFundingClusterCount,2);
+  const flow=assessWalletSupport(result,2,now);
+  assert.equal(flow.status,'pass');assert.equal(flow.facts.partialSampleIsolated,true);
+  assert.deepEqual(flow.facts.excludedPartialWallets,[c]);
+  assert.equal((flow.facts.completeSupportGroups as string[]).length,2);
+  assert.equal(assessWalletSupport(result,3,now).status,'unknown');
+  assert.equal(assessWalletSupport(result,2,new Date(now.getTime()+120_001)).status,'unknown');
+});
+
+test('partial-sample support cannot bypass malformed identities, activities, conflicting holdings/funding or new diagnostics', async () => {
+  for(const issue of ['stats_scope','activity_scope','future','holdings','funding','unknown_reason'] as const) {
+    const rows=[holder(a),holder(b),holder(c,issue==='funding'?{native_transfer:{address:b}}:{})];
+    const client=clientFor(rows,{
+      smart:issue==='holdings'?[holder(a),holder(b),holder(c,{balance:'0'})]:rows,
+      stats:(_,query)=>query.wallet_address!==c?{realized_profit:'20'}:issue==='stats_scope'?{wallet_address:b,realized_profit:'20'}:
+        issue==='funding'?{realized_profit:'20',common:{fund_from_address:a}}:{},
+      activity:(_,query)=>({activities:query.wallet_address===c&&issue==='activity_scope'?[event('buy','10',-1,{token:{address:ca(999)}})]:
+        query.wallet_address===c&&issue==='future'?[event('buy','10',1)]:[event('buy')],next:null})});
+    const result=await analyzeWallets(signal(),info(),client,opts);
+    if(issue==='unknown_reason')result.reasons.push('FUTURE_PROVIDER_VALIDATION_FAILURE');
+    assert.equal(result.status,'unknown',issue);
+    assert.equal(assessWalletSupport(result,2,now).status,'unknown',issue);
+  }
+});
+
+test('partial-sample support still collapses funding groups and verifies the supporting wallet evidence', async () => {
+  const result=await analyzeWallets(signal(),info(),clientFor([holder(a),holder(b),holder(c)],{
+    stats:(_,query)=>query.wallet_address===c?{}:{realized_profit:'20'}}),opts);
+  for(const invalidate of [
+    (r:typeof result)=>{r.wallets[0].holding.currentlyHolding=false;},
+    (r:typeof result)=>{r.wallets[0].funding.conflict=true;},
+    (r:typeof result)=>{r.wallets[0].developerLinks.push('VENDOR_TOKEN_LAUNCH_ACTIVITY');},
+    (r:typeof result)=>{r.wallets[0].enrichment.activity!.recent.coverage='partial';},
+    (r:typeof result)=>{r.wallets[0].enrichment.activity!.recent.netBuyUsd='-1';},
+    (r:typeof result)=>{r.facts.token={chain:'solana',address:token};},
+  ]) {
+    const changed=structuredClone(result);invalidate(changed);assert.equal(assessWalletSupport(changed,2,now).status,'unknown');
+  }
+  const merged=await analyzeWallets(signal(),info(),clientFor([holder(a,{native_transfer:{address:funder}}),holder(b,{native_transfer:{address:funder}}),holder(c)],{
+    stats:(_,query)=>query.wallet_address===c?{}:{realized_profit:'20'}}),opts);
+  assert.equal(merged.summary.qualifiedSmartFundingClusterCount,1);assert.equal(assessWalletSupport(merged,2,now).status,'unknown');
 });

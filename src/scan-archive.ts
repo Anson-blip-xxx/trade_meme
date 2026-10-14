@@ -8,6 +8,7 @@ import {PROCESSING_LEASE_MS,type Stored} from './store.js';
 import type {Chain,Report,Signal,Status,Narrative} from './types.js';
 import type {WalletAnalysis} from './research/wallet-types.js';
 import {compactWalletScreening} from './wallet-screening-summary.js';
+import {StrategyObservation} from './strategy-observation.js';
 
 export interface ScanToken {chain:Chain;address:string;}
 export interface ScanCheck {status:Status;reasons:string[];}
@@ -45,7 +46,7 @@ export interface ScanWalletProfile {
   risks:string[];
 }
 export interface ScanRecord extends ScanToken {
-  id:string;source:'debot'|'gmgn'|'manual';status:Stored['status'];mode?:Report['mode'];
+  id:string;source:'debot'|'gmgn'|'manual';status:Stored['status'];mode?:Report['mode'];policyVersion?:string;
   receivedAt:string;occurredAt:string;evaluatedAt?:string;decision?:Report['decision'];buyEligible?:boolean;validUntil?:string;
   name?:string;symbol?:string;reasons:string[];advisoryReasons?:string[];
   checks:{provenance:ScanCheck;safety:ScanCheck;narrative:ScanCheck;wallets:ScanCheck;flow:ScanCheck};
@@ -62,6 +63,7 @@ export interface ScanListOptions {limit?:number;offset?:number;chain?:Chain;deci
 export interface ScanArchiveStats {
   total:number;eligible:number;tracking:number;maxGainPct?:number;
   byStatus:Record<Stored['status'],number>;byDecision:Record<Report['decision']|'PENDING',number>;
+  comparison?:ReturnType<StrategyObservation['summary']>;
 }
 export interface ScanPrice extends ScanToken {priceUsd:number;observedAt:string;source:string;metadata?:PriceEvidence;}
 
@@ -208,6 +210,7 @@ function thinPoints(points:ScanPricePoint[],peakAt:string):ScanPricePoint[] {
 /** Bounded research history and retry scheduling; execution still requires its own entry guards. */
 export class ScanArchive {
   private readonly db:DatabaseSync;
+  private readonly comparison:StrategyObservation;
   private readonly now:()=>Date;
   private readonly retentionDays:number;
   private readonly maxEntries:number;
@@ -255,6 +258,7 @@ export class ScanArchive {
       }
       this.db.exec('COMMIT');
     } catch(error) {this.db.exec('ROLLBACK');this.db.close();throw error;}
+    this.comparison=new StrategyObservation(this.db);
     this.prune();
   }
 
@@ -280,7 +284,7 @@ export class ScanArchive {
       const reportMatches=report&&report.id===entry.id&&reportToken?.chain===identity.chain&&reportToken.address===identity.address;
       if(reportMatches&&evaluated&&Date.parse(evaluated)<=nowMs&&Date.parse(evaluated)>=Date.parse(result.receivedAt)&&
         (!result.evaluatedAt||evaluated>=result.evaluatedAt)) {
-        result={...result,mode:report.mode,evaluatedAt:evaluated,decision:report.decision,buyEligible:report.buyEligible===true,
+        result={...result,mode:report.mode,policyVersion:text(report.policyVersion,80),evaluatedAt:evaluated,decision:report.decision,buyEligible:report.buyEligible===true,
           validUntil:timestamp(report.validUntil),reasons:reasonCodes(report.reasons,24),advisoryReasons:reasonCodes(report.advisoryReasons,24),
           checks:{provenance:compactCheck(report.provenance),safety:compactCheck(report.safety),narrative:compactCheck(report.narrative),
             wallets:compactCheck(report.wallets),flow:compactCheck(report.flow)}};
@@ -310,6 +314,7 @@ export class ScanArchive {
         }
         if(!result.performance&&report.mode==='live'&&report.decision==='BUY_CANDIDATE'&&report.buyEligible===true)
           result.performance={eligibleAt:evaluated,samples:0,status:'waiting',points:[]};
+        this.comparison.capture(report,result,current);
       }
       const lease=entry.status==='processing'?(timestamp(entry.leaseExpiresAt)??
         new Date(Date.parse(result.receivedAt)+PROCESSING_LEASE_MS).toISOString()):null;
@@ -447,6 +452,7 @@ export class ScanArchive {
       const decision=row.decision===null?'PENDING':String(row.decision);
       if(Object.hasOwn(result.byDecision,decision)) result.byDecision[decision as keyof ScanArchiveStats['byDecision']]=Number(row.n);
     }
+    result.comparison=this.comparison.summary(this.now());
     return result;
   }
 
@@ -457,6 +463,14 @@ export class ScanArchive {
       WHERE eligible_at>? AND eligible_at<=? GROUP BY chain,address ORDER BY attempted ASC,MIN(eligible_at) ASC,chain,address LIMIT ?`)
       .all(new Date(now.getTime()-this.trackingMs).toISOString(),now.toISOString(),take)
       .map(row=>({chain:row.chain as Chain,address:String(row.address)}));
+  }
+
+  /** Share the existing quote budget: up to two eligible tokens and one control each cycle. */
+  trackingTokens(limit=3,now=this.now(),covered:(token:ScanToken)=>boolean=()=>false):ScanToken[] {
+    const eligible=this.pendingTokens(200,now).filter(t=>!covered(t));
+    const controls=this.comparison.pending(now).filter(t=>!covered(t)&&!eligible.some(e=>e.chain===t.chain&&e.address===t.address));
+    const take=Math.max(1,Math.min(3,limit));
+    return controls.length?[...eligible.slice(0,Math.max(0,take-1)),controls[0]]:eligible.slice(0,take);
   }
 
   /** Public identity for forward-only exit observation; never supplies old prices or peaks. */
@@ -480,6 +494,7 @@ export class ScanArchive {
     this.db.exec('BEGIN IMMEDIATE');
     try {
       this.pruneInside(now);
+      this.comparison.price({...price,...identity,observedAt:at},now);
       for(const row of this.db.prepare('SELECT record,last_price_attempt_at FROM scan_summaries WHERE chain=? AND address=? AND eligible_at IS NOT NULL')
         .all(identity.chain,identity.address)) {
         const record=JSON.parse(String(row.record)) as ScanRecord,p=record.performance!;
@@ -508,6 +523,7 @@ export class ScanArchive {
     this.db.exec('BEGIN IMMEDIATE');
     try {
       this.pruneInside(now);
+      this.comparison.error(identity,error,now);
       for(const row of this.db.prepare('SELECT record,last_price_attempt_at FROM scan_summaries WHERE chain=? AND address=? AND eligible_at IS NOT NULL')
         .all(identity.chain,identity.address)) {
         const record=JSON.parse(String(row.record)) as ScanRecord,p=record.performance!;
@@ -614,6 +630,7 @@ export class ScanArchive {
         record.performance?.maxGainPct??null,JSON.stringify(record));
   }
   private pruneInside(now:Date):void {
+    this.comparison.prune(now);
     const cutoff=new Date(now.getTime()-this.retentionDays*86_400_000).toISOString();
     this.db.prepare('DELETE FROM scan_summaries WHERE received_at<?').run(cutoff);
     if(Number(this.db.prepare('SELECT count(*) AS n FROM scan_summaries').get()!.n)>this.maxEntries)

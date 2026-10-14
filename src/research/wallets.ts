@@ -4,12 +4,14 @@ import {z} from 'zod';
 import type {Signal, Chain} from '../types.js';
 import {GmgnError, type GmgnClient} from '../providers/gmgn-client.js';
 import type {WalletAnalysis, WalletAnalysisOptions, WalletIdentity, WalletRecord, WalletCluster, WalletActivity} from './wallet-types.js';
+import {parseTargetTokenBalance} from './wallet-targets.js';
 
 export type {WalletAnalysis, WalletAnalysisOptions, WalletIdentity} from './wallet-types.js';
 export const RECENT_WALLET_WINDOW_SECONDS = 3_600;
 const HOLDERS = '/v1/market/token_top_holders';
 const STATS = '/v1/user/wallet_stats';
 const ACTIVITY = '/v1/user/wallet_activity';
+const TOKEN_BALANCE = '/v1/user/wallet_token_balance';
 type Obj = Record<string, unknown>;
 const object = (v: unknown): v is Obj => v !== null && typeof v === 'object' && !Array.isArray(v);
 const str = (v: unknown, max = 160): string | undefined => typeof v === 'string' && v.length > 0 && v.length <= max ? v : undefined;
@@ -98,7 +100,7 @@ function recognize(platform: string[], token: string[]): WalletRecord['recognize
   if (platform.some(v => v === 'exchange' || v === 'cex')) out.push('exchange_or_pool');
   return out;
 }
-function rowToWallet(row: Obj, signal: Signal, source: 'top_holders' | 'smart_holders', identities: Map<string, WalletIdentity>): WalletRecord | null {
+function rowToWallet(row: Obj, signal: Signal, source: WalletRecord['sources'][number], identities: Map<string, WalletIdentity>): WalletRecord | null {
   const chain = signal.token.chain, ca = address(row.address, chain);
   if (!ca || !tokenMatches(row, signal.token) || (object(row.token) && !tokenMatches(row.token, signal.token, true))) return null;
   const amount = decimal(row.balance) ?? decimal(row.amount_cur);
@@ -130,10 +132,12 @@ function addStats(wallet: WalletRecord, payload: unknown, identities: Map<string
   // Single-wallet endpoint is a bare object. A batch array cannot safely be attributed without its own address.
   const data = object(payload) ? payload : Array.isArray(payload) && payload.length === 1 && object(payload[0]) &&
     address(payload[0].wallet_address ?? payload[0].address, wallet.chain) === wallet.address ? payload[0] as Obj : null;
-  if (!data || !chainMatches(data.chain, wallet.chain) ||
+  const wrongScope = (Array.isArray(payload) && payload.length > 0 && !data) || (!!data && (!chainMatches(data.chain, wallet.chain) ||
     (data.wallet_address !== undefined && address(data.wallet_address, wallet.chain) !== wallet.address) ||
     (data.address !== undefined && address(data.address, wallet.chain) !== wallet.address) ||
-    (object(data.common) && data.common.wallet_address != null && data.common.wallet_address !== '' && address(data.common.wallet_address, wallet.chain) !== wallet.address) ||
+    (object(data.common) && data.common.wallet_address != null && data.common.wallet_address !== '' && address(data.common.wallet_address, wallet.chain) !== wallet.address)));
+  if (wrongScope) wallet.enrichment.reasons.push('GMGN_WALLET_SCOPE_MISMATCH');
+  if (!data || wrongScope ||
     !['realized_profit', 'total_cost', 'winrate', 'buy_count', 'sell_count', 'buy', 'sell', 'common'].some(k => data[k] !== undefined)) return false;
   const pnlStat = object(data.pnl_stat) ? data.pnl_stat : {};
   const stats: NonNullable<WalletRecord['enrichment']['stats']> = {period: '7d', scope: 'entire_wallet', realizedProfitUsd: decimal(data.realized_profit, true),
@@ -164,16 +168,28 @@ function addStats(wallet: WalletRecord, payload: unknown, identities: Map<string
 }
 
 function addActivity(wallet: WalletRecord, payload: unknown, signal: Signal, now: Date, windowSeconds: number): boolean {
-  if (!object(payload) || !tokenMatches(payload, signal.token) || !Array.isArray(payload.activities) || payload.activities.length > 100 ||
-    (payload.wallet_address !== undefined && address(payload.wallet_address, wallet.chain) !== wallet.address)) return false;
+  if (!object(payload)) return false;
+  if (!tokenMatches(payload, signal.token) ||
+    (payload.wallet_address !== undefined && address(payload.wallet_address, wallet.chain) !== wallet.address)) {
+    wallet.enrichment.reasons.push('GMGN_WALLET_SCOPE_MISMATCH'); return false;
+  }
+  if (!Array.isArray(payload.activities) || payload.activities.length > 100) return false;
   const events: WalletActivity[] = [], seen = new Set<string>();
   let invalid = false;
   for (const raw of payload.activities) {
     if (!object(raw) || !chainMatches(raw.chain, wallet.chain) || !object(raw.token) || !tokenMatches(raw.token, signal.token, true) ||
-      (raw.wallet !== undefined && address(raw.wallet, wallet.chain) !== wallet.address)) {invalid = true; continue;}
+      (raw.wallet !== undefined && address(raw.wallet, wallet.chain) !== wallet.address)) {
+      invalid = true; wallet.enrichment.reasons.push('GMGN_WALLET_SCOPE_MISMATCH'); continue;
+    }
     const type = raw.event_type ?? raw.type;
     const at = date(raw.timestamp), tx = str(raw.tx_hash, 128);
-    if (!at || !tx || !['buy', 'sell', 'transferIn', 'transferOut', 'add', 'remove'].includes(String(type)) || Date.parse(at) > now.getTime()) {invalid = true; continue;}
+    if (!at || !tx || !['buy', 'sell', 'transferIn', 'transferOut', 'add', 'remove', 'launch'].includes(String(type)) || Date.parse(at) > now.getTime()) {invalid = true; continue;}
+    // GMGN launch activity is a vendor-reported creator link, never buy flow.
+    // Retain the raw event and exclude this wallet's entire funding component.
+    if (type === 'launch') {
+      if (!wallet.developerLinks.includes('VENDOR_TOKEN_LAUNCH_ACTIVITY')) wallet.developerLinks.push('VENDOR_TOKEN_LAUNCH_ACTIVITY');
+      continue;
+    }
     const event: WalletActivity = {txHash: tx, type: type as WalletActivity['type'], timestamp: at, amount: decimal(raw.token_amount), usd: decimal(raw.cost_usd)};
     const key = JSON.stringify(event);
     if (!seen.has(key)) {events.push(event); seen.add(key);}
@@ -250,7 +266,7 @@ function makeClusters(wallets: WalletRecord[], chain: Chain, developer: string |
  * skills/gmgn-token/SKILL.md + skills/gmgn-portfolio/SKILL.md. All labels are claims. */
 export async function analyzeWallets(signal: Signal, tokenInfo: unknown, client: GmgnClient,
   options: WalletAnalysisOptions = {}): Promise<WalletAnalysis> {
-  const now = (options.now ?? (() => new Date()))();
+  const clock = options.now ?? (() => new Date()), startedAt = clock();
   const chain = signal.token.chain, apiChain = chain === 'solana' ? 'sol' : chain;
   const max = Number.isFinite(options.maxWallets) ? Math.max(1, Math.min(5, Math.floor(options.maxWallets!))) : 3;
   const windowSeconds = Number.isFinite(options.recentWindowSec) ? Math.max(60, Math.min(86_400, Math.floor(options.recentWindowSec!))) : RECENT_WALLET_WINDOW_SECONDS;
@@ -298,20 +314,57 @@ export async function analyzeWallets(signal: Signal, tokenInfo: unknown, client:
   }
   const info = validInfo ? tokenInfo as Obj : {}, dev = object(info.dev) ? info.dev : {};
   const developer = address(dev.creator_address, chain), developerFunder = address(dev.fund_from, chain);
-  const list = [...wallets.values()];
   // Prioritize smart participants, then suspicious/developer wallets, before ordinary large holders.
   const priority = (w: WalletRecord) => (w.holding.currentlyHolding === true ? 200 : 0) + (w.recognizedLabels.includes('smart') ? 100 : 0) +
     (w.address === developer || w.recognizedLabels.some(t => ['bundler', 'rat_trader', 'developer'].includes(t)) ? 50 : 0) + (w.holding.supplyRatio ?? 0);
-  const selected = [...list].filter(w => !w.recognizedLabels.includes('exchange_or_pool')).sort((a, b) => priority(b) - priority(a)).slice(0, max);
+  const plan=options.researchTargets,planAt=Date.parse(plan?.checkedAt??''),targetAddresses:string[]=[];
+  if(validInfo&&plan?.source==='local_observations'&&plan.token.chain===chain&&address(plan.token.address,chain)===address(signal.token.address,chain)&&
+    Number.isFinite(planAt)&&planAt<=startedAt.getTime()&&startedAt.getTime()-planAt<=120000&&Array.isArray(plan.targets)) {
+    for(const target of plan.targets.slice(0,6)){
+      const who=address(target.address,chain),eventAt=Date.parse(target.eventAt),observedAt=Date.parse(target.observedAt);
+      if(who&&!/^0x0+$/i.test(who)&&address(target.triggerWallet,chain)&&Number.isFinite(eventAt)&&Number.isFinite(observedAt)&&
+        eventAt<=observedAt&&observedAt<=planAt&&planAt-eventAt<=600000&&!targetAddresses.includes(who))targetAddresses.push(who);
+    }
+  }
+  const ranked=[...wallets.values()].filter(w=>!w.recognizedLabels.includes('exchange_or_pool')).sort((a,b)=>priority(b)-priority(a));
+  const selected:WalletRecord[]=[],balanceNeeded=new Set<string>(),selectedAddresses=new Set<string>();
+  let requestsRemaining=max*2,plannedWeight=0;
+  // Preserve the old per-analysis cap: max wallets, 2*max requests and 6*max weighted units.
+  // An off-list target costs balance + stats + activity, replacing existing slots rather than expanding the budget.
+  for(const who of [...targetAddresses,...ranked.map(w=>w.address)]){
+    if(selected.length>=max||selectedAddresses.has(who))continue;
+    let wallet=wallets.get(who);if(wallet?.recognizedLabels.includes('exchange_or_pool'))continue;
+    const balance=targetAddresses.includes(who)&&(!wallet||wallet.holding.currentlyHolding===null),cost=balance?3:2,weight=balance?8:6;
+    if(cost>requestsRemaining||plannedWeight+weight>max*6)continue;
+    if(!wallet){wallet=rowToWallet({address:who,token_address:signal.token.address,chain},signal,'targeted_balance',identities)!;wallets.set(who,wallet);}
+    selected.push(wallet);selectedAddresses.add(who);requestsRemaining-=cost;plannedWeight+=weight;if(balance)balanceNeeded.add(who);
+  }
+  const list = [...wallets.values()];
   for (const wallet of selected) {
+    if(balanceNeeded.has(wallet.address)){
+      const payload=await request(`balance:${wallet.address}`,TOKEN_BALANCE,{chain:apiChain,wallet_address:wallet.address,token_address:signal.token.address},2);
+      const balance=parseTargetTokenBalance(payload,signal.token,wallet.address);
+      wallet.holding.currentlyHolding=balance.currentlyHolding;
+      // The official token-balance reference does not define its amount units. Only zero/positive is portable.
+      wallet.holding.amount=balance.currentlyHolding===false?'0':null;
+      if(!wallet.sources.includes('targeted_balance'))wallet.sources.push('targeted_balance');
+      if(balance.status!=='confirmed'){
+        unavailable=true;reasons.add(balance.reason);wallet.enrichment.reasons.push(balance.reason);
+        if(balance.reason==='GMGN_TARGET_BALANCE_SCOPE_MISMATCH'){wallet.risks.push(balance.reason);reasons.add('GMGN_WALLET_SCOPE_MISMATCH');}
+      }
+    }
     const stats = await request(`stats:${wallet.address}`, STATS, {chain: apiChain, wallet_address: wallet.address, period: '7d'}, 3);
     const statsOk = addStats(wallet, stats, identities);
     if (!statsOk) wallet.enrichment.reasons.push('GMGN_WALLET_STATS_INVALID');
     const activity = await request(`activity:${wallet.address}`, ACTIVITY, {chain: apiChain, wallet_address: wallet.address, token_address: signal.token.address, limit: 20}, 3);
-    const activityOk = addActivity(wallet, activity, signal, now, windowSeconds);
+    // A trade can occur while preceding holder/stats requests are in flight.
+    // Validate against this response's receipt time, not research start time.
+    const activityOk = addActivity(wallet, activity, signal, clock(), windowSeconds);
     if (!activityOk) wallet.enrichment.reasons.push('GMGN_WALLET_ACTIVITY_INVALID');
     wallet.enrichment.status = statsOk && activityOk ? 'complete' : 'partial';
     if (!statsOk || !activityOk) {unavailable = true; reasons.add('GMGN_WALLET_ENRICHMENT_PARTIAL');}
+    if (wallet.enrichment.reasons.includes('GMGN_WALLET_SCOPE_MISMATCH')) reasons.add('GMGN_WALLET_SCOPE_MISMATCH');
+    if (wallet.enrichment.reasons.includes('GMGN_ACTIVITY_ROWS_INVALID_OR_WRONG_TOKEN')) reasons.add('GMGN_WALLET_ACTIVITY_DATA_INVALID');
   }
   const clusters = makeClusters(list, chain, developer, developerFunder, identities);
   const smart = list.filter(w => w.recognizedLabels.includes('smart') && w.holding.currentlyHolding === true);
@@ -329,8 +382,13 @@ export async function analyzeWallets(signal: Signal, tokenInfo: unknown, client:
   if (!recentComplete && eligible.length) reasons.add('RECENT_SMART_FLOW_COVERAGE_INCOMPLETE');
   reasons.add('WALLET_TAGS_ARE_VENDOR_CLAIMS'); reasons.add('WALLET_OWNERSHIP_UNVERIFIED'); reasons.add('CUMULATIVE_VOLUMES_ARE_NOT_RECENT_FLOW');
   const cumulative = list.filter(w => w.cumulative.buyVolumeUsd !== null && w.cumulative.sellVolumeUsd !== null);
-  return {status: unavailable ? 'unknown' : 'pass', checkedAt: now.toISOString(), reasons: [...reasons],
+  const completedAt = clock();
+  return {status: unavailable ? 'unknown' : 'pass', checkedAt: completedAt.toISOString(), reasons: [...reasons],
     facts: {provider: 'gmgn', source: 'openapi', token: signal.token, maxEnrichedWallets: max, holderLimitPerQuery: 20,
+      collectionStartedAt: startedAt.toISOString(),
+      ...(plan?{researchTargets:{source:'local_observations',requested:targetAddresses,selected:targetAddresses.filter(a=>selectedAddresses.has(a)),
+        deferred:targetAddresses.filter(a=>!selectedAddresses.has(a)),balanceQueries:[...balanceNeeded],truncated:plan.truncated,
+        requestBudget:max*2,plannedRequests:max*2-requestsRemaining,weightedBudget:max*6,plannedWeight}}:{}),
       sampleOnly: true, developerAddress: developer, developerFundingAddress: developerFunder, developerSource: 'vendor_claim',
       scopeBinding: 'chain_and_token_request_with_response_checks', realPersonIdentityVerified: false,
       rawResponses: raw, documentation: ['https://github.com/GMGNAI/gmgn-skills/blob/main/skills/gmgn-token/SKILL.md',

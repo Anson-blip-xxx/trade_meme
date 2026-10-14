@@ -57,7 +57,7 @@ export function decide(signal:Signal,receivedAt:string,config:Config,provenance:
   if(flow?.reasons.includes('WALLET_SETUP_SUPPORT_WITHDRAWN'))reasons.push('WALLET_SETUP_SUPPORT_WITHDRAWN');
   const fail=[provenance,safety].some(c=>c.status==='fail')||identityConflict;
   const decision=fail?'REJECT':reasons.length?'WATCH':'BUY_CANDIDATE';
-  return {id,policyVersion:walletScreening?'entry-gate-v7':'entry-gate-v6',mode,signal,receivedAt,evaluatedAt:now.toISOString(),
+  return {id,policyVersion:'entry-gate-v8',mode,signal,receivedAt,evaluatedAt:now.toISOString(),
     validUntil:new Date(Math.min(now.getTime()+config.decisionTtlSec*1000,Date.parse(signal.occurredAt)+config.maxSignalAgeSec*1000,
       flow?.reasons.includes('PROFILED_WALLET_SETUP_SUPPORTED')?Date.parse(walletScreening!.validUntil):Infinity)).toISOString(),
     decision,buyEligible:decision==='BUY_CANDIDATE'&&mode==='live',executionEnabled:false,

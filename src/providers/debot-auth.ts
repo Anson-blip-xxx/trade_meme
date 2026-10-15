@@ -9,6 +9,8 @@ type Cookie={name:string;value:string;domain:string;path:string;expires:number;h
 type Challenge={id:string;expires:number;attempts:number;cookies:Cookie[]};
 const object=(value:unknown):value is Record<string,unknown>=>value!==null&&typeof value==='object'&&!Array.isArray(value);
 const secret=(value:unknown):value is string=>typeof value==='string'&&value.length>0&&value.length<=8192&&!/[\u0000-\u0020\u007f]/.test(value);
+// DeBot's web client accepts a truthy inviteCode and also uses it as a numeric account ID.
+const inviteCode=(value:unknown):boolean=>secret(value)||typeof value==='number'&&Number.isSafeInteger(value)&&value>0;
 
 export class DebotAuthError extends Error {
   constructor(readonly reason:string,readonly statusCode:number) {super(reason);this.name='DebotAuthError';}
@@ -144,8 +146,10 @@ export class DebotAuthManager {
         notification_lang:'zh-CN',notification_timezone:-480},cookies,'signin');
       if(!cookieHeader(cookies,new URL('/api/user/info',ORIGIN),this.now().getTime()))throw error('COOKIE_MISSING',502);
       const info=await this.call('/api/user/info','GET',undefined,cookies,'info');
-      if(!object(info.data)||!secret(info.data.inviteCode)||!secret(info.data.sub_token)||
-        info.data.email!==undefined&&info.data.email!==this.email)throw error('VERIFY_FAILED',401);
+      if(!object(info.data))throw error('USER_INFO_INVALID',401);
+      if(!inviteCode(info.data.inviteCode))throw error('INVITE_CODE_INVALID',401);
+      if(!secret(info.data.sub_token))throw error('SUB_TOKEN_INVALID',401);
+      if(info.data.email!==undefined&&info.data.email!==this.email)throw error('ACCOUNT_MISMATCH',401);
       if(!cookieHeader(cookies,new URL('/api/user/info',ORIGIN),this.now().getTime()))throw error('COOKIE_MISSING',502);
       await this.save({version:1,createdAt:this.now().toISOString(),email:this.email,cookies: cookies.filter(cookie=>
         cookie.expires===-1||cookie.expires*1000>this.now().getTime()),subToken:info.data.sub_token});
@@ -201,7 +205,7 @@ export class DebotAuthManager {
       } finally {reader.releaseLock();}
       let value:unknown;try {value=JSON.parse(Buffer.concat(chunks,length).toString('utf8'));}catch {throw error('RESPONSE_INVALID',502);}
       if(!object(value)||typeof value.code!=='number')throw error('RESPONSE_INVALID',502);
-      if(value.code!==0)throw error(stage==='signin'?'CODE_REJECTED':stage==='send'?'SEND_REJECTED':stage==='info'?'VERIFY_FAILED':'METHOD_UNSUPPORTED',stage==='signin'||stage==='info'?401:502);
+      if(value.code!==0&&value.code!==200)throw error(stage==='signin'?'CODE_REJECTED':stage==='send'?'SEND_REJECTED':stage==='info'?'VERIFY_FAILED':'METHOD_UNSUPPORTED',stage==='signin'||stage==='info'?401:502);
       return value;
     } catch(cause) {
       if(cause instanceof DebotAuthError)throw cause;

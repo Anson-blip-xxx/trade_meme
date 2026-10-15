@@ -123,6 +123,25 @@ test('verification schema, network errors and excessive responses expose only fi
   }
 });
 
+test('numeric inviteCode and code 200 are valid only with a string subscription token',async()=>{
+  const cases:{code:number;inviteCode:unknown;sub_token:unknown;accepted:boolean}[]=[
+    {code:0,inviteCode:123456,sub_token:'verified-private-token',accepted:true},
+    {code:200,inviteCode:Number.MAX_SAFE_INTEGER,sub_token:'verified-private-token',accepted:true},
+    {code:200,inviteCode:'invite-private',sub_token:'verified-private-token',accepted:true},
+    ...[0,-1,1.5,Number.MAX_SAFE_INTEGER+1,NaN,Infinity,'','has space',true,{},[]].map(inviteCode=>
+      ({code:0,inviteCode,sub_token:'verified-private-token',accepted:false})),
+    ...[123456,'',null].map(sub_token=>({code:200,inviteCode:123456,sub_token,accepted:false})),
+    {code:101,inviteCode:123456,sub_token:'verified-private-token',accepted:false},
+  ];
+  for(const {code,inviteCode,sub_token,accepted} of cases) {
+    const f=fixture();try {
+      const client=new DebotSessionClient({path:f.path,now:()=>new Date(NOW),fetcher:async()=>Response.json({code,data:{inviteCode,sub_token}})});
+      if(accepted)assert.equal((await client.getSession()).subToken,'verified-private-token');
+      else await assert.rejects(client.getSession(),reason('AUTH_REQUIRED'));
+    }finally{f.cleanup();}
+  }
+});
+
 test('missing, public, oversized, malformed and symlinked session files are rejected before networking',async()=>{
   const f=fixture();let calls=0;
   const client=new DebotSessionClient({path:f.path,fetcher:async()=>{calls++;return info();},now:()=>new Date(NOW)});

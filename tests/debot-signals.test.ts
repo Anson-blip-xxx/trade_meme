@@ -41,6 +41,19 @@ test('真实响应格式保留告警时间、统计及别名，空钱包不成�
   assert.equal('wallets' in observation,false);assert.equal('transaction' in observation,false);
 });
 
+test('官方成功码 200 与 0 均可读取信号和钱包详情，未登录业务码仍拒绝',async()=>{
+  for(const code of [0,200]){
+    const payload={...sample(),code};
+    const page=await fetchDebotSignalPage('bsc',{now:()=>now,fetcher:async()=>Response.json(payload)});
+    assert.equal(page.observations.length,1);assert.equal(page.reason,undefined);
+    const details=await fetchDebotWalletDetails(page.observations[0],{now:()=>now,
+      fetcher:async()=>Response.json({code,data:[{wallet_stats:{wallet:other,alias:'test'}}]})});
+    assert.equal(details.vendorWallets.length,1);assert.equal(details.vendorWallets[0].address,other);
+  }
+  const invalid=normalizeDebotSignals({...sample(),code:101},'bsc',now);
+  assert.equal(invalid.observations.length,0);assert.ok(invalid.reason);
+});
+
 test('三个链和官方频道严格对应，Solana CA 大小写保留',()=>{
   for(const chain of ['bsc','solana','robinhood'] as const) {
     const result=normalizeDebotSignals(sample(chain),chain,now);

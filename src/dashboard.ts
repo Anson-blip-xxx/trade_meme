@@ -122,7 +122,9 @@ export function buildDashboard(config:Config,services:DashboardServices,assetDir
             challengeId:input.challengeId as string,emailCode:input.emailCode as string,totpCode:input.totpCode as string});
           send(res,200,status);
         }catch(error){
-          if(error instanceof DebotAuthError)send(res,error.statusCode,{error:error.reason});
+          // This user is already authenticated to the dashboard. A vendor login
+          // failure must not challenge the browser's HTTP Basic credentials.
+          if(error instanceof DebotAuthError)send(res,[401,403].includes(error.statusCode)?422:error.statusCode,{error:error.reason});
           else send(res,503,{error:'DEBOT_AUTH_UNAVAILABLE'});
         }
         return;

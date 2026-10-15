@@ -79,3 +79,29 @@ test('disabled DeBot login remains visible as unavailable and cannot send codes'
     assert.equal((await f.post('/code',{})).status,503);
   }finally {await f.close();}
 });
+
+test('vendor authentication errors never challenge or invalidate the dashboard login',async t=>{
+  for(const code of [401,403])await t.test(`vendor ${code}`,async()=>{
+    const f=await fixture({getStatus:()=>status,
+      sendCode:async()=>{throw new DebotAuthError('DEBOT_AUTH_LOGIN_REJECTED',code);},
+      login:async()=>{throw new DebotAuthError('DEBOT_AUTH_VERIFY_FAILED',code);}});
+    try{
+      // Exercise the dashboard cookie login as well as the production proxy path.
+      const login=await fetch(f.base+'/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({password})});
+      assert.equal(login.status,200);const cookie=login.headers.get('set-cookie')!.split(';')[0];
+      for(const headers of [f.headers,{'content-type':'application/json',cookie}]){
+        for(const path of ['code','login']){
+          const body=path==='code'?{}:{challengeId:'current',emailCode:'123456',totpCode:'654321'};
+          const response=await fetch(`${f.base}/debot/auth/${path}`,{method:'POST',headers,body:JSON.stringify(body)});
+          assert.equal(response.status,422);
+          assert.equal(response.headers.get('www-authenticate'),null);assert.equal(response.headers.get('set-cookie'),null);
+          assert.deepEqual(await response.json(),{error:path==='code'?'DEBOT_AUTH_LOGIN_REJECTED':'DEBOT_AUTH_VERIFY_FAILED'});
+          const session=await fetch(f.base+'/session',{headers});
+          assert.equal(session.status,200);assert.equal((await session.json()).authenticated,true);
+          assert.equal((await fetch(f.base+'/debot/auth',{headers})).status,200);
+        }
+      }
+      assert.equal((await fetch(f.base+'/session')).status,401);
+    }finally{await f.close();}
+  });
+});

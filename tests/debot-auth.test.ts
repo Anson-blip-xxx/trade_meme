@@ -85,6 +85,47 @@ test('status never infers authentication by reading an existing session file',()
   }finally{f.cleanup();}
 });
 
+test('official success codes and numeric inviteCode survive login and subsequent session verification',async t=>{
+  for(const [code,inviteCode] of [[0,123456],[200,Number.MAX_SAFE_INTEGER],[200,'PRIVATE-INVITE']] as const) {
+    await t.test(`code ${code}, inviteCode type ${typeof inviteCode}`,async()=>{
+      const f=fixture();const userInfo=()=>json({code,data:{inviteCode,sub_token:'PRIVATE-SUB-TOKEN',email}});
+      const manager=new DebotAuthManager({...f.options,fetcher:async(input,init)=>{
+        if(new URL(String(input)).pathname==='/api/user/info')return userInfo();
+        const response=await f.request(input,init),payload=await response.json() as Record<string,unknown>;
+        return new Response(JSON.stringify({...payload,code}),{headers:response.headers});
+      }});
+      try {
+        const challenge=await manager.sendCode();
+        const status=await manager.login({challengeId:challenge.challengeId!,emailCode:'123456',totpCode:'654321'});
+        assert.equal(status.state,'authenticated');assert.equal(status.lastError,undefined);
+        const client=new DebotSessionClient({path:f.path,fetcher:async()=>userInfo(),now:()=>new Date(NOW)});
+        assert.equal((await client.getSession()).subToken,'PRIVATE-SUB-TOKEN');
+        assert.ok(!JSON.stringify(status).includes('PRIVATE'));
+      }finally{f.cleanup();}
+    });
+  }
+});
+
+test('numeric inviteCode compatibility does not accept invalid IDs, token types or anonymous user info',async()=>{
+  const cases:[Record<string,unknown>,string][]=[
+    ...[0,-1,1.5,Number.MAX_SAFE_INTEGER+1,NaN,Infinity,'','has space',true,{},[]].map(inviteCode=>[
+      {code:0,data:{inviteCode,sub_token:'PRIVATE'}},'INVITE_CODE_INVALID'] as [Record<string,unknown>,string]),
+    ...[123456,'',null].map(sub_token=>[{code:0,data:{inviteCode:123456,sub_token}},'SUB_TOKEN_INVALID'] as [Record<string,unknown>,string]),
+    [{code:0,data:null},'USER_INFO_INVALID'],
+    [{code:101,data:{inviteCode:123456,sub_token:'PRIVATE'}},'VERIFY_FAILED'],
+  ];
+  for(const [value,expected] of cases) {
+    const f=fixture();const manager=new DebotAuthManager({...f.options,fetcher:async(input,init)=>
+      new URL(String(input)).pathname==='/api/user/info'?json(value):f.request(input,init)});
+    try {
+      const challenge=await manager.sendCode();
+      await assert.rejects(manager.login({challengeId:challenge.challengeId!,emailCode:'123456',totpCode:'654321'}),matches(expected));
+      assert.equal(existsSync(f.path),false);assert.equal(manager.getStatus().lastError,`DEBOT_AUTH_${expected}`);
+      assert.ok(!JSON.stringify(manager.getStatus()).includes('PRIVATE'));
+    }finally{f.cleanup();}
+  }
+});
+
 test('cooldown starts before requests, failed sends publish no challenge, and the concurrent request lock prevents duplicate email sends',async()=>{
   const first=deferred<Response>();let requests=0;
   const f=fixture({fetcher:async()=>{requests++;return first.promise;}});
@@ -200,8 +241,8 @@ test('foreign, injected, invalid prefix or ambiguous cookie fields cannot create
 
 test('user-info verification and surviving authentication cookies are required before saving',async t=>{
   for(const [value,cookies,expected] of [
-    [{code:0,data:{inviteCode:'ok'}},[],'VERIFY_FAILED'],
-    [{code:0,data:{inviteCode:'ok',sub_token:'PRIVATE',email:'someone@example.test'}},[],'VERIFY_FAILED'],
+    [{code:0,data:{inviteCode:'ok'}},[],'SUB_TOKEN_INVALID'],
+    [{code:0,data:{inviteCode:'ok',sub_token:'PRIVATE',email:'someone@example.test'}},[],'ACCOUNT_MISMATCH'],
     [{code:0,data:{inviteCode:'ok',sub_token:'PRIVATE'}},['auth=; Path=/; Domain=.debot.ai; Max-Age=0'],'COOKIE_MISSING'],
   ] as const)await t.test(expected,async()=>{
     const f=fixture();const manager=new DebotAuthManager({...f.options,fetcher:async(input,init)=>

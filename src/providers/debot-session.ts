@@ -12,6 +12,7 @@ type SessionFile={version:1;createdAt:string;email:string;cookies:Cookie[];subTo
 type Verified={fingerprint:string;until:number;subToken:string};
 const object=(v:unknown):v is Record<string,unknown>=>v!==null&&typeof v==='object'&&!Array.isArray(v);
 const secretString=(v:unknown):v is string=>typeof v==='string'&&v.length>0&&v.length<=8192&&!/[\u0000-\u0020\u007f]/.test(v);
+const inviteCode=(v:unknown):boolean=>secretString(v)||typeof v==='number'&&Number.isSafeInteger(v)&&v>0;
 
 export class DebotSessionError extends Error {
   constructor(readonly reason:string,readonly cooldownUntil?:number) {super(reason);this.name='DebotSessionError';}
@@ -177,9 +178,9 @@ export class DebotSessionClient {
     }
     this.verified=undefined;
     const {value}=await this.read(url,cookieHeader);
-    if(!object(value)||value.code!==0||!object(value.data))throw failure('RESPONSE_INVALID');
+    if(!object(value)||(value.code!==0&&value.code!==200)||!object(value.data))throw failure('RESPONSE_INVALID');
     // The web client treats a successful /user/info response without inviteCode as anonymous.
-    if(!secretString(value.data.inviteCode)||!secretString(value.data.sub_token)) {
+    if(!inviteCode(value.data.inviteCode)||!secretString(value.data.sub_token)) {
       const error=failure('AUTH_REQUIRED');this.notifyAuthRequired(error);throw error;
     }
     if((await this.load()).fingerprint!==file.fingerprint)throw failure('FILE_CHANGED');

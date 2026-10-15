@@ -262,7 +262,11 @@
     DEBOT_AUTH_CODE_REJECTED: '验证码未通过，请检查邮箱验证码与当前 Authenticator 动态码。',
     DEBOT_AUTH_LOGIN_REJECTED: 'DeBot 拒绝了本次登录，请重新发送验证码后重试。',
     DEBOT_AUTH_SEND_REJECTED: 'DeBot 未接受本次验证码发送请求，请稍后重试。',
-    DEBOT_AUTH_VERIFY_FAILED: '登录后的账户核验未通过，请重新登录。',
+    DEBOT_AUTH_VERIFY_FAILED: 'DeBot 未确认登录后的账户状态，请在此处重新发送验证码验证。',
+    DEBOT_AUTH_USER_INFO_INVALID: 'DeBot 账户信息响应异常，请稍后在此处重试。',
+    DEBOT_AUTH_INVITE_CODE_INVALID: 'DeBot 账户登录标识无效，请在此处重新验证。',
+    DEBOT_AUTH_SUB_TOKEN_INVALID: 'DeBot 未返回有效的信号订阅凭据，暂时无法连接实时推送。',
+    DEBOT_AUTH_ACCOUNT_MISMATCH: 'DeBot 返回的账户与服务器配置邮箱不一致，请检查账户配置。',
     DEBOT_AUTH_COOKIE_MISSING: 'DeBot 未返回有效登录状态，请重新登录。',
     DEBOT_AUTH_COOKIE_INVALID: 'DeBot 返回的登录状态无法安全保存，请稍后重试。',
     DEBOT_AUTH_REDIRECT_REJECTED: 'DeBot 登录接口返回了异常跳转，请稍后重试。',
@@ -523,7 +527,7 @@
       let result; try { result = await response.json(); } catch { result = null; }
       if (!response.ok) {
         const error = new RequestError(response.status);
-        error.reason = typeof result?.error === 'string' && /^DEBOT_AUTH_[A-Z_]+$/.test(result.error) ? result.error : '';
+        error.reason = typeof result?.error === 'string' && (/^DEBOT_AUTH_[A-Z_]+$/.test(result.error) || ['ORIGIN_REJECTED', 'UNAUTHORIZED'].includes(result.error)) ? result.error : '';
         throw error;
       }
       if (!result || !['authenticated', 'required', 'unavailable'].includes(result.state)) throw new Error('DEBOT_AUTH_RESPONSE_INVALID');
@@ -531,7 +535,9 @@
     } finally { clearTimeout(timeout); }
   }
   function debotAuthError(error) {
-    return debotAuthErrors[error.reason] || (error.status === 429 ? '请求过于频繁，请稍后重试。' : error.status === 400 || error.status === 422 ? '验证未通过，请检查两个 6 位码；若邮箱验证码已过期，请重新发送。' : error.status === 401 || error.status === 403 ? '登录验证未通过，请刷新工作台后重试。' : '操作未确认，请检查登录状态后重试。');
+    if (error.reason === 'ORIGIN_REJECTED') return '当前页面地址未通过验证，请从控制台的正式地址打开 DeBot 登录入口。';
+    if (error.reason === 'UNAUTHORIZED') return '9528 访问会话已失效，请重新打开控制台。';
+    return debotAuthErrors[error.reason] || (error.status === 429 ? '请求过于频繁，请稍后重试。' : error.status === 400 || error.status === 422 ? 'DeBot 验证未通过，请检查两个 6 位码；若邮箱验证码已过期，请重新发送。' : 'DeBot 操作未确认，请查看此处的登录状态后重试。');
   }
   $('debot-send-code').addEventListener('click', async () => {
     if (debotAuth.busy || $('debot-send-code').disabled) return;

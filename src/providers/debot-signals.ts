@@ -77,7 +77,7 @@ export function normalizeDebotSignals(payload:unknown,chain:Chain,observedAt:Dat
   if(!Object.hasOwn(CHANNELS,chain)||!Number.isFinite(observedAt.getTime())) {
     result.reason='DEBOT_SIGNAL_INPUT_INVALID';return result;
   }
-  if(!object(payload)||payload.code!==0||!object(payload.data)||!Array.isArray(payload.data.results)) {
+  if(!object(payload)||![0,200].includes(payload.code as number)||!object(payload.data)||!Array.isArray(payload.data.results)) {
     result.reason='DEBOT_SIGNAL_RESPONSE_INVALID';return result;
   }
   const data=payload.data,rows=data.results as unknown[];
@@ -251,7 +251,7 @@ export async function fetchDebotWalletDetails(observation:DebotSignalObservation
     const payload=await readBoundedJson(response),observedAt=now();
     if(!Number.isFinite(observedAt.getTime()))throw new DebotSignalError('DEBOT_SIGNAL_INPUT_INVALID');
     const result:DebotWalletDetails={fetchedAt:observedAt.toISOString(),received:0,rejected:0,vendorWallets:[]};
-    if(!object(payload)||payload.code!==0||!Array.isArray(payload.data)) {
+    if(!object(payload)||![0,200].includes(payload.code as number)||!Array.isArray(payload.data)) {
       result.reason='DEBOT_SIGNAL_RESPONSE_INVALID';return result;
     }
     result.received=payload.data.length;

@@ -227,7 +227,7 @@ export async function fetchDebotSignalPage(chain:Chain,
 
 /** Only a credential-aware caller may fetch account-visible details; no anonymous fallback exists. */
 export async function fetchDebotWalletDetails(observation:DebotSignalObservation,
-  options:{fetcher:Fetcher;now?:()=>Date}):Promise<DebotWalletDetails> {
+  options:{fetcher:Fetcher;now?:()=>Date;signal?:AbortSignal}):Promise<DebotWalletDetails> {
   if(!options||typeof options.fetcher!=='function')throw new DebotSignalError('DEBOT_SIGNAL_AUTH_REQUIRED');
   const target=observation?.signal?.token,chain=target?.chain;
   if(!chain||!Object.hasOwn(CHANNELS,chain)||!address(target.address,chain)||observation.signal.source!=='debot'||
@@ -241,7 +241,7 @@ export async function fetchDebotWalletDetails(observation:DebotSignalObservation
   try {
     // The supplied session client is responsible for attaching its validated login state.
     const response=await options.fetcher(url,{method:'GET',credentials:'omit',redirect:'error',
-      headers:{accept:'application/json'},signal:AbortSignal.timeout(10_000)});
+      headers:{accept:'application/json'},signal:options.signal?AbortSignal.any([options.signal,AbortSignal.timeout(10_000)]):AbortSignal.timeout(10_000)});
     if(!response.ok) {
       const until=response.status===429?cooldown(response,now().getTime()):undefined;
       await response.body?.cancel().catch(()=>{});

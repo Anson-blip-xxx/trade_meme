@@ -17,6 +17,7 @@ export interface DashboardServices {
   protection?:()=>unknown;
   chainStream?:()=>unknown;
   debotAuth?:Pick<DebotAuthManager,'getStatus'|'sendCode'|'login'>;
+  debotSignals?:()=>unknown;
   protectionDetail?:(id:string)=>unknown;
   walletHistory?:Pick<WalletHistory,'listWallets'|'getWallet'>;
   walletResearchStatus?:()=>unknown;
@@ -132,6 +133,7 @@ export function buildDashboard(config:Config,services:DashboardServices,assetDir
       if(req.method!=='GET') {send(res,405,{error:'READ_ONLY'});return;}
       if(url.pathname==='/dashboard/api/session') {send(res,200,{authenticated:true,readOnly:true,authentication:proxyAuthenticated(req)?'proxy':'session'});return;}
       if(url.pathname==='/dashboard/api/overview') {send(res,200,services.overview());return;}
+      if(url.pathname==='/dashboard/api/debot/signals') {send(res,200,services.debotSignals?.()??{now:new Date().toISOString(),items:[]});return;}
       if(url.pathname==='/dashboard/api/orders') {send(res,200,services.orders());return;}
       if(url.pathname==='/dashboard/api/chain-stream') {send(res,200,services.chainStream?.()??{enabled:false,running:false,chains:[],recentEvents:[]});return;}
       if(url.pathname==='/dashboard/api/protection') {

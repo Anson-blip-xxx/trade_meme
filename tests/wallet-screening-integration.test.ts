@@ -32,7 +32,7 @@ function report(s=screening(),flow?:Check,safety=pass(),provenance=pass()) {
 
 test('profiled entry routes provide alternative flow while safety, origin, identity and age remain mandatory',()=>{
   for(const route of ['precursor','public_entry'] as const){const s=screening();s.setups[0].route=route;
-    const r=report(s);assert.equal(r.decision,'BUY_CANDIDATE');assert.equal(r.policyVersion,'entry-gate-v8');
+    const r=report(s);assert.equal(r.decision,'BUY_CANDIDATE');assert.equal(r.policyVersion,'entry-gate-v9');
     assert.equal(r.flow?.facts.ownershipProven,false);assert.equal(r.validUntil,s.validUntil);
     assert.equal(effectiveReport(r,new Date(Date.parse(s.validUntil))).buyEligible,false);
     assert.equal(report(s,undefined,unknown('NO_SAFETY')).decision,'WATCH');

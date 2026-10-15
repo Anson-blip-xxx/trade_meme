@@ -118,7 +118,9 @@ test('real-shaped GMGN research → candidate → durable paper order; replay ne
   const providers: Providers = {
     research: researchProvider(config, client, []),
     provenance: async (_signal, research) => {
-      assert.equal(research?.wallets.summary.qualifiedSmartFundingClusterCount, 2);
+      assert.equal((research?.snapshot.info as {address:string}|undefined)?.address, token);
+      // Source checks receive the early token snapshot, without waiting for wallet enrichment.
+      assert.equal(Object.hasOwn(research??{},'wallets'),false);
       return {...pass(), platform: 'four', facts: {creationTransactionVerified: true}};
     },
     safety: async () => ({...pass(), facts: {permissionsChecked: true}}),

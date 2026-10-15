@@ -23,6 +23,24 @@ function fixture(data:unknown=session()) {
   return {path,cleanup:()=>rmSync(directory,{recursive:true,force:true})};
 }
 
+test('the detail request cancellation also bounds its preceding session verification',async()=>{
+  const f=fixture(),controller=new AbortController();const calls:string[]=[];
+  let started!:()=>void;const verifying=new Promise<void>(resolve=>{started=resolve;});
+  const client=new DebotSessionClient({path:f.path,now:()=>new Date(NOW),fetcher:async(input,init)=>{
+    calls.push(new URL(String(input)).pathname);started();
+    return new Promise<Response>((_resolve,reject)=>{
+      const cancel=()=>reject(new DOMException('private-abort-detail','AbortError'));
+      if(init?.signal?.aborted)cancel();else init?.signal?.addEventListener('abort',cancel,{once:true});
+    });
+  }});
+  try {
+    const request=client.fetcher(endpoint,{signal:controller.signal});
+    await verifying;controller.abort();
+    await assert.rejects(request,reason('REQUEST_TIMEOUT'));
+    assert.deepEqual(calls,['/api/user/info']);
+  }finally{controller.abort();f.cleanup();}
+});
+
 test('session verifies real user info, sends only fixed read headers, and returns verified subscription token',async()=>{
   const f=fixture();let now=NOW;const calls:string[]=[];
   const request:Fetcher=async(input,init)=>{

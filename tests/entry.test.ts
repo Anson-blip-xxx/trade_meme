@@ -5,6 +5,7 @@ import {readConfig, type Config} from '../src/config.js';
 import {EntryController, type LiveProtectionProvider} from '../src/entry.js';
 import {OrderStore} from '../src/orders.js';
 import {GmgnClient} from '../src/providers/gmgn-client.js';
+import {combineSafety} from '../src/research.js';
 import type {Report,Check} from '../src/types.js';
 import {signal, token, pass, narrative} from './helpers.js';
 
@@ -272,6 +273,84 @@ test('off/demo/noncandidate/unknown checks/stale reports never quote or reserve'
     assert.equal((await ctx.controller.consider(report)).status, 'skipped');
   }
   assert.equal(ctx.readCalls.length, 0); assert.equal(ctx.signedCalls.length, 0); assert.equal(ctx.store.list().length, 0);
+});
+
+test('required market-risk evidence must pass before any quote or order reservation',async t=>{
+  for(const status of [undefined,'unknown','fail'] as const){
+    const ctx=setup(t,{config:{marketRiskRequired:true}}),report=candidate();
+    if(status)report.marketRisk={...pass(),status,reasons:['MARKET_DATA_INCOMPLETE']};
+    const result=await ctx.controller.consider(report);
+    assert.equal(result.reason,'ENTRY_MARKET_RISK_NOT_PASSED');
+    assert.equal(ctx.readCalls.length,0);assert.equal(ctx.signedCalls.length,0);assert.equal(ctx.store.list().length,0);
+  }
+  const valid=setup(t,{config:{marketRiskRequired:true}}),report=candidate();report.marketRisk=pass();
+  assert.equal((await valid.controller.consider(report)).order?.status,'paper_open');
+  assert.equal(valid.readCalls.length,1);assert.equal(valid.signedCalls.length,0);
+});
+
+test('market evidence expires independently of a fresh candidate timestamp',async t=>{
+  for(const checkedAt of [new Date(baseTime-120000).toISOString(),new Date(baseTime-120001).toISOString(),'invalid']){
+    const ctx=setup(t,{config:{marketRiskRequired:true,maxSignalAgeSec:600}}),report=candidate();
+    report.marketRisk={...pass(),checkedAt};
+    const result=await ctx.controller.consider(report);assert.equal(result.reason,'ENTRY_CANDIDATE_EXPIRED');
+    assert.equal(ctx.readCalls.length,0);assert.equal(ctx.signedCalls.length,0);assert.equal(ctx.store.list().length,0);
+  }
+});
+
+test('combined safety cannot hide future, malformed or expired underlying evidence behind a fresh aggregate time',async t=>{
+  for(const component of ['primary','supplement'] as const){
+    for(const checkedAt of [new Date(baseTime+30001).toISOString(),'invalid',new Date(baseTime-120000).toISOString()]){
+      const ctx=setup(t,{config:{maxSignalAgeSec:600}}),report=candidate(),primary=pass(),supplement=pass();
+      (component==='primary'?primary:supplement).checkedAt=checkedAt;
+      report.safety=combineSafety(primary,supplement);
+      // Earlier producers stamped the aggregate at assembly time. Nested source
+      // evidence must independently expire even for those internally saved reports.
+      report.safety.checkedAt=new Date(baseTime).toISOString();
+      const result=await ctx.controller.consider(report);
+      assert.equal(result.reason,'ENTRY_CANDIDATE_EXPIRED',`${component}: ${checkedAt}`);
+      assert.equal(ctx.readCalls.length,0);assert.equal(ctx.signedCalls.length,0);assert.equal(ctx.store.list().length,0);
+    }
+  }
+  const ctx=setup(t),report=candidate();
+  report.safety=combineSafety(pass(),{...pass(),status:'unknown',reasons:['GMGN_SECURITY_FIELDS_UNVERIFIED']});
+  assert.equal((await ctx.controller.consider(report)).order?.status,'paper_open');
+});
+
+test('DeBot source cannot inherit a longer global signal age and expires at the exact 120-second boundary',async t=>{
+  for(const ageMs of [120000,120001,300000]){
+    const ctx=setup(t,{config:{maxSignalAgeSec:600}}),report=candidate();
+    report.signal={...report.signal,source:'debot',occurredAt:new Date(baseTime-ageMs).toISOString()};
+    const result=await ctx.controller.consider(report);assert.equal(result.reason,'ENTRY_CANDIDATE_EXPIRED');
+    assert.equal(ctx.readCalls.length,0);assert.equal(ctx.signedCalls.length,0);assert.equal(ctx.store.list().length,0);
+  }
+  const young=setup(t,{config:{maxSignalAgeSec:600}}),report=candidate();
+  report.signal={...report.signal,source:'debot',occurredAt:new Date(baseTime-119999).toISOString()};
+  assert.equal((await young.controller.consider(report)).order?.status,'paper_open');
+});
+
+test('market evidence aging during quote blocks submission while the broader candidate is still current',async t=>{
+  const ctx=setup(t,{mode:'live',config:{marketRiskRequired:true,maxSignalAgeSec:600},
+    quote:()=>{ctx.clock.time+=2000;return quote();}}),report=candidate();
+  report.marketRisk={...pass(),checkedAt:new Date(baseTime-119000).toISOString()};
+  const result=await ctx.controller.consider(report);
+  assert.equal(result.reason,'ENTRY_CANDIDATE_EXPIRED');assert.equal(result.order?.status,'failed');
+  assert.equal(ctx.readCalls.length,1);assert.equal(ctx.signedCalls.length,0);
+});
+
+test('market evidence and DeBot age are checked again after the shared signed-request queue',async t=>{
+  for(const staleField of ['market','signal'] as const){
+    const ctx=setup(t,{mode:'live',config:{marketRiskRequired:true,maxSignalAgeSec:600}}),report=candidate();
+    report.marketRisk=pass();
+    if(staleField==='market')report.marketRisk.checkedAt=new Date(baseTime-119000).toISOString();
+    else report.signal={...report.signal,source:'debot',occurredAt:new Date(baseTime-119000).toISOString()};
+    const schedule=ctx.client.scheduleRequest.bind(ctx.client);let calls=0;
+    ctx.client.scheduleRequest=async<T>(weight:number,execute:()=>Promise<T>)=>{
+      calls++;if(calls===2)ctx.clock.time+=2000;return schedule(weight,execute);
+    };
+    const result=await ctx.controller.consider(report);
+    assert.equal(result.reason,'ENTRY_CANDIDATE_EXPIRED');assert.equal(result.order?.status,'failed');
+    assert.equal(ctx.readCalls.length,1);assert.equal(ctx.signedCalls.length,0);
+  }
 });
 
 test('missing or malformed operator amounts, wallet and input token block without guessing', async t => {

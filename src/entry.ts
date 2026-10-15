@@ -9,6 +9,7 @@ import {assessExitStrategy} from './exit-tracking.js';
 import {readPositionBalance} from './position-balance.js';
 import {readNativeBalance,nativeBalanceCoversOrder,NATIVE_INPUT_TOKENS} from './native-balance.js';
 import {compactWalletScreening} from './wallet-screening-summary.js';
+import {requiredSafetyEvidence} from './research.js';
 
 export interface EntryResult {
   status: 'skipped' | 'created' | 'existing' | 'blocked';
@@ -74,6 +75,10 @@ function eligibility(report: Report, config: Config, now: Date): string | undefi
       !Number.isFinite(Date.parse(screening.validUntil))||Date.parse(screening.validUntil)<=now.getTime())return 'ENTRY_CANDIDATE_EXPIRED';
   }
   const checks: Check[] = [report.provenance, report.safety];
+  if(config.marketRiskRequired){
+    if(!report.marketRisk||report.marketRisk.status!=='pass')return 'ENTRY_MARKET_RISK_NOT_PASSED';
+    checks.push(report.marketRisk);
+  }
   if(narrativeIdentityConflict(report.signal,report.narrative)) return 'ENTRY_NARRATIVE_TOKEN_IDENTITY_CONFLICT';
   if (config.walletSupportRequired) {
     if (!report.flow || report.flow.status !== 'pass') return 'ENTRY_FLOW_NOT_PASSED';
@@ -86,9 +91,9 @@ function eligibility(report: Report, config: Config, now: Date): string | undefi
   const occurred = Date.parse(report.signal.occurredAt), current = now.getTime();
   if (![evaluated, validUntil, occurred, current].every(Number.isFinite) || validUntil <= current ||
       evaluated > current + 30_000 || current - evaluated > config.decisionTtlSec * 1_000 ||
-      occurred > current + 30_000 || current - occurred > config.maxSignalAgeSec * 1_000 ||
-      checks.some(check => !Number.isFinite(Date.parse(check.checkedAt)) || Date.parse(check.checkedAt) > current + 30_000 ||
-        current - Date.parse(check.checkedAt) > config.maxSignalAgeSec * 1_000)) return 'ENTRY_CANDIDATE_EXPIRED';
+      occurred > current + 30_000 || current - occurred >= Math.min(config.maxSignalAgeSec,report.signal.source==='debot'?120:Infinity) * 1_000 ||
+      checks.flatMap(requiredSafetyEvidence).some(check => !Number.isFinite(Date.parse(check.checkedAt)) || Date.parse(check.checkedAt) > current + 30_000 ||
+        current - Date.parse(check.checkedAt) >= Math.min(120,config.maxSignalAgeSec) * 1_000)) return 'ENTRY_CANDIDATE_EXPIRED';
   return undefined;
 }
 
@@ -112,7 +117,7 @@ function entryDetails(report: Report): Record<string, unknown> {
     signal: {source: report.signal.source, eventId: report.signal.sourceEventId, occurredAt: report.signal.occurredAt},
     evaluatedAt: report.evaluatedAt, validUntil: report.validUntil,
     walletScreening:compactWalletScreening(report.walletScreening,report.signal.token,report.evaluatedAt),
-    checks: {provenance: briefCheck(report.provenance), safety: briefCheck(report.safety),
+    checks: {provenance: briefCheck(report.provenance), safety: briefCheck(report.safety),market:briefCheck(report.marketRisk),
       narrative: briefCheck(report.narrative), flow: briefCheck(report.flow)},
     evidenceLinks: links,
     ...(summary ? {walletSummary: {

@@ -54,15 +54,15 @@ export class DebotSessionClient {
     this.request=options.fetcher??fetch;this.now=options.now??(()=>new Date());
     this.fetcher=async(input,init)=>{
       const url=this.allowed(input,init);
-      await this.getSession();
+      const signal=init?.signal??(input instanceof Request?input.signal:undefined);
+      await this.getSession(signal??undefined);
       const file=await this.load();
       // A replaced session must be verified before any request uses its cookies.
-      if(this.verified?.fingerprint!==file.fingerprint)await this.getSession();
+      if(this.verified?.fingerprint!==file.fingerprint)await this.getSession(signal??undefined);
       const current=await this.load();
       if(this.verified?.fingerprint!==current.fingerprint)throw failure('FILE_CHANGED');
       const cookieHeader=cookiesFor(current.data.cookies,url,this.now().getTime());
       if(!cookieHeader){const error=failure('AUTH_REQUIRED');this.notifyAuthRequired(error);throw error;}
-      const signal=init?.signal??(input instanceof Request?input.signal:undefined);
       const result=await this.read(url,cookieHeader,signal??undefined);
       if(!object(result.value)||typeof result.value.code!=='number')throw failure('RESPONSE_INVALID');
       return new Response(result.text,{status:result.status,headers:{'content-type':'application/json'}});
@@ -168,7 +168,7 @@ export class DebotSessionClient {
     }
   }
 
-  async getSession():Promise<{subToken:string;cookieHeader:string}> {
+  async getSession(signal?:AbortSignal):Promise<{subToken:string;cookieHeader:string}> {
     const file=await this.load(),now=this.now().getTime();
     const url=new URL(INFO,ORIGIN),cookieHeader=cookiesFor(file.data.cookies,url,now);
     if(!cookieHeader){const error=failure('AUTH_REQUIRED');this.notifyAuthRequired(error);throw error;}
@@ -177,7 +177,7 @@ export class DebotSessionClient {
       return {subToken:this.verified.subToken,cookieHeader:socketCookies};
     }
     this.verified=undefined;
-    const {value}=await this.read(url,cookieHeader);
+    const {value}=await this.read(url,cookieHeader,signal);
     if(!object(value)||(value.code!==0&&value.code!==200)||!object(value.data))throw failure('RESPONSE_INVALID');
     // The web client treats a successful /user/info response without inviteCode as anonymous.
     if(!inviteCode(value.data.inviteCode)||!secretString(value.data.sub_token)) {

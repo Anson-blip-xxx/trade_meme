@@ -10,7 +10,7 @@ import {ScanArchive} from '../src/scan-archive.js';
 import {Store} from '../src/store.js';
 import {OrderStore} from '../src/orders.js';
 import {evaluate} from '../src/engine.js';
-import {config,signal,providers} from './helpers.js';
+import {config,signal,providers,now} from './helpers.js';
 
 const password='test-dashboard-password-independent-12345678';
 async function fixture() {
@@ -79,7 +79,9 @@ test('dashboard credentials must not reuse the trading API or ingest credentials
     }
   } finally {await f.close();}
 });
-test('store change observer receives actual processing and completed reports, not duplicates',async()=>{
+test('store change observer receives actual processing and completed reports, not duplicates',async t=>{
+  // Provider fixtures and the observer clock must describe the same fresh evaluation.
+  t.mock.timers.enable({apis:['Date'],now:now.getTime()});
   const archive=new ScanArchive(':memory:'),store=new Store(':memory:',item=>archive.capture(item));
   try {
     const current=signal({occurredAt:new Date().toISOString()});

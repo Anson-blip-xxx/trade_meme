@@ -2,7 +2,8 @@ import {DatabaseSync} from 'node:sqlite';
 import {mkdirSync,chmodSync} from 'node:fs';
 import {dirname} from 'node:path';
 import bs58 from 'bs58';
-import type {Chain,Signal} from './types.js';
+import {createHash} from 'node:crypto';
+import type {Chain,Signal,Report,Status} from './types.js';
 import {fetchDebotSignalPage,DebotSignalError,type DebotSignalObservation,type DebotWalletDetails} from './providers/debot-signals.js';
 
 type Page=Awaited<ReturnType<typeof fetchDebotSignalPage>>;
@@ -13,10 +14,15 @@ interface Cycle {
 export interface DebotScannerOptions {
   database:string;chains:Chain[];intervalSec?:number;maxAgeSec:number;
   mode?:'anonymous_poll'|'authenticated_stream';
-  onSignal:(signal:Signal,observedAt:string)=>Promise<unknown>;shouldDefer?:()=>string|undefined;
+  onSignal:(signal:Signal,observedAt:string,context?:{detailsReady:Promise<void>})=>Promise<unknown>;shouldDefer?:()=>string|undefined;
+  maxConcurrent?:number;parallelDetails?:boolean;
   fetchPage?:(chain:Chain)=>Promise<Page>;now?:()=>Date;
   fetchDetails?:(observation:DebotSignalObservation)=>Promise<DebotWalletDetails>;
 }
+export interface DebotRiskProgress {
+  stage:'safety'|'provenance'|'wallets'|'market'|'narrative';checkedAt:string;elapsedMs:number;status:Status;reasons:string[];
+}
+const reasonCodes=(value:unknown)=>Array.isArray(value)?value.filter((v):v is string=>typeof v==='string'&&/^[A-Z][A-Z0-9_]{0,99}$/.test(v)).slice(0,24):[];
 const object=(value:unknown):value is Record<string,unknown>=>value!==null&&typeof value==='object'&&!Array.isArray(value);
 function walletAddress(value:unknown,chain:Chain):string|undefined {
   if(typeof value!=='string')return;
@@ -42,6 +48,7 @@ export class DebotScanner {
   private dispatchTimer?:ReturnType<typeof setTimeout>;
   private collecting?:Promise<void>;
   private dispatching?:Promise<void>;
+  private readonly workers=new Set<Promise<void>>();
   private lastCycle?:Cycle;
   private lastError?:string;
   private deferredReason?:string;
@@ -54,7 +61,8 @@ export class DebotScanner {
     this.chains=[...new Set(options.chains)];
     if(!this.chains.length||this.chains.some(c=>!['bsc','solana','robinhood'].includes(c))||
       !Number.isInteger(this.intervalSec)||this.intervalSec<15||this.intervalSec>3600||
-      !Number.isInteger(options.maxAgeSec)||options.maxAgeSec<10||options.maxAgeSec>86400)
+      !Number.isInteger(options.maxAgeSec)||options.maxAgeSec<10||options.maxAgeSec>86400||
+      options.maxConcurrent!==undefined&&![1,2].includes(options.maxConcurrent))
       throw new Error('DEBOT_SCANNER_CONFIG_INVALID');
     if(options.database!==':memory:')mkdirSync(dirname(options.database),{recursive:true,mode:0o700});
     this.db=new DatabaseSync(options.database);
@@ -71,11 +79,65 @@ export class DebotScanner {
     const columns=new Set(this.db.prepare('PRAGMA table_info(debot_signals)').all().map(row=>String(row.name)));
     if(!columns.has('details'))this.db.exec('ALTER TABLE debot_signals ADD COLUMN details TEXT');
     if(!columns.has('details_error'))this.db.exec('ALTER TABLE debot_signals ADD COLUMN details_error TEXT');
+    for(const column of ['report_id','progress','verdict','dedup_key'])if(!columns.has(column))this.db.exec(`ALTER TABLE debot_signals ADD COLUMN ${column} TEXT`);
+    this.db.exec('CREATE INDEX IF NOT EXISTS debot_signals_dedup ON debot_signals(dedup_key)');
     if(options.database!==':memory:')chmodSync(options.database,0o600);
     // A claimed event is never silently replayed after a crash. Its incomplete
     // analysis remains visible instead of creating another signal/order attempt.
     const prior=this.db.prepare('SELECT max(dispatched_at) AS at FROM debot_signals').get() as {at:string|null};
     if(prior.at)this.nextDispatchAt=Date.parse(prior.at)+this.dispatchIntervalMs();
+  }
+
+  bindReport(eventId:string,reportId:string):void {
+    if(this.closed||!/^[0-9a-f-]{36}$/.test(reportId))return;
+    this.db.prepare("UPDATE debot_signals SET report_id=? WHERE id=? AND state='dispatching'").run(reportId,eventId);
+  }
+  recordProgress(eventId:string,progress:DebotRiskProgress):void {
+    if(this.closed||!['safety','provenance','market','wallets','narrative'].includes(progress.stage)||
+      !['pass','fail','unknown'].includes(progress.status)||!Number.isFinite(Date.parse(progress.checkedAt))||
+      !Number.isFinite(progress.elapsedMs)||progress.elapsedMs<0||progress.elapsedMs>600_000)return;
+    const row=this.db.prepare("SELECT progress FROM debot_signals WHERE id=? AND state='dispatching'").get(eventId) as {progress:string|null}|undefined;
+    if(!row)return;
+    const checks=row.progress?JSON.parse(row.progress):{};
+    const previous=checks[progress.stage];
+    checks[progress.stage]={status:progress.status,reasons:reasonCodes(progress.reasons),checkedAt:progress.checkedAt,
+      firstResultMs:previous?.firstResultMs??Math.round(progress.elapsedMs),elapsedMs:Math.round(progress.elapsedMs)};
+    this.db.prepare("UPDATE debot_signals SET progress=? WHERE id=? AND state='dispatching'").run(JSON.stringify(checks),eventId);
+  }
+  recordReport(eventId:string,report:Report):void {
+    if(this.closed)return;
+    const row=this.db.prepare("SELECT chain,address,dispatched_at,progress FROM debot_signals WHERE id=? AND state='dispatching'").get(eventId) as {chain:Chain;address:string;dispatched_at:string;progress:string|null}|undefined;
+    if(!row||report.signal.sourceEventId!==eventId||report.signal.token.chain!==row.chain||report.signal.token.address!==row.address)return;
+    const checks={safety:report.safety,provenance:report.provenance,market:report.marketRisk,wallets:report.flow,narrative:report.narrative};
+    const previous=row.progress?JSON.parse(row.progress):{};
+    for(const [stage,check] of Object.entries(checks))if(check){
+      const prior=previous[stage];
+      // Final publication must not replace an unchanged early result's actual latency with the full evaluation duration.
+      if(prior?.status===check.status&&prior.checkedAt===check.checkedAt&&JSON.stringify(prior.reasons)===JSON.stringify(reasonCodes(check.reasons)))continue;
+      this.recordProgress(eventId,{stage:stage as DebotRiskProgress['stage'],status:check.status,reasons:check.reasons,
+        checkedAt:check.checkedAt,elapsedMs:Math.max(0,Date.parse(report.evaluatedAt)-Date.parse(row.dispatched_at))});
+    }
+    this.db.prepare("UPDATE debot_signals SET verdict=? WHERE id=? AND state='dispatching'").run(JSON.stringify({decision:report.decision,
+      buyEligible:report.buyEligible,validUntil:report.validUntil,reasons:reasonCodes(report.reasons)}),eventId);
+  }
+  recent(limit=12) {
+    if(!Number.isInteger(limit)||limit<1||limit>50)throw new Error('DEBOT_SIGNAL_LIMIT_INVALID');
+    const now=this.now();
+    const rows=this.db.prepare(`SELECT id,report_id,chain,address,occurred_at,observed_at,state,reason,dispatched_at,completed_at,progress,verdict
+      FROM debot_signals WHERE reason IS NULL OR reason NOT IN ('DEBOT_SIGNAL_STALE','DEBOT_DUPLICATE_TOKEN_ALERT')
+      ORDER BY observed_at DESC LIMIT ?`).all(limit);
+    return {now:now.toISOString(),items:rows.map(row=>{
+      const receivedAt=String(row.observed_at),startedAt=row.dispatched_at?String(row.dispatched_at):undefined;
+      const endedAt=row.completed_at?String(row.completed_at):row.state==='dispatching'?now.toISOString():undefined;
+      const verdict=row.verdict?JSON.parse(String(row.verdict)):{};
+      return {eventId:String(row.id),reportId:row.report_id??undefined,chain:row.chain,address:row.address,
+        occurredAt:row.occurred_at,receivedAt,state:row.state,startedAt,completedAt:row.completed_at??undefined,
+        signalDelayMs:Date.parse(receivedAt)-Date.parse(String(row.occurred_at)),
+        queueMs:startedAt?Math.max(0,Date.parse(startedAt)-Date.parse(receivedAt)):undefined,
+        analysisMs:startedAt&&endedAt?Math.max(0,Date.parse(endedAt)-Date.parse(startedAt)):undefined,
+        ...verdict,buyEligible:row.state==='completed'&&verdict.buyEligible===true&&Date.parse(verdict.validUntil)>now.getTime(),
+        reasons:[...reasonCodes(verdict.reasons),...reasonCodes(row.reason?[row.reason]:[])],checks:row.progress?JSON.parse(String(row.progress)):{}};
+    })};
   }
   private dispatchIntervalMs():number {return this.options.mode==='authenticated_stream'?0:60_000;}
   private maxAgeSec():number {return this.options.mode==='authenticated_stream'?Math.min(120,this.options.maxAgeSec):this.options.maxAgeSec;}
@@ -147,23 +209,27 @@ export class DebotScanner {
   }
 
   dispatchOnce():Promise<void> {
-    if(this.dispatching)return this.dispatching;
+    const concurrency=this.options.mode==='authenticated_stream'?(this.options.maxConcurrent??1):1;
+    if(this.workers.size>=concurrency&&this.dispatching)return this.dispatching;
     if(this.stopped||this.closed)return Promise.resolve();
     const generation=this.generation;
-    const work=Promise.resolve().then(async()=>{
+    for(let slot=this.workers.size;slot<concurrency;slot++){
+      const worker=Promise.resolve().then(async()=>{
       // Drain arrivals behind an active analysis without a one-second delay per event.
       // A bounded turn yields to timers and shutdown even for synchronous callbacks.
       const limit=this.options.mode==='authenticated_stream'?20:1;
       for(let i=0;i<limit&&!this.interrupted(generation);i++)if(!await this.dispatch(generation))break;
-    }).catch(()=>{this.lastError='DEBOT_SIGNAL_DISPATCH_FAILED';})
-      .finally(()=>{if(this.dispatching===work)this.dispatching=undefined;});
+      }).catch(()=>{this.lastError='DEBOT_SIGNAL_DISPATCH_FAILED';}).finally(()=>this.workers.delete(worker));
+      this.workers.add(worker);
+    }
+    const work=Promise.all([...this.workers]).then(()=>{}).finally(()=>{if(this.dispatching===work)this.dispatching=undefined;});
     this.dispatching=work;return work;
   }
 
   async stop():Promise<void> {
     this.running=false;this.stopped=true;this.generation++;
     clearTimeout(this.timer);clearTimeout(this.dispatchTimer);
-    await Promise.all([this.collecting,this.dispatching]);
+    await Promise.all([this.collecting,...this.workers]);
   }
 
   async close():Promise<void> {
@@ -243,9 +309,12 @@ export class DebotScanner {
       this.db.prepare('DELETE FROM debot_signals WHERE id=?').run(oldest.id);
     }
     const stale=Date.parse(signal.occurredAt)<this.now().getTime()-this.maxAgeSec()*1000;
-    this.db.prepare('INSERT INTO debot_signals(id,chain,address,occurred_at,observed_at,state,payload,reason) VALUES(?,?,?,?,?,?,?,?)')
+    const dedupKey=createHash('sha256').update(JSON.stringify([signal.token,signal.occurredAt,observation.walletCount,observation.addressCount,
+      [...observation.aliases].sort(),observation.averageWalletVolumeUsd,observation.vendorWallets])).digest('hex');
+    const duplicate=this.options.mode==='authenticated_stream'&&!!this.db.prepare('SELECT 1 FROM debot_signals WHERE dedup_key=?').get(dedupKey);
+    this.db.prepare('INSERT INTO debot_signals(id,chain,address,occurred_at,observed_at,state,payload,reason,dedup_key) VALUES(?,?,?,?,?,?,?,?,?)')
       .run(signal.sourceEventId,signal.token.chain,signal.token.address,signal.occurredAt,observation.observedAt,
-        stale?'ignored':'pending',JSON.stringify(observation),stale?'DEBOT_SIGNAL_STALE':null);
+        stale||duplicate?'ignored':'pending',JSON.stringify(observation),stale?'DEBOT_SIGNAL_STALE':duplicate?'DEBOT_DUPLICATE_TOKEN_ALERT':null,dedupKey);
     return 1;
   }
 
@@ -260,7 +329,9 @@ export class DebotScanner {
     if(this.nextDispatchAt>this.now().getTime())return false;
     this.deferredReason=this.options.shouldDefer?.();
     if(this.deferredReason)return false;
-    const row=this.db.prepare("SELECT id,payload FROM debot_signals WHERE state='pending' ORDER BY occurred_at DESC,id LIMIT 1")
+    const row=this.db.prepare(`SELECT id,payload FROM debot_signals p WHERE state='pending'
+      AND NOT EXISTS (SELECT 1 FROM debot_signals a WHERE a.state='dispatching' AND a.chain=p.chain AND a.address=p.address)
+      ORDER BY occurred_at DESC,id LIMIT 1`)
       .get() as {id:string;payload:string}|undefined;
     if(!row)return false;
     const observation=JSON.parse(row.payload) as DebotSignalObservation;
@@ -269,27 +340,32 @@ export class DebotScanner {
       .run(at,row.id);
     if(!changed.changes)return false;
     this.nextDispatchAt=this.now().getTime()+this.dispatchIntervalMs();
-    try {
-      if(this.options.fetchDetails) {
+    const detailsReady=(async()=>{
+      if(this.options.fetchDetails){
         try {
           const details=await this.options.fetchDetails(observation);
           this.db.prepare('UPDATE debot_signals SET details=?,details_error=? WHERE id=?')
             .run(JSON.stringify(details),details.reason??null,row.id);
         }catch {this.db.prepare("UPDATE debot_signals SET details_error='DEBOT_DETAILS_UNAVAILABLE' WHERE id=?").run(row.id);}
       }
+    })();
+    try {
+      if(!this.options.parallelDetails)await detailsReady;
       if(this.interrupted(generation)) {
-        this.db.prepare("UPDATE debot_signals SET state='interrupted',reason='DEBOT_SIGNAL_INTERRUPTED' WHERE id=?").run(row.id);return false;
+        this.db.prepare("UPDATE debot_signals SET state='interrupted',reason='DEBOT_SIGNAL_INTERRUPTED',completed_at=? WHERE id=?")
+          .run(this.now().toISOString(),row.id);return false;
       }
       if(Date.parse(observation.signal.occurredAt)<this.now().getTime()-this.maxAgeSec()*1000) {
         this.db.prepare("UPDATE debot_signals SET state='ignored',reason='DEBOT_SIGNAL_STALE' WHERE id=?").run(row.id);return true;
       }
-      await this.options.onSignal(observation.signal,observation.observedAt);
+      await this.options.onSignal(observation.signal,observation.observedAt,{detailsReady});
       this.db.prepare("UPDATE debot_signals SET state='completed',completed_at=? WHERE id=?")
         .run(this.now().toISOString(),row.id);
     } catch {
-      this.db.prepare("UPDATE debot_signals SET state='failed',reason='DEBOT_SIGNAL_DISPATCH_FAILED' WHERE id=?").run(row.id);
+      this.db.prepare("UPDATE debot_signals SET state='failed',reason='DEBOT_SIGNAL_DISPATCH_FAILED',completed_at=? WHERE id=?")
+        .run(this.now().toISOString(),row.id);
       this.lastError='DEBOT_SIGNAL_DISPATCH_FAILED';
-    }
+    }finally{await detailsReady;}
     return true;
   }
 }

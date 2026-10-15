@@ -118,7 +118,7 @@ test('missing, unknown, stale or adverse AI narrative is advisory and does not v
   ]) {
     const result=decide(signal(),now.toISOString(),config(),pass(),pass(),report,now);
     assert.equal(result.decision,'BUY_CANDIDATE'); assert.equal(result.buyEligible,true);
-    assert.equal(result.policyVersion,'entry-gate-v8');
+    assert.equal(result.policyVersion,'entry-gate-v9');
     assert.ok(report.reasons.every(reason=>result.advisoryReasons?.includes(reason)&&!result.reasons.includes(reason)));
   }
 });

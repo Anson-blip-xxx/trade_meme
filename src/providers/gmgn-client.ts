@@ -1,4 +1,5 @@
 import {createHash, randomUUID} from 'node:crypto';
+import {abortable} from '../http.js';
 
 const HOST = 'https://openapi.gmgn.ai';
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
@@ -20,7 +21,7 @@ const READ_ROUTES = new Map<string, number>([
 export type GmgnErrorReason = 'GMGN_API_KEY_MISSING' | 'GMGN_PATH_NOT_ALLOWED' | 'GMGN_QUERY_INVALID'
   | 'GMGN_RATE_LIMITED' | 'GMGN_QUEUE_TIMEOUT' | 'GMGN_REQUEST_TIMEOUT' | 'GMGN_REQUEST_FAILED'
   | 'GMGN_RESPONSE_TOO_LARGE' | 'GMGN_RESPONSE_INVALID' | 'GMGN_INVALID_JSON'
-  | 'GMGN_AUTH_FAILED' | 'GMGN_HTTP_ERROR' | 'GMGN_API_ERROR';
+  | 'GMGN_REQUEST_ABORTED' | 'GMGN_AUTH_FAILED' | 'GMGN_HTTP_ERROR' | 'GMGN_API_ERROR';
 
 /** Deliberately contains no upstream message, URL, query, key, or response body. */
 export class GmgnError extends Error {
@@ -43,7 +44,6 @@ interface RateState { nextAt: number; cooldownUntil: number; }
 // weighted pacing and cooldown, even when constructed by different providers.
 let requestTail: Promise<void> = Promise.resolve();
 const rateStates = new Map<string, RateState>();
-const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 const object = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value);
 
@@ -52,6 +52,7 @@ export interface GmgnClientOptions {
   minIntervalMs?: number;
   fetcher?: typeof fetch;
   now?: () => number;
+  signal?: AbortSignal;
 }
 
 export class GmgnClient {
@@ -60,12 +61,14 @@ export class GmgnClient {
   private readonly fetcher: typeof fetch;
   private readonly now: () => number;
   private readonly state: RateState;
+  private readonly signal?: AbortSignal;
 
   constructor(options: GmgnClientOptions = {}) {
     this.apiKey = options.apiKey?.trim() || undefined;
     this.interval = Number.isFinite(options.minIntervalMs) && options.minIntervalMs! >= 0
       ? Math.min(options.minIntervalMs!, MAX_QUEUE_WAIT_MS) : 1_200;
     this.fetcher = options.fetcher ?? fetch;
+    this.signal = options.signal;
     this.now = options.now ?? Date.now;
     const key = createHash('sha256').update(this.apiKey ?? '').digest('hex');
     let state = rateStates.get(key);
@@ -73,10 +76,18 @@ export class GmgnClient {
     this.state = state;
   }
 
+  /** An evaluation scope shares the original credential budget and never resets cooldown. */
+  withSignal(signal:AbortSignal):GmgnClient {
+    return new GmgnClient({apiKey:this.apiKey,minIntervalMs:this.interval,fetcher:this.fetcher,now:this.now,
+      signal:this.signal?AbortSignal.any([this.signal,signal]):signal});
+  }
+  private checkAborted():void {if(this.signal?.aborted)throw new GmgnError('GMGN_REQUEST_ABORTED');}
+
   /** Epoch milliseconds; allows pollers to skip work until the shared reset. */
   get cooldownUntil(): number { return this.state.cooldownUntil; }
 
   async get(path: string, query: Record<string, string | number>, weight?: number): Promise<unknown> {
+    this.checkAborted();
     if (!this.apiKey) throw new GmgnError('GMGN_API_KEY_MISSING');
     const routeWeight = READ_ROUTES.get(path);
     if (routeWeight === undefined) throw new GmgnError('GMGN_PATH_NOT_ALLOWED');
@@ -95,6 +106,7 @@ export class GmgnClient {
 
   /** Shared budget only: this does not expose a network write method or credentials. */
   async scheduleRequest<T>(weight: number, execute: () => Promise<T>): Promise<T> {
+    this.checkAborted();
     if (!this.apiKey) throw new GmgnError('GMGN_API_KEY_MISSING');
     if (!Number.isFinite(weight) || weight < 1 || weight > 100) throw new GmgnError('GMGN_QUERY_INVALID');
     const cost = Math.ceil(weight);
@@ -104,6 +116,7 @@ export class GmgnClient {
       timer = setTimeout(() => { expired = true; reject(new GmgnError('GMGN_QUEUE_TIMEOUT')); }, MAX_QUEUE_WAIT_MS);
     });
     const operation = requestTail.then(async () => {
+      this.checkAborted();
       if (expired) throw new GmgnError('GMGN_QUEUE_TIMEOUT');
       const now = this.now();
       if (this.state.cooldownUntil > now) {
@@ -111,14 +124,20 @@ export class GmgnClient {
       }
       const wait = Math.max(0, this.state.nextAt - now);
       if (wait >= MAX_QUEUE_WAIT_MS) throw new GmgnError('GMGN_QUEUE_TIMEOUT', this.state.nextAt, now);
-      if (wait) await sleep(wait);
+      if (wait) {
+        let waitTimer:ReturnType<typeof setTimeout>|undefined;
+        try {await abortable(new Promise<void>(resolve=>{waitTimer=setTimeout(resolve,wait);}),this.signal);}
+        finally {clearTimeout(waitTimer);}
+      }
+      this.checkAborted();
       if (expired) throw new GmgnError('GMGN_QUEUE_TIMEOUT');
       clearTimeout(timer);
       this.state.nextAt = this.now() + this.interval * cost;
       return execute();
     });
     requestTail = operation.then(() => undefined, () => undefined);
-    try { return await Promise.race([operation, timeout]); }
+    try { return await abortable(Promise.race([operation, timeout]),this.signal); }
+    catch(error){this.checkAborted();throw error;}
     finally { clearTimeout(timer!); }
   }
 
@@ -130,7 +149,9 @@ export class GmgnClient {
     for (const [key, value] of Object.entries(query)) url.searchParams.set(key, String(value));
     url.searchParams.set('timestamp', String(Math.floor(this.now() / 1_000)));
     url.searchParams.set('client_id', randomUUID());
+    this.checkAborted();
     const controller = new AbortController();
+    const signal=this.signal?AbortSignal.any([controller.signal,this.signal]):controller.signal;
     let timer: ReturnType<typeof setTimeout>;
     const timeout = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
@@ -140,7 +161,7 @@ export class GmgnClient {
     });
     const run = async (): Promise<unknown> => {
       const response = await this.fetcher(url, {
-        method: 'GET', redirect: 'error', credentials: 'omit', signal: controller.signal,
+        method: 'GET', redirect: 'error', credentials: 'omit', signal,
         headers: {'X-APIKEY': this.apiKey!, accept: 'application/json'},
       });
       // Install a cooldown even if the 429 body is missing, malformed or oversized.
@@ -191,8 +212,9 @@ export class GmgnClient {
       if (!Object.hasOwn(payload, 'data')) throw new GmgnError('GMGN_RESPONSE_INVALID');
       return payload.data;
     };
-    try { return await Promise.race([run(), timeout]); }
+    try { return await abortable(Promise.race([run(), timeout]),signal); }
     catch (error) {
+      this.checkAborted();
       if (error instanceof GmgnError) throw error;
       if (controller.signal.aborted || (error instanceof Error && ['AbortError', 'TimeoutError'].includes(error.name)))
         throw new GmgnError('GMGN_REQUEST_TIMEOUT');

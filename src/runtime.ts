@@ -106,7 +106,7 @@ export function createRuntime(config:Config) {
   const entry=new EntryController(config,orders,client,walletScreening?{walletEvidence:(report,now)=>walletScreening.revalidate(report,now)}:{});
   const reconciler=new OrderReconciler(orders,entry);
   let closed=false,active=0,archiveMaintenanceError:string|undefined;
-  const onSignal=async(signal:Signal,firstReceivedAt?:string)=>{
+  const onSignal=async(signal:Signal,firstReceivedAt?:string,context?:{detailsReady:Promise<void>}):Promise<void>=>{
     if(closed||active>=4) throw new Error('RESEARCH_BUSY');
     store.prune(config.researchCacheTtlSec,config.researchCacheMax);
     const reserved=store.reserve(signal,undefined,'notification_copy',firstReceivedAt);
@@ -114,8 +114,12 @@ export function createRuntime(config:Config) {
     if(!reserved.created) return;
     const item=reserved.entry;active++;
     try {
-      const report=await evaluate(signal,config,providers,{id:item.id,receivedAt:item.receivedAt});
+      if(signal.source==='debot')debotScanner?.bindReport(signal.sourceEventId,item.id);
+      const report=await evaluate(signal,config,providers,{id:item.id,receivedAt:item.receivedAt,
+        walletTargetsReady:context?.detailsReady,
+        ...(signal.source==='debot'?{onProgress:progress=>debotScanner?.recordProgress(signal.sourceEventId,progress)}:{})});
       if(!store.finish(item.id,report,item.claimId!)) throw new Error('PROCESSING_CLAIM_EXPIRED');
+      if(signal.source==='debot')debotScanner?.recordReport(signal.sourceEventId,report);
       if(!closed) await entry.consider(report);
     } catch(error) {store.interrupt(item.id,item.claimId!);throw error;}
     finally {active--;}
@@ -126,13 +130,14 @@ export function createRuntime(config:Config) {
   let debotAuth:DebotAuthManager|undefined;
   const debotSession=config.debotScannerEnabled&&config.debotTransport==='authenticated_stream'?new DebotSessionClient({
     path:config.debotSessionPath,onAuthRequired:()=>{debotAuth?.setAuthenticated(false);debotStream?.invalidateSession();}}):undefined;
-  const debotScanner=config.debotScannerEnabled?new DebotScanner({database:config.debotSignalsDatabase,mode:config.debotTransport,
+  const debotScanner:DebotScanner|undefined=config.debotScannerEnabled?new DebotScanner({database:config.debotSignalsDatabase,mode:config.debotTransport,
     chains:config.scannerChains,intervalSec:config.debotScannerIntervalSec,
+    maxConcurrent:debotSession?2:1,parallelDetails:!!debotSession,
     maxAgeSec:debotSession?Math.min(120,config.maxSignalAgeSec):config.maxSignalAgeSec,onSignal,
     ...(debotSession?{fetchPage:(chain:Signal['token']['chain'])=>fetchDebotSignalPage(chain,{fetcher:debotSession.fetcher}),
-      fetchDetails:(observation:Parameters<typeof fetchDebotWalletDetails>[0])=>fetchDebotWalletDetails(observation,{fetcher:debotSession.fetcher})}:{}),
-    shouldDefer:()=>closed?'SERVICE_STOPPING':!config.gmgnApiKey?.trim()?'GMGN_API_KEY_MISSING':
-      client.cooldownUntil>Date.now()?'GMGN_RATE_LIMITED':active>=(debotSession?2:4)?'RESEARCH_BUSY':
+      fetchDetails:(observation:Parameters<typeof fetchDebotWalletDetails>[0])=>fetchDebotWalletDetails(observation,{fetcher:debotSession.fetcher,signal:AbortSignal.timeout(4000)})}:{}),
+    shouldDefer:()=>closed?'SERVICE_STOPPING':!debotSession&&!config.gmgnApiKey?.trim()?'GMGN_API_KEY_MISSING':
+      !debotSession&&client.cooldownUntil>Date.now()?'GMGN_RATE_LIMITED':active>=4?'RESEARCH_BUSY':
         !debotSession&&scanner.getStatus().inFlight?'SCANNER_BUSY':undefined}):undefined;
   const debotStream=debotSession&&debotScanner?new DebotStream({chains:config.scannerChains,
     getSession:async()=>{

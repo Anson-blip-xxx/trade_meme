@@ -111,6 +111,7 @@ export interface SocialReport {
   score:number;scope:'research_priority';signals:SocialSignal[];endorsementVerified:false;
 }
 export interface Report {
+  marketRisk?:Check;
   id: string; policyVersion: string; mode: 'live' | 'demo';
   signal: Signal; receivedAt: string; evaluatedAt: string; validUntil: string;
   decision: 'BUY_CANDIDATE' | 'WATCH' | 'REJECT'; buyEligible: boolean;

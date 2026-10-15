@@ -49,7 +49,7 @@ export interface ScanRecord extends ScanToken {
   id:string;source:'debot'|'gmgn'|'manual';status:Stored['status'];mode?:Report['mode'];policyVersion?:string;
   receivedAt:string;occurredAt:string;evaluatedAt?:string;decision?:Report['decision'];buyEligible?:boolean;validUntil?:string;
   name?:string;symbol?:string;reasons:string[];advisoryReasons?:string[];
-  checks:{provenance:ScanCheck;safety:ScanCheck;narrative:ScanCheck;wallets:ScanCheck;flow:ScanCheck};
+  checks:{provenance:ScanCheck;safety:ScanCheck;narrative:ScanCheck;wallets:ScanCheck;flow:ScanCheck;market?:ScanCheck};
   narrative?:{thesis?:string;stage?:Narrative['stage'];assessment?:Narrative['assessment'];supplier?:'gmgn'|'debot';sourceUrl?:string;
     text?:string;textTruncated?:boolean;updatedAt?:string;retained?:boolean};
   social?:Report['social'];
@@ -287,7 +287,7 @@ export class ScanArchive {
         result={...result,mode:report.mode,policyVersion:text(report.policyVersion,80),evaluatedAt:evaluated,decision:report.decision,buyEligible:report.buyEligible===true,
           validUntil:timestamp(report.validUntil),reasons:reasonCodes(report.reasons,24),advisoryReasons:reasonCodes(report.advisoryReasons,24),
           checks:{provenance:compactCheck(report.provenance),safety:compactCheck(report.safety),narrative:compactCheck(report.narrative),
-            wallets:compactCheck(report.wallets),flow:compactCheck(report.flow)}};
+            wallets:compactCheck(report.wallets),flow:compactCheck(report.flow),...(report.marketRisk?{market:compactCheck(report.marketRisk)}:{})}};
         const narrative=report.narrative;
         if(narrative) {
           const supplier=narrative.supplier?.provider;

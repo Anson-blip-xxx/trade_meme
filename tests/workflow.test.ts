@@ -5,9 +5,10 @@ import {Store} from '../src/store.js';
 import {buildServer} from '../src/server.js';
 import {liveProviders,evaluate} from '../src/engine.js';
 import {renderReport} from '../src/report.js';
-import {signal,config,providers,evidence,token} from './helpers.js';
+import {signal,config,providers,evidence,token,now} from './helpers.js';
 
-test('通知→供应商原文→证据诊断→持久化→查询/重试完整流程无需模型API',async()=>{
+test('通知→供应商原文→证据诊断→持久化→查询/重试完整流程无需模型API',async t=>{
+  t.mock.timers.enable({apis:['Date'],now:now.getTime()});
   const c=config();c.openaiKey='must-not-appear-in-status';
   const p=providers();let lookups=0;
   p.evidence=async()=>{lookups++;return {evidence:evidence(),diagnostics:[{operation:'search',status:'empty',reason:'NO_VALID_EVIDENCE',returned:0}]};};
@@ -45,8 +46,10 @@ test('通知→供应商原文→证据诊断→持久化→查询/重试完整�
   } finally {server.close();await once(server,'close');store.close();}
 });
 
-test('历史候选查询保留当时结论，但当前买入标志失效且不修改存档',async()=>{
-  const c=config(),past=new Date(Date.now()-120000),s=signal({occurredAt:past.toISOString()});
+test('历史候选查询保留当时结论，但当前买入标志失效且不修改存档',async t=>{
+  // The proof is fresh at evaluation; only the later report read is expired.
+  t.mock.timers.enable({apis:['Date'],now:now.getTime()+120000});
+  const c=config(),past=now,s=signal({occurredAt:past.toISOString()});
   const r=await evaluate(s,c,providers(),{now:()=>past});
   assert.equal(r.decision,'BUY_CANDIDATE');
   const output=renderReport(r);

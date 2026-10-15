@@ -5,9 +5,15 @@ import {GmgnClient} from './providers/gmgn-client.js';
 import {collectGmgnToken,assessGmgnSafety,type GmgnTokenSnapshot} from './providers/gmgn-safety.js';
 import {analyzeWallets,parseWalletIdentities} from './research/wallets.js';
 import type {WalletAnalysis,WalletIdentity,WalletRecord,VendorWalletTargets} from './research/wallet-types.js';
+import {abortable} from './http.js';
 import type {WalletResearchTargets} from './research/wallet-targets.js';
 export type {VendorWalletTargets} from './research/wallet-types.js';
 
+export interface ResearchContext {
+  signal?:AbortSignal;
+  onSnapshot?:(snapshot:GmgnTokenSnapshot)=>void;
+  walletTargetsReady?:Promise<unknown>;
+}
 export interface GmgnResearch {snapshot:GmgnTokenSnapshot;safety:Check;wallets:WalletAnalysis;flow:Check;}
 export function loadIdentities(path?:string):WalletIdentity[] {
   if(!path) return [];
@@ -68,12 +74,20 @@ export function assessWalletSupport(wallets:WalletAnalysis,minGroups:number,now=
 export function researchProvider(config:Config,client:GmgnClient,identities=loadIdentities(config.walletIdentitiesPath),
   options:{walletTargets?:(signal:Signal)=>WalletResearchTargets;
     vendorWalletTargets?:(signal:Signal)=>VendorWalletTargets|undefined}={}) {
-  return async(signal:Signal):Promise<GmgnResearch>=>{
-    const snapshot=await collectGmgnToken(signal,client);
+  return async(signal:Signal,context:ResearchContext={}):Promise<GmgnResearch>=>{
+    context.signal?.throwIfAborted();
+    const scoped=context.signal?client.withSignal(context.signal):client;
+    const snapshot=await collectGmgnToken(signal,scoped);
+    context.signal?.throwIfAborted();
+    context.onSnapshot?.(snapshot);
+    if(context.walletTargetsReady)await abortable(context.walletTargetsReady,context.signal).catch(()=>{
+      context.signal?.throwIfAborted();
+    });
+    context.signal?.throwIfAborted();
     let researchTargets:WalletResearchTargets|undefined,vendorWalletTargets:VendorWalletTargets|undefined,targetError=false,vendorTargetError=false;
     try{researchTargets=options.walletTargets?.(signal);}catch{targetError=true;}
     try{vendorWalletTargets=options.vendorWalletTargets?.(signal);}catch{vendorTargetError=true;}
-    const wallets=await analyzeWallets(signal,snapshot.info,client,{maxWallets:config.walletMaxProfiles,identities,researchTargets,vendorWalletTargets});
+    const wallets=await analyzeWallets(signal,snapshot.info,scoped,{maxWallets:config.walletMaxProfiles,identities,researchTargets,vendorWalletTargets});
     if(targetError)wallets.facts.targetSelectionError='LOCAL_WALLET_TARGETS_UNAVAILABLE';
     if(vendorTargetError)wallets.facts.vendorTargetSelectionError='VENDOR_WALLET_TARGETS_UNAVAILABLE';
     return {snapshot,safety:assessGmgnSafety(snapshot,config.maxTaxRate),wallets,
@@ -81,9 +95,33 @@ export function researchProvider(config:Config,client:GmgnClient,identities=load
   };
 }
 
+/** Preserve the provenance of merged timestamps for independent final/entry checks. */
+export function requiredSafetyEvidence(check:Check):Check[] {
+  const checks:Check[]=[],seen=new Set<Check>();
+  const invalid=()=>({...unknown('SAFETY_EVIDENCE_TIMESTAMP_INVALID'),checkedAt:''});
+  const visit=(value:Check,depth:number)=>{
+    if(seen.has(value)||depth>4){checks.push(invalid());return;}
+    seen.add(value);checks.push(value);
+    if(value.facts?.scope!=='primary_permission_checks_with_supplemental_gmgn_flags'){seen.delete(value);return;}
+    for(const key of ['primary','gmgn']) {
+      const child=value.facts[key];
+      if(!child||typeof child!=='object'||Array.isArray(child)||
+        !['pass','fail','unknown'].includes(String((child as Check).status))||typeof (child as Check).checkedAt!=='string')checks.push(invalid());
+      else visit(child as Check,depth+1);
+    }
+    seen.delete(value);
+  };
+  visit(check,0);return checks;
+}
+
 export function combineSafety(primary:Check,supplement?:Check):Check {
   if(!supplement) return primary;
+  const timestamps=[primary.checkedAt,supplement.checkedAt];
+  const invalid=timestamps.findIndex(at=>!Number.isFinite(Date.parse(at)));
   return {status:primary.status==='fail'||supplement.status==='fail'?'fail':primary.status,
-    checkedAt:new Date().toISOString(),reasons:[...primary.reasons,...supplement.reasons],
+    // An invalid required timestamp must survive the merge; substituting a fresh
+    // supplemental timestamp would turn malformed evidence into current proof.
+    checkedAt:invalid>=0?timestamps[invalid]:timestamps.sort((a,b)=>Date.parse(a)-Date.parse(b))[0],
+    reasons:[...primary.reasons,...supplement.reasons],
     facts:{primary,gmgn:supplement,scope:'primary_permission_checks_with_supplemental_gmgn_flags'}};
 }

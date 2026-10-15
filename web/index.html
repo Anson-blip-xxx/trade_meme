@@ -78,6 +78,13 @@
 
         <div id="workbench" class="workbench-grid">
           <div class="primary-column">
+            <section id="debot-risk-panel" class="panel debot-risk-panel" aria-labelledby="debot-risk-title">
+              <div class="panel-heading"><div class="section-title"><span class="section-marker"></span><h2 id="debot-risk-title">实时信号风控</h2><span id="debot-risk-count" class="count-pill">—</span></div><span id="debot-risk-status" class="badge neutral" role="status">等待实时记录</span></div>
+              <div class="debot-risk-intro"><p>DeBot 信号到达后，先核验合约、发行来源与市场风险，再结合钱包证据判断。</p><span id="debot-risk-updated">每 2 秒更新最新 12 条 · 研究候选不代表已下单</span></div>
+              <p id="debot-risk-warning" class="debot-risk-warning" role="status" hidden></p>
+              <div id="debot-risk-items" class="debot-risk-items" tabindex="0" aria-label="最新信号风控记录，可滚动查看"></div>
+              <p id="debot-risk-empty" class="debot-risk-empty">正在读取信号核验进度…</p>
+            </section>
             <section id="scans-panel" class="panel scans-panel" aria-labelledby="list-title">
               <div class="panel-heading"><div class="section-title"><span class="section-marker"></span><h2 id="list-title">全部扫描记录</h2><span id="list-count" class="count-pill">—</span></div><span class="auto-refresh"><span class="tiny-dot"></span>每 15 秒更新</span></div>
               <div class="chain-tabs" role="group" aria-label="按网络筛选"><button class="chain-tab active" data-chain="" aria-pressed="true">全部网络</button><button class="chain-tab" data-chain="bsc" aria-pressed="false"><span class="chain-dot bsc"></span>BSC</button><button class="chain-tab" data-chain="solana" aria-pressed="false"><span class="chain-dot solana"></span>Solana</button><button class="chain-tab" data-chain="robinhood" aria-pressed="false"><span class="chain-dot robinhood"></span>Robinhood</button></div>

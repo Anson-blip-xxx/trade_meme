@@ -10,7 +10,7 @@ import {fetchDebotNarrative} from '../src/providers/debot-client.js';
 import {liveProviders} from '../src/engine.js';
 import {buildServer} from '../src/server.js';
 import {Store} from '../src/store.js';
-import {config,providers} from './helpers.js';
+import {config,providers,now} from './helpers.js';
 
 const fixture=()=>JSON.parse(readFileSync(new URL('../fixtures/debot-story-v2.example.json',import.meta.url),'utf8'));
 const ca='0xc24f42b1e458251e3a128b74c65c4c7fa0c97777';
@@ -39,7 +39,8 @@ test('DeBot 导入要求原始信号时间，生成时间只标记叙事版本�
   } finally {rmSync(directory,{recursive:true,force:true});}
 });
 
-test('HTTP 信号自动取 DeBot 叙事并持久化；低分及读取失败不否决，安全失败仍拒绝',async()=>{
+test('HTTP 信号自动取 DeBot 叙事并持久化；低分及读取失败不否决，安全失败仍拒绝',async t=>{
+  t.mock.timers.enable({apis:['Date'],now:now.getTime()});
   const c=config(),p=providers();let vendorCalls=0,safetyFails=false,unavailable=false;
   // Synthetic fresh versions are only used in this mocked integration test, not as live alerts.
   const payload=fixture();payload.data.history.generated_at=new Date().toISOString();
@@ -55,7 +56,12 @@ test('HTTP 信号自动取 DeBot 叙事并持久化；低分及读取失败不�
     provider:'fxembed',verification:'third_party',authority:'public',
   })),diagnostics:[{operation:'lookup',status:'ok',returned:2}]});
   p.narrative=liveProviders(c).narrative;
-  p.safety=async()=>({status:safetyFails?'fail':'pass',reasons:safetyFails?['TEST_HONEYPOT']:[],facts:{},checkedAt:new Date().toISOString()});
+  p.safety=async()=>{
+    // This case covers a narrative returned before required checks finish. Slow
+    // optional responses are separately tested as non-blocking and omitted.
+    if(!safetyFails)await new Promise<void>(resolve=>setImmediate(resolve));
+    return {status:safetyFails?'fail':'pass',reasons:safetyFails?['TEST_HONEYPOT']:[],facts:{},checkedAt:new Date().toISOString()};
+  };
   const store=new Store(':memory:'),server=buildServer(c,store,p);
   server.listen(0,'127.0.0.1');await once(server,'listening');
   const base=`http://127.0.0.1:${(server.address() as any).port}`;

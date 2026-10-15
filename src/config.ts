@@ -17,6 +17,9 @@ const schema = z.object({
   scannerEnabled:z.enum(['true','false']).default('false').transform(v=>v==='true'),
   scannerIntervalSec:z.coerce.number().int().min(15).max(3600).default(60),
   scannerMaxSignals:z.coerce.number().int().min(1).max(20).default(3),
+  debotScannerEnabled:z.enum(['true','false']).default('false').transform(v=>v==='true'),
+  debotScannerIntervalSec:z.coerce.number().int().min(15).max(3600).default(30),
+  debotTransport:z.enum(['authenticated_stream','anonymous_poll']).default('authenticated_stream'),
   researchCacheMax:z.coerce.number().int().min(10).max(10000).default(200),
   researchCacheTtlSec:z.coerce.number().int().min(60).max(86400).default(1800),
   entryMode:z.enum(['off','paper','live']).default('off'),
@@ -33,7 +36,7 @@ export interface Config extends z.infer<typeof schema> {
   issuerIds: string[]; trackedIds: string[];
   ingestToken?:string; database:string; host:string; port:number;
   gmgnApiKey?:string; gmgnPrivateKey?:string; walletIdentitiesPath?:string;
-  scannerChains:Chain[]; ordersDatabase:string;
+  scannerChains:Chain[]; ordersDatabase:string;debotSignalsDatabase:string;debotSessionPath:string;debotLoginEmail?:string;
   entryWallets:Partial<Record<Chain,string>>; entryAmounts:Partial<Record<Chain,string>>;
   entryInputTokens:Partial<Record<Chain,string>>;
   entryFeeReserves:Record<Chain,string>;
@@ -82,6 +85,8 @@ export function readConfig(env:NodeJS.ProcessEnv=process.env): Config {
       decisionTtlSec:env.DECISION_TTL_SEC,maxTaxRate:env.MAX_TAX_RATE,xDataProvider:env.X_DATA_PROVIDER,narrativeProvider:env.NARRATIVE_PROVIDER,
       gmgnMinIntervalMs:env.GMGN_MIN_INTERVAL_MS,walletMaxProfiles:env.WALLET_MAX_PROFILES,minSmartWalletGroups:env.MIN_SMART_WALLET_GROUPS,walletSupportRequired:env.WALLET_SUPPORT_REQUIRED,
       scannerEnabled:env.SCANNER_ENABLED,scannerIntervalSec:env.SCANNER_INTERVAL_SEC,scannerMaxSignals:env.SCANNER_MAX_SIGNALS,
+      debotScannerEnabled:env.DEBOT_SCANNER_ENABLED,debotScannerIntervalSec:env.DEBOT_SCANNER_INTERVAL_SEC,
+      debotTransport:env.DEBOT_TRANSPORT,
       researchCacheMax:env.RESEARCH_CACHE_MAX,researchCacheTtlSec:env.RESEARCH_CACHE_TTL_SEC,
       entryMode:env.ENTRY_MODE,entrySizing:env.ENTRY_SIZING,entrySlippagePct:env.ENTRY_SLIPPAGE_PCT,entryMaxOpen:env.ENTRY_MAX_OPEN,
       entryGasPriceBsc:env.ENTRY_GAS_PRICE_BSC_WEI,entryPriorityFeeSolana:env.ENTRY_PRIORITY_FEE_SOLANA,entryTipFeeSolana:env.ENTRY_TIP_FEE_SOLANA}),
@@ -102,6 +107,9 @@ export function readConfig(env:NodeJS.ProcessEnv=process.env): Config {
     // Raw research stays ephemeral; the dashboard retains only bounded compact summaries.
     ingestToken:env.INGEST_TOKEN,database:':memory:',
     ordersDatabase:z.string().trim().refine(isPersistentOrderPath,'Order storage requires a persistent file path').parse(env.ORDERS_DATABASE_PATH??'data/orders.sqlite'),
+    debotSignalsDatabase:z.string().trim().refine(isPersistentOrderPath).parse(env.DEBOT_SIGNALS_DATABASE_PATH??'data/debot-signals.sqlite'),
+    debotSessionPath:z.string().trim().refine(isPersistentOrderPath).parse(env.DEBOT_SESSION_PATH??'data/debot/session.json'),
+    debotLoginEmail:env.DEBOT_LOGIN_EMAIL?.trim()?z.string().trim().email().max(254).parse(env.DEBOT_LOGIN_EMAIL):undefined,
     entryWallets:{bsc:env.ENTRY_WALLET_BSC,solana:env.ENTRY_WALLET_SOLANA,robinhood:env.ENTRY_WALLET_ROBINHOOD},
     entryAmounts:{bsc:env.ENTRY_AMOUNT_BSC,solana:env.ENTRY_AMOUNT_SOLANA,robinhood:env.ENTRY_AMOUNT_ROBINHOOD},
     entryInputTokens:{bsc:env.ENTRY_INPUT_TOKEN_BSC,solana:env.ENTRY_INPUT_TOKEN_SOLANA,robinhood:env.ENTRY_INPUT_TOKEN_ROBINHOOD},

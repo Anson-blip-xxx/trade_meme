@@ -48,7 +48,7 @@
 | 来源 | 依据与限制 |
 | --- | --- |
 | [官方 AI 信号说明](https://docs.debot.ai/basic-features/ai-xin-hao-ban-kuai) | 账号、CA、相关推文及后续叙事更新；金银铜狗和告警后最大涨幅是事后指标，未给当前 v2 score 的满分/等级映射 |
-| [官方合作中心](https://docs.debot.ai/debot-he-zuo-zhong-xin) | API/Webhook 合作入口；本项目没有完成 DeBot 原生 App/网页推送订阅或供应商验签 |
+| [官方合作中心](https://docs.debot.ai/debot-he-zuo-zhong-xin) | API/Webhook 合作入口；当前使用观察到的网页登录及 Socket.IO 协议，没有独立供应商签名验证 |
 | [Umi 页面](https://debot.ai/token/bsc/248286_0xc24f42b1e458251e3a128b74c65c4c7fa0c97777) | 用户提供的币种页面，核对链与完整 CA |
 | [用户响应样本](../fixtures/debot-story-v2.example.json) | `code=0/success=true/data.version=v2`；中文 13 节、38 个来源 ID。只删英文、日文翻译，其余未改写 |
 
@@ -96,6 +96,20 @@ Flap 的版本枚举以专门版本说明为依据：0/1 legacy、2 permit、3 G
 来源列表、转载副本、相同资金来源均不是独立性证明。当前没有完整社交传播统计、独立连续买卖模拟、程序升级监控或完整持仓生命周期。
 
 ## 本地状态的依据
+
+### 2026-10-15 DeBot AI 信号列表
+
+读取 [DeBot 网页前端 API 定义](https://debot.ai/assets/2.2.220/api-D8CF9i8S.js)、[信号订阅模块](https://debot.ai/assets/2.2.220/useCommunitySocket-CWk1CgOx.js) 和 [AI 信号说明](https://docs.debot.ai/basic-features/ai-xin-hao-ban-kuai)，确定网页列表 `GET /api/community/signal/channel/list`、钱包明细 `/api/community/signal/channel/wallets/profit`，及 Socket.IO 新信号事件 `community-signal-channel-new-notification`。公共脚本存在长连接不等于已验证服务器可用的订阅授权。
+
+本环境不带 Cookie / Authorization、正常请求三链官方频道，均得到 HTTP 200、`code=0`：BSC `chain=bsc/channel_ids=2`，Solana `chain=solana/channel_ids=1`，Robinhood `chain=robinhood/channel_ids=83`。信号行含稳定 `id`、`create_time` Unix 秒、完整 `token` 和 `chain`；元数据按 CA 绑定。匿名响应的 `wallet_stats[].wallet` 为空，只提供别名、金额、时间；同条 BSC 的钱包明细请求返回空数组，不能推断登录后一定开放地址。
+
+匿名列表已确认存在延迟，不能用于实时监控；UI 当前未登录提示延迟一小时，用户也报告过约十分钟延迟，不能固定假设延迟值。生产配置改用认证 Socket.IO，保留匿名模式仅供诊断。
+
+[登录模块](https://debot.ai/assets/2.2.220/api-DSGLawib.js)、[登录方式模块](https://debot.ai/assets/2.2.220/api-BnYQ31UZ.js) 及 [共享订阅 Worker](https://debot.ai/assets/2.2.220/sharedSocketWorker-DNiMKdBJ.js) 提供当前协议依据：固定邮箱获取验证码，`/api/login/code/signIn` 提交邮箱码与 TOTP，`/api/user/info` 返回登录态及 `sub_token`。本账号 `/api/security/login/method` 实测需要 `email` 和 `totp`；正常请求需要 Origin/Referer。Gmail 不提供 Google Authenticator 云同步动态码读取接口，因此在现有受保护控制台由用户填写两码。
+
+服务保存经过 user/info 验证的 Cookie，连接 `/portal-ws`，等待 `authorization=success` 再订阅三链；`bid` 仅用于网页标识，不作为认证。恢复连接重新验证会话，禁止匿名降级。授权后每分钟一页补数，HTTP 每页 20 条、限制响应大小、10 秒超时和禁止重定向。推送按原告警时间核对 120 秒时效，冻结最初接收时间，供应商高点和金银铜狗不进入候选特征。
+
+登录后新信号的 `/wallets/profit` 若返回完整地址，仅作为最多 3 个 GMGN 定向研究对象，不直接生成买入记录或身份结论。邮箱和双码流程、会话保存、Socket.IO 重连已加入自动化测试；真实账号的最终登录、订阅授权及登录后钱包字段仍需用户在控制台输入动态码后实测，不因单测通过而宣称已拿到实时信号。
 
 [运行时](../src/runtime.ts)仅以有 TTL/容量清理的内存库保存研究，CLI 单次研究退出即清空；report/retry 读取运行服务的缓存。[订单账本](../src/orders.ts)永久保存开单明细和有限入场摘要，不保存供应商全文/原始研究。正常运行要求磁盘订单路径；旧 data 文件不自动删除。
 

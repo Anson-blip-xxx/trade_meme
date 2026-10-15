@@ -8,6 +8,7 @@ import type {WalletHistory} from './wallet-history.js';
 import {WALLET_PROFILE_GROUPS,type WalletProfileReader} from './wallet-profiles.js';
 import bs58 from 'bs58';
 import type {WalletSetupLedger} from './wallet-setup-ledger.js';
+import {DebotAuthError,type DebotAuthManager} from './providers/debot-auth.js';
 
 export interface DashboardServices {
   archive:ScanArchive;
@@ -15,6 +16,7 @@ export interface DashboardServices {
   orders:()=>unknown;
   protection?:()=>unknown;
   chainStream?:()=>unknown;
+  debotAuth?:Pick<DebotAuthManager,'getStatus'|'sendCode'|'login'>;
   protectionDetail?:(id:string)=>unknown;
   walletHistory?:Pick<WalletHistory,'listWallets'|'getWallet'>;
   walletResearchStatus?:()=>unknown;
@@ -98,6 +100,32 @@ export function buildDashboard(config:Config,services:DashboardServices,assetDir
         const id=sessionId(req);if(id)sessions.delete(id);
         res.setHeader('set-cookie',`${cookieName}=; HttpOnly; SameSite=Strict; Path=/dashboard; Max-Age=0`);
         send(res,200,{ok:true});return;
+      }
+      if(req.method==='GET'&&url.pathname==='/dashboard/api/debot/auth') {
+        send(res,200,services.debotAuth?.getStatus()??{enabled:false,state:'unavailable',requiresTotp:true});return;
+      }
+      if(req.method==='POST'&&['/dashboard/api/debot/auth/code','/dashboard/api/debot/auth/login'].includes(url.pathname)) {
+        if(!services.debotAuth){send(res,503,{error:'DEBOT_AUTH_DISABLED'});return;}
+        if(!req.headers['content-type']?.startsWith('application/json')){send(res,415,{error:'JSON_REQUIRED'});return;}
+        let size=0;const chunks:Buffer[]=[];
+        for await(const part of req){size+=part.length;if(size>1024){send(res,413,{error:'BODY_TOO_LARGE'});return;}chunks.push(part);}
+        let input:Record<string,unknown>;
+        try{input=JSON.parse(Buffer.concat(chunks).toString('utf8'));if(!input||typeof input!=='object'||Array.isArray(input))throw new Error();}
+        catch{send(res,400,{error:'INVALID_JSON'});return;}
+        const isCode=url.pathname.endsWith('/code');
+        const keys=isCode?[]:['challengeId','emailCode','totpCode'];
+        if(Object.keys(input).some(key=>!keys.includes(key))||!isCode&&keys.some(key=>typeof input[key]!=='string')) {
+          send(res,400,{error:'DEBOT_AUTH_INPUT_INVALID'});return;
+        }
+        try {
+          const status=isCode?await services.debotAuth.sendCode():await services.debotAuth.login({
+            challengeId:input.challengeId as string,emailCode:input.emailCode as string,totpCode:input.totpCode as string});
+          send(res,200,status);
+        }catch(error){
+          if(error instanceof DebotAuthError)send(res,error.statusCode,{error:error.reason});
+          else send(res,503,{error:'DEBOT_AUTH_UNAVAILABLE'});
+        }
+        return;
       }
       if(req.method!=='GET') {send(res,405,{error:'READ_ONLY'});return;}
       if(url.pathname==='/dashboard/api/session') {send(res,200,{authenticated:true,readOnly:true,authentication:proxyAuthenticated(req)?'proxy':'session'});return;}

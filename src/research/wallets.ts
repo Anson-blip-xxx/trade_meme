@@ -6,7 +6,7 @@ import {GmgnError, type GmgnClient} from '../providers/gmgn-client.js';
 import type {WalletAnalysis, WalletAnalysisOptions, WalletIdentity, WalletRecord, WalletCluster, WalletActivity} from './wallet-types.js';
 import {parseTargetTokenBalance} from './wallet-targets.js';
 
-export type {WalletAnalysis, WalletAnalysisOptions, WalletIdentity} from './wallet-types.js';
+export type {WalletAnalysis, WalletAnalysisOptions, WalletIdentity, VendorWalletTargets} from './wallet-types.js';
 export const RECENT_WALLET_WINDOW_SECONDS = 3_600;
 const HOLDERS = '/v1/market/token_top_holders';
 const STATS = '/v1/user/wallet_stats';
@@ -326,6 +326,30 @@ export async function analyzeWallets(signal: Signal, tokenInfo: unknown, client:
         eventAt<=observedAt&&observedAt<=planAt&&planAt-eventAt<=600000&&!targetAddresses.includes(who))targetAddresses.push(who);
     }
   }
+  const localTargetAddresses=[...targetAddresses],vendor=options.vendorWalletTargets,vendorAddresses:string[]=[];
+  let vendorRejection:string|undefined;
+  if(vendor!==undefined) {
+    const checkedAt=object(vendor)&&typeof vendor.checkedAt==='string'?Date.parse(vendor.checkedAt):NaN;
+    if(!validInfo||!object(vendor)||vendor.provider!=='debot'||!object(vendor.token)||vendor.token.chain!==chain||
+      !address(vendor.token.address,chain)||address(vendor.token.address,chain)!==address(signal.token.address,chain)||
+      /^0x0{40}$/i.test(signal.token.address)||signal.token.address==='11111111111111111111111111111111')
+      vendorRejection='VENDOR_WALLET_TARGET_SCOPE_INVALID';
+    else if(!Number.isFinite(checkedAt)||checkedAt>startedAt.getTime()||startedAt.getTime()-checkedAt>120_000)
+      vendorRejection='VENDOR_WALLET_TARGET_TIME_INVALID';
+    else if(!Array.isArray(vendor.addresses)||vendor.addresses.length>100)
+      vendorRejection='VENDOR_WALLET_TARGET_ADDRESSES_INVALID';
+    else {
+      // Read at most a detail page and nominate three actual addresses. Aliases and counts are never inspected.
+      for(const value of vendor.addresses.slice(0,20)) {
+        const who=address(value,chain);
+        if(!who||/^0x0{40}$/i.test(who)||who==='11111111111111111111111111111111'||vendorAddresses.includes(who))continue;
+        vendorAddresses.push(who);if(vendorAddresses.length===3)break;
+      }
+      if(!vendorAddresses.length)vendorRejection='VENDOR_WALLET_TARGET_ADDRESSES_INVALID';
+    }
+    // Local qualifications keep priority. Vendor nominees consume the same existing research budget.
+    for(const who of vendorAddresses)if(!targetAddresses.includes(who))targetAddresses.push(who);
+  }
   const ranked=[...wallets.values()].filter(w=>!w.recognizedLabels.includes('exchange_or_pool')).sort((a,b)=>priority(b)-priority(a));
   const selected:WalletRecord[]=[],balanceNeeded=new Set<string>(),selectedAddresses=new Set<string>();
   let requestsRemaining=max*2,plannedWeight=0;
@@ -386,9 +410,15 @@ export async function analyzeWallets(signal: Signal, tokenInfo: unknown, client:
   return {status: unavailable ? 'unknown' : 'pass', checkedAt: completedAt.toISOString(), reasons: [...reasons],
     facts: {provider: 'gmgn', source: 'openapi', token: signal.token, maxEnrichedWallets: max, holderLimitPerQuery: 20,
       collectionStartedAt: startedAt.toISOString(),
-      ...(plan?{researchTargets:{source:'local_observations',requested:targetAddresses,selected:targetAddresses.filter(a=>selectedAddresses.has(a)),
-        deferred:targetAddresses.filter(a=>!selectedAddresses.has(a)),balanceQueries:[...balanceNeeded],truncated:plan.truncated,
+      ...(plan?{researchTargets:{source:'local_observations',requested:localTargetAddresses,selected:localTargetAddresses.filter(a=>selectedAddresses.has(a)),
+        deferred:localTargetAddresses.filter(a=>!selectedAddresses.has(a)),balanceQueries:[...balanceNeeded].filter(a=>localTargetAddresses.includes(a)),truncated:plan.truncated,
         requestBudget:max*2,plannedRequests:max*2-requestsRemaining,weightedBudget:max*6,plannedWeight}}:{}),
+      ...(vendor!==undefined?{vendorWalletTargets:{provider:'debot',scope:'research_nomination_only',requested:vendorAddresses,
+        selected:vendorAddresses.filter(a=>selectedAddresses.has(a)),deferred:vendorAddresses.filter(a=>!selectedAddresses.has(a)),
+        balanceQueries:[...balanceNeeded].filter(a=>vendorAddresses.includes(a)),
+        ...(vendorRejection?{reason:vendorRejection}:{}),requestBudget:max*2,plannedRequests:max*2-requestsRemaining,
+        weightedBudget:max*6,plannedWeight,ownershipProven:false,buyEvidence:false,qualifiesAsSmart:false,
+        note:'DeBot 提名仅安排查询；钱包归属、聪明钱包资格及买入支持仍由独立研究判定。'}}:{}),
       sampleOnly: true, developerAddress: developer, developerFundingAddress: developerFunder, developerSource: 'vendor_claim',
       scopeBinding: 'chain_and_token_request_with_response_checks', realPersonIdentityVerified: false,
       rawResponses: raw, documentation: ['https://github.com/GMGNAI/gmgn-skills/blob/main/skills/gmgn-token/SKILL.md',

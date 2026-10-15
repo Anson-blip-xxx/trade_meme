@@ -5,6 +5,11 @@ import {OrderStore} from './orders.js';
 import {EntryController} from './entry.js';
 import {GmgnClient} from './providers/gmgn-client.js';
 import {GmgnScanner} from './scanner.js';
+import {DebotScanner} from './debot-scanner.js';
+import {DebotStream} from './debot-stream.js';
+import {DebotSessionClient,DebotSessionError} from './providers/debot-session.js';
+import {DebotAuthManager} from './providers/debot-auth.js';
+import {fetchDebotSignalPage,fetchDebotWalletDetails} from './providers/debot-signals.js';
 import {OrderReconciler} from './reconcile.js';
 import {evaluate,liveProviders} from './engine.js';
 import {ScanArchive,type ScanPrice,type ScanToken} from './scan-archive.js';
@@ -18,12 +23,26 @@ import {WalletScreeningService} from './wallet-screening-service.js';
 import {SystemMonitor} from './system-monitor.js';
 import {WatchRechecker} from './watch-rechecker.js';
 import {ExitShadow} from './exit-shadow.js';
-import {dirname} from 'node:path';
+import {dirname,resolve} from 'node:path';
+import {existsSync,realpathSync,statSync} from 'node:fs';
 import {researchProvider} from './research.js';
 
 export function createRuntime(config:Config) {
   if(!isPersistentOrderPath(config.ordersDatabase)) throw new Error('PERSISTENT_ORDER_DATABASE_REQUIRED');
   if(config.gmgnApiKey?.trim()==='gmgn_solbscbaseethmonadtron') throw new Error('GMGN_DEMO_KEY_TEST_ONLY');
+  const sameDatabase=(a:string,b:string)=>{
+    if(resolve(a)===resolve(b))return true;
+    if(!existsSync(a)||!existsSync(b))return false;
+    const left=statSync(a),right=statSync(b);
+    return realpathSync(a)===realpathSync(b)||left.dev===right.dev&&left.ino===right.ino;
+  };
+  if(config.debotScannerEnabled&&(!isPersistentOrderPath(config.debotSignalsDatabase)||
+    [config.ordersDatabase,config.dashboard.archivePath,config.walletResearch.database,config.walletProfiles.database,
+      config.walletScreening.database,config.chainStream.database,config.exitShadow.database]
+      .some(path=>sameDatabase(path,config.debotSignalsDatabase))))throw new Error('DEBOT_SIGNAL_DATABASE_CONFLICT');
+  if(config.debotScannerEnabled&&[config.ordersDatabase,config.dashboard.archivePath,config.walletResearch.database,
+    config.walletProfiles.database,config.walletScreening.database,config.chainStream.database,config.exitShadow.database,
+    config.debotSignalsDatabase].some(path=>sameDatabase(path,config.debotSessionPath)))throw new Error('DEBOT_SESSION_PATH_CONFLICT');
   const client=new GmgnClient({apiKey:config.gmgnApiKey,minIntervalMs:config.gmgnMinIntervalMs});
   const providers=liveProviders(config,client);
   const archive=config.dashboard.enabled||config.watch.enabled||config.exitShadow.enabled||config.chainStream.enabled?new ScanArchive(config.dashboard.archivePath,{
@@ -87,10 +106,10 @@ export function createRuntime(config:Config) {
   const entry=new EntryController(config,orders,client,walletScreening?{walletEvidence:(report,now)=>walletScreening.revalidate(report,now)}:{});
   const reconciler=new OrderReconciler(orders,entry);
   let closed=false,active=0,archiveMaintenanceError:string|undefined;
-  const onSignal=async(signal:Signal)=>{
+  const onSignal=async(signal:Signal,firstReceivedAt?:string)=>{
     if(closed||active>=4) throw new Error('RESEARCH_BUSY');
     store.prune(config.researchCacheTtlSec,config.researchCacheMax);
-    const reserved=store.reserve(signal);
+    const reserved=store.reserve(signal,undefined,'notification_copy',firstReceivedAt);
     if(reserved.conflict) throw new Error('EVENT_ID_PAYLOAD_CONFLICT');
     if(!reserved.created) return;
     const item=reserved.entry;active++;
@@ -104,6 +123,33 @@ export function createRuntime(config:Config) {
   const scanner=new GmgnScanner({client,chains:config.scannerChains,intervalMs:config.scannerIntervalSec*1000,
     maxAgeSec:config.maxSignalAgeSec,maxSignalsPerCycle:config.scannerMaxSignals,onSignal,
     ...(walletObserver?{onFeed:walletObserver.observeFeed.bind(walletObserver)}:{})});
+  let debotAuth:DebotAuthManager|undefined;
+  const debotSession=config.debotScannerEnabled&&config.debotTransport==='authenticated_stream'?new DebotSessionClient({
+    path:config.debotSessionPath,onAuthRequired:()=>{debotAuth?.setAuthenticated(false);debotStream?.invalidateSession();}}):undefined;
+  const debotScanner=config.debotScannerEnabled?new DebotScanner({database:config.debotSignalsDatabase,mode:config.debotTransport,
+    chains:config.scannerChains,intervalSec:config.debotScannerIntervalSec,
+    maxAgeSec:debotSession?Math.min(120,config.maxSignalAgeSec):config.maxSignalAgeSec,onSignal,
+    ...(debotSession?{fetchPage:(chain:Signal['token']['chain'])=>fetchDebotSignalPage(chain,{fetcher:debotSession.fetcher}),
+      fetchDetails:(observation:Parameters<typeof fetchDebotWalletDetails>[0])=>fetchDebotWalletDetails(observation,{fetcher:debotSession.fetcher})}:{}),
+    shouldDefer:()=>closed?'SERVICE_STOPPING':!config.gmgnApiKey?.trim()?'GMGN_API_KEY_MISSING':
+      client.cooldownUntil>Date.now()?'GMGN_RATE_LIMITED':active>=(debotSession?2:4)?'RESEARCH_BUSY':
+        !debotSession&&scanner.getStatus().inFlight?'SCANNER_BUSY':undefined}):undefined;
+  const debotStream=debotSession&&debotScanner?new DebotStream({chains:config.scannerChains,
+    getSession:async()=>{
+      try{const session=await debotSession.getSession();debotAuth?.setAuthenticated(true);return session;}
+      catch(error){
+        if(error instanceof DebotSessionError&&['DEBOT_SESSION_FILE_MISSING','DEBOT_SESSION_FILE_INVALID',
+          'DEBOT_SESSION_FILE_PERMISSIONS','DEBOT_SESSION_AUTH_REQUIRED'].includes(error.reason))debotAuth?.setAuthenticated(false);
+        throw error;
+      }
+    },onPage:page=>debotScanner.acceptPage(page),onAuthorized:()=>debotScanner.runOnce()}):undefined;
+  if(debotStream&&config.debotLoginEmail)debotAuth=new DebotAuthManager({email:config.debotLoginEmail,
+    sessionPath:config.debotSessionPath,onAuthenticated:async()=>{
+      await debotStream.stop();if(!closed)void debotStream.start();
+    }});
+  if(debotScanner)providers.research=researchProvider(config,client,undefined,{
+    ...(walletScreening?{walletTargets:(signal:Signal)=>walletScreening.researchTargets(signal)}:{}),
+    vendorWalletTargets:signal=>debotScanner.vendorWalletTargets(signal)});
   const watchRechecker=archive&&config.watch.enabled?new WatchRechecker({archive,
     intervalMs:config.watch.intervalSec*1000,maxPerCycle:config.watch.maxPerCycle,
     shouldDefer:()=>closed?'SERVICE_STOPPING':!config.gmgnApiKey?.trim()?'GMGN_API_KEY_MISSING':
@@ -126,6 +172,7 @@ export function createRuntime(config:Config) {
     catch {archiveMaintenanceError='SCAN_ARCHIVE_MAINTENANCE_FAILED';}
   },60000);sweep.unref();
   let reconcileTimer:ReturnType<typeof setInterval>|undefined;
+  let debotSyncTimer:ReturnType<typeof setInterval>|undefined;
   let walletIndexTimer:ReturnType<typeof setInterval>|undefined;
   let walletIndexWork:Promise<void>|undefined;
   let walletStats:unknown,walletStatsAt=0;
@@ -168,9 +215,11 @@ export function createRuntime(config:Config) {
     try {return {...exitShadow.summary(),captureError:exitCaptureError};}
     catch {return {enabled:true,mode:'shadow',liveReady:false,captureError:'EXIT_SHADOW_READ_FAILED'};}
   };
-  return {client,providers,store,orders,entry,scanner,archive,tracking,walletHistory,walletObserver,walletResearchStatus,walletProfiles,walletProfilesStatus,walletScreening,watchRechecker,exitShadow,chainMonitor,chainStreamStatus,
+  return {client,providers,store,orders,entry,scanner,debotScanner,debotStream,debotAuth,archive,tracking,walletHistory,walletObserver,walletResearchStatus,walletProfiles,walletProfilesStatus,walletScreening,watchRechecker,exitShadow,chainMonitor,chainStreamStatus,
     dashboardProtection:()=>exitShadow?{...exitShadow.list(),captureError:exitCaptureError}:{...protectionSummary(),items:[]},
     dashboardOverview:()=>({now:new Date().toISOString(),entryMode:config.entryMode,scanner:scanner.getStatus(),
+      debotScanner:debotScanner?.getStatus()??{enabled:false,running:false},
+      debotStream:debotStream?.getStatus(),
       tracking:tracking?.getStatus(),stats:archive?.stats(),archiveError:archiveCaptureError??store.observationError??archiveMaintenanceError,
       settings:dashboardSettings(config),balances:balances?.get()??[],system:system?.get(),walletResearch:walletResearchStatus(),exitProtection:protectionSummary(),chainStream:chainStreamStatus(),
       watchRecheck:watchRechecker?{enabled:true,...watchRechecker.getStatus()}:{enabled:false}}),
@@ -187,6 +236,12 @@ export function createRuntime(config:Config) {
       }
       if(config.gmgnApiKey?.trim())walletObserver?.start();
       if(config.scannerEnabled&&config.gmgnApiKey?.trim()) scanner.start();
+      debotScanner?.start();
+      if(debotStream) {
+        void debotStream.start();
+        debotSyncTimer=setInterval(()=>{if(debotStream.getStatus().authorized)void debotScanner?.runOnce();},60_000);
+        debotSyncTimer.unref();
+      }
       watchRechecker?.start();
       if(!reconcileTimer&&config.gmgnApiKey?.trim()&&config.gmgnPrivateKey?.trim()) {
         void reconciler.runOnce();
@@ -194,14 +249,16 @@ export function createRuntime(config:Config) {
       }
     },
     async close(){
-      if(closed) return;closed=true;scanner.stop();clearInterval(sweep);clearInterval(reconcileTimer);clearInterval(walletIndexTimer);
-      await Promise.all([chainMonitor?.stop(),tracking?.stop(),balances?.stop(),walletObserver?.stop(),system?.stop(),watchRechecker?.stop()]);
+      if(closed) return;closed=true;scanner.stop();clearInterval(sweep);clearInterval(reconcileTimer);clearInterval(walletIndexTimer);clearInterval(debotSyncTimer);
+      await debotStream?.stop();
+      await Promise.all([chainMonitor?.stop(),tracking?.stop(),balances?.stop(),walletObserver?.stop(),system?.stop(),watchRechecker?.stop(),debotScanner?.stop()]);
       await walletIndexWork;
       await reconciler.stop();
       // Stop means no new work. Await current callback before closing its stores.
       while(active) await new Promise(resolve=>setTimeout(resolve,50));
       await walletScreening?.close();
       await walletProfiles?.stop();
+      await debotScanner?.close();
       store.close();orders.close();archive?.close();walletHistory?.close();exitShadow?.close();
     }};
 }

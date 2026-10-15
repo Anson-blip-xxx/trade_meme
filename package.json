@@ -25,6 +25,7 @@
   "dependencies": {
     "@solana/addresses": "^8.4.0",
     "bs58": "^6.0.0",
+    "socket.io-client": "4.8.4",
     "viem": "^2.57.3",
     "zod": "^4.6.5"
   },

@@ -51,6 +51,44 @@
     DECISION_EXPIRED: '本次研究判断已过期',
     GMGN_WALLET_RESEARCH_UNAVAILABLE: '暂时无法获取 GMGN 钱包研究数据',
     GMGN_RATE_LIMITED: 'GMGN 请求受到限流',
+    DEBOT_SIGNAL_STORE_FULL: 'DeBot 信号存储已达到容量上限',
+    DEBOT_SIGNAL_PERSIST_FAILED: 'DeBot 信号保存失败',
+    DEBOT_SIGNAL_DISPATCH_FAILED: 'DeBot 信号分析失败，本条尚未完成',
+    DEBOT_SIGNAL_STALE: 'DeBot 信号已超过分析有效期',
+    DEBOT_SIGNAL_INTERRUPTED: 'DeBot 信号分析因服务中断而未完成',
+    DEBOT_SIGNAL_COLLECTION_FAILED: 'DeBot 信号采集失败',
+    DEBOT_SIGNAL_INPUT_INVALID: 'DeBot 信号采集参数无效',
+    DEBOT_SIGNAL_RESPONSE_INVALID: 'DeBot 信号响应格式异常',
+    DEBOT_SIGNAL_CHANNEL_MISMATCH: 'DeBot 信号频道与请求网络不一致',
+    DEBOT_SIGNAL_RECORDS_REJECTED: '部分 DeBot 信号记录未通过格式与一致性校验',
+    DEBOT_SIGNAL_RESPONSE_TOO_LARGE: 'DeBot 信号响应超过接收上限',
+    DEBOT_SIGNAL_INVALID_JSON: 'DeBot 信号响应无法解析',
+    DEBOT_SIGNAL_HTTP_401: 'DeBot 信号接口要求登录',
+    DEBOT_SIGNAL_HTTP_403: 'DeBot 信号接口拒绝匿名访问，需要登录',
+    DEBOT_SIGNAL_HTTP_429: 'DeBot 信号接口限流，等待重试',
+    DEBOT_SIGNAL_AUTH_REQUIRED: 'DeBot 信号接口要求登录',
+    DEBOT_SIGNAL_RATE_LIMITED: 'DeBot 信号接口限流，等待重试',
+    DEBOT_SIGNAL_HTTP_ERROR: 'DeBot 信号接口返回异常状态',
+    DEBOT_SIGNAL_REQUEST_TIMEOUT: 'DeBot 信号请求超时',
+    DEBOT_SIGNAL_REQUEST_FAILED: 'DeBot 信号请求失败',
+    DEBOT_SESSION_FILE_MISSING: '尚未保存 DeBot 登录状态，请在上方完成登录',
+    DEBOT_SESSION_AUTH_REQUIRED: 'DeBot 登录状态已失效，请重新验证',
+    DEBOT_SESSION_FILE_INVALID: 'DeBot 登录文件无效，需要重新登录',
+    DEBOT_SESSION_FILE_PERMISSIONS: 'DeBot 登录文件权限异常，等待服务端修复',
+    DEBOT_SESSION_REQUEST_TIMEOUT: 'DeBot 登录验证请求超时，等待重试',
+    DEBOT_SESSION_REQUEST_FAILED: 'DeBot 登录验证暂不可用，等待重试',
+    DEBOT_SESSION_RATE_LIMITED: 'DeBot 登录验证受到限流，等待重试',
+    DEBOT_STREAM_AUTH_TIMEOUT: 'DeBot 实时订阅认证超时，等待重连',
+    DEBOT_STREAM_AUTH_REJECTED: 'DeBot 实时订阅认证失败，请重新登录',
+    DEBOT_STREAM_CONNECT_FAILED: 'DeBot 实时连接失败，等待重连',
+    DEBOT_STREAM_DISCONNECTED: 'DeBot 实时连接已断开，等待重连',
+    DEBOT_STREAM_TRANSPORT_ERROR: 'DeBot 实时连接异常，等待重连',
+    DEBOT_STREAM_DELAYED: '最近收到的 DeBot 信号存在传输延迟',
+    DEBOT_STREAM_MESSAGE_INVALID: 'DeBot 推送格式异常，本条未作为有效信号',
+    DEBOT_STREAM_CHAIN_NOT_SUBSCRIBED: '收到未订阅网络的推送，未作为有效信号',
+    DEBOT_STREAM_CAPTURE_FAILED: 'DeBot 实时信号保存失败',
+    DEBOT_STREAM_CAPTURE_BACKLOG: 'DeBot 实时信号处理积压，等待重连恢复',
+    DEBOT_STREAM_SYNC_FAILED: 'DeBot 登录后的信号补充读取未完成',
     SERVICE_STOPPING: '服务正在停止',
     GMGN_API_KEY_MISSING: '尚未配置 GMGN 访问凭证',
     RESEARCH_BUSY: '等待当前研究任务完成',
@@ -199,6 +237,43 @@
   };
   const state = {authenticated: false, view: 'scans', chain: '', decision: '', search: '', offset: 0, total: 0, items: [], orders: [], overview: null, refreshing: false, queued: false, queryVersion: 0, timer: null, searchTimer: null, lastSuccess: null, resourceErrors: {}, scansLoaded: false, ordersLoaded: false, detailId: null, detailKind: 'scan', detailWallet: null, detailGeneration: 0, returnFocus: null, walletEvidenceOpen: new Set(),
     walletSort: 'profiles', associationStatus: null, walletProfileStatus: null, walletProfilesReady: false, walletGroup: '', walletChain: '', walletSearch: '', walletOffset: 0, walletTotal: 0, walletItems: [], walletStatus: null, walletsLoaded: false, walletSearchTimer: null, protection: null, protectionLoaded: false, chainStream: null, chainStreamLoaded: false};
+
+  const debotAuth = {status: null, busy: '', message: '', error: false, generation: 0};
+  const debotAuthErrors = {
+    DEBOT_AUTH_DISABLED: 'DeBot 登录功能尚未启用。',
+    DEBOT_AUTH_EMAIL_MISSING: '服务器尚未配置登录邮箱。',
+    DEBOT_AUTH_RATE_LIMITED: '验证码发送过于频繁，请等待冷却后重试。',
+    DEBOT_AUTH_COOLDOWN: '请等待发送倒计时结束后重试。',
+    DEBOT_AUTH_CHALLENGE_EXPIRED: '邮箱验证码已过期，请重新发送。',
+    DEBOT_AUTH_CHALLENGE_INVALID: '本次验证请求已失效，请重新发送邮箱验证码。',
+    DEBOT_AUTH_INVALID_CODE: '验证码未通过，请检查邮箱验证码与当前动态码。',
+    DEBOT_AUTH_CODE_INVALID: '验证码未通过，请检查邮箱验证码与当前动态码。',
+    DEBOT_AUTH_TOTP_REQUIRED: '请填写 Authenticator 当前显示的 6 位动态码。',
+    DEBOT_AUTH_INVALID_INPUT: '请填写两个完整的 6 位验证码。',
+    DEBOT_AUTH_REQUEST_TIMEOUT: 'DeBot 响应超时，请检查当前状态后重试。',
+    DEBOT_AUTH_REQUEST_FAILED: '暂时无法连接 DeBot，请稍后重试。',
+    DEBOT_AUTH_AUTH_REQUIRED: 'DeBot 登录验证未通过，请检查验证码后重试。',
+    DEBOT_AUTH_SESSION_SAVE_FAILED: '登录状态保存失败，请稍后重试。',
+    DEBOT_AUTH_CONFIG_MISSING: '服务器尚未完成 DeBot 登录配置。',
+    DEBOT_AUTH_SEND_COOLDOWN: '请等待发送倒计时结束后重试。',
+    DEBOT_AUTH_METHOD_UNSUPPORTED: '当前账户的登录验证方式与邮箱加动态码不匹配。',
+    DEBOT_AUTH_ATTEMPTS_EXHAUSTED: '本次验证码尝试次数已用完，请重新发送邮箱验证码。',
+    DEBOT_AUTH_BUSY: '已有登录操作正在处理，请等待完成。',
+    DEBOT_AUTH_CODE_REJECTED: '验证码未通过，请检查邮箱验证码与当前 Authenticator 动态码。',
+    DEBOT_AUTH_LOGIN_REJECTED: 'DeBot 拒绝了本次登录，请重新发送验证码后重试。',
+    DEBOT_AUTH_SEND_REJECTED: 'DeBot 未接受本次验证码发送请求，请稍后重试。',
+    DEBOT_AUTH_VERIFY_FAILED: '登录后的账户核验未通过，请重新登录。',
+    DEBOT_AUTH_COOKIE_MISSING: 'DeBot 未返回有效登录状态，请重新登录。',
+    DEBOT_AUTH_COOKIE_INVALID: 'DeBot 返回的登录状态无法安全保存，请稍后重试。',
+    DEBOT_AUTH_REDIRECT_REJECTED: 'DeBot 登录接口返回了异常跳转，请稍后重试。',
+    DEBOT_AUTH_HTTP_ERROR: 'DeBot 登录接口暂不可用，请稍后重试。',
+    DEBOT_AUTH_RESPONSE_INVALID: 'DeBot 登录接口响应异常，请稍后重试。',
+    DEBOT_AUTH_RESPONSE_TOO_LARGE: 'DeBot 登录接口响应异常，请稍后重试。',
+    DEBOT_AUTH_SESSION_TOO_LARGE: '登录状态超过保存上限，请联系服务端检查。',
+    DEBOT_AUTH_SESSION_PATH_UNSAFE: '登录状态保存目录需要服务端修复。',
+    DEBOT_AUTH_SAVE_FAILED: '登录状态保存失败，请稍后重试。',
+    DEBOT_AUTH_RECONNECT_FAILED: '账户已登录，实时连接尚未恢复；请查看连接状态。',
+  };
 
   function el(tag, className, text) {
     const node = document.createElement(tag);
@@ -370,6 +445,7 @@
   }
   function showLogin(message = '') {
     state.authenticated = false;
+    debotAuth.generation++; debotAuth.status = null; debotAuth.busy = ''; clearDebotCodes();
     clearTimeout(state.timer); closeDrawer();
     $('app').hidden = true; $('boot-view').hidden = true; $('login-view').hidden = false;
     text('login-error', message); $('password').value = ''; $('password').focus();
@@ -403,6 +479,100 @@
     try { await api('/logout', {method: 'POST'}); showLogin(); }
     catch { showToast('退出失败，请重试'); }
   });
+
+  function clearDebotCodes() { $('debot-email-code').value = ''; $('debot-totp-code').value = ''; }
+  function debotDelay(value) { return finite(value) && value >= 0 ? `${new Intl.NumberFormat('zh-CN', {maximumFractionDigits: 1}).format(value / 1000)} 秒` : '尚无样本'; }
+  function debotStreamLabel(stream, scanner) {
+    if (scanner?.mode === 'anonymous_poll') return '匿名轮询 · 非实时订阅';
+    if (!stream) return scanner?.enabled ? '等待订阅状态' : '未启用';
+    if (stream.state === 'auth_required') return '未登录 · 等待验证';
+    if (stream.state === 'live' && stream.connected && stream.authorized) return '已认证 · 实时订阅中';
+    return {connecting: '正在连接', authorizing: '已连接 · 等待认证', disconnected: '连接断开 · 等待重连', stopped: '订阅未运行', error: '订阅异常'}[stream.state] || '等待订阅状态';
+  }
+  function renderDebotAuth() {
+    const auth = debotAuth.status, stream = state.overview?.debotStream, scanner = state.overview?.debotScanner;
+    const authenticated = auth?.state === 'authenticated';
+    const badgeNode = $('debot-auth-badge');
+    badgeNode.className = `badge ${authenticated ? 'pass' : auth?.state === 'required' ? 'watch' : 'neutral'}`;
+    badgeNode.textContent = !auth ? '读取登录状态' : !auth.enabled ? '登录功能未启用' : authenticated ? '账户已登录' : auth.state === 'required' ? '需要登录' : '登录状态暂不可用';
+    $('debot-email').value = typeof auth?.email === 'string' ? auth.email : '';
+    const live = $('debot-live-status'); live.replaceChildren(kv('实时信号连接', debotStreamLabel(stream, scanner)), kv('最近实时推送', date(stream?.lastSignalAt, true)), kv('最近推送延迟', debotDelay(stream?.lastSignalDelayMs)), kv('最近分析排队耗时', debotDelay(scanner?.lastAnalysisQueueDelayMs)));
+    if (stream?.lastError) live.append(el('p', 'detail-small', reasonNames[stream.lastError] || 'DeBot 订阅暂不可用，服务端将重试。'));
+    const message = auth?.lastError === 'DEBOT_AUTH_RECONNECT_FAILED' ? debotAuthErrors[auth.lastError] : debotAuth.message || (auth?.lastError ? debotAuthErrors[auth.lastError] || 'DeBot 登录状态暂不可用，请稍后刷新。' : '');
+    text('debot-auth-message', message); $('debot-auth-message').hidden = !message;
+    $('debot-auth-message').classList.toggle('error', debotAuth.error || Boolean(!debotAuth.message && auth?.lastError));
+    renderDebotCountdown();
+  }
+  function renderDebotCountdown() {
+    const auth = debotAuth.status, now = Date.now();
+    const remaining = auth?.canSendAt ? Math.max(0, Math.ceil((Date.parse(auth.canSendAt) - now) / 1000)) : 0;
+    const challengeValid = typeof auth?.challengeId === 'string' && auth.challengeId.length > 0 && Date.parse(auth.challengeExpiresAt) > now;
+    const allowed = state.authenticated && auth?.enabled && typeof auth.email === 'string' && auth.email.length > 0;
+    $('debot-send-code').disabled = !allowed || Boolean(debotAuth.busy) || remaining > 0;
+    text('debot-send-code', debotAuth.busy === 'code' ? '正在发送…' : remaining > 0 ? `${remaining} 秒后可重发` : auth?.challengeId ? '重新发送验证码' : '发送邮箱验证码');
+    $('debot-email-code').disabled = !allowed || !challengeValid || Boolean(debotAuth.busy);
+    $('debot-totp-code').disabled = !allowed || !challengeValid || Boolean(debotAuth.busy);
+    $('debot-login-submit').disabled = !allowed || !challengeValid || Boolean(debotAuth.busy);
+    text('debot-login-submit', debotAuth.busy === 'login' ? '正在验证并连接…' : '验证并连接 DeBot');
+    text('debot-code-hint', challengeValid ? `邮箱验证码有效至 ${time(auth.challengeExpiresAt)}；动态码请使用 Authenticator 当前显示的数字。` : auth?.challengeId ? '本次邮箱验证码已过期，请重新发送。' : auth?.state === 'authenticated' ? '账户已登录；重新登录时可再次发送验证码。实时订阅状态见上方。' : '先发送验证码，再填写两项 6 位码。');
+  }
+  async function debotAuthRequest(path, body) {
+    const controller = new AbortController(), timeout = setTimeout(() => controller.abort(), 65000);
+    try {
+      const response = await fetch(`${API}/debot/auth/${path}`, {method: 'POST', credentials: 'same-origin', cache: 'no-store', signal: controller.signal, headers: {Accept: 'application/json', 'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+      let result; try { result = await response.json(); } catch { result = null; }
+      if (!response.ok) {
+        const error = new RequestError(response.status);
+        error.reason = typeof result?.error === 'string' && /^DEBOT_AUTH_[A-Z_]+$/.test(result.error) ? result.error : '';
+        throw error;
+      }
+      if (!result || !['authenticated', 'required', 'unavailable'].includes(result.state)) throw new Error('DEBOT_AUTH_RESPONSE_INVALID');
+      return result;
+    } finally { clearTimeout(timeout); }
+  }
+  function debotAuthError(error) {
+    return debotAuthErrors[error.reason] || (error.status === 429 ? '请求过于频繁，请稍后重试。' : error.status === 400 || error.status === 422 ? '验证未通过，请检查两个 6 位码；若邮箱验证码已过期，请重新发送。' : error.status === 401 || error.status === 403 ? '登录验证未通过，请刷新工作台后重试。' : '操作未确认，请检查登录状态后重试。');
+  }
+  $('debot-send-code').addEventListener('click', async () => {
+    if (debotAuth.busy || $('debot-send-code').disabled) return;
+    debotAuth.busy = 'code'; debotAuth.message = ''; debotAuth.error = false; const generation = ++debotAuth.generation;
+    clearDebotCodes(); renderDebotAuth();
+    try {
+      const result = await debotAuthRequest('code', {});
+      if (!state.authenticated || generation !== debotAuth.generation) return;
+      debotAuth.status = result; debotAuth.message = '邮箱验证码已发送，请填写邮箱验证码和当前 Authenticator 动态码。';
+    } catch (error) {
+      if (!state.authenticated || generation !== debotAuth.generation) return;
+      debotAuth.error = true; debotAuth.message = debotAuthError(error);
+    } finally {
+      if (generation === debotAuth.generation) { debotAuth.busy = ''; debotAuth.generation++; renderDebotAuth(); void refresh(); if (!$('debot-email-code').disabled) $('debot-email-code').focus(); }
+    }
+  });
+  $('debot-auth-form').addEventListener('submit', async event => {
+    event.preventDefault(); if (debotAuth.busy || $('debot-login-submit').disabled) return;
+    let emailCode = $('debot-email-code').value.trim(), totpCode = $('debot-totp-code').value.trim();
+    clearDebotCodes();
+    if (!/^\d{6}$/.test(emailCode) || !/^\d{6}$/.test(totpCode)) { emailCode = ''; totpCode = ''; debotAuth.message = '请填写两个完整的 6 位验证码。'; debotAuth.error = true; renderDebotAuth(); return; }
+    const challengeId = debotAuth.status?.challengeId;
+    if (!challengeId || Date.parse(debotAuth.status.challengeExpiresAt) <= Date.now()) { emailCode = ''; totpCode = ''; debotAuth.message = '邮箱验证码已过期，请重新发送。'; debotAuth.error = true; renderDebotAuth(); return; }
+    debotAuth.busy = 'login'; debotAuth.message = ''; debotAuth.error = false; const generation = ++debotAuth.generation; renderDebotAuth();
+    try {
+      const pending = debotAuthRequest('login', {challengeId, emailCode, totpCode}); emailCode = ''; totpCode = '';
+      const result = await pending;
+      if (!state.authenticated || generation !== debotAuth.generation) return;
+      debotAuth.status = result;
+      debotAuth.message = result.state === 'authenticated' ? '账户登录成功。实时连接与认证状态见上方。' : '验证尚未完成，请检查登录状态后重试。';
+      debotAuth.error = result.state !== 'authenticated';
+    } catch (error) {
+      if (!state.authenticated || generation !== debotAuth.generation) return;
+      debotAuth.error = true; debotAuth.message = debotAuthError(error);
+    } finally {
+      emailCode = ''; totpCode = ''; clearDebotCodes();
+      if (generation === debotAuth.generation) { debotAuth.busy = ''; debotAuth.generation++; renderDebotAuth(); void refresh(); }
+    }
+  });
+  window.addEventListener('pagehide', clearDebotCodes);
+  setInterval(() => { if (state.authenticated && state.view === 'system') renderDebotCountdown(); }, 1000);
 
   function scanQuery() {
     const q = new URLSearchParams({limit: String(PAGE_SIZE), offset: String(state.offset)});
@@ -445,6 +615,10 @@
     }});
     if (activeView === 'protection') jobs.push({key: 'protection', run: () => api('/protection'), apply: data => { state.protection = data; state.protectionLoaded = true; renderProtection(); }});
     if (activeView === 'system') jobs.push({key: 'chainStream', run: () => api('/chain-stream'), apply: data => { state.chainStream = data; state.chainStreamLoaded = true; renderChainStream(); }});
+    if (activeView === 'system' && !debotAuth.busy) {
+      const generation = debotAuth.generation;
+      jobs.push({key: 'debotAuth', run: () => api('/debot/auth'), apply: data => { if (generation === debotAuth.generation && !debotAuth.busy) { debotAuth.status = data; renderDebotAuth(); } }});
+    }
     if (activeView === 'orders') jobs.push({key: 'orders', run: () => api('/orders'), apply: data => { state.orders = Array.isArray(data.items) ? data.items : []; state.ordersLoaded = true; renderOrders(); }});
     if (activeView === 'wallets') {
       jobs.push({key: 'walletStatus', run: () => api('/wallet-research/status'), apply: data => { state.walletStatus = data; renderWalletStatus(); }});
@@ -487,6 +661,7 @@
   $('system-details').addEventListener('click', () => setView('system'));
   $('system-protection-link').addEventListener('click', () => setView('protection'));
   $('chain-stream-summary').addEventListener('click', () => { setView('system'); $('chain-stream-panel').scrollIntoView({block: 'start'}); });
+  $('debot-settings-link').addEventListener('click', () => { setView('system'); $('debot-auth-panel').scrollIntoView({block: 'start'}); });
   function filtersChanged() { state.offset = 0; state.queryVersion++; void refresh(); }
   document.querySelectorAll('[data-chain]').forEach(button => button.addEventListener('click', () => {
     state.chain = button.dataset.chain;
@@ -523,7 +698,8 @@
     text('list-title', view === 'candidates' ? '曾通过研究判断的信号' : '全部扫描记录');
     delete state.resourceErrors.scans; delete state.resourceErrors.orders; delete state.resourceErrors.wallets; delete state.resourceErrors.walletStatus; delete state.resourceErrors.walletProfiles; delete state.resourceErrors.associations; delete state.resourceErrors.protection; delete state.resourceErrors.chainStream;
     if (view === 'scans' || view === 'candidates') { state.items = []; state.scansLoaded = false; $('scan-rows').replaceChildren(); text('list-count', '—'); renderScanEmpty('正在读取记录', '即将展示当前筛选条件下的真实数据。'); }
-    if (view === 'system') { renderSystem(); renderChainStream(); }
+    if (view === 'system') { renderSystem(); renderChainStream(); renderDebotAuth(); }
+    else clearDebotCodes();
     if (view === 'protection') renderProtection();
     if (view === 'wallets') { state.walletOffset = 0; renderWalletRankingNote(); if (state.walletStatus) renderWalletStatus(); if (!state.walletsLoaded) walletEmpty('正在读取钱包研究档案', '从真实观测记录中整理研究目标。'); }
     void refresh();
@@ -538,7 +714,7 @@
     text('tracking-policy-note', finite(settings.sampleIntervalSec) ? `每 ${settings.sampleIntervalSec} 秒轮询 · 逐币报价时间可不同` : '按服务端间隔轮询，逐币时间以报价为准');
     text('performance-note', `以首次符合条件后的首个有效价格为基准${finite(settings.trackingHours) ? `，追踪 ${settings.trackingHours} 小时` : ''}；最高涨幅仅为采样观测值，不代表全市场最高价或实际收益。通过研究门槛不代表已下单。`);
     if (data.walletResearch) { state.walletStatus = data.walletResearch; renderWalletStatus(); }
-    renderBalances(Array.isArray(data.balances) ? data.balances : []); renderScanner(data.scanner); renderSystemOverview(); renderSystem(); if (state.view === 'system') renderChainStream();
+    renderBalances(Array.isArray(data.balances) ? data.balances : []); renderScanner(data.scanner); renderSystemOverview(); renderSystem(); renderDebotAuth(); if (state.view === 'system') renderChainStream();
   }
   function renderBalances(balances) {
     const container = $('balance-list'); container.replaceChildren();
@@ -607,6 +783,10 @@
     text('chain-stream-summary-text', !stream ? '链上订阅：状态未知' : !stream.enabled ? '链上订阅：未启用' : !stream.running ? '链上订阅：未运行' : `链上订阅：${streamLive} / ${streamChains.length} 个网络已连接`);
     statusDot('chain-stream-summary-dot', streamIssue ? 'watch' : streamLive ? 'pass' : 'neutral');
     text('chain-stream-summary-note', streamIssue ? '连接或补数需关注 · 查看各链详情；实盘保护仍需单独核实。' : '仅观察目标钱包与池，连接正常不代表实盘保护就绪。');
+    const debot = data.debotStream, debotScanner = data.debotScanner;
+    text('debot-summary-text', `DeBot：${debotStreamLabel(debot, debotScanner)}`);
+    text('debot-summary-note', debot?.authorized && debot?.connected ? `最近推送延迟 ${debotDelay(debot.lastSignalDelayMs)} · 登录与连接详情` : '邮箱 + Authenticator 登录 · 查看实时信号设置');
+    statusDot('debot-summary-dot', debot?.state === 'live' && debot?.authorized && debot?.connected ? 'pass' : debotScanner?.enabled ? 'watch' : 'neutral');
     const problem = scanProblem || walletProblem || balanceProblem || resourceProblem || data.archiveError || protectionError || streamIssue;
     const loading = !data.system || system.status === 'loading' || balances.length === 0 || balances.some(balance => balance.status === 'loading') || stream?.enabled && streamChains.some(chain => chain.state === 'connecting');
     const status = $('system-overall-status'); status.className = `badge ${problem ? 'watch' : loading ? 'neutral' : 'pass'}`; status.textContent = problem ? '部分项目需关注' : loading ? '正在初始化 / 等待采样' : '运行正常';
@@ -841,6 +1021,31 @@
       const exit = el('td'); exit.append(badge(exitStatuses[order.exit?.state] || '未配置 / 无记录', ['attention', 'unverified'].includes(order.exit?.state) ? 'watch' : order.exit?.state === 'monitoring' ? 'pass' : 'neutral')); if (order.exit?.checkedAt) exit.append(el('div', 'cell-subtitle', date(order.exit.checkedAt))); row.append(exit); body.append(row);
     }
   }
+  function renderDebotScanner(runtime, scanner, stream) {
+    if (!scanner) return;
+    const cycle = scanner.lastCycle || {};
+    const cooling = scanner.cooldownUntil && Date.parse(scanner.cooldownUntil) > Date.now();
+    const authRequired = ['DEBOT_SIGNAL_HTTP_401', 'DEBOT_SIGNAL_HTTP_403', 'DEBOT_SIGNAL_AUTH_REQUIRED'].includes(scanner.lastError) || (Array.isArray(cycle.diagnostics) && cycle.diagnostics.some(item => item.status === 'auth_required'));
+    const rateLimited = ['DEBOT_SIGNAL_HTTP_429', 'DEBOT_SIGNAL_RATE_LIMITED'].includes(scanner.lastError) || (Array.isArray(cycle.diagnostics) && cycle.diagnostics.some(item => item.status === 'rate_limited'));
+    const status = !scanner.enabled ? '未启用' : !scanner.running ? '未运行' : authRequired ? '待登录后重试' : cooling ? rateLimited ? '限流冷却中' : '等待重试' : scanner.inFlight ? '正在采集' : '持续运行中';
+    runtime.append(el('p', 'policy-caption', 'DeBot 信号采集'), kv('DeBot 采集状态', scanner.mode === 'authenticated_stream' ? debotStreamLabel(stream, scanner) : status), kv('采集方式', scanner.mode === 'anonymous_poll' ? `匿名轮询 · 每 ${scalar(scanner.intervalSec)} 秒调度 · 非实时订阅` : scanner.mode === 'authenticated_stream' ? '登录认证后的实时订阅 + 补充读取' : '未配置'), kv('最近一轮补充读取', date(cycle.completedAt, true)), kv('最近收到信号', date(scanner.lastObservedAt, true)), kv('已保存信号 / 已送分析 / 待分析', `${count(scanner.stored)} / ${count(scanner.dispatched)} / ${count(scanner.pending)}`), kv('已忽略信号', count(scanner.ignored)));
+    if (stream) runtime.append(kv('最近实时认证成功', date(stream.lastAuthorizedAt, true)), kv('本次服务实时推送数 / 重连次数', `${count(stream.received)} / ${count(stream.reconnects)}`), kv('最近实时推送延迟', debotDelay(stream.lastSignalDelayMs)), kv('最大实时推送延迟', debotDelay(stream.maxSignalDelayMs)), kv('最近分析排队耗时', debotDelay(scanner.lastAnalysisQueueDelayMs)));
+    if (finite(scanner.detailsReceived)) runtime.append(kv('已补充钱包详情 / 详情失败', `${count(scanner.detailsReceived)} / ${count(scanner.detailsFailed)}`));
+    if (scanner.interrupted > 0 || scanner.failed > 0) runtime.append(kv('分析中断 / 失败', `${count(scanner.interrupted)} / ${count(scanner.failed)}`));
+    if (cycle.completedAt || cycle.startedAt) runtime.append(kv('本轮接收 / 新增', `${count(cycle.received)} / ${count(cycle.added)}`), kv('本轮请求 / 错误', `${count(cycle.requests)} / ${count(cycle.errors)}`));
+    if (cooling) runtime.append(kv('DeBot 下次重试时间', date(scanner.cooldownUntil, true)));
+    if (scanner.deferredReason) runtime.append(kv('DeBot 分析排队原因', reasonNames[scanner.deferredReason] || scalar(scanner.deferredReason)));
+    if (scanner.lastError) runtime.append(el('p', 'detail-message detail-error', `DeBot 最近异常：${reasonNames[scanner.lastError] || scalar(scanner.lastError)}`));
+    if (Array.isArray(cycle.diagnostics)) {
+      const labels = {ok: '正常', unavailable: '暂不可用', rate_limited: '限流', auth_required: '需要登录', invalid_response: '响应异常'};
+      for (const item of cycle.diagnostics) {
+        runtime.append(kv(`DeBot · ${chainName(item.chain)}`, `${labels[item.status] || scalar(item.status)} · 接收 ${count(item.received)} 条`));
+        if (item.reason) runtime.append(el('p', 'detail-small', reasonNames[item.reason] || scalar(item.reason)));
+      }
+    }
+    if (Array.isArray(cycle.reasons) && cycle.reasons.length) runtime.append(reasonList(cycle.reasons));
+    runtime.append(el('p', 'detail-small', '完整钱包地址取得后才进入归属研究；钱包别名不能认定独立买家或同一控制人。信号仍需安全与钱包研究检查，已送分析不代表已通过条件或已买入。推送延迟从平台信号时间算起，分析排队耗时从本地接收算起。'));
+  }
   function renderSystem() {
     const runtime = $('system-runtime'); const policy = $('system-policy'); runtime.replaceChildren(); policy.replaceChildren();
     const data = state.overview;
@@ -873,6 +1078,7 @@
       runtime.append(el('p', 'policy-caption', '各来源最近状态'));
       for (const item of cycle.diagnostics) runtime.append(kv(`${chainName(item.chain)} · ${scalar(item.kind)}`, {ok: '正常', empty: '暂无新记录', invalid_response: '响应异常', unavailable: '暂不可用', rate_limited: '限流'}[item.status] || scalar(item.status)));
     }
+    renderDebotScanner(runtime, data.debotScanner, data.debotStream);
     if (data.archiveError) runtime.append(el('p', 'detail-message detail-error', '档案写入失败，记录可能不完整。'));
     runtime.append(el('p', 'policy-caption', '工作台只展示服务端状态。通过研究门槛不代表已下单；实际开单还需报价、余额和执行检查。价格任务逐币轮询，实际间隔以最后报价时间为准。'));
     if (settings.watchRecheck) policy.append(kv('观察定时复评', settings.watchRecheck.enabled ? '已启用' : '未启用'), kv('最长观察窗口', `${scalar(settings.watchRecheck.windowSec)} 秒（受原始信号有效期限制）`), kv('复评队列调度', `每 ${scalar(settings.watchRecheck.intervalSec)} 秒，单轮最多 ${scalar(settings.watchRecheck.maxPerCycle)} 条`));

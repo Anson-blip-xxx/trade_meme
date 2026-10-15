@@ -44,16 +44,19 @@ export class Store {
       WHERE status='processing' AND (claim_id IS NULL OR lease_expires_at IS NULL OR lease_expires_at<=?)`)
       .run(now.toISOString());
   }
-  reserve(signal:Signal,notificationPayload?:unknown,channel:'notification_copy'|'debot_story_response'='notification_copy'):{created:boolean;conflict:boolean;entry:Stored} {
+  reserve(signal:Signal,notificationPayload?:unknown,channel:'notification_copy'|'debot_story_response'='notification_copy',firstReceivedAt?:string):{created:boolean;conflict:boolean;entry:Stored} {
     const payload=JSON.stringify(signal),hash=createHash('sha256').update(payload).digest('hex');
     const id=randomUUID(),now=new Date(),claimId=randomUUID();
+    if(firstReceivedAt!==undefined&&(!Number.isFinite(Date.parse(firstReceivedAt))||Date.parse(firstReceivedAt)>now.getTime()+30_000))
+      throw new Error('SIGNAL_RECEIVED_TIME_INVALID');
+    const receivedAt=firstReceivedAt===undefined?now.toISOString():new Date(firstReceivedAt).toISOString();
     const leaseExpiresAt=new Date(now.getTime()+PROCESSING_LEASE_MS).toISOString();
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const write=this.db.prepare(`INSERT OR IGNORE INTO signals
         (id,source,event_id,payload_hash,signal,received_at,status,report,claim_id,lease_expires_at)
         VALUES (?,?,?,?,?,?,'processing',NULL,?,?)`)
-        .run(id,signal.source,signal.sourceEventId,hash,payload,now.toISOString(),claimId,leaseExpiresAt);
+        .run(id,signal.source,signal.sourceEventId,hash,payload,receivedAt,claimId,leaseExpiresAt);
       const row=this.db.prepare('SELECT * FROM signals WHERE source=? AND event_id=?').get(signal.source,signal.sourceEventId)!;
       const conflict=row.payload_hash!==hash,entry=this.decode(row);
       if(!conflict&&notificationPayload!==undefined) this.recordImport(entry.id,notificationPayload,channel);

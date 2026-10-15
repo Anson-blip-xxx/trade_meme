@@ -58,6 +58,7 @@ GMGN 回退默认每轮间隔 60 秒、最多轮询 3 个尚未被新鲜链上�
 | 环节 | 实际行为 |
 | --- | --- |
 | 扫描 | GMGN `/v1/user/kol`、`/v1/user/smartmoney`，每链每路一页；只接受新鲜有效 buy，使用完整 `base_address` 与原交易 `timestamp` |
+| DeBot 信号 | 可启用 BSC / Solana / Robinhood 官方频道列表匿名轮询；每链一页最多 20 条、每轮后等 30 秒。独立采集并持久去重，分析每分钟最多 1 条，等待 GMGN 扫描空档与限流解除 |
 | 控制 | 默认一轮完成后等 60 秒，每轮研究最多 3 个信号。按链/交易/钱包/CA/方向去重；请求和回调串行，去重有 TTL/容量限制，429 服从共享冷却 |
 | GMGN 数据 | token info、security、pool、持币者、钱包统计和活动；平台名称、标签、代币描述均为供应商材料 |
 | 叙事 | 缺快照时 BSC/Solana 自动按 CA 读取 DeBot v2。不是 DeBot 网页/App 原生推送订阅，也不是全市场社交扫描 |
@@ -68,6 +69,16 @@ GMGN 回退默认每轮间隔 60 秒、最多轮询 3 个尚未被新鲜链上�
 | 结论 | `BUY_CANDIDATE` 为研究候选，必要数据缺失或模式未适配为 `WATCH`，明确阻断为 `REJECT`。实际执行结果看订单账本 |
 
 有限公开标签钱包样本不等于全市场发现。未来涨幅、`price_change`、金银铜狗、事后 10 倍不作为当前信号，不回填到历史入场特征。
+
+DeBot 配置为 `DEBOT_SCANNER_ENABLED=true`、`DEBOT_TRANSPORT=authenticated_stream`。在 9528 控制台“运行状态 → DeBot 登录”中发送邮箱验证码，并输入邮箱验证码和 Google Authenticator 当前动态码。邮箱由服务器 `DEBOT_LOGIN_EMAIL` 固定配置；两个验证码仅用于当次请求，不存入数据库、日志或浏览器存储。通过官方 `/api/user/info` 验证后，会话原子保存到 `DEBOT_SESSION_PATH`（默认 `data/debot/session.json`，目录 0700、文件 0600）。该凭据文件仅留在服务器，禁止提交到 Git。
+
+登录后使用网页当前采用的 Socket.IO `/portal-ws`，先发 `authorization` 并等到 `success`，再订阅 BSC=2、Solana=1、Robinhood=83 三个频道。断线退避重连并重新验证会话；明确失效时停止订阅，提示重新登录，不自动切到匿名信号。授权后及每 60 秒读取一页最近信号用于补数，不跟随历史分页。此为观察到的网页协议，不是供应商公开稳定 API；代码测试不等于真实账号已完成授权，实际状态以页面为准。
+
+精简信号单独存入 `data/debot-signals.sqlite`（最多 30 天、10,000 条、SQLite 主库 64 MiB），冻结首次接收时间、原告警时间、完整 CA 和供应商钱包线索；不保存 Cookie、供应商原响应或事后涨幅。超过 120 秒的告警和排队期间过期的信号不送入实时研究。卡片刷新、重启不会重复送交同一事件；分析期间宕机的记录标为中断。页面分别显示订阅授权、信号延迟、研究排队和异常；研究仍受 GMGN 额度限制，断线、队列或页容量可能遗漏信号。
+
+新信号会请求对应的钱包明细，最多提名 3 个完整非零地址进入既有 GMGN 钱包研究预算，随后核验持仓、统计和活动。别名、盈利榜、供应商钱包数不生成链上交易，不算作独立聪明资金组，也不证明 KOL 归属。缺少地址时继续已有研究流程，不编造地址。DeBot 叙事和平台标签不覆盖合约安全检查。扫描列表标明 `DEBOT` 来源。
+
+`anonymous_poll` 仅保留作诊断模式，匿名告警有供应商延迟，不能视为实时。默认不启用该模式。登录方式、信号字段或权限变更会在控制台显示固定错误码，需要重新核对网页协议。
 
 ### 叙事与证据
 
@@ -346,6 +357,11 @@ npm run orders -- <订单ID>
 | --- | --- |
 | `GMGN_MIN_INTERVAL_MS` | 350；按权重排队，429 服从供应商冷却，不保证套餐吞吐 |
 | `SCANNER_INTERVAL_SEC` / `SCANNER_MAX_SIGNALS` | 60 / 3 |
+| `DEBOT_SCANNER_ENABLED` / `DEBOT_SCANNER_INTERVAL_SEC` | false / 30；启用信号来源，间隔仅用于匿名诊断模式；认证流每 60 秒补数 |
+| `DEBOT_TRANSPORT` | `authenticated_stream`；匿名轮询仅供诊断 |
+| `DEBOT_LOGIN_EMAIL` | 固定 DeBot 登录邮箱，控制台不能改成其他账户 |
+| `DEBOT_SESSION_PATH` | `data/debot/session.json`；私有登录会话，不能与任何数据库共用路径 |
+| `DEBOT_SIGNALS_DATABASE_PATH` | `data/debot-signals.sqlite`；与其他数据库使用不同路径 |
 | `WALLET_SUPPORT_REQUIRED` / `MIN_SMART_WALLET_GROUPS` | true / 2；钱包支持默认必需 |
 | `WALLET_MAX_PROFILES` | 3，可设 1–5 |
 | `WATCH_RECHECK_ENABLED` | 未配置为 false；示例模板及当前服务器为 true |
@@ -366,7 +382,7 @@ npm run demo
 
 `check` 覆盖来源伪造/错链、有限日志查找、模式/权限、叙事引用与评分隔离、钱包分组和覆盖、扫描去重/冷却、内存清理、订单幂等、报价/签名和不明状态恢复。测试使用模拟响应，不提交实盘；`demo` 使用虚构材料，不是实时机会。
 
-尚未完成真实账户端到端联调、独立成交/卖出模拟、独立池深及价格冲击模型、程序升级监控和 DeBot 原生推送接入。接口依据和实测边界见 [docs/sources.md](docs/sources.md)。
+尚未完成真实账户端到端联调、独立成交/卖出模拟、独立池深及价格冲击模型、程序升级监控和 DeBot 登录态/长连接推送接入；DeBot 官方信号列表已支持匿名轮询。接口依据和实测边界见 [docs/sources.md](docs/sources.md)。
 
 
 ## 链上长连接与 GMGN 降频

@@ -107,4 +107,10 @@ export interface WalletAnalysisOptions {
   recentWindowSec?: number;
   now?: () => Date;
   researchTargets?: WalletResearchTargets;
+  vendorWalletTargets?: VendorWalletTargets;
+}
+
+/** A vendor's nomination for bounded research; never ownership, smart-wallet or trade evidence. */
+export interface VendorWalletTargets {
+  provider:'debot';token:Signal['token'];checkedAt:string;addresses:string[];
 }

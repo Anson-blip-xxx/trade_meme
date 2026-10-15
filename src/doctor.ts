@@ -104,7 +104,11 @@ export async function runDoctor(config:Config,options:{live?:boolean;fetcher?:Fe
   add('goplus','warn',present(config.goPlusToken)
     ?'GoPlus Key 已配置，但安全接口、额度及每个代币的报告完整性尚未验证。'
     :'GoPlus 使用未认证公共访问；可选 GOPLUS_ACCESS_TOKEN，接口限流或缺失字段会使安全结论保持未知。');
-  add('debot','warn','DeBot 叙事读取已接入，原生推送尚未接入；可使用 GMGN KOL/聪明钱轮询或手动 HTTP 信号。');
+  add('debot',config.debotScannerEnabled&&config.debotTransport==='authenticated_stream'?'pass':'warn',config.debotScannerEnabled
+    ?config.debotTransport==='authenticated_stream'
+      ?'DeBot 已配置认证长连接；需在控制台完成邮箱与验证器双码登录。是否已授权、信号延迟与会话失效以运行状态为准；钱包线索仍需独立核验。'
+      :'DeBot 当前使用匿名诊断轮询；匿名告警有延迟，不能作为实时信号。'
+    :'DeBot 叙事读取已接入；实时信号未启用，可配置 DEBOT_SCANNER_ENABLED、DEBOT_LOGIN_EMAIL 后在控制台登录。');
   add('scanner',config.scannerEnabled&&gmgnReady?'pass':'warn',config.scannerEnabled&&gmgnReady
     ?'服务启动后轮询 GMGN KOL/聪明钱买入事件；按交易原时间去重，数量有限，不等于全市场覆盖。'
     :'自动轮询尚未启用或缺少个人 GMGN Key；HTTP 导入仍可用。');

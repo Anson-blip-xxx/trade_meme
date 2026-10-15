@@ -4,8 +4,9 @@ import {unknown,type Check,type Signal} from './types.js';
 import {GmgnClient} from './providers/gmgn-client.js';
 import {collectGmgnToken,assessGmgnSafety,type GmgnTokenSnapshot} from './providers/gmgn-safety.js';
 import {analyzeWallets,parseWalletIdentities} from './research/wallets.js';
-import type {WalletAnalysis,WalletIdentity,WalletRecord} from './research/wallet-types.js';
+import type {WalletAnalysis,WalletIdentity,WalletRecord,VendorWalletTargets} from './research/wallet-types.js';
 import type {WalletResearchTargets} from './research/wallet-targets.js';
+export type {VendorWalletTargets} from './research/wallet-types.js';
 
 export interface GmgnResearch {snapshot:GmgnTokenSnapshot;safety:Check;wallets:WalletAnalysis;flow:Check;}
 export function loadIdentities(path?:string):WalletIdentity[] {
@@ -65,13 +66,16 @@ export function assessWalletSupport(wallets:WalletAnalysis,minGroups:number,now=
 }
 
 export function researchProvider(config:Config,client:GmgnClient,identities=loadIdentities(config.walletIdentitiesPath),
-  options:{walletTargets?:(signal:Signal)=>WalletResearchTargets}={}) {
+  options:{walletTargets?:(signal:Signal)=>WalletResearchTargets;
+    vendorWalletTargets?:(signal:Signal)=>VendorWalletTargets|undefined}={}) {
   return async(signal:Signal):Promise<GmgnResearch>=>{
     const snapshot=await collectGmgnToken(signal,client);
-    let researchTargets:WalletResearchTargets|undefined,targetError=false;
+    let researchTargets:WalletResearchTargets|undefined,vendorWalletTargets:VendorWalletTargets|undefined,targetError=false,vendorTargetError=false;
     try{researchTargets=options.walletTargets?.(signal);}catch{targetError=true;}
-    const wallets=await analyzeWallets(signal,snapshot.info,client,{maxWallets:config.walletMaxProfiles,identities,researchTargets});
+    try{vendorWalletTargets=options.vendorWalletTargets?.(signal);}catch{vendorTargetError=true;}
+    const wallets=await analyzeWallets(signal,snapshot.info,client,{maxWallets:config.walletMaxProfiles,identities,researchTargets,vendorWalletTargets});
     if(targetError)wallets.facts.targetSelectionError='LOCAL_WALLET_TARGETS_UNAVAILABLE';
+    if(vendorTargetError)wallets.facts.vendorTargetSelectionError='VENDOR_WALLET_TARGETS_UNAVAILABLE';
     return {snapshot,safety:assessGmgnSafety(snapshot,config.maxTaxRate),wallets,
       flow:assessWalletSupport(wallets,config.minSmartWalletGroups)};
   };

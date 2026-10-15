@@ -130,11 +130,11 @@ test('late verified labels fill earlier alerts for the same chain and CA without
     const earlier=observation('1'),later=observation('2'),otherChain=observation('1','robinhood');
     earlier.signal.occurredAt=new Date(now.getTime()-5000).toISOString();
     scanner.acceptPage(page(earlier,later,otherChain));await scanner.dispatchOnce();
-    assert.equal(calls,3);assert.equal(scanner.getStatus().dispatched,3);
+    assert.equal(calls,2);assert.equal(scanner.getStatus().dispatched,2);
     const before=new Map(scanner.recent().items.map(item=>[item.eventId,item]));
     const storedBefore=new Map(f.rows().map(row=>[row.id,row]));
     scanner.acceptPage(page({...later,name:'BABA',symbol:'BABA'}));await scanner.dispatchOnce();
-    assert.equal(calls,3);assert.equal(scanner.getStatus().stored,3);
+    assert.equal(calls,2);assert.equal(scanner.getStatus().stored,3);
     for(const item of scanner.recent().items) {
       const old=before.get(item.eventId)!;
       if(item.chain==='bsc'){assert.equal(item.name,'BABA');assert.equal(item.symbol,'BABA');}

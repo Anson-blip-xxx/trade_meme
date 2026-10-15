@@ -8,7 +8,7 @@
   const chainSymbols = {bsc: 'BNB', solana: 'SOL', robinhood: 'ETH'};
   const views = {
     home: ['工作台总览', '观察信号、追踪结果、研究钱包，从需要的栏目开始。'],
-    risk: ['实时信号风控', '查看新信号的核验评分与进度；历史记录按页查阅。'],
+    risk: ['实时信号风控', '同链同币合并显示，保留每次通知的变化与核验进度。'],
     sources: ['信号来源', '管理 DeBot 登录，检查信号接收与实时订阅状态。'],
     associations: ['前置关联', '沿公开钱包之前的买入时序，寻找能够重复验证的关联线索。'],
     scans: ['信号扫描', '从链上信号到筛选依据，让每一次观察都有迹可循。'],
@@ -544,6 +544,90 @@
     } finally { clearTimeout(timeout); }
   }
   const debotRiskChecks = [['safety', '合约安全'], ['provenance', '官方来源'], ['market', '市场风险'], ['wallets', '钱包支持']];
+  const debotChangeNames = {first: '首次通知', replay: '重复投递', display: '展示信息更新', wallet_hint: '钱包线索变化'};
+  function debotChangeText(change) {
+    const kind = typeof change === 'string' ? change : change?.kind;
+    if (kind === 'display' && Array.isArray(change?.reasons) && change.reasons.includes('DEBOT_REPEAT_NOTIFICATION')) return '再次提醒 · 无新变化';
+    return debotChangeNames[kind] || '变化待分类';
+  }
+  function debotChangeTitle(change) {
+    if (!change || typeof change !== 'object') return '';
+    const details = [], delta = change.delta;
+    for (const [key, label] of [['walletCount', '供应商钱包提示数'], ['addressCount', '供应商地址提示数']]) {
+      if (finite(delta?.[key]?.before) && finite(delta?.[key]?.after)) details.push(`${label}：${count(delta[key].before)} → ${count(delta[key].after)}`);
+    }
+    if (finite(delta?.addedAddressCount)) details.push(`新增地址提示：${count(delta.addedAddressCount)}`);
+    if (finite(delta?.addedAliasCount)) details.push(`新增别名：${count(delta.addedAliasCount)}，不代表独立买家数`);
+    if (Array.isArray(change.reasons)) for (const code of change.reasons) if (typeof code === 'string') details.push(`${debotNotificationReason(code)} [${code}]`);
+    return details.join('\n');
+  }
+  function debotReviewText(value) {
+    return {pending: '等待补充核验', dispatching: '正在处理新通知', completed: '本轮分析完成', ignored: '未重复分析', failed: '补充核验暂未完成', interrupted: '本轮处理已中断'}[value] || '复评状态待同步';
+  }
+  function debotNotificationReason(value) {
+    if (typeof value !== 'string') return '';
+    return debotNotificationReasons[value] || reasonNames[value] || value;
+  }
+  const debotNotificationReasons = {
+    first_analysis: '首次实质分析',
+    reassessment: '取得新增证据，重新分析',
+    display_only: '仅更新展示信息',
+    no_material_change: '暂未发现足以触发复评的变化',
+    evidence_pending: '等待核实新增线索',
+    coalesced: '已并入该币正在处理的任务',
+    stale: '历史通知，未重新分析',
+    failed: '本轮核验暂未完成',
+    interrupted: '核验被中断',
+    DEBOT_UPDATE_COALESCED: '新通知已合并，等待该币当前任务完成',
+    DEBOT_NO_MATERIAL_CHANGE: '暂未发现足以触发复评的变化',
+    DEBOT_REPEAT_EVIDENCE_PENDING: '供应商提示尚未形成新增可核验证据',
+    DEBOT_REPEAT_COOLDOWN: '已保存通知变化，等待复核间隔',
+    DEBOT_REPEAT_REASSESSMENT: '已取得新增证据，重新分析',
+    DEBOT_INITIAL_ANALYSIS: '首次收到该币，开始实质分析',
+    DEBOT_FIRST_NOTIFICATION: '首次收到该币通知',
+    DEBOT_VENDOR_WALLET_HINT_CHANGED: '供应商钱包提示发生变化',
+    DEBOT_DISPLAY_CHANGED: '展示字段发生变化',
+    DEBOT_REPEAT_NOTIFICATION: '再次提醒，未发现实质字段变化',
+    DEBOT_NOTIFICATION_REPLAY: '同一事件内容再次送达，已合并',
+    DEBOT_EVENT_TIME_CONFLICT: '同一事件的平台时间存在冲突，需要复核',
+    DEBOT_REPEAT_WINDOW_INVALID: '本次核验时间窗口无效',
+    DEBOT_REPEAT_DETAILS_SCOPE_OR_RESPONSE_INVALID: '详情与当前链或合约尚未核实',
+    DEBOT_REPEAT_DETAILS_UNAVAILABLE: '补充钱包详情暂不可用',
+    DEBOT_REPEAT_DETAILS_STALE_OR_REPLAYED: '钱包详情已过期或为重复快照',
+    DEBOT_REPEAT_BASELINE_SCOPE_OR_RESPONSE_INVALID: '前次钱包快照与当前合约尚未核实',
+    DEBOT_REPEAT_ACTUAL_ADDRESSES_UNAVAILABLE: '仅有钱包提示，尚未取得有效地址',
+    DEBOT_REPEAT_NEW_ACTUAL_WALLET_PENDING_VERIFICATION: 'DeBot 详情出现新地址，身份与交易仍待核验',
+    DEBOT_REPEAT_VENDOR_ACTIVITY_PENDING_VERIFICATION: '供应商交易时间发生变化，待核验',
+    DEBOT_REPEAT_VENDOR_QUANTITY_PENDING_VERIFICATION: '供应商买入或持仓数量发生变化，待核验',
+    DEBOT_REPEAT_VENDOR_HOLDING_DECREASE_PENDING_VERIFICATION: '供应商持仓数量减少，优先核验风险',
+    DEBOT_REPEAT_LOCAL_EVIDENCE_UNAVAILABLE: '本地交易样本暂不可用',
+    DEBOT_REPEAT_LOCAL_EVIDENCE_SCOPE_INVALID: '本地交易样本范围尚未核实',
+    DEBOT_REPEAT_LOCAL_EVIDENCE_TRUNCATED: '本地样本覆盖不完整',
+    DEBOT_REPEAT_LOCAL_SELL_OBSERVED: '本地已采集到新增卖出交易样本',
+    DEBOT_REPEAT_LOCAL_BUY_OBSERVED: '本地已采集到新增买入交易样本',
+    DEBOT_REPEAT_PROFILED_WALLET_RESEARCH_PRIORITY: '观测交易命中钱包画像，优先研究关联目标',
+    DEBOT_REPEAT_NO_NEW_WALLET_EVIDENCE: '暂未发现新增钱包证据',
+    RESEARCH_TRIGGER_NOT_ENTRY_PERMISSION: '触发研究复核不代表允许买入',
+    VENDOR_REPORTS_NOT_OWNERSHIP_PROOF: '供应商记录不能证明钱包实际归属',
+    MISSING_WALLET_NOT_A_SALE: '钱包未出现在当前列表中，不能推定已卖出',
+    INVALID_OR_ALIAS_ONLY_WALLETS_IGNORED: '仅别名或无效钱包记录未作为地址证据',
+    PARTIAL_VENDOR_DETAILS: '供应商钱包详情覆盖不完整',
+    VENDOR_CHANGE_EXAMPLES_LIMIT_24: '仅展示最多 24 项供应商变化样本',
+    REPLAYED_VENDOR_WALLET_IGNORED: '过期的供应商钱包记录未计入新增变化',
+    INVALID_LOCAL_TRADE_IGNORED: '无效本地交易样本未计入证据',
+    LOCAL_TRADE_EXAMPLES_LIMITED: '交易为有限代表样本，非完整流水',
+    MONITORED_WALLET_SAMPLE_NOT_WHOLE_MARKET: '交易样本仅覆盖已监控钱包，不代表全市场',
+    PROFILE_RELATION_NOT_OWNERSHIP_PROOF: '画像关联仅为研究线索，不能证明共同归属',
+    RESEARCH_TARGETS_PARTIAL: '研究目标为部分优先对象',
+    FIRST_NOTIFICATION: '首次收到该币通知',
+    EXACT_REPLAY: '同一事件重复投递，已合并',
+    DISPLAY_ONLY_CHANGE: '仅展示信息变化，沿用最近分析',
+    WALLET_HINT_CHANGED: '供应商钱包线索变化，需要进一步核验',
+    WALLET_ALIASES_CHANGED: '钱包别名列表发生变化，不代表新增独立买家',
+    WALLET_TRANSACTIONS_VERIFIED: '已取得匹配地址与交易的新增样本',
+    NO_NEW_VERIFIED_EVIDENCE: '暂未取得新增可核验证据',
+    ANALYSIS_IN_PROGRESS: '同币分析正在执行，新变化已合并',
+  };
   function debotRiskVisible() { return state.authenticated && !document.hidden && state.view === 'risk'; }
   function debotRiskNow() { return debotRisk.serverNow ? debotRisk.serverNow + Math.max(0, Date.now() - debotRisk.lastSuccess) : Date.now(); }
   function debotRiskStale() { return Boolean(debotRisk.error || !debotRisk.lastSuccess || debotRisk.offset === 0 && Date.now() - debotRisk.lastSuccess > 8000); }
@@ -668,9 +752,9 @@
     text('debot-risk-empty', debotRisk.loaded ? '尚未接收到可展示的 DeBot 信号，收到后将显示核验进度。' : debotRisk.error ? '连接恢复后将自动继续读取。' : '正在读取信号核验进度…');
     if (debotRisk.items.length) {
       const table = el('table', 'debot-risk-table');
-      const caption = el('caption', 'sr-only', '实时信号风控：名称、所属链、百分制核验评分与分析结果'); table.append(caption);
+      const caption = el('caption', 'sr-only', '同链同币合并的实时信号风控：名称、所属链、百分制核验评分、通知变化与分析结果'); table.append(caption);
       const head = el('thead'); const header = el('tr');
-      for (const [label, name] of [['代币 / 所属链', 'token'], ['核验分', 'score'], ['所属链', 'chain'], ['核验项目', 'checks'], ['状态 / 主要原因', 'conclusion'], ['接收时间 / 耗时', 'timing'], ['操作', 'actions']]) { const cell = el('th', `debot-risk-${name}-cell`, label); cell.scope = 'col'; header.append(cell); }
+      for (const [label, name] of [['代币 / 所属链', 'token'], ['核验分', 'score'], ['所属链', 'chain'], ['核验项目', 'checks'], ['状态 / 主要原因', 'conclusion'], ['通知 / 本次变化', 'notifications'], ['首次 / 最近接收', 'timing'], ['操作', 'actions']]) { const cell = el('th', `debot-risk-${name}-cell`, label); cell.scope = 'col'; header.append(cell); }
       head.append(header); const body = el('tbody'); table.append(head, body); container.append(table);
       for (const item of debotRisk.items) {
         const row = el('tr', 'debot-risk-row'); row.dataset.eventId = scalar(item.eventId, '');
@@ -701,14 +785,25 @@
         const reasons = [...new Set([...debotRiskChecks.flatMap(([key]) => item.checks?.[key]?.status !== 'pass' && Array.isArray(item.checks?.[key]?.reasons) ? item.checks[key].reasons : []), ...(Array.isArray(item.reasons) ? item.reasons : [])])].filter(reason => typeof reason === 'string').slice(0, 4);
         const summary = reasons.length ? reasons.map(reason => reasonNames[reason] || reason).join('；') : missing.length ? `待核验：${missing.join('、')}` : conclusion[0] === '研究候选' ? `有效至 ${time(item.validUntil)} · 未代表下单` : '详细结论见核验证据';
         const reason = el('p', 'debot-risk-reason', summary); reason.title = summary; decision.append(reason);
-        const timing = el('td', 'debot-risk-timing-cell'); const received = el('time', '', time(item.receivedAt)); received.title = date(item.receivedAt, true); if (validDate(item.receivedAt)) received.dateTime = item.receivedAt;
-        timing.append(received, el('span', '', `到达 ${debotRiskDuration(item.signalDelayMs)}`), el('span', '', `分析 ${debotRiskDuration(item.analysisMs)}`)); timing.title = `排队 ${debotRiskDuration(item.queueMs)}\n分析 ${debotRiskDuration(item.analysisMs)}`;
+        const aggregation = item.aggregation;
+        if (item.state === 'completed' && ['pending', 'dispatching'].includes(aggregation?.reviewState)) decision.append(el('p', 'debot-notification-note', '保留上次判断 · 新通知待核验'));
+        const notifications = el('td', 'debot-risk-notifications-cell'); notifications.append(el('strong', '', aggregation ? `${count(aggregation.notificationCount)} 次通知` : '统计待同步'));
+        const change = el('span', 'debot-notification-change', debotChangeText(aggregation?.lastChange)); change.title = debotChangeTitle(aggregation?.lastChange); notifications.append(change);
+        if (aggregation?.lastChange?.kind === 'wallet_hint') notifications.append(el('span', 'debot-notification-note', '供应商线索 · 待核验'));
+        if (finite(aggregation?.analysisCount)) notifications.append(el('span', 'debot-notification-note', `已完成 ${count(aggregation.analysisCount)} 轮分析`));
+        if (aggregation?.reviewState || item.reviewState) { const reviewState = aggregation?.reviewState || item.reviewState, reviewReason = aggregation?.reviewReason || item.reviewReason; const review = el('span', 'debot-notification-review', debotReviewText(reviewState)); review.title = [reviewState, reviewReason ? `${debotNotificationReason(reviewReason)} [${reviewReason}]` : ''].filter(Boolean).join('\n'); notifications.append(review); }
+        const timing = el('td', 'debot-risk-timing-cell');
+        for (const [label, value] of [['首次', aggregation?.firstSeenAt || item.receivedAt], ['最近', aggregation?.lastSeenAt || item.receivedAt]]) {
+          const received = el('time', '', `${label} ${date(value)}`); received.title = date(value, true); if (validDate(value)) received.dateTime = value; timing.append(received);
+        }
+        timing.append(el('span', '', `本轮分析 ${debotRiskDuration(item.analysisMs)}`)); timing.title = `到达 ${debotRiskDuration(item.signalDelayMs)}\n排队 ${debotRiskDuration(item.queueMs)}\n分析 ${debotRiskDuration(item.analysisMs)}`;
         const actions = el('td', 'debot-risk-actions-cell'); actions.append(gmgnTokenLink(item.chain, item.address));
+        const history = el('button', 'text-button', '通知历史 ↗'); history.type = 'button'; history.setAttribute('aria-label', `查看 ${scalar(item.address)} 的通知历史`); history.addEventListener('click', () => openDebotHistory(item, history)); actions.append(history);
         if (typeof item.reportId === 'string' && item.reportId) {
           const detail = el('button', 'text-button', '核验证据 ↗'); detail.type = 'button'; detail.setAttribute('aria-label', `查看 ${scalar(item.address)} 的核验证据`); detail.addEventListener('click', () => openDetail(item.reportId, detail)); actions.append(detail);
           const follow = el('button', 'text-button', '后续复盘 ↗'); follow.type = 'button'; follow.setAttribute('aria-label', `查看 ${scalar(item.address)} 的后续复盘`); follow.addEventListener('click', () => openFollowup(item, follow)); actions.append(follow);
         }
-        row.append(token, score, chain, checksCell, decision, timing, actions); body.append(row);
+        row.append(token, score, chain, checksCell, decision, notifications, timing, actions); body.append(row);
       }
     }
     container.scrollTop = scrollTop; container.scrollLeft = scrollLeft;
@@ -1631,13 +1726,125 @@
     const focus = container.contains(document.activeElement) ? document.activeElement.getAttribute('aria-label') : null; container.replaceChildren(wrapper); if (focus) [...container.querySelectorAll('[aria-label]')].find(node => node.getAttribute('aria-label') === focus)?.focus({preventScroll: true});
   }
 
+  function openDebotHistory(item, trigger) {
+    return openDetail(`debot-history:${item.chain}:${item.address}`, trigger, {debotHistory: true, chain: item.chain, address: item.address, name: item.name || item.symbol, aggregation: item.aggregation, offset: 0, requestedOffset: 0, total: 0, asOf: '', loading: false});
+  }
+  function renderDebotHistory(data) {
+    const history = state.detailWallet;
+    if (!history?.debotHistory) return;
+    const previousOffset = history.offset;
+    history.offset = finite(data.offset) ? data.offset : history.requestedOffset;
+    history.requestedOffset = history.offset; history.total = finite(data.total) ? data.total : 0; history.asOf = data.asOf || history.asOf;
+    const aggregation = {...history.aggregation, ...data.aggregation}, wrapper = el('div', 'debot-history');
+    const heading = el('div', 'detail-token'), title = el('h2', '', `${scalar(history.name, '代币')} · 通知历史`); title.id = 'detail-title';
+    heading.append(title); wrapper.append(heading, el('div', 'token-meta', `${chainName(history.chain)} · 同币通知合并记录`), addressNode(history.address, 'detail-address'));
+    const links = el('div', 'detail-links'); links.append(gmgnTokenLink(history.chain, history.address, '在 GMGN 查看代币 ↗')); wrapper.append(links);
+    wrapper.append(el('p', 'debot-history-note', '首次判断与追踪基准保持不变，通知次数不参与加分。钱包提示变化会先补查详情；供应商地址、数量变化仍为待核验线索，本地已采集交易另列。'));
+    const stats = el('div', 'debot-history-stats');
+    stats.append(kv('通知次数', count(aggregation.notificationCount)), kv('累计投递', count(aggregation.deliveryCount)), kv('已完成分析', finite(aggregation.analysisCount) ? `${count(aggregation.analysisCount)} 轮` : '—'), kv('首次收到', date(aggregation.firstSeenAt, true)), kv('最近收到', date(aggregation.lastSeenAt, true)));
+    wrapper.append(stats);
+    if (aggregation.truncatedHistory || aggregation.historyTruncated || data.truncatedHistory || data.historyTruncated) wrapper.append(el('p', 'notice warning', '部分较早通知已超出明细保留范围；累计次数可能大于当前可查明细。'));
+    const toolbar = el('div', 'debot-history-toolbar'), refresh = el('button', 'text-button', '读取最新通知'); refresh.type = 'button'; refresh.dataset.historyAction = 'refresh';
+    refresh.addEventListener('click', () => { history.requestedOffset = 0; history.asOf = ''; void loadDetail(state.detailId, true); });
+    toolbar.append(el('span', '', `变化版本按接收时间倒序 · 每页 ${PAGE_SIZE} 条；相同内容重发合并投递次数`), refresh); wrapper.append(toolbar);
+    const items = Array.isArray(data.items) ? data.items : [];
+    if (!items.length) wrapper.append(el('p', 'drawer-loading', '当前没有可展示的通知明细。'));
+    const list = el('ol', 'debot-history-list');
+    for (const item of items) {
+      if (!item || typeof item !== 'object') continue;
+      const entry = el('li', 'debot-history-event'), top = el('div', 'debot-history-event-heading');
+      top.append(badge(debotChangeText(item), item.kind === 'wallet_hint' ? 'watch' : 'neutral'), el('time', '', date(item.observedAt || item.lastObservedAt, true))); entry.append(top);
+      const classification = typeof item.classification === 'string' ? item.classification : item.classification?.state || item.classification?.kind;
+      if (classification) { const label = el('p', 'debot-history-classification', debotNotificationReason(classification)); label.title = classification; entry.append(label); }
+      if (item.kind === 'wallet_hint') entry.append(el('p', 'debot-history-source-note', '供应商线索，钱包别名与交易提示均不直接证明身份、归属或独立买家数量。'));
+      else if (item.kind === 'replay') entry.append(el('p', 'debot-history-source-note', '同一事件重复送达，合并计数，不重复触发整套分析。'));
+      else if (item.kind === 'display') entry.append(el('p', 'debot-history-source-note', '通知本身的展示变化不单独作为交易依据；是否复评取决于补查结果。'));
+      const reasons = Array.isArray(item.reasons) ? item.reasons.filter(reason => typeof reason === 'string') : [];
+      if (reasons.length) { const notes = el('ul', 'debot-history-reasons'); for (const reason of reasons) { const label = el('li', '', debotNotificationReason(reason)); label.title = reason; notes.append(label); } entry.append(notes); }
+      const changes = debotDeltaNode(item.delta); if (changes) entry.append(changes);
+      const evidence = debotNotificationEvidence(item.evidence); if (evidence) entry.append(evidence);
+      const facts = el('div', 'debot-history-event-facts');
+      if (validDate(item.occurredAt)) facts.append(el('span', '', `平台事件 ${date(item.occurredAt, true)}`));
+      if (finite(item.deliveryCount)) facts.append(el('span', '', `累计投递 ${count(item.deliveryCount)} 次`));
+      if (validDate(item.lastObservedAt) && item.lastObservedAt !== item.observedAt) facts.append(el('span', '', `最近收到 ${date(item.lastObservedAt, true)}`));
+      if (facts.childNodes.length) entry.append(facts);
+      if (item.eventId) { const source = el('details', 'debot-history-source'), summary = el('summary', '', '查看事件标识'); source.append(summary, el('code', '', scalar(item.eventId))); entry.append(source); }
+      list.append(entry);
+    }
+    wrapper.append(list);
+    const footer = el('div', 'table-footer debot-history-pagination'), controls = el('div', 'pagination');
+    const previous = el('button', '', '←'), next = el('button', '', '→'); previous.type = next.type = 'button'; previous.setAttribute('aria-label', '通知历史上一页'); next.setAttribute('aria-label', '通知历史下一页'); previous.dataset.historyAction = 'previous'; next.dataset.historyAction = 'next';
+    previous.disabled = history.offset === 0; next.disabled = data.hasMore === false || history.offset + PAGE_SIZE >= history.total;
+    previous.addEventListener('click', () => { history.requestedOffset = Math.max(0, history.offset - PAGE_SIZE); void loadDetail(state.detailId, true); });
+    next.addEventListener('click', () => { history.requestedOffset = history.offset + PAGE_SIZE; void loadDetail(state.detailId, true); });
+    const pageNumber = el('span', 'debot-history-page-number', `${Math.floor(history.offset / PAGE_SIZE) + 1} / ${Math.max(1, Math.ceil(history.total / PAGE_SIZE))}`); pageNumber.setAttribute('aria-live', 'polite');
+    controls.append(previous, pageNumber, next); footer.append(el('span', '', history.total ? `显示 ${items.length ? history.offset + 1 : 0}–${Math.min(history.offset + items.length, history.total)} 条，共 ${count(history.total)} 条明细` : '共 0 条明细'), controls); wrapper.append(footer);
+    $('detail-content').replaceChildren(wrapper);
+    if (previousOffset !== history.offset) { title.tabIndex = -1; title.focus({preventScroll: true}); $('detail-drawer').scrollTop = 0; }
+  }
+  function debotDeltaNode(delta) {
+    if (!delta || typeof delta !== 'object') return null;
+    const labels = {addedAliases: '新增钱包别名', removedAliases: '减少钱包别名', addedAddresses: '新增地址提示', removedAddresses: '减少地址提示'};
+    const fields = {name: '名称', symbol: '代号', alertPriceUsd: '通知价格', averageWalletVolumeUsd: '平均交易金额', claimedPlatform: '平台标记', walletDisplay: '钱包展示', lastTradeAt: '最近交易时间', amount: '数量', volumeUsd: '交易金额'};
+    const node = el('div', 'debot-history-delta');
+    for (const [key, label] of [['walletCount', '供应商钱包提示数'], ['addressCount', '供应商地址提示数']]) {
+      if (finite(delta[key]?.before) && finite(delta[key]?.after) && delta[key].before !== delta[key].after) node.append(kv(label, `${count(delta[key].before)} → ${count(delta[key].after)}`));
+    }
+    for (const [key, label] of Object.entries(labels)) {
+      const value = delta[key];
+      if (Array.isArray(value) && value.length) {
+        const entries = value.filter(item => typeof item === 'string');
+        if (entries.length) node.append(kv(label, entries.join('、')));
+      }
+    }
+    if (Array.isArray(delta.displayFields) && delta.displayFields.length) node.append(kv('展示字段', delta.displayFields.filter(value => typeof value === 'string').map(value => fields[value] || value).join('、')));
+    if (Array.isArray(delta.changedWallets)) for (const wallet of delta.changedWallets) {
+      if (typeof wallet?.identity !== 'string' || !Array.isArray(wallet.fields)) continue;
+      const identity = wallet.identity.startsWith('alias:') ? `别名 ${wallet.identity.slice(6)}` : wallet.identity;
+      node.append(kv('钱包提示变化', `${identity} · ${wallet.fields.filter(value => typeof value === 'string').map(value => fields[value] || value).join('、')}`));
+    }
+    if (delta.eventTimeConflict) node.append(el('p', 'debot-history-source-note', '供应商更改了事件时间，原始时间保留，未据此刷新首次基准。'));
+    return node.childNodes.length ? node : null;
+  }
+  function debotNotificationEvidence(evidence) {
+    if (!evidence || typeof evidence !== 'object' || Array.isArray(evidence)) return null;
+    const node = el('div', 'debot-history-evidence'); node.append(el('h3', '', '补充核验记录'));
+    node.append(el('p', '', {changed: '发现新增线索，进入复核流程', unchanged: '本次尚未发现新增有效线索', unavailable: '补充核验证据暂不可用'}[evidence.status] || '核验状态待同步'));
+    if (validDate(evidence.fromAt) && validDate(evidence.untilAt)) node.append(el('p', 'debot-history-source-note', `本轮范围 ${date(evidence.fromAt, true)} – ${date(evidence.untilAt, true)}`));
+    const appendEvidence = (key, label, render) => {
+      const entries = Array.isArray(evidence[key]) ? evidence[key].filter(item => item && typeof item === 'object') : [];
+      if (!entries.length) return;
+      const details = el('details', 'debot-history-evidence-details'); details.append(el('summary', '', `${label} · ${count(entries.length)} 条代表样本`));
+      for (const item of entries) { const row = el('div', 'debot-history-evidence-item'); render(row, item); details.append(row); }
+      node.append(details);
+    };
+    appendEvidence('vendorChanges', 'DeBot 详情变化 · 待核验', (row, item) => {
+      row.append(kv('供应商变化', {new_address: '出现新地址', last_trade_at: '最近交易时间变化', buy_amount: '买入数量变化', hold_amount: '持仓数量变化'}[item.kind] || '变化待分类'), kv('钱包地址', item.address));
+      if (item.previousValue !== undefined || item.value !== undefined) row.append(kv('前次 → 本次', `${scalar(item.previousValue)} → ${scalar(item.value)}`));
+      row.append(kv('本次获取', date(item.observedAt, true)), el('p', 'debot-history-source-note', 'DeBot 供应商快照，未证明交易或归属；持仓减少不等于已核实卖出。'));
+    });
+    appendEvidence('observedTrades', '本地已采集交易', (row, item) => {
+      row.append(kv('交易方向', {buy: '买入', sell: '卖出'}[item.side] || '未知'), kv('钱包地址', item.wallet), kv('交易标识', item.txHash), kv('样本金额', usd(item.volumeUsd)), kv('交易时间', date(item.eventAt, true)), kv('本地观测', date(item.observedAt, true)), kv('样本来源', item.source));
+    });
+    appendEvidence('researchTargets', '画像关联研究目标', (row, item) => {
+      row.append(kv('研究目标', item.address), kv('触发钱包', item.triggerWallet), kv('优先研究依据', {profiled_buy: '已有画像的钱包出现买入样本', precursor_leader: '前置钱包样本命中关联公开钱包'}[item.reason] || '待核对'), kv('交易标识', item.txHash), el('p', 'debot-history-source-note', '只提高研究优先级，关联线索不能证明共同归属。'));
+    });
+    if (evidence.coverage === 'truncated') node.append(el('p', 'debot-history-source-note', '本地样本覆盖被截断，不能按完整市场证据解释。'));
+    if (Array.isArray(evidence.limitations) && evidence.limitations.length) {
+      const limits = el('ul', 'debot-history-reasons');
+      for (const value of evidence.limitations) if (typeof value === 'string') { const label = el('li', '', debotNotificationReason(value)); label.title = value; limits.append(label); }
+      node.append(limits);
+    }
+    return node;
+  }
+
   async function openDetail(id, trigger, wallet) {
     if (typeof id !== 'string') return;
     closeNarrative();
-    state.returnFocus = trigger || document.activeElement; state.detailId = id; state.detailKind = wallet?.protection ? 'protection' : wallet?.followup ? 'followup' : wallet?.association ? 'association' : wallet?.profile ? 'profile' : wallet ? 'wallet' : 'scan'; state.detailWallet = wallet || null; state.detailGeneration++; state.walletEvidenceOpen = new Set();
-    text('detail-eyebrow', wallet?.protection ? 'PROTECTION EVIDENCE' : wallet?.followup ? 'SIGNAL FOLLOW-UP' : wallet ? 'WALLET RESEARCH' : 'SIGNAL DETAIL');
+    state.returnFocus = trigger || document.activeElement; state.detailId = id; state.detailKind = wallet?.debotHistory ? 'debot-history' : wallet?.protection ? 'protection' : wallet?.followup ? 'followup' : wallet?.association ? 'association' : wallet?.profile ? 'profile' : wallet ? 'wallet' : 'scan'; state.detailWallet = wallet || null; state.detailGeneration++; state.walletEvidenceOpen = new Set();
+    text('detail-eyebrow', wallet?.debotHistory ? 'NOTIFICATION HISTORY' : wallet?.protection ? 'PROTECTION EVIDENCE' : wallet?.followup ? 'SIGNAL FOLLOW-UP' : wallet ? 'WALLET RESEARCH' : 'SIGNAL DETAIL');
     $('drawer-backdrop').hidden = false; $('detail-drawer').hidden = false; $('app').inert = true; document.body.classList.add('drawer-open');
-    const loading = el('p', 'drawer-loading', wallet ? '正在读取研究证据…' : '正在读取信号详情…'); loading.id = 'detail-title'; $('detail-content').replaceChildren(loading); $('detail-drawer').focus();
+    const loading = el('p', 'drawer-loading', wallet?.debotHistory ? '正在读取通知历史…' : wallet ? '正在读取研究证据…' : '正在读取信号详情…'); loading.id = 'detail-title'; $('detail-content').replaceChildren(loading); $('detail-drawer').focus();
     await loadDetail(id);
   }
   async function loadDetail(id, quiet = false) {
@@ -1648,19 +1855,29 @@
     const profile = state.detailKind === 'profile' ? state.detailWallet : null;
     const followup = state.detailKind === 'followup' ? state.detailWallet : null;
     const protection = state.detailKind === 'protection';
+    const history = state.detailKind === 'debot-history' ? state.detailWallet : null;
+    const historyQuery = history ? new URLSearchParams({limit: String(PAGE_SIZE), offset: String(history.requestedOffset)}) : null;
+    if (history?.asOf) historyQuery.set('asOf', history.asOf);
+    if (history) { history.loading = true; $('detail-content').setAttribute('aria-busy', 'true'); $('detail-content').querySelectorAll('[data-history-action]').forEach(button => { button.disabled = true; }); }
     try {
-      const record = await api(protection ? `/protection/${encodeURIComponent(id)}` : followup ? `/followup/${encodeURIComponent(followup.chain)}/${encodeURIComponent(followup.address)}` : profile ? `/wallet-profiles/${encodeURIComponent(profile.chain)}/${encodeURIComponent(profile.address)}` : association ? `/wallet-associations/${encodeURIComponent(association.chain)}/${encodeURIComponent(association.leader)}/${encodeURIComponent(association.candidate)}` : wallet ? `/wallets/${encodeURIComponent(wallet.chain)}/${encodeURIComponent(wallet.address)}` : `/scans/${encodeURIComponent(id)}`, {signal: controller.signal});
-      if (state.detailId === id && generation === state.detailGeneration) { if (protection) renderProtectionDetail(record); else if (followup) renderFollowupDetail(record); else if (profile) renderWalletProfileDetail(record.profile || record); else if (association) renderAssociationDetail(record); else if (wallet) renderWalletResearchDetail(record); else { renderDetail(record); void loadWalletScreeningLedger(record, id, generation); } }
+      const record = await api(history ? `/debot/tokens/${encodeURIComponent(history.chain)}/${encodeURIComponent(history.address)}/events?${historyQuery}` : protection ? `/protection/${encodeURIComponent(id)}` : followup ? `/followup/${encodeURIComponent(followup.chain)}/${encodeURIComponent(followup.address)}` : profile ? `/wallet-profiles/${encodeURIComponent(profile.chain)}/${encodeURIComponent(profile.address)}` : association ? `/wallet-associations/${encodeURIComponent(association.chain)}/${encodeURIComponent(association.leader)}/${encodeURIComponent(association.candidate)}` : wallet ? `/wallets/${encodeURIComponent(wallet.chain)}/${encodeURIComponent(wallet.address)}` : `/scans/${encodeURIComponent(id)}`, {signal: controller.signal});
+      if (!controller.signal.aborted && state.detailId === id && generation === state.detailGeneration) { if (history) renderDebotHistory(record); else if (protection) renderProtectionDetail(record); else if (followup) renderFollowupDetail(record); else if (profile) renderWalletProfileDetail(record.profile || record); else if (association) renderAssociationDetail(record); else if (wallet) renderWalletResearchDetail(record); else { renderDetail(record); void loadWalletScreeningLedger(record, id, generation); } }
     } catch (error) {
       if (controller.signal.aborted || state.detailId !== id || generation !== state.detailGeneration) return;
       if (error.status === 401) { showLogin('会话已结束，请重新登录。'); return; }
       if (!quiet) $('detail-content').replaceChildren(el('h2', '', '详情暂不可用'), el('p', 'drawer-loading detail-error', error.status === 404 ? followup ? '本币尚未在持续复盘模块中登记。模块上线前的旧信号不会补造首次价格或后续表现。' : '这条记录已超出保留期或不存在。' : '连接异常，请关闭详情后重试。'));
-      else { const old = $('detail-stale'); if (!old) { const note = el('p', 'notice warning', '详情暂时无法更新，以下为最近成功读取的记录。'); note.id = 'detail-stale'; $('detail-content').prepend(note); } }
+      else { const old = $('detail-stale'); if (!old) { const note = el('p', 'notice warning', history ? '通知历史暂时无法更新，仍显示此前成功读取的页。请重试。' : '详情暂时无法更新，以下为最近成功读取的记录。'); note.id = 'detail-stale'; $('detail-content').prepend(note); } }
+    } finally {
+      if (history && state.detailId === id && generation === state.detailGeneration && state.detailController === controller) {
+        history.loading = false; $('detail-content').removeAttribute('aria-busy');
+        $('detail-content').querySelectorAll('[data-history-action]').forEach(button => { button.disabled = button.dataset.historyAction === 'previous' ? history.offset === 0 : button.dataset.historyAction === 'next' ? history.offset + PAGE_SIZE >= history.total : false; });
+      }
     }
   }
   function closeDrawer() {
     closeNarrative();
     state.detailController?.abort(); state.detailController = null;
+    $('detail-content').removeAttribute('aria-busy');
     const wasOpen = state.detailId !== null;
     state.detailId = null; state.detailWallet = null; state.detailGeneration++; $('detail-drawer').hidden = true; $('drawer-backdrop').hidden = true; $('app').inert = false; document.body.classList.remove('drawer-open');
     if (wasOpen && state.returnFocus?.isConnected) state.returnFocus.focus();

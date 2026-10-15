@@ -27,6 +27,7 @@ import {dirname,resolve} from 'node:path';
 import {existsSync,realpathSync,statSync} from 'node:fs';
 import {researchProvider} from './research.js';
 import type {DashboardPageOptions} from './dashboard.js';
+import {assessDebotRepeatEvidence} from './debot-repeat-evidence.js';
 
 export function createRuntime(config:Config) {
   if(!isPersistentOrderPath(config.ordersDatabase)) throw new Error('PERSISTENT_ORDER_DATABASE_REQUIRED');
@@ -114,7 +115,7 @@ export function createRuntime(config:Config) {
   const entry=new EntryController(config,orders,client,walletScreening?{walletEvidence:(report,now)=>walletScreening.revalidate(report,now)}:{});
   const reconciler=new OrderReconciler(orders,entry);
   let closed=false,active=0,archiveMaintenanceError:string|undefined;
-  const onSignal=async(signal:Signal,firstReceivedAt?:string,context?:{detailsReady:Promise<void>}):Promise<void>=>{
+  const onSignal=async(signal:Signal,firstReceivedAt?:string,context?:{detailsReady:Promise<void>;repeat?:boolean}):Promise<void>=>{
     if(closed||active>=4) throw new Error('RESEARCH_BUSY');
     store.prune(config.researchCacheTtlSec,config.researchCacheMax);
     const reserved=store.reserve(signal,undefined,'notification_copy',firstReceivedAt);
@@ -128,7 +129,7 @@ export function createRuntime(config:Config) {
         ...(signal.source==='debot'?{onProgress:progress=>debotScanner?.recordProgress(signal.sourceEventId,progress)}:{})});
       if(!store.finish(item.id,report,item.claimId!)) throw new Error('PROCESSING_CLAIM_EXPIRED');
       if(signal.source==='debot')debotScanner?.recordReport(signal.sourceEventId,report);
-      if(!closed) await entry.consider(report);
+      if(!closed)await entry.consider(report);
     } catch(error) {store.interrupt(item.id,item.claimId!);throw error;}
     finally {active--;}
   };
@@ -143,6 +144,11 @@ export function createRuntime(config:Config) {
     maxConcurrent:debotSession?2:1,parallelDetails:!!debotSession,
     lookupDisplay:reportId=>archive?.tokenDisplay(reportId),
     maxAgeSec:debotSession?Math.min(120,config.maxSignalAgeSec):config.maxSignalAgeSec,onSignal,
+    repeatEvidence:(input,signal)=>{
+      // Optional profile lookup must not hide independently observed sell trades.
+      const walletTargets=(()=>{try{return walletScreening?.researchTargets(signal);}catch{return undefined;}})();
+      return assessDebotRepeatEvidence({...input,history:walletHistory,walletTargets});
+    },
     ...(debotSession?{fetchPage:(chain:Signal['token']['chain'])=>fetchDebotSignalPage(chain,{fetcher:debotSession.fetcher}),
       fetchDetails:(observation:Parameters<typeof fetchDebotWalletDetails>[0])=>fetchDebotWalletDetails(observation,{fetcher:debotSession.fetcher,signal:AbortSignal.timeout(4000)})}:{}),
     shouldDefer:()=>closed?'SERVICE_STOPPING':!debotSession&&!config.gmgnApiKey?.trim()?'GMGN_API_KEY_MISSING':

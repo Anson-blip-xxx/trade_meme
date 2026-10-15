@@ -56,7 +56,7 @@ test('two distinct-token burst alerts start risk checks concurrently while a thi
   }finally{release.resolve();await f.close();}
 });
 
-test('repeated CA alerts with different event times never overlap, without blocking another token',async()=>{
+test('repeated CA alerts keep the first assessment and do not block another token or reanalyze unchanged evidence',async()=>{
   const release=deferred<void>(),active=new Set<string>();const started:number[]=[];let overlap=false;
   const f=fixture({onSignal:async s=>{
     if(active.has(s.token.address))overlap=true;active.add(s.token.address);started.push(Number(s.sourceEventId.split(':').at(-1)));
@@ -65,9 +65,9 @@ test('repeated CA alerts with different event times never overlap, without block
   try{
     const scanner=f.create();scanner.acceptPage(page(observation(1,1,-2000),observation(2,1,-1000),observation(3,3,-1000)));
     const work=scanner.dispatchOnce();await turn();
-    assert.equal(started.length,2);assert.ok(started.includes(2));assert.ok(started.includes(3));
+    assert.equal(started.length,2);assert.ok(started.includes(1));assert.ok(started.includes(3));
     assert.equal(active.size,2);assert.equal(overlap,false);
-    release.resolve();await work;assert.equal(started.length,3);assert.equal(overlap,false);
+    release.resolve();await work;assert.equal(started.length,2);assert.equal(overlap,false);
   }finally{release.resolve();await f.close();}
 });
 
@@ -159,7 +159,7 @@ test('different vendor IDs describing the same CA event and unchanged payload di
     await scanner.close();scanner=f.create();scanner.acceptPage(page({...second,id:'3',signal:{...second.signal,sourceEventId:'debot:fast:3'}}));
     await scanner.dispatchOnce();assert.equal(calls,1);assert.equal(scanner.getStatus().ignored,2);
     const changed=structuredClone(second);changed.id='4';changed.signal.sourceEventId='debot:fast:4';changed.signal.occurredAt=at(-500);
-    scanner.acceptPage(page(changed));await scanner.dispatchOnce();assert.equal(calls,2);
+    scanner.acceptPage(page(changed));await scanner.dispatchOnce();assert.equal(calls,1);
   }finally{await f.close();}
 });
 

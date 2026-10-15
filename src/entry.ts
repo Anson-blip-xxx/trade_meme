@@ -229,7 +229,8 @@ export class EntryController {
     const reservation = this.orders.reserve({eventKey, chain, tokenAddress: target, mode: this.config.entryMode,
       wallet: chain === 'solana' ? wallet : wallet.toLowerCase(),
       inputToken: chain === 'solana' ? inputToken : inputToken.toLowerCase(), inputAmount: amount,
-      slippagePct: this.config.entrySlippagePct, details,...(exit?{exit}:{})}, this.config.entryMaxOpen, this.now(),funding);
+      slippagePct: this.config.entrySlippagePct, details,...(exit?{exit}:{})}, this.config.entryMaxOpen, this.now(),funding,
+      {preventReentry:report.signal.source==='debot'});
     if (!reservation.created) return reservation.order ? {status: 'existing', order: reservation.order} :
       {status: 'blocked', reason: reservation.reason};
     let order = reservation.order!;

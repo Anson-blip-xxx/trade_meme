@@ -227,10 +227,11 @@ test('missing, mismatched, malformed and unknown strategy data cannot close even
   }
 });
 
-test('three terminal conditions plus verified zero balance release the asset for a new event only', async t => {
+test('three terminal conditions plus verified zero balance release the asset for a new non-DeBot event only', async t => {
   for (const chain of ['bsc', 'solana', 'robinhood'] as const) {
     const ctx = setup(t, {chain, config: {entryMaxOpen: 1}});
     const original = candidate(chain);
+    original.signal.source='gmgn';
     const created = await ctx.controller.consider(original);
     const result = await ctx.controller.reconcile(created.order!.id);
     assert.equal(result.order?.exit?.state, 'closed');
@@ -242,7 +243,8 @@ test('three terminal conditions plus verified zero balance release the asset for
     const replay = await ctx.controller.consider(original);
     assert.equal(replay.status, 'existing');
     assert.equal(replay.order?.id, created.order!.id);
-    const next = await ctx.controller.consider(candidate(chain, 'new-event'));
+    const nextReport=candidate(chain,'new-event');nextReport.signal.source='gmgn';
+    const next = await ctx.controller.consider(nextReport);
     assert.equal(next.status, 'created');
     assert.notEqual(next.order?.id, created.order!.id);
     assert.equal(ctx.signedCalls.filter(call => call.url.pathname === '/v1/trade/swap').length, 2);

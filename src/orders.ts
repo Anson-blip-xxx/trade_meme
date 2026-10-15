@@ -76,7 +76,8 @@ export class OrderStore {
         details TEXT NOT NULL
       );`);
   }
-  reserve(input:NewOpening,maxOpen:number,now=new Date(),funding?:FundingSnapshot):{created:boolean;order?:OpeningOrder;reason?:string} {
+  reserve(input:NewOpening,maxOpen:number,now=new Date(),funding?:FundingSnapshot,
+    options:{preventReentry?:boolean}={}):{created:boolean;order?:OpeningOrder;reason?:string} {
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const previous=this.byEvent(input.eventKey);
@@ -84,6 +85,12 @@ export class OrderStore {
       const duplicate=this.db.prepare(`SELECT id FROM opening_orders WHERE chain=? AND token_address=? AND mode=? AND ${occupies} LIMIT 1`)
         .get(input.chain,input.tokenAddress,input.mode);
       if(duplicate) {this.db.exec('COMMIT');return {created:false,reason:'ASSET_ALREADY_OPEN'};}
+      // A repeat notification can arrive through live scanning or WATCH rechecks.
+      // Keep the no-reentry check under this same write lock, including confirmed
+      // positions closed while the controller was awaiting its balance request.
+      if(options.preventReentry&&this.hasOpeningHistory(input.chain,input.tokenAddress,input.mode)) {
+        this.db.exec('COMMIT');return {created:false,reason:'DEBOT_REENTRY_BLOCKED'};
+      }
       if(input.mode==='live'&&this.hasUnprotectedOpening(now)) {
         this.db.exec('COMMIT');return {created:false,reason:'EXIT_PROTECTION_UNVERIFIED'};
       }
@@ -201,6 +208,10 @@ export class OrderStore {
   }
   get(id:string):OpeningOrder|undefined {const row=this.db.prepare('SELECT details FROM opening_orders WHERE id=?').get(id);return row?JSON.parse(String(row.details)):undefined;}
   byEvent(key:string):OpeningOrder|undefined {const row=this.db.prepare('SELECT details FROM opening_orders WHERE event_key=?').get(key);return row?JSON.parse(String(row.details)):undefined;}
+  hasOpeningHistory(chain:Chain,address:string,mode:string):boolean {
+    return !!this.db.prepare(`SELECT 1 FROM opening_orders WHERE chain=? AND token_address=? ${chain==='solana'?'':'COLLATE NOCASE'} AND mode=?
+      AND status IN ('prepared','submitting','submitted','confirmed','unknown','paper_open') LIMIT 1`).get(chain,address,mode);
+  }
   list(limit=50):OpeningOrder[] {return this.db.prepare('SELECT details FROM opening_orders ORDER BY rowid DESC LIMIT ?').all(limit).map(r=>JSON.parse(String(r.details)));}
   /** Dashboard pagination is separate from funding/reconciliation coverage. */
   page(options:{limit?:number;offset?:number;chain?:Chain}={}) {

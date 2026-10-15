@@ -50,10 +50,21 @@ export class ExitShadow {
         updated_at TEXT NOT NULL,phase TEXT NOT NULL,state TEXT NOT NULL,last_price_at TEXT NOT NULL,last_price REAL NOT NULL,error TEXT,error_at TEXT,
         UNIQUE(chain,address,candidate_id));
       CREATE INDEX IF NOT EXISTS exit_shadow_token ON exit_shadow_positions(chain,address,started_at DESC);
+      CREATE INDEX IF NOT EXISTS exit_shadow_page ON exit_shadow_positions(started_at DESC,id);
+      CREATE INDEX IF NOT EXISTS exit_shadow_chain_page ON exit_shadow_positions(chain,started_at DESC,id);
       CREATE TABLE IF NOT EXISTS exit_shadow_samples(position_id TEXT NOT NULL,at TEXT NOT NULL,price REAL NOT NULL,
         source TEXT NOT NULL,context TEXT NOT NULL,PRIMARY KEY(position_id,at));
       CREATE TABLE IF NOT EXISTS exit_shadow_events(id INTEGER PRIMARY KEY,position_id TEXT NOT NULL,at TEXT NOT NULL,data TEXT NOT NULL);
-      CREATE INDEX IF NOT EXISTS exit_shadow_event_position ON exit_shadow_events(position_id,id DESC);`);
+      CREATE INDEX IF NOT EXISTS exit_shadow_event_position ON exit_shadow_events(position_id,id DESC);
+      CREATE TABLE IF NOT EXISTS exit_shadow_metrics(position_id TEXT PRIMARY KEY,peak_price REAL NOT NULL,
+        max_gap_sec REAL NOT NULL,last_source TEXT NOT NULL);`);
+    // Derived display aggregates only: backfill from actual retained observations
+    // once, without changing adaptive policy state or replaying exit decisions.
+    this.db.exec(`INSERT OR IGNORE INTO exit_shadow_metrics(position_id,peak_price,max_gap_sec,last_source)
+      SELECT p.id,COALESCE(MAX(s.price),p.last_price),COALESCE(MAX(json_extract(s.context,'$.gapSec')),0),
+        COALESCE((SELECT source FROM exit_shadow_samples WHERE position_id=p.id ORDER BY at DESC LIMIT 1),'')
+      FROM exit_shadow_positions p LEFT JOIN exit_shadow_samples s ON s.position_id=p.id
+      WHERE NOT EXISTS (SELECT 1 FROM exit_shadow_metrics m WHERE m.position_id=p.id) GROUP BY p.id;`);
     this.db.prepare('INSERT OR IGNORE INTO exit_shadow_meta VALUES (?,?)').run('started_at',this.now().toISOString());
     this.db.prepare('INSERT OR IGNORE INTO exit_shadow_meta VALUES (?,?)').run('history_complete','true');
   }
@@ -106,6 +117,10 @@ export class ExitShadow {
         const inserted=this.db.prepare('INSERT OR IGNORE INTO exit_shadow_samples VALUES (?,?,?,?,?)')
           .run(id,at,price.priceUsd,price.source,JSON.stringify(context));
         if(!Number(inserted.changes)){this.db.exec('COMMIT');return;}
+        this.db.prepare(`INSERT INTO exit_shadow_metrics(position_id,peak_price,max_gap_sec,last_source) VALUES (?,?,?,?)
+          ON CONFLICT(position_id) DO UPDATE SET peak_price=MAX(peak_price,excluded.peak_price),
+          max_gap_sec=MAX(max_gap_sec,excluded.max_gap_sec),last_source=excluded.last_source`)
+          .run(id,price.priceUsd,context.gapSec,price.source);
         const emit=(event:ShadowEvent)=>this.db.prepare('INSERT INTO exit_shadow_events(position_id,at,data) VALUES (?,?,?)').run(id,event.at,JSON.stringify(event));
         if(!previous)emit({at,kind:'initialized',reason:'SHADOW_STARTED',observationOnly:true,priceUsd:price.priceUsd,gainPct:0,remainingPct:100});
         else if(previous.error)emit({at,kind:'price_recovered',reason:'PRICE_SAMPLE_RECOVERED',observationOnly:true,priceUsd:price.priceUsd});
@@ -147,11 +162,13 @@ export class ExitShadow {
   }
 
   summary(now=this.now()) {
-    const rows=this.db.prepare('SELECT * FROM exit_shadow_positions ORDER BY started_at DESC,id LIMIT ?').all(this.maxPositions) as unknown as ShadowRow[];
-    const active=rows.filter(x=>x.phase==='tracking'&&Date.parse(x.ends_at)>now.getTime());
+    const at=now.toISOString(),cutoff=new Date(now.getTime()-this.staleMs).toISOString();
+    const counts=this.db.prepare(`SELECT count(*) AS positions,SUM(phase='tracking' AND ends_at>?) AS active,
+      SUM(phase='triggered') AS triggered,SUM(phase='tracking' AND ends_at>? AND (error IS NOT NULL OR last_price_at<?)) AS stale
+      FROM exit_shadow_positions`).get(at,at,cutoff)!;
     return {enabled:true,mode:'shadow' as const,liveReady:false,policyVersion:ADAPTIVE_SHADOW_V1.version,
-      status:{positions:rows.length,active:active.length,triggered:rows.filter(x=>x.phase==='triggered').length,
-        stale:active.filter(x=>!!x.error||now.getTime()-Date.parse(x.last_price_at)>this.staleMs).length,
+      status:{positions:Number(counts.positions),active:Number(counts.active??0),triggered:Number(counts.triggered??0),
+        stale:Number(counts.stale??0),
         samples:Number(this.db.prepare('SELECT count(*) AS n FROM exit_shadow_samples').get()!.n),
         events:Number(this.db.prepare('SELECT count(*) AS n FROM exit_shadow_events').get()!.n),
         startedAt:this.meta('started_at'),lastSampleAt:this.meta('last_sample_at'),lastError:this.lastError??this.meta('last_error'),
@@ -163,6 +180,15 @@ export class ExitShadow {
     const rows=this.db.prepare('SELECT * FROM exit_shadow_positions ORDER BY started_at DESC,id LIMIT ?').all(take) as unknown as ShadowRow[];
     return {...this.summary(now),items:rows.map(row=>this.project(row,now)),limit:take};
   }
+  page(options:{limit?:number;offset?:number;chain?:Chain}={},now=this.now()) {
+    const limit=Number.isSafeInteger(options.limit)?Math.max(1,Math.min(100,options.limit!)):20;
+    const offset=Number.isSafeInteger(options.offset)?Math.max(0,Math.min(1_000_000,options.offset!)):0;
+    const where=options.chain?'WHERE chain=?':'',args=options.chain?[options.chain]:[];
+    const total=Number(this.db.prepare(`SELECT count(*) AS n FROM exit_shadow_positions ${where}`).get(...args)!.n);
+    const rows=this.db.prepare(`SELECT * FROM exit_shadow_positions ${where} ORDER BY started_at DESC,id LIMIT ? OFFSET ?`)
+      .all(...args,limit,offset) as unknown as ShadowRow[];
+    return {...this.summary(now),items:rows.map(row=>this.projectList(row,now)),total,limit,offset,hasMore:offset+rows.length<total};
+  }
   detail(id:string,now=this.now()) {
     const row=this.db.prepare('SELECT * FROM exit_shadow_positions WHERE id=?').get(id) as unknown as ShadowRow|undefined;
     if(!row)return;
@@ -172,22 +198,26 @@ export class ExitShadow {
       responseTruncated:count>samples.length,storedSamplesThinned:false,mode:'shadow',liveReady:false};
   }
   close():void {this.db.close();}
-  private project(row:ShadowRow,now:Date) {
+  private projectList(row:ShadowRow,now:Date) {
     const state=JSON.parse(row.state) as AdaptiveExitState;
-    const events=this.db.prepare('SELECT data FROM exit_shadow_events WHERE position_id=? ORDER BY id DESC LIMIT 5').all(row.id).map(x=>JSON.parse(String(x.data)) as ShadowEvent);
-    const pressure=state.walletPressure;
-    const rawPeak=Number(this.db.prepare('SELECT MAX(price) AS peak FROM exit_shadow_samples WHERE position_id=?').get(row.id)!.peak);
-    const rawGap=this.db.prepare("SELECT MAX(json_extract(context,'$.gapSec')) AS gap FROM exit_shadow_samples WHERE position_id=?").get(row.id)!.gap;
+    const metrics=this.db.prepare('SELECT peak_price,max_gap_sec,last_source FROM exit_shadow_metrics WHERE position_id=?').get(row.id);
+    const rawPeak=Number(metrics?.peak_price??row.last_price),rawGap=metrics?.max_gap_sec;
     return {id:row.id,chain:row.chain,address:row.address,symbol:row.symbol??undefined,candidateId:row.candidate_id,
       eligibleAt:row.eligible_at,startedAt:row.started_at,updatedAt:row.updated_at,endsAt:row.ends_at,
       phase:row.phase==='triggered'?'triggered':Date.parse(row.ends_at)<=now.getTime()?'ended':row.phase,
       health:row.error?'unavailable':now.getTime()-Date.parse(row.last_price_at)>this.staleMs?'stale':'fresh',
-      lastPriceAt:row.last_price_at,priceSource:this.db.prepare('SELECT source FROM exit_shadow_samples WHERE position_id=? ORDER BY at DESC LIMIT 1').get(row.id)?.source,maxGapSec:Number(rawGap??0),baselinePriceUsd:state.baselinePriceUsd,
+      lastPriceAt:row.last_price_at,priceSource:metrics?.last_source||undefined,maxGapSec:Number(rawGap??0),baselinePriceUsd:state.baselinePriceUsd,
       latestPriceUsd:row.last_price,peakPriceUsd:rawPeak,gainPct:(row.last_price/state.baselinePriceUsd-1)*100,
       peakGainPct:(rawPeak/state.baselinePriceUsd-1)*100,triggerPeakGainPct:(state.peakPriceUsd/state.baselinePriceUsd-1)*100,
       protectionPriceUsd:state.protectionPriceUsd,
       protectionGainPct:(state.protectionPriceUsd/state.baselinePriceUsd-1)*100,activationGainPct:state.activationGainPct,
       protectionActive:state.protectionActive,trailPct:state.drawdownPct,remainingPct:state.remainingPctOfInitial,
+      lastError:row.error??undefined,mode:'shadow',liveReady:false};
+  }
+  private project(row:ShadowRow,now:Date) {
+    const state=JSON.parse(row.state) as AdaptiveExitState,pressure=state.walletPressure;
+    const events=this.db.prepare('SELECT data FROM exit_shadow_events WHERE position_id=? ORDER BY id DESC LIMIT 5').all(row.id).map(x=>JSON.parse(String(x.data)) as ShadowEvent);
+    return {...this.projectList(row,now),
       pressure:pressure?{status:'observed',tradeCount:pressure.evidenceCount,netSellRatio:pressure.netSellRatio,
         source:pressure.sources.join(', '),evidenceIds:pressure.evidenceIds,verification:pressure.verification}:{status:'unknown'},
       events,lastEvent:state.shadowClosed?this.lastExitEvent(row.id)??events[0]:events[0],lastError:row.error??undefined,mode:'shadow',liveReady:false};

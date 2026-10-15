@@ -9,15 +9,42 @@ import {WALLET_PROFILE_GROUPS,type WalletProfileReader} from './wallet-profiles.
 import bs58 from 'bs58';
 import type {WalletSetupLedger} from './wallet-setup-ledger.js';
 import {DebotAuthError,type DebotAuthManager} from './providers/debot-auth.js';
+import type {Chain} from './types.js';
+import type {DebotSignalListOptions} from './debot-scanner.js';
+import type {FollowupListOptions} from './signal-followup.js';
+
+export interface DashboardPageOptions {limit:number;offset:number;chain?:Chain;}
+function pageOptions(url:URL):DashboardPageOptions {
+  const bounded=(name:string,def:number,max:number)=>{const raw=url.searchParams.get(name);if(raw===null)return def;
+    if(!/^\d{1,8}$/.test(raw)||Number(raw)>max)throw new Error('INVALID_FILTER');return Number(raw);};
+  const chain=url.searchParams.get('chain')||undefined,limit=bounded('limit',20,100),offset=bounded('offset',0,1000000);
+  if(limit<1||chain&&!['bsc','solana','robinhood'].includes(chain))throw new Error('INVALID_FILTER');
+  return {limit,offset,...(chain?{chain:chain as Chain}:{})};
+}
+function pageAsOf(url:URL):{asOf?:string} {
+  const asOf=url.searchParams.get('asOf');if(asOf===null)return {};
+  if(!/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(asOf)||!Number.isFinite(Date.parse(asOf))||new Date(asOf).toISOString()!==asOf)throw new Error('INVALID_FILTER');
+  return {asOf};
+}
+function followupOptions(url:URL):FollowupListOptions {
+  const result:FollowupListOptions={...pageOptions(url),...pageAsOf(url)};
+  const decision=url.searchParams.get('decision')||undefined,selected=url.searchParams.get('selected'),status=url.searchParams.get('status')||undefined;
+  if(decision&&!['BUY_CANDIDATE','WATCH','REJECT'].includes(decision)||selected!==null&&selected!==''&&!['true','false'].includes(selected)||
+    status&&!['collecting','needs_validation','consistent_association','not_replicated'].includes(status))throw new Error('INVALID_FILTER');
+  if(decision)result.decision=decision as FollowupListOptions['decision'];
+  if(selected!==null&&selected!=='')result.selected=selected==='true';
+  if(status)result.status=status as FollowupListOptions['status'];return result;
+}
 
 export interface DashboardServices {
   archive:ScanArchive;
   overview:()=>unknown;
-  orders:()=>unknown;
-  protection?:()=>unknown;
+  home?:()=>unknown;
+  orders:(options?:DashboardPageOptions)=>unknown;
+  protection?:(options?:DashboardPageOptions)=>unknown;
   chainStream?:()=>unknown;
   debotAuth?:Pick<DebotAuthManager,'getStatus'|'sendCode'|'login'>;
-  debotSignals?:()=>unknown;
+  debotSignals?:(options?:DebotSignalListOptions)=>unknown;
   protectionDetail?:(id:string)=>unknown;
   walletHistory?:Pick<WalletHistory,'listWallets'|'getWallet'>;
   walletResearchStatus?:()=>unknown;
@@ -133,7 +160,11 @@ export function buildDashboard(config:Config,services:DashboardServices,assetDir
       if(req.method!=='GET') {send(res,405,{error:'READ_ONLY'});return;}
       if(url.pathname==='/dashboard/api/session') {send(res,200,{authenticated:true,readOnly:true,authentication:proxyAuthenticated(req)?'proxy':'session'});return;}
       if(url.pathname==='/dashboard/api/overview') {send(res,200,services.overview());return;}
-      if(url.pathname==='/dashboard/api/followup') {send(res,200,services.archive.followupSummary());return;}
+      if(url.pathname==='/dashboard/api/home') {send(res,200,services.home?.()??{enabled:false});return;}
+      if(url.pathname==='/dashboard/api/followup') {send(res,200,services.archive.followupDashboardSummary());return;}
+      if(url.pathname==='/dashboard/api/followup/records') {send(res,200,services.archive.followupList(followupOptions(url)));return;}
+      if(url.pathname==='/dashboard/api/followup/groups') {send(res,200,services.archive.followupGroups(followupOptions(url)));return;}
+      if(url.pathname==='/dashboard/api/followup/learning') {send(res,200,services.archive.followupLearning(followupOptions(url)));return;}
       const followupMatch=url.pathname.match(/^\/dashboard\/api\/followup\/([^/]+)\/([^/]+)$/);
       if(followupMatch) {
         const chain=followupMatch[1];let address:string;
@@ -146,11 +177,18 @@ export function buildDashboard(config:Config,services:DashboardServices,assetDir
         const detail=services.archive.followupDetail({chain:chain as 'bsc'|'solana'|'robinhood',address});
         send(res,detail?200:404,detail??{error:'NOT_FOUND'});return;
       }
-      if(url.pathname==='/dashboard/api/debot/signals') {send(res,200,services.debotSignals?.()??{now:new Date().toISOString(),items:[]});return;}
-      if(url.pathname==='/dashboard/api/orders') {send(res,200,services.orders());return;}
+      if(url.pathname==='/dashboard/api/debot/signals') {
+        const options:DebotSignalListOptions={...pageOptions(url),...pageAsOf(url)},state=url.searchParams.get('state')||undefined;
+        if(state&&!['pending','dispatching','completed','failed','interrupted','ignored'].includes(state))throw new Error('INVALID_FILTER');
+        if(state)options.state=state;
+        send(res,200,services.debotSignals?.(options)??{now:new Date().toISOString(),asOf:options.asOf??new Date().toISOString(),
+          total:0,limit:options.limit,offset:options.offset,hasMore:false,items:[]});return;
+      }
+      if(url.pathname==='/dashboard/api/orders') {send(res,200,services.orders(pageOptions(url)));return;}
       if(url.pathname==='/dashboard/api/chain-stream') {send(res,200,services.chainStream?.()??{enabled:false,running:false,chains:[],recentEvents:[]});return;}
       if(url.pathname==='/dashboard/api/protection') {
-        send(res,200,services.protection?.()??{enabled:false,mode:'shadow',liveReady:false,items:[]});return;
+        const options=pageOptions(url);
+        send(res,200,services.protection?.(options)??{enabled:false,mode:'shadow',liveReady:false,items:[],total:0,...options,hasMore:false});return;
       }
       const protectionMatch=url.pathname.match(/^\/dashboard\/api\/protection\/([0-9a-f-]{36})$/);
       if(protectionMatch) {
@@ -164,11 +202,10 @@ export function buildDashboard(config:Config,services:DashboardServices,assetDir
       }
       if(url.pathname==='/dashboard/api/wallet-screening/status') {send(res,200,services.walletScreening?.status()??{enabled:false});return;}
       if(url.pathname==='/dashboard/api/wallet-screening') {
-        const chain=url.searchParams.get('chain')||undefined,address=url.searchParams.get('address')||undefined,raw=url.searchParams.get('limit')??'20';
-        if(chain&&!['bsc','solana','robinhood'].includes(chain)||!/^\d{1,3}$/.test(raw)||Number(raw)<1||Number(raw)>100)throw new Error('INVALID_FILTER');
+        const options=pageOptions(url),chain=options.chain,address=url.searchParams.get('address')||undefined;
         if(address){if(!chain)throw new Error('INVALID_FILTER');try{if(chain==='solana'){if(address.length>44||bs58.decode(address).length!==32)throw new Error();}
           else if(!/^0x[0-9a-fA-F]{40}$/.test(address))throw new Error();}catch{throw new Error('INVALID_FILTER');}}
-        send(res,200,services.walletScreening?.list({chain:chain as any,address,limit:Number(raw)})??{items:[],sampleOnly:true});return;
+        send(res,200,services.walletScreening?.list({...options,address})??{items:[],sampleOnly:true,total:0,...options,hasMore:false});return;
       }
       if(url.pathname==='/dashboard/api/wallet-profiles') {
         const chain=url.searchParams.get('chain')||undefined,group=url.searchParams.get('group')||undefined,search=url.searchParams.get('search')??'';
@@ -244,8 +281,8 @@ export function buildDashboard(config:Config,services:DashboardServices,assetDir
         if(chain&&!['bsc','solana','robinhood'].includes(chain)||decision&&!['BUY_CANDIDATE','WATCH','REJECT'].includes(decision)) throw new Error('INVALID_FILTER');
         const search=url.searchParams.get('search')??'';if(search.length>160) throw new Error('INVALID_FILTER');
         const eligible=url.searchParams.get('eligible');if(eligible!==null&&!['true','false'].includes(eligible))throw new Error('INVALID_FILTER');
-        const limit=number('limit',50,200),offset=number('offset',0,100000);if(limit<1)throw new Error('INVALID_FILTER');
-        send(res,200,services.archive.list({chain:chain as any,decision:decision as any,search,limit,offset,
+        const limit=number('limit',20,200),offset=number('offset',0,100000);if(limit<1)throw new Error('INVALID_FILTER');
+        send(res,200,services.archive.dashboardList({chain:chain as any,decision:decision as any,search,limit,offset,
           ...(eligible!==null?{eligible:eligible==='true'}:{})}));return;
       }
       const match=url.pathname.match(/^\/dashboard\/api\/scans\/([0-9a-f-]{36})$/);

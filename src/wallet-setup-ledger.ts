@@ -203,16 +203,22 @@ export class WalletSetupLedger {
         .run(now,item.state,item.closedAt??null,JSON.stringify(item),JSON.stringify(evidence),sequence,item.review.status==='withdrawn'?1:0,item.id);
     }
   }
-  list(options:{chain?:Chain;address?:string;limit?:number}={}):{items:Readonly<WalletSetupLedgerItem>[];sampleOnly:true} {
+  list(options:{chain?:Chain;address?:string;limit?:number;offset?:number}={}):{
+    items:Readonly<WalletSetupLedgerItem>[];sampleOnly:true;total:number;limit:number;offset:number;hasMore:boolean;
+  } {
+    const limit=Number.isSafeInteger(options.limit)?Math.max(1,Math.min(100,options.limit!)):20;
+    const offset=Number.isSafeInteger(options.offset)?Math.max(0,Math.min(1000000,options.offset!)):0;
+    const empty={items:[] as Readonly<WalletSetupLedgerItem>[],sampleOnly:true as const,total:0,limit,offset,hasMore:false};
     const filters:string[]=[],params:(string|number)[]=[];
-    if(options.chain!==undefined){if(!['bsc','solana','robinhood'].includes(options.chain))return {items:[],sampleOnly:true};filters.push('chain=?');params.push(options.chain);}
+    if(options.chain!==undefined){if(!['bsc','solana','robinhood'].includes(options.chain))return empty;filters.push('chain=?');params.push(options.chain);}
     if(options.address!==undefined){
       const address=options.chain?chainAddress(options.chain,options.address):/^0x[\da-f]{40}$/i.test(options.address)?options.address.toLowerCase():chainAddress('solana',options.address);
-      if(!address)return {items:[],sampleOnly:true};filters.push('address=?');params.push(address);
+      if(!address)return empty;filters.push('address=?');params.push(address);
     }
-    const take=Number.isSafeInteger(options.limit)?Math.max(1,Math.min(100,options.limit!)):20;params.push(take);
-    const rows=this.db.prepare(`SELECT data FROM wsl_setups ${filters.length?'WHERE '+filters.join(' AND '):''} ORDER BY registered_at DESC,id LIMIT ?`).all(...params);
-    return {items:rows.map(row=>deepFreeze(JSON.parse(String(row.data)) as WalletSetupLedgerItem)),sampleOnly:true};
+    const where=filters.length?'WHERE '+filters.join(' AND '):'';
+    const total=Number(this.db.prepare(`SELECT count(*) AS n FROM wsl_setups ${where}`).get(...params)!.n);
+    const rows=this.db.prepare(`SELECT data FROM wsl_setups ${where} ORDER BY registered_at DESC,id LIMIT ? OFFSET ?`).all(...params,limit,offset);
+    return {items:rows.map(row=>deepFreeze(JSON.parse(String(row.data)) as WalletSetupLedgerItem)),sampleOnly:true,total,limit,offset,hasMore:offset+rows.length<total};
   }
   status():WalletSetupLedgerStatus {
     const totals=this.db.prepare('SELECT count(*) AS records,sum(closed_at IS NULL) AS pending,sum(review_withdrawn) AS withdrawn FROM wsl_setups').get()!;

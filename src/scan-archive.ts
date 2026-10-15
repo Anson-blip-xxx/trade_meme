@@ -9,7 +9,7 @@ import type {Chain,Report,Signal,Status,Narrative} from './types.js';
 import type {WalletAnalysis} from './research/wallet-types.js';
 import {compactWalletScreening} from './wallet-screening-summary.js';
 import {StrategyObservation} from './strategy-observation.js';
-import {SignalFollowup} from './signal-followup.js';
+import {SignalFollowup,type FollowupListOptions} from './signal-followup.js';
 import type {FollowupWalletEvidence} from './wallet-history.js';
 
 export interface ScanToken {chain:Chain;address:string;}
@@ -223,6 +223,7 @@ export class ScanArchive {
   private readonly maxEntries:number;
   private readonly trackingMs:number;
   private watch?:WatchOptions;
+  private cachedOverview?:{at:number;value:{total:number;eligible:number;tracking:number;maxGainPct?:number;computedAt:string}};
   constructor(path:string,options:ScanArchiveOptions={}) {
     this.retentionDays=options.retentionDays??30;this.maxEntries=options.maxEntries??10_000;
     const hours=options.trackingHours??24;
@@ -428,6 +429,30 @@ export class ScanArchive {
 
   list(options:ScanListOptions={}):{items:ScanRecord[];total:number} {
     this.prune();
+    const {rows,total}=this.listRows(options,'record');
+    return {items:rows.map(row=>this.withObservation(JSON.parse(String(row.record)) as ScanRecord)),total};
+  }
+  /** List-only SQL projection; full evidence remains available through get(id). */
+  dashboardList(options:ScanListOptions={}) {
+    const projection=`json_object('id',id,'chain',chain,'address',address,'status',status,'decision',decision,
+      'receivedAt',received_at,'occurredAt',json_extract(record,'$.occurredAt'),'evaluatedAt',json_extract(record,'$.evaluatedAt'),
+      'source',json_extract(record,'$.source'),'name',json_extract(record,'$.name'),'symbol',json_extract(record,'$.symbol'),
+      'validUntil',json_extract(record,'$.validUntil'),'buyEligible',CASE json_type(record,'$.buyEligible') WHEN 'true' THEN json('true') WHEN 'false' THEN json('false') END,
+      'performance',json_remove(json_extract(record,'$.performance'),'$.points','$.priceEvidence'),
+      'narrative',CASE WHEN json_type(record,'$.narrative')='object' THEN json_object(
+        'thesis',substr(json_extract(record,'$.narrative.thesis'),1,240),'text',substr(json_extract(record,'$.narrative.text'),1,240),
+        'textTruncated',json('true'),'listExcerpt',json('true'),'supplier',json_extract(record,'$.narrative.supplier'),
+        'updatedAt',json_extract(record,'$.narrative.updatedAt'),'retained',CASE json_type(record,'$.narrative.retained') WHEN 'true' THEN json('true') WHEN 'false' THEN json('false') END) END,
+      'social',CASE WHEN json_type(record,'$.social')='object' THEN json_object(
+        'score',json_extract(record,'$.social.score'),'scope',json_extract(record,'$.social.scope')) END,
+      'walletScreening',CASE WHEN json_type(record,'$.walletScreening')='object' THEN json_object(
+        'scope',json_extract(record,'$.walletScreening.scope'),'status',json_extract(record,'$.walletScreening.status'),
+        'validUntil',json_extract(record,'$.walletScreening.validUntil'),'priorityScore',json_extract(record,'$.walletScreening.priorityScore'),
+        'setups',json((SELECT json_group_array(json_object('route',json_extract(value,'$.route'))) FROM json_each(record,'$.walletScreening.setups')))) END) AS record`;
+    const {rows,total}=this.listRows(options,projection);
+    return {items:rows.map(row=>this.withObservation(JSON.parse(String(row.record)) as {id:string}&Record<string,unknown>)),total};
+  }
+  private listRows(options:ScanListOptions,projection:string) {
     const limit=Number.isSafeInteger(options.limit)?Math.max(1,Math.min(200,options.limit!)):50;
     const offset=Number.isSafeInteger(options.offset)?Math.max(0,options.offset!):0;
     const clauses:string[]=[],values:(string|number)[]=[];
@@ -441,8 +466,8 @@ export class ScanArchive {
     }
     const where=clauses.length?`WHERE ${clauses.join(' AND ')}`:'';
     const total=Number(this.db.prepare(`SELECT count(*) AS n FROM scan_summaries ${where}`).get(...values)!.n);
-    const rows=this.db.prepare(`SELECT record FROM scan_summaries ${where} ORDER BY received_at DESC,rowid DESC LIMIT ? OFFSET ?`).all(...values,limit,offset);
-    return {items:rows.map(row=>this.withObservation(JSON.parse(String(row.record)) as ScanRecord)),total};
+    const rows=this.db.prepare(`SELECT ${projection} FROM scan_summaries ${where} ORDER BY received_at DESC,rowid DESC LIMIT ? OFFSET ?`).all(...values,limit,offset);
+    return {rows,total};
   }
 
   get(id:string):ScanRecord|undefined {this.prune();const record=this.read(id);return record&&this.withObservation(record);}
@@ -471,6 +496,17 @@ export class ScanArchive {
     }
     result.comparison=this.comparison.summary(this.now());
     return result;
+  }
+
+  /** Home counters only; no retention sweep, comparisons, payloads or external calls. */
+  overviewStats(now=this.now()) {
+    if(this.cachedOverview&&now.getTime()>=this.cachedOverview.at&&now.getTime()-this.cachedOverview.at<15000)return {...this.cachedOverview.value};
+    const row=this.db.prepare(`SELECT count(*) AS total,SUM(eligible_at IS NOT NULL) AS eligible,
+      SUM(eligible_at>? AND eligible_at<=?) AS tracking,MAX(max_gain_pct) AS gain FROM scan_summaries`)
+      .get(new Date(now.getTime()-this.trackingMs).toISOString(),now.toISOString())!;
+    const value={total:Number(row.total),eligible:Number(row.eligible??0),tracking:Number(row.tracking??0),
+      ...(typeof row.gain==='number'&&Number.isFinite(row.gain)?{maxGainPct:row.gain}:{}),computedAt:now.toISOString()};
+    this.cachedOverview={at:now.getTime(),value};return {...value};
   }
 
   pendingTokens(limit=20,now=this.now()):ScanToken[] {
@@ -518,6 +554,17 @@ export class ScanArchive {
   }
 
   followupSummary(now=this.now()) {return this.followup?.summary(now)??{enabled:false};}
+  followupDashboardSummary(now=this.now()) {return this.followup?.dashboardSummary(now)??{enabled:false};}
+  followupList(options:FollowupListOptions={},now=this.now()) {
+    return this.followup?.list(options,now)??{now:now.toISOString(),asOf:options.asOf??now.toISOString(),total:0,
+      limit:options.limit??20,offset:options.offset??0,hasMore:false,items:[]};
+  }
+  followupGroups(options:FollowupListOptions={},now=this.now()) {
+    return this.followup?.groups(options,now)??{now:now.toISOString(),total:0,limit:options.limit??20,offset:options.offset??0,hasMore:false,items:[]};
+  }
+  followupLearning(options:FollowupListOptions={},now=this.now()) {
+    return this.followup?.learning(options,now)??{now:now.toISOString(),total:0,limit:options.limit??20,offset:options.offset??0,hasMore:false,items:[]};
+  }
   refreshFollowup(now=this.now()):void {this.followup?.refresh(now);}
   followupDetail(value:ScanToken,now=this.now()) {
     const identity=token(value);return identity?this.followup?.detail(identity.chain,identity.address,now):undefined;
@@ -598,7 +645,7 @@ export class ScanArchive {
   private watchRow(id:string):WatchRow|undefined {
     return this.db.prepare('SELECT * FROM watch_jobs WHERE id=?').get(id) as unknown as WatchRow|undefined;
   }
-  private withObservation(record:ScanRecord):ScanRecord {
+  private withObservation<T extends {id:string}>(record:T):T&{observation?:ScanObservation} {
     const row=this.watchRow(record.id);if(!row)return record;
     return {...record,observation:{state:row.state,firstReceivedAt:row.first_received_at,endsAt:row.ends_at,
       ...(row.next_check_at?{nextCheckAt:row.next_check_at}:{}),...(row.last_check_at?{lastCheckAt:row.last_check_at}:{}),

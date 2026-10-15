@@ -4,7 +4,7 @@ import {once} from 'node:events';
 import {mkdtempSync,writeFileSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {buildDashboard} from '../src/dashboard.js';
+import {buildDashboard,type DashboardServices} from '../src/dashboard.js';
 import {DashboardBalances,dashboardSettings,dashboardOrders} from '../src/dashboard-data.js';
 import {ScanArchive} from '../src/scan-archive.js';
 import {Store} from '../src/store.js';
@@ -13,18 +13,45 @@ import {evaluate} from '../src/engine.js';
 import {config,signal,providers,now} from './helpers.js';
 
 const password='test-dashboard-password-independent-12345678';
-async function fixture() {
+async function fixture(overrides:Partial<DashboardServices>={}) {
   const directory=mkdtempSync(join(tmpdir(),'dashboard-test-'));
   for(const name of ['index.html','app.js','styles.css'])writeFileSync(join(directory,name),name);
   const cfg=config();cfg.dashboard.token=password;
   const archive=new ScanArchive(':memory:');
-  const server=buildDashboard(cfg,{archive,overview:()=>({entryMode:'off'}),orders:()=>({items:[]})},directory);
+  const server=buildDashboard(cfg,{archive,overview:()=>({entryMode:'off'}),orders:()=>({items:[]}),...overrides},directory);
   server.listen(0,'127.0.0.1');await once(server,'listening');
   const base=`http://127.0.0.1:${(server.address() as {port:number}).port}`;
   return {cfg,archive,base,server,async close(){server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));archive.close();rmSync(directory,{recursive:true,force:true});}};
 }
 const login=(base:string,value=password,origin?:string)=>fetch(`${base}/dashboard/api/login`,{
   method:'POST',headers:{'content-type':'application/json',...(origin?{origin}:{})},body:JSON.stringify({password:value})});
+
+test('dashboard page routes enforce authentication, validate filters and pass bounded options to read-only services',async()=>{
+  const calls:unknown[]=[];
+  const service=(options:unknown)=>{calls.push(options);return {items:[],total:0};};
+  const f=await fixture({home:()=>({entryMode:'off',compact:true}),debotSignals:service,orders:service,protection:service});
+  try {
+    const headers={'x-dashboard-access':password};
+    for(const route of ['home','debot/signals','followup/records','followup/groups','followup/learning','orders','protection','wallet-screening']) {
+      assert.equal((await fetch(`${f.base}/dashboard/api/${route}`)).status,401,route);
+      assert.equal((await fetch(`${f.base}/dashboard/api/${route}`,{method:'POST',headers})).status,405,route);
+    }
+    assert.deepEqual(await (await fetch(`${f.base}/dashboard/api/home`,{headers})).json(),{entryMode:'off',compact:true});
+    for(const route of ['debot/signals','followup/records','followup/groups','followup/learning','orders','protection','wallet-screening'])
+      for(const query of ['limit=0','limit=101','offset=-1','offset=1000001','offset=1.5','chain=eth'])
+        assert.equal((await fetch(`${f.base}/dashboard/api/${route}?${query}`,{headers})).status,400,`${route}: ${query}`);
+    for(const query of ['decision=BUY','selected=yes','status=any','asOf=2026-10-15'])
+      assert.equal((await fetch(`${f.base}/dashboard/api/followup/records?${query}`,{headers})).status,400,query);
+    for(const query of ['state=any','asOf=invalid','asOf=2026-02-31T00:00:00.000Z'])
+      assert.equal((await fetch(`${f.base}/dashboard/api/debot/signals?${query}`,{headers})).status,400,query);
+    assert.equal(calls.length,0);
+    for(const route of ['orders','protection','debot/signals'])
+      assert.equal((await fetch(`${f.base}/dashboard/api/${route}?limit=7&offset=21&chain=solana`,{headers})).status,200);
+    assert.deepEqual(calls,[{limit:7,offset:21,chain:'solana'},{limit:7,offset:21,chain:'solana'},{limit:7,offset:21,chain:'solana'}]);
+    const page=await (await fetch(`${f.base}/dashboard/api/followup/records?limit=7&offset=21`,{headers})).json();
+    assert.equal(page.total,0);assert.equal(page.limit,7);assert.equal(page.offset,21);assert.equal(page.hasMore,false);assert.deepEqual(page.items,[]);
+  } finally {await f.close();}
+});
 
 test('dashboard exposes assets but protects private data and serves strict CSP',async()=>{
   const f=await fixture();try {

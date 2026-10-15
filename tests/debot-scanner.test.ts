@@ -38,6 +38,26 @@ function fixture(overrides:Partial<DebotScannerOptions>={}) {
     close:async()=>{for(const scanner of scanners)await scanner.close();rmSync(root,{recursive:true,force:true});}};
 }
 
+test('DeBot pages are filtered in SQL with stable time anchors, bounded arguments and no inbox payloads',async()=>{
+  const f=fixture({chains:['bsc','robinhood'],mode:'authenticated_stream'});
+  try {
+    const scanner=f.create();
+    const items=Array.from({length:6},(_,i)=>observation(i+1));
+    items[1].signal.token.chain='robinhood';scanner.acceptPage(page(...items,observation(20,1)));
+    const first=scanner.list({limit:2});assert.equal(first.total,6);assert.equal(first.hasMore,true);
+    assert.deepEqual(first.items.map(r=>r.eventId),['debot:signal:6','debot:signal:5']);
+    f.advance(1001);scanner.acceptPage(page(observation(7,1000,1001)));
+    const next=scanner.list({limit:2,offset:2,asOf:first.asOf});assert.equal(next.total,6);
+    assert.deepEqual(next.items.map(r=>r.eventId),['debot:signal:4','debot:signal:3']);
+    assert.equal(scanner.list({limit:2,offset:20,asOf:first.asOf}).items.length,0);
+    assert.equal(scanner.list({chain:'robinhood',state:'pending'}).total,1);
+    assert.equal(scanner.list({state:'failed'}).total,0);
+    const serialized=JSON.stringify(first);for(const secret of ['payload','details','platform-alias'])assert.equal(serialized.includes(secret),false);
+    for(const options of [{limit:0},{limit:101},{offset:-1},{offset:1000001},{chain:'eth'},{state:'active'},{asOf:'bad'}])
+      assert.throws(()=>scanner.list(options as any),/INVALID_FILTER/);
+  }finally{await f.close();}
+});
+
 test('DeBot inbox survives restart and freezes the first observed payload while repeated card updates deduplicate',async()=>{
   let current=observation(1);
   const f=fixture({fetchPage:async()=>page(current)});

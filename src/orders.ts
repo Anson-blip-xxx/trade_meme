@@ -202,6 +202,16 @@ export class OrderStore {
   get(id:string):OpeningOrder|undefined {const row=this.db.prepare('SELECT details FROM opening_orders WHERE id=?').get(id);return row?JSON.parse(String(row.details)):undefined;}
   byEvent(key:string):OpeningOrder|undefined {const row=this.db.prepare('SELECT details FROM opening_orders WHERE event_key=?').get(key);return row?JSON.parse(String(row.details)):undefined;}
   list(limit=50):OpeningOrder[] {return this.db.prepare('SELECT details FROM opening_orders ORDER BY rowid DESC LIMIT ?').all(limit).map(r=>JSON.parse(String(r.details)));}
+  /** Dashboard pagination is separate from funding/reconciliation coverage. */
+  page(options:{limit?:number;offset?:number;chain?:Chain}={}) {
+    const limit=Number.isSafeInteger(options.limit)?Math.max(1,Math.min(100,options.limit!)):20;
+    const offset=Number.isSafeInteger(options.offset)?Math.max(0,Math.min(1_000_000,options.offset!)):0;
+    const where=options.chain?'WHERE chain=?':'',args=options.chain?[options.chain]:[];
+    const total=Number(this.db.prepare(`SELECT count(*) AS n FROM opening_orders ${where}`).get(...args)!.n);
+    const items=this.db.prepare(`SELECT details FROM opening_orders ${where} ORDER BY rowid DESC LIMIT ? OFFSET ?`)
+      .all(...args,limit,offset).map(row=>JSON.parse(String(row.details)) as OpeningOrder);
+    return {items,total,limit,offset,hasMore:offset+items.length<total};
+  }
   /** All confirmed debits in a funding scope; UI pagination must never limit coverage checks. */
   fundingOrders(scope:Pick<OpeningOrder,'chain'|'mode'|'wallet'|'inputToken'>):OpeningOrder[] {
     return this.db.prepare("SELECT details FROM opening_orders WHERE mode=? AND chain=? AND status='confirmed' ORDER BY rowid ASC")

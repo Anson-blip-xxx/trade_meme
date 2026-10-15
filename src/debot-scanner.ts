@@ -25,6 +25,9 @@ export interface DebotScannerOptions {
 export interface DebotRiskProgress {
   stage:'safety'|'provenance'|'wallets'|'market'|'narrative';checkedAt:string;elapsedMs:number;status:Status;reasons:string[];
 }
+export interface DebotSignalListOptions {
+  limit?:number;offset?:number;chain?:Chain;state?:string;asOf?:string;
+}
 const reasonCodes=(value:unknown)=>Array.isArray(value)?value.filter((v):v is string=>typeof v==='string'&&/^[A-Z][A-Z0-9_]{0,99}$/.test(v)).slice(0,24):[];
 const object=(value:unknown):value is Record<string,unknown>=>value!==null&&typeof value==='object'&&!Array.isArray(value);
 function walletAddress(value:unknown,chain:Chain):string|undefined {
@@ -149,11 +152,25 @@ export class DebotScanner {
   }
   recent(limit=12) {
     if(!Number.isInteger(limit)||limit<1||limit>50)throw new Error('DEBOT_SIGNAL_LIMIT_INVALID');
+    const {now,items}=this.list({limit});return {now,items};
+  }
+  list(options:DebotSignalListOptions={}) {
+    const limit=options.limit??20,offset=options.offset??0;
+    if(!Number.isInteger(limit)||limit<1||limit>100||!Number.isInteger(offset)||offset<0||offset>1000000||
+      options.chain&&!['bsc','solana','robinhood'].includes(options.chain)||
+      options.state&&!['pending','dispatching','completed','failed','interrupted','ignored'].includes(options.state)||
+      options.asOf&&(!/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(options.asOf)||!Number.isFinite(Date.parse(options.asOf))||new Date(options.asOf).toISOString()!==options.asOf))
+      throw new Error('INVALID_FILTER');
     const now=this.now();
+    const asOf=options.asOf??now.toISOString(),clauses=["(reason IS NULL OR reason NOT IN ('DEBOT_SIGNAL_STALE','DEBOT_DUPLICATE_TOKEN_ALERT'))",'observed_at<=?'];
+    const values:(string|number)[]=[asOf];
+    if(options.chain){clauses.push('chain=?');values.push(options.chain);}
+    if(options.state){clauses.push('state=?');values.push(options.state);}
+    const where=clauses.join(' AND ');
+    const total=Number(this.db.prepare(`SELECT count(*) AS n FROM debot_signals WHERE ${where}`).get(...values)!.n);
     const rows=this.db.prepare(`SELECT id,report_id,chain,address,token_name,token_symbol,occurred_at,observed_at,state,reason,dispatched_at,completed_at,progress,verdict
-      FROM debot_signals WHERE reason IS NULL OR reason NOT IN ('DEBOT_SIGNAL_STALE','DEBOT_DUPLICATE_TOKEN_ALERT')
-      ORDER BY observed_at DESC LIMIT ?`).all(limit);
-    return {now:now.toISOString(),items:rows.map(row=>{
+      FROM debot_signals WHERE ${where} ORDER BY observed_at DESC,id DESC LIMIT ? OFFSET ?`).all(...values,limit,offset);
+    return {now:now.toISOString(),asOf,total,limit,offset,hasMore:offset+rows.length<total,items:rows.map(row=>{
       const receivedAt=String(row.observed_at),startedAt=row.dispatched_at?String(row.dispatched_at):undefined;
       const endedAt=row.completed_at?String(row.completed_at):row.state==='dispatching'?now.toISOString():undefined;
       const verdict=row.verdict?JSON.parse(String(row.verdict)):{};

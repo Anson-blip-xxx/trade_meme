@@ -2,7 +2,7 @@ import {formatUnits} from 'viem';
 import type {Config} from './config.js';
 import {readNativeBalance,nativeCurrency,type NativeBalance} from './native-balance.js';
 import type {Chain} from './types.js';
-import type {OrderStore} from './orders.js';
+import type {OrderStore,OpeningOrder} from './orders.js';
 
 const chains:Chain[]=['bsc','solana','robinhood'];
 export interface DashboardBalance {
@@ -18,8 +18,8 @@ export function dashboardSettings(config:Config) {
       feeReserve:formatUnits(BigInt(config.entryFeeReserves[chain]),nativeCurrency(chain).decimals)})),
     exitPolicy:config.exitPolicy??null};
 }
-export function dashboardOrders(orders:OrderStore) {
-  return {items:orders.list(200).map(order=>({id:order.id,chain:order.chain,tokenAddress:order.tokenAddress,
+function projectOrder(order:OpeningOrder) {
+  return {id:order.id,chain:order.chain,tokenAddress:order.tokenAddress,
     createdAt:order.createdAt,updatedAt:order.updatedAt,status:order.status,mode:order.mode,
     amountIn:formatUnits(BigInt(order.actualInputAmount??order.inputAmount),nativeCurrency(order.chain).decimals),
     requestedAmount:formatUnits(BigInt(order.inputAmount),nativeCurrency(order.chain).decimals),
@@ -29,7 +29,16 @@ export function dashboardOrders(orders:OrderStore) {
     failureReason:order.failureReason,
     // Explicit projection: never return the request body, signing material or raw provider response.
     exit:order.exit?{state:order.exit.state,reasons:order.exit.reasons,checkedAt:order.exit.checkedAt,
-      positionClosed:order.exit.positionClosed,policy:order.exit.policy}:null})),limit:200};
+      positionClosed:order.exit.positionClosed,policy:order.exit.policy}:null};
+}
+type OrderPageOptions={limit?:number;offset?:number;chain?:Chain};
+export function dashboardOrders(orders:OrderStore,options:OrderPageOptions):Omit<ReturnType<OrderStore['page']>,'items'>&{items:ReturnType<typeof projectOrder>[]};
+export function dashboardOrders(orders:OrderStore):{items:ReturnType<typeof projectOrder>[];limit:number};
+export function dashboardOrders(orders:OrderStore,options?:OrderPageOptions) {
+  // Legacy callers can still project an explicit bounded list; the dashboard
+  // passes page options so no unrequested order is materialized.
+  const page=options?orders.page(options):{items:orders.list(200),limit:200};
+  return {...page,items:page.items.map(projectOrder)};
 }
 /** Cached read-only RPC balances. Polling the page never multiplies RPC calls. */
 export class DashboardBalances {

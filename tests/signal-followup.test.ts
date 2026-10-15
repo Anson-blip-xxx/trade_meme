@@ -29,6 +29,39 @@ function setup() {
   const capture=(n=1,patch:Partial<Report>={},at=0)=>{const f=fixture(n,patch,at);followup.capture(f.report,f.record,date(at));return f;};
   return {db,followup,capture,detail:(n=1,at=0)=>followup.detail('bsc',address(n),date(at))!};
 }
+test('dashboard followup pages retain every registration while excluding detailed evidence and pinning new arrivals',()=>{
+  const {db,followup,capture,detail}=setup();try {
+    for(let n=1;n<=8;n++)capture(n,{},n*1000);
+    followup.price(price(1,10000,10),date(10000));
+    const first=followup.list({limit:3},date(10000));assert.equal(first.total,8);assert.equal(first.hasMore,true);
+    assert.deepEqual(first.items.map(r=>r.address),[address(8),address(7),address(6)]);
+    capture(9,{},11000);
+    const second=followup.list({limit:3,offset:3,asOf:first.asOf},date(12000));assert.equal(second.total,8);
+    assert.deepEqual(second.items.map(r=>r.address),[address(5),address(4),address(3)]);
+    assert.equal(followup.list({selected:true},date(12000)).total,3);
+    assert.equal(followup.list({selected:false},date(12000)).total,6);
+    assert.equal(followup.list({decision:'REJECT'},date(12000)).total,0);
+    const slim=followup.list({selected:true},date(12000)).items.find(r=>r.address===address(1))!;
+    assert.equal(slim.performance.samples,1);assert.ok(slim.horizons);
+    for(const field of ['timeline','points','walletGroups','socialSignals','features','checks'])assert.equal(JSON.stringify(slim).includes('"'+field+'"'),false);
+    assert.equal(detail().performance.points.length,1);assert.ok(detail().initial.checks);
+    const end=followup.list({offset:50},date(12000));assert.equal(end.total,9);assert.equal(end.hasMore,false);assert.deepEqual(end.items,[]);
+  }finally{db.close();}
+});
+test('dashboard summary and aggregate pages are independent, bounded and isolated from caller mutation',()=>{
+  const {db,followup,capture}=setup();try {
+    capture(1);capture(2,{decision:'REJECT'});capture(3,{decision:'BUY_CANDIDATE',buyEligible:true});
+    const summary=followup.dashboardSummary(date());assert.equal(summary.total,3);assert.equal(summary.groupsTotal,3);assert.equal(summary.learningTotal,45);
+    for(const field of ['items','groups','learning'])assert.equal(Object.hasOwn(summary,field),false);
+    const groups=followup.groups({limit:1,offset:1},date());assert.equal(groups.total,3);assert.equal(groups.items.length,1);assert.equal(groups.hasMore,true);
+    const learning=followup.learning({limit:4,offset:4,decision:'WATCH',status:'collecting'},date());
+    assert.equal(learning.total,15);assert.equal(learning.items.length,4);learning.items[0].train.count=999;
+    assert.notEqual(followup.learning({limit:4,offset:4,decision:'WATCH'},date()).items[0].train.count,999);
+    assert.equal(followup.learning({status:'consistent_association'},date()).total,0);
+    for(const options of [{limit:0},{limit:101},{offset:-1},{offset:1000001},{chain:'eth'},{decision:'BUY'},{selected:'true'},{status:'invalid'},{asOf:'bad'}])
+      assert.throws(()=>followup.list(options as any,date()),/INVALID_FILTER/);
+  }finally{db.close();}
+});
 test('freezes first verdict and features per chain/token, only fills missing display labels',()=>{
   const {db,followup,detail}=setup();try {
     const original=fixture();delete original.record.name;

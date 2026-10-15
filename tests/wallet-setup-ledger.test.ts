@@ -23,6 +23,23 @@ function fixture(options:{maxBytes?:number;windowSec?:number}={}){
   return {ledger,advance:(n:number)=>{now=n;},one:()=>ledger.list().items[0]};
 }
 
+test('wallet opportunity pages use filtered totals and retain all records across offsets',()=>{
+  const f=fixture();try {
+    for(let n=1;n<=5;n++){
+      f.advance(100+n);f.ledger.record(report({trigger:event(90,{wallet,txHash:hash(n)})},{checkedAt:iso(100+n)}));
+    }
+    const first=f.ledger.list({chain:'bsc',address:token.address.toUpperCase().replace('0X','0x'),limit:2});
+    assert.equal(first.total,5);assert.equal(first.limit,2);assert.equal(first.offset,0);assert.equal(first.hasMore,true);
+    assert.deepEqual(first.items.map(r=>r.registeredAt),[iso(105),iso(104)]);
+    const second=f.ledger.list({limit:2,offset:2});assert.equal(second.total,5);
+    assert.deepEqual(second.items.map(r=>r.registeredAt),[iso(103),iso(102)]);
+    assert.equal(f.ledger.list({limit:2,offset:4}).hasMore,false);
+    const end=f.ledger.list({offset:10});assert.deepEqual(end.items,[]);assert.equal(end.total,5);assert.equal(end.hasMore,false);
+    assert.equal(f.ledger.list({chain:'robinhood'}).total,0);assert.equal(f.ledger.list({chain:'bsc',address:address(999)}).total,0);
+    assert.equal(f.ledger.status().records,5);
+  }finally{f.ledger.close();}
+});
+
 test('registration freezes the initial proof and real registration time across refreshes and renamed setup IDs',()=>{
   const f=fixture();try{
     f.ledger.record(report());const first=f.one();assert.equal(first.registeredAt,iso(100));assert.equal(first.state,'awaiting_leader');assert.equal(first.proof.trigger.eventAt,iso(90));

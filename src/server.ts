@@ -107,9 +107,10 @@ if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href) {
   const config=readConfig(),runtime=createRuntime(config);
   const server=buildServer(config,runtime.store,runtime.providers,runtime);
   const dashboard=config.dashboard.enabled&&runtime.archive?buildDashboard(config,{
-    archive:runtime.archive,overview:runtime.dashboardOverview,orders:runtime.dashboardOrders,
+    archive:runtime.archive,home:runtime.dashboardHome,overview:runtime.dashboardOverview,orders:runtime.dashboardOrders,
     debotAuth:runtime.debotAuth,
-    debotSignals:()=>runtime.debotScanner?.recent()??{now:new Date().toISOString(),items:[]},
+    debotSignals:options=>runtime.debotScanner?.list(options)??{now:new Date().toISOString(),items:[],total:0,
+      limit:options?.limit??20,offset:options?.offset??0,hasMore:false},
     chainStream:runtime.chainStreamStatus,protection:runtime.dashboardProtection,protectionDetail:id=>runtime.exitShadow?.detail(id),
     walletHistory:runtime.walletHistory,walletResearchStatus:runtime.walletResearchStatus,walletAssociations:runtime.walletHistory,
     walletProfiles:runtime.walletProfiles?.reader,walletProfilesStatus:runtime.walletProfilesStatus,walletScreening:runtime.walletScreening?.ledger}):undefined;

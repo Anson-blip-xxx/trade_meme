@@ -37,6 +37,28 @@ function fixture() {
   return {archive,price,setNow:(at:number)=>{elapsed=at;},now:()=>new Date(start+elapsed)};
 }
 
+test('dashboard scan projection preserves visible metrics but loads narrative and evidence only on detail',()=>{
+  const {archive,price}=fixture();try {
+    const row=stored();row.report!.narrative.supplier!.text='A'.repeat(2000);archive.capture(row);
+    price(2000,10);price(3000,20);
+    const list=archive.dashboardList({limit:1});assert.equal(list.total,1);const item=list.items[0];
+    assert.equal(item.id,row.id);assert.equal(item.name,'Synthetic Name');assert.equal(item.buyEligible,true);assert.equal((item.performance as any).maxGainPct,100);
+    assert.equal((item.performance as any).points,undefined);assert.equal(item.wallets,undefined);assert.equal(item.checks,undefined);
+    assert.equal((item.narrative as any).text.length,240);assert.equal((item.narrative as any).listExcerpt,true);
+    const detail=archive.get(row.id)!;assert.equal(detail.narrative!.text!.length,2000);assert.equal(detail.performance!.points.length,2);
+    assert.equal(archive.dashboardList({offset:5}).total,1);assert.deepEqual(archive.dashboardList({offset:5}).items,[]);
+  }finally{archive.close();}
+});
+test('home counters are cached scalars and expire tracking by time without pruning or serializing comparisons',()=>{
+  const {archive,setNow}=fixture();try {
+    archive.capture(stored());const first=archive.overviewStats();assert.equal(first.total,1);assert.equal(first.tracking,1);
+    archive.capture(stored('second'));assert.equal(archive.overviewStats().total,1);
+    setNow(17000);const refreshed=archive.overviewStats();assert.equal(refreshed.total,2);assert.equal(refreshed.tracking,2);
+    assert.equal(Object.hasOwn(refreshed,'comparison'),false);refreshed.total=100;
+    assert.equal(archive.overviewStats().total,2);setNow(86402000);assert.equal(archive.overviewStats().tracking,0);
+  }finally{archive.close();}
+});
+
 test('基线来自首次符合条件之后实际采样，涨跌和最高涨幅只由已采样报价计算',()=>{
   const {archive,price}=fixture();
   try {

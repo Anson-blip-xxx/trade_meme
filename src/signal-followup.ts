@@ -51,6 +51,14 @@ export interface FollowupLearning {
   train:LearningSplit;validation:LearningSplit;splitAt?:string;
   purgedTrainingCount:number;minimumPerFeatureGroup:number;scope:'observational_correlation';
 }
+export interface FollowupListOptions {
+  limit?:number;offset?:number;chain?:ScanToken['chain'];decision?:Report['decision'];selected?:boolean;asOf?:string;
+  status?:FollowupLearning['status'];
+}
+export type FollowupListRecord=Omit<FollowupRecord,'initial'|'performance'|'timeline'>&{
+  initial:Pick<FollowupInitial,'decision'|'policyVersion'|'source'|'reasons'>;
+  performance:Omit<FollowupPerformance,'points'|'baselineMarket'|'latestMarket'|'marketLimitations'>;
+};
 interface OutcomeRecord {
   chain:ScanToken['chain'];registeredAt:string;endsAt:string;selected:boolean;
   initial:Pick<FollowupInitial,'decision'|'policyVersion'|'features'>;
@@ -313,13 +321,71 @@ export class SignalFollowup {
   private withStatus(row:FollowupRecord,now:Date):FollowupRecord {
     return {...row,performance:{...row.performance,...(row.selected&&row.endsAt<=now.toISOString()?{status:'ended' as const}:{})}};
   }
-  summary(now:Date):ReturnType<SignalFollowup['buildSummary']> {
-    if(this.cachedSummary&&now.getTime()>=this.cachedSummary.at&&now.getTime()-this.cachedSummary.at<60000)return structuredClone(this.cachedSummary.value);
-    const value=this.buildSummary(now);this.cachedSummary={at:now.getTime(),value};return structuredClone(value);
+  private aggregate(now:Date):ReturnType<SignalFollowup['buildSummary']> {
+    if(this.cachedSummary&&now.getTime()>=this.cachedSummary.at&&now.getTime()-this.cachedSummary.at<60000)return this.cachedSummary.value;
+    const value=this.buildSummary(now);this.cachedSummary={at:now.getTime(),value};return value;
+  }
+  /** Legacy internal summary. Dashboard lists use separate bounded SQL pages. */
+  summary(now:Date) {
+    const rows=this.db.prepare(`SELECT record FROM signal_followups ORDER BY
+      CASE WHEN selected=1 AND ends_at>? THEN 0 WHEN selected=1 THEN 1 ELSE 2 END,registered_at DESC,chain,address LIMIT 30`).all(now.toISOString());
+    return {...structuredClone(this.aggregate(now)),items:rows.map(row=>{
+      const r=this.withStatus(JSON.parse(String(row.record)) as FollowupRecord,now);return {...r,performance:{...r.performance,points:undefined}};
+    })};
+  }
+  dashboardSummary(now:Date) {
+    const {groups,learning,...summary}=this.aggregate(now);
+    return {...structuredClone(summary),groupsTotal:groups.length,learningTotal:learning.length};
+  }
+  private page(options:FollowupListOptions,now:Date) {
+    const limit=options.limit??20,offset=options.offset??0,asOf=options.asOf??now.toISOString();
+    if(!Number.isInteger(limit)||limit<1||limit>100||!Number.isInteger(offset)||offset<0||offset>1000000||
+      options.chain&&!['bsc','solana','robinhood'].includes(options.chain)||
+      options.decision&&!['BUY_CANDIDATE','WATCH','REJECT'].includes(options.decision)||
+      options.selected!==undefined&&typeof options.selected!=='boolean'||
+      options.status&&!['collecting','needs_validation','consistent_association','not_replicated'].includes(options.status)||
+      !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(asOf)||!Number.isFinite(Date.parse(asOf))||new Date(asOf).toISOString()!==asOf)throw new Error('INVALID_FILTER');
+    return {limit,offset,asOf};
+  }
+  list(options:FollowupListOptions={},now=new Date()) {
+    const {limit,offset,asOf}=this.page(options,now),clauses=['registered_at<=?'],values:(string|number)[]=[asOf];
+    if(options.chain){clauses.push('chain=?');values.push(options.chain);}
+    if(options.decision){clauses.push('decision=?');values.push(options.decision);}
+    if(options.selected!==undefined){clauses.push('selected=?');values.push(options.selected?1:0);}
+    const where=clauses.join(' AND '),total=Number(this.db.prepare(`SELECT count(*) AS n FROM signal_followups WHERE ${where}`).get(...values)!.n);
+    // Project only the row fields in SQLite: timelines, wallet evidence and charts
+    // never cross the database boundary until the user opens a token detail.
+    const rows=this.db.prepare(`SELECT json_object(
+      'chain',chain,'address',address,'name',json_extract(record,'$.name'),'symbol',json_extract(record,'$.symbol'),
+      'registeredAt',registered_at,'endsAt',ends_at,'selected',json(CASE WHEN selected=1 THEN 'true' ELSE 'false' END),
+      'selection',json_extract(record,'$.selection'),
+      'initial',json_object('decision',decision,'policyVersion',policy_version,'source',json_extract(record,'$.initial.source'),
+        'reasons',json_extract(record,'$.initial.reasons')),
+      'performance',json_remove(json_extract(record,'$.performance'),'$.points','$.baselineMarket','$.latestMarket','$.marketLimitations'),
+      'horizons',json_extract(record,'$.horizons')) AS item
+      FROM signal_followups WHERE ${where} ORDER BY registered_at DESC,chain,address LIMIT ? OFFSET ?`).all(...values,limit,offset);
+    const items=rows.map(row=>{const item=JSON.parse(String(row.item)) as FollowupListRecord;
+      if(item.selected&&item.endsAt<=now.toISOString())item.performance.status='ended';return item;});
+    return {now:now.toISOString(),asOf,total,limit,offset,hasMore:offset+items.length<total,items};
+  }
+  groups(options:FollowupListOptions={},now=new Date()) {
+    const {limit,offset}=this.page(options,now),summary=this.aggregate(now);
+    const rows=summary.groups.filter(r=>(!options.chain||r.chain===options.chain)&&(!options.decision||r.decision===options.decision));
+    return {now:now.toISOString(),computedAt:summary.computedAt,total:rows.length,limit,offset,hasMore:offset+limit<rows.length,
+      items:structuredClone(rows.slice(offset,offset+limit))};
+  }
+  learning(options:FollowupListOptions={},now=new Date()) {
+    const {limit,offset}=this.page(options,now),summary=this.aggregate(now);
+    const rank={consistent_association:0,needs_validation:1,not_replicated:2,collecting:3};
+    const rows=summary.learning.filter(r=>(!options.chain||r.chain===options.chain)&&(!options.decision||r.decision===options.decision)&&
+      (!options.status||r.status===options.status)).sort((a,b)=>rank[a.status]-rank[b.status]||a.chain.localeCompare(b.chain)||
+      a.decision.localeCompare(b.decision)||a.policyVersion.localeCompare(b.policyVersion)||a.seconds-b.seconds||a.feature.localeCompare(b.feature));
+    return {now:now.toISOString(),computedAt:summary.computedAt,total:rows.length,limit,offset,hasMore:offset+limit<rows.length,
+      items:structuredClone(rows.slice(offset,offset+limit))};
   }
   /** Called by existing maintenance work, independent of dashboard visitors. */
   refresh(now:Date):void {
-    const summary=this.summary(now);
+    const summary=this.aggregate(now);
     const previous=this.db.prepare("SELECT value FROM signal_followup_meta WHERE key='last_review_at'").get()?.value;
     if(previous===summary.computedAt)return;
     const review={version:summary.version,computedAt:summary.computedAt,total:summary.total,selected:summary.selected,
@@ -369,13 +435,6 @@ export class SignalFollowup {
       }
     }
     const sampleTimes=rows.flatMap(r=>r.performance.latestAt?[r.performance.latestAt]:[]).sort();
-    // Pick identifiers before reading the large evidence records: sorting full
-    // timeline JSON across 20k rows would block the realtime event loop.
-    const recentIds=this.db.prepare('SELECT chain,address FROM signal_followups WHERE selected=1 AND ends_at>? ORDER BY registered_at DESC,chain,address LIMIT 30').all(now.toISOString());
-    if(recentIds.length<30)recentIds.push(...this.db.prepare('SELECT chain,address FROM signal_followups WHERE selected=1 AND ends_at<=? ORDER BY registered_at DESC,chain,address LIMIT ?').all(now.toISOString(),30-recentIds.length));
-    if(recentIds.length<30)recentIds.push(...this.db.prepare('SELECT chain,address FROM signal_followups WHERE selected=0 ORDER BY registered_at DESC,chain,address LIMIT ?').all(30-recentIds.length));
-    const read=this.db.prepare('SELECT record FROM signal_followups WHERE chain=? AND address=?');
-    const latest=recentIds.map(id=>JSON.parse(String(read.get(id.chain!,id.address!)!.record)) as FollowupRecord);
     return {enabled:true,version:'signal-followup-v1',now:now.toISOString(),computedAt:now.toISOString(),updatedAt:now.toISOString(),
       refreshIntervalSec:60,scope:'observational_correlation',mode:'observation_only',selection:'first_arrivals_per_decision_with_capacity_limit',
       startedAt:this.db.prepare("SELECT value FROM signal_followup_meta WHERE key='started_at'").get()?.value??null,
@@ -385,7 +444,6 @@ export class SignalFollowup {
       sampled:rows.filter(r=>r.performance.samples>0).length,capacitySkipped:rows.filter(r=>!r.selected).length,
       lastSampleAt:sampleTimes.at(-1)??null,groups,learning,
       limitations:['SAMPLED_QUOTES_NOT_REALIZED_RETURNS','CAPACITY_LIMITED_NON_RANDOM_COHORT','CORRELATION_NOT_CAUSATION',
-        'WALLET_IDENTITY_AND_SOCIAL_ENDORSEMENT_UNPROVEN','MISSING_HORIZONS_ARE_NOT_ZERO','NO_AUTOMATIC_POLICY_CHANGE'],
-      items:latest.map(row=>{const r=this.withStatus(row,now);return {...r,performance:{...r.performance,points:undefined}};})};
+        'WALLET_IDENTITY_AND_SOCIAL_ENDORSEMENT_UNPROVEN','MISSING_HORIZONS_ARE_NOT_ZERO','NO_AUTOMATIC_POLICY_CHANGE']};
   }
 }

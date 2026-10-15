@@ -26,6 +26,7 @@ import {ExitShadow} from './exit-shadow.js';
 import {dirname,resolve} from 'node:path';
 import {existsSync,realpathSync,statSync} from 'node:fs';
 import {researchProvider} from './research.js';
+import type {DashboardPageOptions} from './dashboard.js';
 
 export function createRuntime(config:Config) {
   if(!isPersistentOrderPath(config.ordersDatabase)) throw new Error('PERSISTENT_ORDER_DATABASE_REQUIRED');
@@ -229,14 +230,25 @@ export function createRuntime(config:Config) {
     catch {return {enabled:true,mode:'shadow',liveReady:false,captureError:'EXIT_SHADOW_READ_FAILED'};}
   };
   return {client,providers,store,orders,entry,scanner,debotScanner,debotStream,debotAuth,archive,tracking,walletHistory,walletObserver,walletResearchStatus,walletProfiles,walletProfilesStatus,walletScreening,watchRechecker,exitShadow,chainMonitor,chainStreamStatus,
-    dashboardProtection:()=>exitShadow?{...exitShadow.list(),captureError:exitCaptureError}:{...protectionSummary(),items:[]},
+    dashboardHome:()=>{
+      const host=system?.get();
+      return {now:new Date().toISOString(),entryMode:config.entryMode,stats:archive?.overviewStats(),
+        status:{scannerRunning:scanner.getStatus().running,debotState:debotStream?.getStatus().state??'disabled',
+          trackingRunning:tracking?.getStatus().running??false,startedAt:host?.startedAt,uptimeSec:host?.uptimeSec,
+          archiveError:archiveCaptureError??store.observationError??archiveMaintenanceError},
+        settings:{scanRetentionDays:config.dashboard.retentionDays,trackingHours:config.dashboard.trackingHours,
+          sampleIntervalSec:config.dashboard.sampleIntervalSec}};
+    },
+    dashboardProtection:(options:DashboardPageOptions={limit:20,offset:0})=>exitShadow
+      ?{...exitShadow.page(options),captureError:exitCaptureError}
+      :{...protectionSummary(),items:[],total:0,limit:options.limit,offset:options.offset,hasMore:false},
     dashboardOverview:()=>({now:new Date().toISOString(),entryMode:config.entryMode,scanner:scanner.getStatus(),
       debotScanner:debotScanner?.getStatus()??{enabled:false,running:false},
       debotStream:debotStream?.getStatus(),
       tracking:tracking?.getStatus(),stats:archive?.stats(),archiveError:archiveCaptureError??store.observationError??archiveMaintenanceError,
       settings:dashboardSettings(config),balances:balances?.get()??[],system:system?.get(),walletResearch:walletResearchStatus(),exitProtection:protectionSummary(),chainStream:chainStreamStatus(),
       watchRecheck:watchRechecker?{enabled:true,...watchRechecker.getStatus()}:{enabled:false}}),
-    dashboardOrders:()=>dashboardOrders(orders),
+    dashboardOrders:(options:DashboardPageOptions={limit:20,offset:0})=>dashboardOrders(orders,options),
     start(){
       if(closed) return;
       chainMonitor?.start();tracking?.start();balances?.start();system?.start();walletProfiles?.start();walletScreening?.start(async signal=>{

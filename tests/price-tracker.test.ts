@@ -4,9 +4,10 @@ import bs58 from 'bs58';
 import {PriceTracker, type PriceTrackerOptions} from '../src/price-tracker.js';
 import {GmgnError} from '../src/providers/gmgn-client.js';
 import type {Chain} from '../src/types.js';
+import type {ScanPrice} from '../src/scan-archive.js';
 
 type Token = {chain: Chain; address: string};
-type Sample = {chain: Chain; address: string; priceUsd: number; observedAt: string; source: string};
+type Sample = ScanPrice;
 const token = (index = 1, chain: Chain = 'bsc'): Token => ({chain,
   address: chain === 'solana' ? bs58.encode(new Uint8Array(32).fill(index)) : '0x' + index.toString(16).padStart(40, '0')});
 const instant = Date.parse('2026-10-09T00:00:00.000Z');
@@ -78,6 +79,32 @@ test('round robin covers all bounded candidates while input order changes and on
   await tracker.runOnce();
   assert.deepEqual(ctx.calls.slice(-2).map(call => call.query.address), [tokens[1].address, token(6).address]);
   assert.equal(tracker.getStatus().trackedTokens, 2);
+});
+
+test('follow-up market context reuses scoped current fields and preserves missing values',async()=>{
+  const archive=memoryArchive([token(),token(2),token(3)]);
+  const ctx=mockedClient(async query=>query.address===token().address?{
+    address:query.address,chain:'bsc',price:{price:'2',address:query.address,chain:'bsc'},liquidity:'45000.25',
+    holder_count:241,stat:{top_10_holder_rate:'0.21'},biggest_pool_address:token(8).address,
+    ath_price:99999,price_24h:99,
+  }:query.address===token(2).address?{
+    address:query.address,price:{price:'3'},liquidity:null,holder_count:'',stat:{top_10_holder_rate:21},
+    biggest_pool_address:query.address,
+  }:{address:query.address,price:{price:'3'},liquidity:0,holder_count:0,stat:{top_10_holder_rate:0}});
+  const tracker=new PriceTracker({archive:archive.archive,client:ctx.client});
+  const cycle=await tracker.runOnce();assert.equal(cycle.requests,3);
+  assert.deepEqual(archive.samples[0].market,{liquidityUsd:45000.25,holderCount:241,top10HolderRate:0.21,poolAddress:token(8).address});
+  assert.equal(archive.samples[1].market,undefined);
+  assert.deepEqual(archive.samples[2].market,{liquidityUsd:0,holderCount:0,top10HolderRate:0});
+});
+
+test('nested wrong-token current prices cannot enter the follow-up archive',async()=>{
+  const archive=memoryArchive([token(),token(2)]);
+  const ctx=mockedClient(async query=>({address:query.address,chain:'bsc',liquidity:'99999',
+    price:{price:'5',...(query.address===token().address?{address:token(9).address}:{chain:'sol'})}}));
+  const tracker=new PriceTracker({archive:archive.archive,client:ctx.client});
+  const cycle=await tracker.runOnce();assert.equal(cycle.recorded,0);assert.equal(cycle.errors,2);
+  assert.equal(archive.samples.length,0);assert.ok(archive.errors.every(e=>e.reason==='PRICE_TOKEN_MISMATCH'));
 });
 
 test('deduplicates full chain plus address identity and bounds archive selection', async () => {

@@ -1,6 +1,6 @@
 import bs58 from 'bs58';
 import {GmgnError, type GmgnClient} from './providers/gmgn-client.js';
-import type {ScanArchive, ScanToken} from './scan-archive.js';
+import type {ScanArchive, ScanToken, ScanPrice} from './scan-archive.js';
 import type {Chain} from './types.js';
 
 // Verified 2026-10-09 against GMGNAI/gmgn-skills commit
@@ -59,7 +59,7 @@ function normalizeToken(value: unknown): ScanToken | undefined {
   return {chain, address: value.address.toLowerCase()};
 }
 
-function priceFromInfo(raw: unknown, token: ScanToken): {priceUsd: number} | {reason: string} {
+function priceFromInfo(raw: unknown, token: ScanToken): {priceUsd: number;market?:ScanPrice['market']} | {reason: string} {
   if (!object(raw)) return {reason: 'PRICE_SCHEMA_INVALID'};
   const returned = normalizeToken({chain: token.chain, address: raw.address});
   if (!returned || returned.address !== token.address ||
@@ -68,7 +68,24 @@ function priceFromInfo(raw: unknown, token: ScanToken): {priceUsd: number} | {re
       !/^(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d{1,3})?$/.test(raw.price.price)) return {reason: 'PRICE_SCHEMA_INVALID'};
   const priceUsd = Number(raw.price.price);
   if (!Number.isFinite(priceUsd) || priceUsd <= 0) return {reason: 'PRICE_VALUE_INVALID'};
-  return {priceUsd};
+  if (Object.hasOwn(raw.price,'address')&&normalizeToken({chain:token.chain,address:raw.price.address})?.address!==token.address||
+      Object.hasOwn(raw.price,'chain')&&raw.price.chain!==GMGN_CHAINS[token.chain]) return {reason:'PRICE_TOKEN_MISMATCH'};
+  // Reuse the current info response for follow-up context. Field meanings are
+  // documented in GMGNAI/gmgn-skills skills/gmgn-token/SKILL.md (2026-10-15).
+  // Unknown/invalid fields remain absent, rather than becoming zero observations.
+  const numeric=(value:unknown):number|undefined=>{
+    if(typeof value!=='number'&&(typeof value!=='string'||value.length>128||!/^\d+(?:\.\d+)?(?:e[+-]?\d{1,3})?$/i.test(value)))return;
+    const n=Number(value);return Number.isFinite(n)&&n>=0&&n<=1e15?n:undefined;
+  };
+  const liquidity=numeric(raw.liquidity),holders=numeric(raw.holder_count);
+  const concentration=object(raw.stat)?numeric(raw.stat.top_10_holder_rate):undefined;
+  const pool=normalizeToken({chain:token.chain,address:raw.biggest_pool_address});
+  const market:NonNullable<ScanPrice['market']>={
+    ...(liquidity!==undefined?{liquidityUsd:liquidity}:{}),
+    ...(holders!==undefined&&Number.isSafeInteger(holders)?{holderCount:holders}:{}),
+    ...(concentration!==undefined&&concentration<=1?{top10HolderRate:concentration}:{}),
+    ...(pool&&pool.address!==token.address?{poolAddress:pool.address}:{})};
+  return {priceUsd,...(Object.keys(market).length?{market}:{})};
 }
 
 /** Backend-only observation loop; does not quote a trade, sign, or submit orders. */
@@ -229,7 +246,8 @@ export class PriceTracker {
       try {
         // Archive binds this completion-time sample to eligible candidates and sets
         // the first post-decision sample as baseline. No pre-signal price is fetched.
-        this.archive.recordPrice({...token, priceUsd: price.priceUsd, observedAt: observedAt.toISOString(), source: SOURCE});
+        this.archive.recordPrice({...token, priceUsd: price.priceUsd, observedAt: observedAt.toISOString(), source: SOURCE,
+          ...(price.market?{market:price.market}:{})});
         report.recorded++;
       } catch {
         report.errors++; reason('PRICE_ARCHIVE_WRITE_FAILED');

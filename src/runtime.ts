@@ -46,7 +46,7 @@ export function createRuntime(config:Config) {
   const client=new GmgnClient({apiKey:config.gmgnApiKey,minIntervalMs:config.gmgnMinIntervalMs});
   const providers=liveProviders(config,client);
   const archive=config.dashboard.enabled||config.watch.enabled||config.exitShadow.enabled||config.chainStream.enabled?new ScanArchive(config.dashboard.archivePath,{
-    retentionDays:config.dashboard.retentionDays,trackingHours:config.dashboard.trackingHours}):undefined;
+    retentionDays:config.dashboard.retentionDays,trackingHours:config.dashboard.trackingHours,followupEnabled:true}):undefined;
   if(config.watch.enabled)archive?.configureWatch({windowSec:config.watch.windowSec,intervalSec:config.watch.intervalSec,maxSignalAgeSec:config.maxSignalAgeSec});
   const walletHistory=config.walletResearch.enabled?new WalletHistory(config.walletResearch.database,{maxBytes:config.walletResearch.maxBytes}):undefined;
   const walletProfiles=walletHistory&&config.walletProfiles.enabled?new WalletProfileRunner({
@@ -75,7 +75,14 @@ export function createRuntime(config:Config) {
   let exitCaptureError:string|undefined;
   const recordPrice=(price:ScanPrice)=>{
       let archiveFailed=false;
-      try {archive?.recordPrice(price);}catch {archiveFailed=true;}
+      let walletEvidence;
+      // Join only already-observed local transactions at this sample's cutoff.
+      // The follow-up store suppresses old/high-frequency ticks before the DB read.
+      try {
+        const window=archive?.followupEvidenceWindow(price);
+        if(window&&walletHistory)walletEvidence=walletHistory.followupEvidence(price,window.fromAt,window.untilAt);
+      }catch {walletCaptureError='WALLET_FOLLOWUP_EVIDENCE_READ_FAILED';}
+      try {archive?.recordPrice(price,walletEvidence);}catch {archiveFailed=true;}
       if(exitShadow)try {
         // Reuse only newly returned prices. Old archive peaks cannot initialize a shadow position.
         let seed;
@@ -94,7 +101,7 @@ export function createRuntime(config:Config) {
       if(archiveFailed)throw new Error('PRICE_ARCHIVE_WRITE_FAILED');
     };
   const chainMonitor=config.chainStream.enabled?new ChainMonitor({config:config.chainStream,
-    tokens:()=>archive?.pendingTokens(200)??[],wallets:(chain,limit)=>walletHistory?.streamWalletTargets(chain,limit)??[],onPrice:recordPrice}):undefined;
+    tokens:()=>archive?.streamingTokens(new Date(),config.chainStream.maxPools)??[],wallets:(chain,limit)=>walletHistory?.streamWalletTargets(chain,limit)??[],onPrice:recordPrice}):undefined;
   const chainStreamStatus=()=>{try{return chainMonitor?.getStatus()??{enabled:false,running:false,mode:'observation_only',chains:[],recentEvents:[]};}
     catch{return {enabled:config.chainStream.enabled,mode:'observation_only',captureError:'CHAIN_STATUS_READ_FAILED',chains:[],recentEvents:[]};}};
   const tracking=archive?new PriceTracker({archive:{
@@ -174,7 +181,7 @@ export function createRuntime(config:Config) {
   }):undefined;
   const sweep=setInterval(()=>{
     store.prune(config.researchCacheTtlSec,config.researchCacheMax);orders.recover();
-    try {archive?.prune();archiveMaintenanceError=undefined;}
+    try {archive?.prune();archive?.refreshFollowup();archiveMaintenanceError=undefined;}
     catch {archiveMaintenanceError='SCAN_ARCHIVE_MAINTENANCE_FAILED';}
   },60000);sweep.unref();
   let reconcileTimer:ReturnType<typeof setInterval>|undefined;

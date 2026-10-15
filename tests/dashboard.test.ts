@@ -31,7 +31,7 @@ test('dashboard exposes assets but protects private data and serves strict CSP',
     const page=await fetch(f.base+'/');assert.equal(page.status,200);
     assert.equal(await page.text(),'index.html');assert.match(page.headers.get('content-security-policy')!,/script-src 'self'/);
     assert.equal(page.headers.get('referrer-policy'),'no-referrer');
-    for(const route of ['session','overview','scans','orders','chain-stream'])assert.equal((await fetch(`${f.base}/dashboard/api/${route}`)).status,401);
+    for(const route of ['session','overview','scans','orders','chain-stream','followup','followup/bsc/0x0000000000000000000000000000000000000001'])assert.equal((await fetch(`${f.base}/dashboard/api/${route}`)).status,401);
     for(const path of ['/v1/signals','/.env','/config/exit-policy.json','/dashboard/../.env','/dashboard/%2e%2e/.env'])
       assert.equal((await fetch(f.base+path)).status,404);
   } finally {await f.close();}
@@ -65,6 +65,11 @@ test('local authenticated proxy reaches only read-only whitelist and valid filte
       assert.equal((await fetch(f.base+'/dashboard/api/scans?'+query,{headers})).status,400,query);
     assert.deepEqual(await (await fetch(f.base+'/dashboard/api/scans?eligible=true',{headers})).json(),{items:[],total:0});
     assert.deepEqual(await (await fetch(f.base+'/dashboard/api/chain-stream',{headers})).json(),{enabled:false,running:false,chains:[],recentEvents:[]});
+    assert.deepEqual(await (await fetch(f.base+'/dashboard/api/followup',{headers})).json(),{enabled:false});
+    for(const suffix of ['eth/0x0000000000000000000000000000000000000001','bsc/not-address','solana/short','bsc/%E0%A4%A'])
+      assert.equal((await fetch(f.base+'/dashboard/api/followup/'+suffix,{headers})).status,400,suffix);
+    assert.equal((await fetch(f.base+'/dashboard/api/followup/bsc/0x0000000000000000000000000000000000000001',{headers})).status,404);
+    assert.equal((await fetch(f.base+'/dashboard/api/followup',{method:'POST',headers})).status,405);
     assert.equal((await fetch(f.base+'/dashboard/api/chain-stream',{method:'POST',headers})).status,405);
     assert.equal((await fetch(f.base+'/v1/scanner/run',{method:'POST',headers})).status,404);
     assert.equal((await fetch(f.base+'/dashboard/api/scans',{method:'DELETE',headers})).status,405);

@@ -35,6 +35,7 @@
       <nav class="navigation" aria-label="主导航">
         <button class="nav-item active" data-view="scans" aria-current="page"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 4v8l5 5M8 12a4 4 0 0 1 4-4"/></svg><span>信号扫描</span><span class="nav-dot"></span></button>
         <button class="nav-item" data-view="candidates"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 2.7 5.5 6.1.9-4.4 4.3 1 6.1-5.4-2.9-5.4 2.9 1-6.1-4.4-4.3 6.1-.9Z"/></svg><span>条件后追踪</span><span id="candidate-count" class="nav-count">—</span></button>
+        <button class="nav-item" data-view="followup"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19h16M5 15l5-5 4 3 5-8"/><path d="M15 5h4v4"/></svg><span>持续复盘</span><span class="nav-count">研究</span></button>
         <button class="nav-item" data-view="wallets"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="7" r="3"/><circle cx="5" cy="17" r="2"/><circle cx="19" cy="17" r="2"/><path d="m10 10-4 5m8-5 4 5M7 17h10"/></svg><span>钱包研究</span><span class="nav-count">NEW</span></button>
         <button class="nav-item" data-view="protection"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6l8-3Z"/><path d="m7 14 3-4 3 2 4-5"/></svg><span>止盈保护</span><span class="nav-count">影子</span></button>
         <button class="nav-item" data-view="orders"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3h10l3 3v15H4V3h3Zm1 6h8M8 13h8M8 17h5"/></svg><span>订单记录</span></button>
@@ -93,6 +94,20 @@
               <div id="scan-empty" class="empty-state" hidden><div class="empty-radar" aria-hidden="true"><span></span></div><h3 id="scan-empty-title">等待第一个信号</h3><p id="scan-empty-description">扫描结果到达后，会在这里显示筛选依据与后续表现。</p></div>
               <div class="table-footer"><span id="pagination-info">正在读取记录…</span><div class="pagination"><button id="previous-page" type="button" aria-label="上一页" disabled>←</button><span id="page-number">01</span><button id="next-page" type="button" aria-label="下一页" disabled>→</button></div></div>
               <div class="table-footnote"><span aria-hidden="true">ⓘ</span><span id="performance-note">最高涨幅从首次符合条件后的首个有效价格开始计算；仅反映采样观测值，不代表全市场最高价或实际交易收益。缺失数据显示为 —。</span></div>
+            </section>
+
+            <section id="followup-panel" class="followup-panel" aria-labelledby="followup-title" hidden>
+              <div class="followup-intro"><div><span class="eyebrow">SIGNAL → OUTCOME → EVIDENCE</span><h2 id="followup-title">从当时的判断，追到后来的结果</h2><p>冻结首次判断，再跟踪价格与钱包证据。通过、观察、排除的信号都登记，按容量选取后续报价样本，比较哪些线索值得继续验证。</p></div><span id="followup-status" class="badge neutral" role="status">正在读取</span></div>
+              <div class="metrics-grid followup-metrics" aria-label="持续复盘覆盖范围">
+                <article class="metric-card"><div class="metric-label">登记代币</div><div id="followup-total" class="metric-value">—</div><div class="metric-note">同链同币合并，首次判断留档</div></article>
+                <article class="metric-card accent-card"><div class="metric-label">已采样 / 已入选</div><div id="followup-sampled" class="metric-value">—</div><div class="metric-note">首个新报价才建立涨幅基准</div></article>
+                <article class="metric-card"><div class="metric-label">运行中</div><div id="followup-active" class="metric-value">—</div><div class="metric-note">观察周期内继续接收报价</div></article>
+                <article class="metric-card"><div class="metric-label">容量未入选</div><div id="followup-skipped" class="metric-value">—</div><div class="metric-note">仍保留首次判断，无涨跌推断</div></article>
+              </div>
+              <p id="followup-coverage" class="followup-coverage">从此模块上线后开始积累独立样本，历史价格不会回填为提前知道的数据。</p>
+              <div id="followup-warning" class="notice" role="status" hidden></div>
+              <article class="panel followup-learning"><div class="panel-heading"><div class="section-title"><span class="section-marker"></span><h2>正在验证的关系</h2></div><span id="followup-refresh-note" class="auto-refresh">每 15 秒读取 · 汇总每 60 秒更新</span></div><div id="followup-learning" class="followup-learning-content"></div><div id="followup-groups" class="table-scroll" tabindex="0" aria-label="按链、首次判断和策略版本比较相同观察周期"></div></article>
+              <article class="panel followup-records"><div class="panel-heading"><div class="section-title"><span class="section-marker"></span><h2>信号后续表现</h2><span id="followup-count" class="count-pill">—</span></div><span class="followup-mobile-hint">列表可左右滑动</span></div><div class="followup-list-note">优先展示追踪中与已采样币，最多 30 个。逐币查看当时为何通过或未通过、后来何时上涨与回撤，以及涨前已取得哪些钱包证据。</div><div id="followup-list" class="table-scroll" tabindex="0" aria-label="信号后续表现列表，可左右滚动"><table class="followup-table"><thead><tr><th scope="col">代币 / 链</th><th scope="col">首次判断 / 采样</th><th scope="col" class="numeric">采样最高涨幅</th><th scope="col" class="numeric">最新涨幅</th><th scope="col" class="numeric">峰后最大回撤</th><th scope="col">固定窗 1h / 6h / 24h</th><th scope="col">最新采样 / 操作</th></tr></thead><tbody id="followup-rows"></tbody></table></div><div id="followup-empty" class="empty-state"><div class="empty-radar" aria-hidden="true"><span></span></div><h3>开始积累后续证据</h3><p>新信号完成分析后登记；首个有效价格样本到达后显示后续涨跌。</p></div><div class="table-footnote">涨幅与回撤来自采样报价，不代表可成交收益。固定窗口缺少准时报价时显示 —，不会按 0% 计入统计。</div></article>
             </section>
 
             <section id="wallets-panel" class="panel wallets-panel" aria-labelledby="wallet-list-title" hidden>

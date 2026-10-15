@@ -133,6 +133,19 @@ export function buildDashboard(config:Config,services:DashboardServices,assetDir
       if(req.method!=='GET') {send(res,405,{error:'READ_ONLY'});return;}
       if(url.pathname==='/dashboard/api/session') {send(res,200,{authenticated:true,readOnly:true,authentication:proxyAuthenticated(req)?'proxy':'session'});return;}
       if(url.pathname==='/dashboard/api/overview') {send(res,200,services.overview());return;}
+      if(url.pathname==='/dashboard/api/followup') {send(res,200,services.archive.followupSummary());return;}
+      const followupMatch=url.pathname.match(/^\/dashboard\/api\/followup\/([^/]+)\/([^/]+)$/);
+      if(followupMatch) {
+        const chain=followupMatch[1];let address:string;
+        try {
+          address=decodeURIComponent(followupMatch[2]);
+          if(!['bsc','solana','robinhood'].includes(chain))throw new Error();
+          if(chain==='solana'){if(address.length>44||bs58.decode(address).length!==32)throw new Error();}
+          else {if(!/^0x[0-9a-fA-F]{40}$/.test(address))throw new Error();address=address.toLowerCase();}
+        }catch {throw new Error('INVALID_FILTER');}
+        const detail=services.archive.followupDetail({chain:chain as 'bsc'|'solana'|'robinhood',address});
+        send(res,detail?200:404,detail??{error:'NOT_FOUND'});return;
+      }
       if(url.pathname==='/dashboard/api/debot/signals') {send(res,200,services.debotSignals?.()??{now:new Date().toISOString(),items:[]});return;}
       if(url.pathname==='/dashboard/api/orders') {send(res,200,services.orders());return;}
       if(url.pathname==='/dashboard/api/chain-stream') {send(res,200,services.chainStream?.()??{enabled:false,running:false,chains:[],recentEvents:[]});return;}

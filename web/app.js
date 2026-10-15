@@ -9,6 +9,7 @@
   const views = {
     scans: ['信号扫描', '从链上信号到筛选依据，让每一次观察都有迹可循。'],
     candidates: ['条件后追踪', '回看曾通过研究判断的信号，观察此后的价格表现。'],
+    followup: ['持续复盘', '保留当时判断，持续比较后续表现，用时间顺序与对照样本验证上涨线索。'],
     wallets: ['钱包研究', '回查公开钱包之前的买入者，持续验证跨币时序与资金联系。'],
     protection: ['止盈保护', '前瞻验证动态保护线与触发建议，观察利润回撤时策略会如何响应。'],
     orders: ['订单记录', '核对实际订单、执行结果与退出保护状态。'],
@@ -301,7 +302,7 @@
     WALLET_SCREENING_NO_MATCHING_PROFILE: '近期买入尚未匹配到有效的目标钱包画像',
   };
   const state = {authenticated: false, view: 'scans', chain: '', decision: '', search: '', offset: 0, total: 0, items: [], orders: [], overview: null, refreshing: false, queued: false, queryVersion: 0, timer: null, searchTimer: null, lastSuccess: null, resourceErrors: {}, scansLoaded: false, ordersLoaded: false, detailId: null, detailKind: 'scan', detailWallet: null, detailGeneration: 0, returnFocus: null, walletEvidenceOpen: new Set(),
-    walletSort: 'profiles', associationStatus: null, walletProfileStatus: null, walletProfilesReady: false, walletGroup: '', walletChain: '', walletSearch: '', walletOffset: 0, walletTotal: 0, walletItems: [], walletStatus: null, walletsLoaded: false, walletSearchTimer: null, protection: null, protectionLoaded: false, chainStream: null, chainStreamLoaded: false};
+    walletSort: 'profiles', associationStatus: null, walletProfileStatus: null, walletProfilesReady: false, walletGroup: '', walletChain: '', walletSearch: '', walletOffset: 0, walletTotal: 0, walletItems: [], walletStatus: null, walletsLoaded: false, walletSearchTimer: null, protection: null, protectionLoaded: false, chainStream: null, chainStreamLoaded: false, followup: null, followupLoaded: false};
 
   const debotAuth = {status: null, busy: '', message: '', error: false, generation: 0};
   const debotRisk = {items: [], loaded: false, error: '', lastSuccess: 0, serverNow: 0, timer: null, controller: null, generation: 0, signature: ''};
@@ -676,6 +677,7 @@
         const actions = el('td', 'debot-risk-actions-cell'); actions.append(gmgnTokenLink(item.chain, item.address));
         if (typeof item.reportId === 'string' && item.reportId) {
           const detail = el('button', 'text-button', '核验证据 ↗'); detail.type = 'button'; detail.setAttribute('aria-label', `查看 ${scalar(item.address)} 的核验证据`); detail.addEventListener('click', () => openDetail(item.reportId, detail)); actions.append(detail);
+          const follow = el('button', 'text-button', '后续复盘 ↗'); follow.type = 'button'; follow.setAttribute('aria-label', `查看 ${scalar(item.address)} 的后续复盘`); follow.addEventListener('click', () => openFollowup(item, follow)); actions.append(follow);
         }
         row.append(token, score, chain, checksCell, decision, timing, actions); body.append(row);
       }
@@ -900,6 +902,7 @@
       if (version !== state.queryVersion) return;
       state.items = Array.isArray(data.items) ? data.items : []; state.total = finite(data.total) ? data.total : state.items.length; state.scansLoaded = true; renderScans();
     }});
+    if (activeView === 'followup') jobs.push({key: 'followup', run: () => api('/followup'), apply: data => { state.followup = data; state.followupLoaded = true; renderFollowup(); }});
     if (activeView === 'protection') jobs.push({key: 'protection', run: () => api('/protection'), apply: data => { state.protection = data; state.protectionLoaded = true; renderProtection(); }});
     if (activeView === 'system') jobs.push({key: 'chainStream', run: () => api('/chain-stream'), apply: data => { state.chainStream = data; state.chainStreamLoaded = true; renderChainStream(); }});
     if (activeView === 'system' && !debotAuth.busy) {
@@ -933,6 +936,7 @@
       if (state.resourceErrors.walletProfiles && state.view === 'wallets') renderWalletProfileStatus();
       if (state.resourceErrors.walletStatus && state.view === 'wallets') renderWalletScreeningStatus();
       if (state.resourceErrors.protection && state.view === 'protection') renderProtection();
+      if (state.resourceErrors.followup && state.view === 'followup') renderFollowup();
       if (state.resourceErrors.chainStream && state.view === 'system') renderChainStream();
       networkState();
       if (state.detailId) await loadDetail(state.detailId, true);
@@ -980,15 +984,16 @@
       if (active) button.setAttribute('aria-current', 'page'); else button.removeAttribute('aria-current');
     });
     text('breadcrumb-current', views[view][0]); $('page-title').replaceChildren(document.createTextNode(views[view][0]), el('span', 'title-dot', '.')); text('page-description', views[view][1]);
-    $('scans-panel').hidden = !['scans', 'candidates'].includes(view); $('orders-panel').hidden = view !== 'orders'; $('system-panel').hidden = view !== 'system'; $('protection-panel').hidden = view !== 'protection';
+    $('scans-panel').hidden = !['scans', 'candidates'].includes(view); $('orders-panel').hidden = view !== 'orders'; $('system-panel').hidden = view !== 'system'; $('protection-panel').hidden = view !== 'protection'; $('followup-panel').hidden = view !== 'followup';
     $('debot-risk-panel').hidden = !['scans', 'candidates'].includes(view); syncDebotRiskPolling();
-    $('wallets-panel').hidden = view !== 'wallets'; $('wallet-metrics').hidden = view !== 'wallets'; $('scan-metrics').hidden = ['wallets', 'protection', 'system'].includes(view); $('scan-insights').hidden = ['wallets', 'protection', 'system'].includes(view); $('workbench').classList.toggle('wallet-mode', ['wallets', 'protection', 'system'].includes(view));
+    $('wallets-panel').hidden = view !== 'wallets'; $('wallet-metrics').hidden = view !== 'wallets'; $('scan-metrics').hidden = ['wallets', 'protection', 'system', 'followup'].includes(view); $('scan-insights').hidden = ['wallets', 'protection', 'system', 'followup'].includes(view); $('workbench').classList.toggle('wallet-mode', ['wallets', 'protection', 'system', 'followup'].includes(view));
     text('list-title', view === 'candidates' ? '曾通过研究判断的信号' : '全部扫描记录');
-    delete state.resourceErrors.scans; delete state.resourceErrors.orders; delete state.resourceErrors.wallets; delete state.resourceErrors.walletStatus; delete state.resourceErrors.walletProfiles; delete state.resourceErrors.associations; delete state.resourceErrors.protection; delete state.resourceErrors.chainStream;
+    delete state.resourceErrors.scans; delete state.resourceErrors.orders; delete state.resourceErrors.wallets; delete state.resourceErrors.walletStatus; delete state.resourceErrors.walletProfiles; delete state.resourceErrors.associations; delete state.resourceErrors.protection; delete state.resourceErrors.chainStream; delete state.resourceErrors.followup;
     if (view === 'scans' || view === 'candidates') { state.items = []; state.scansLoaded = false; $('scan-rows').replaceChildren(); text('list-count', '—'); renderScanEmpty('正在读取记录', '即将展示当前筛选条件下的真实数据。'); }
     if (view === 'system') { renderSystem(); renderChainStream(); renderDebotAuth(); }
     else clearDebotCodes();
     if (view === 'protection') renderProtection();
+    if (view === 'followup') renderFollowup();
     if (view === 'wallets') { state.walletOffset = 0; renderWalletRankingNote(); if (state.walletStatus) renderWalletStatus(); if (!state.walletsLoaded) walletEmpty('正在读取钱包研究档案', '从真实观测记录中整理研究目标。'); }
     void refresh();
   }
@@ -1395,11 +1400,123 @@
     policy.append(el('p', 'policy-caption', '配置中的阈值与订单的实际退出保护状态分别展示；具体执行结果请查看订单记录。'));
   }
 
+  const followupFeatures = {two_wallet_groups: '至少两组合格钱包线索', positive_net_buy: '已采样钱包净买入为正', social_link: '名人社交关联线索', precursor_setup: '前置钱包买入路径', public_entry_setup: '公开钱包进场路径'};
+  const followupWindow = seconds => ({3600: '1 小时', 21600: '6 小时', 86400: '24 小时'}[seconds] || `${seconds} 秒`);
+  const followupStatus = {waiting: '等待首个报价', tracking: '采样跟踪中', unavailable: '报价暂不可用', ended: '观察周期结束', not_selected: '容量未入选'};
+  function openFollowup(item, trigger) { return openDetail(`followup:${item.chain}:${item.address}`, trigger, {followup: true, chain: item.chain, address: item.address}); }
+  function followupChain(chain) { const node = el('span', 'followup-token-meta'); node.append(el('span', `chain-dot ${chainClass(chain)}`), el('span', '', chainName(chain))); return node; }
+  function followupHorizon(horizon, seconds, initialAt) {
+    const node = el('div', 'followup-horizon'); node.append(el('span', '', {3600: '1h', 21600: '6h', 86400: '24h'}[seconds]), gainNode(horizon?.gainPct));
+    const elapsed = validDate(initialAt) && Date.now() >= Date.parse(initialAt) + seconds * 1000 + 600000;
+    node.title = horizon ? `${followupWindow(seconds)}报价于 ${date(horizon.at, true)}，相对目标时间延迟 ${count(horizon.delaySec)} 秒` : elapsed ? '窗口内未取得有效报价，不按 0% 计算' : '窗口尚未完成或尚无准时报价'; return node;
+  }
+  function renderFollowup() {
+    const data = state.followup || {}, error = Boolean(state.resourceErrors.followup), loaded = state.followupLoaded;
+    text('followup-total', count(data.total)); text('followup-sampled', `${count(data.sampled)} / ${count(data.selected)}`); text('followup-active', count(data.active)); text('followup-skipped', count(data.capacitySkipped));
+    const status = $('followup-status'); status.className = `badge ${error ? 'watch' : data.enabled ? 'pass' : 'neutral'}`; status.textContent = error ? '更新暂时中断' : !loaded ? '正在读取' : data.enabled ? '持续积累中' : '未启用';
+    const started = validDate(data.startedAt) ? `登记起点 ${date(data.startedAt, true)}` : '等待新信号建立登记起点';
+    text('followup-refresh-note', `每 15 秒读取 · 汇总每 ${finite(data.refreshIntervalSec) ? data.refreshIntervalSec : 60} 秒更新`);
+    text('followup-coverage', `${started} · 汇总计算于 ${date(data.computedAt, true)} · 最近报价 ${date(data.lastSampleAt, true)}。${finite(data.retentionDays) ? `保留 ${count(data.retentionDays)} 天，` : ''}按首次到达与容量选取样本；观察和排除信号均参与对照，历史涨幅不回填。`);
+    $('followup-warning').hidden = !error; text('followup-warning', loaded ? '后续记录暂时无法更新，已保留最近成功读取的结果。页面会自动重试。' : '暂时无法读取持续复盘数据，连接恢复后会自动更新。');
+    const learning = $('followup-learning'); learning.replaceChildren();
+    learning.append(el('p', '', '分别检验钱包分组、净买入、名人链接、前置路径与公开钱包进场：同链、同首次判断、同策略版本、同观察窗口进行比较，按时间分为早期样本与后期验证样本。早期结果必须在后期样本登记前已经可知，跨越分界的结果剔除。'));
+    const hypotheses = Array.isArray(data.learning) ? data.learning : []; const ready = hypotheses.filter(item => item.status && item.status !== 'collecting');
+    const cards = el('div', 'followup-learning-cards');
+    if (!ready.length) {
+      const card = el('article', 'followup-learning-card'); card.append(badge('样本积累中', 'neutral'), el('h3', '', '先收齐结果，再验证线索')); const minimum = hypotheses.find(item => finite(item.minimumPerFeatureGroup))?.minimumPerFeatureGroup || 20;
+      card.append(el('p', '', `每项线索的“出现”和“未出现”两组，在早期样本中各需至少 ${minimum} 个有效固定窗结果；再用后期样本验证。缺失的线索与报价单独计数。`)); cards.append(card);
+      const features = el('article', 'followup-learning-card'); features.append(badge('持续比较', 'neutral'), el('h3', '', '观察涨前有哪些共同证据'), el('p', '', Object.values(followupFeatures).join(' · ')), el('p', '', '目前不会根据单个暴涨币上调权重；新证据与复盘结果持续保留。')); cards.append(features);
+    } else for (const item of ready.slice(0, 8)) {
+      const card = el('article', 'followup-learning-card'); const statusLabel = {needs_validation: '待后期样本验证', consistent_association: '前后样本方向一致', not_replicated: '后期未复现'}[item.status] || '积累中';
+      card.append(badge(statusLabel, item.status === 'consistent_association' ? 'pass' : 'watch'), el('h3', '', followupFeatures[item.feature] || scalar(item.feature)), el('p', '', `${chainName(item.chain)} · ${decisions[item.decision]?.[0] || scalar(item.decision)} · ${followupWindow(item.seconds)} · ${scalar(item.policyVersion)}`));
+      for (const [key, label] of [['train', '早期样本'], ['validation', '后期验证']]) {
+        const split = item[key] || {}; const p = split.present || {}, a = split.absent || {}, u = split.unknown || {};
+        card.append(el('p', '', `${label}：线索出现 ${count(p.covered)} 个，中位涨幅 ${percent(p.medianGainPct)}；未出现 ${count(a.covered)} 个，中位涨幅 ${percent(a.medianGainPct)}。报价缺失 ${count((p.missing || 0) + (a.missing || 0) + (u.missing || 0))} 个，线索未知 ${count(u.count)} 个。`));
+      }
+      card.append(el('p', '', `剔除跨越时间分界的早期样本 ${count(item.purgedTrainingCount)} 个；早期结果须在后期样本登记前已经可知。`), el('p', '', '这是样本内关联，仍需新增样本检验；不会自动改动交易门槛。')); cards.append(card);
+    }
+    learning.append(cards); if (Array.isArray(data.groups) && data.groups.length > 30) learning.append(el('p', 'detail-small', `共 ${data.groups.length} 个分组，下面展示前 30 组。`)); if (ready.length > 8) learning.append(el('p', 'detail-small', `当前展示 ${ready.length} 项已达到初步门槛的关系中的前 8 项。`));
+    const groups = $('followup-groups'); const groupScroll = groups.scrollLeft; groups.replaceChildren(); const allGroups = Array.isArray(data.groups) ? data.groups : [];
+    if (allGroups.length) {
+      const table = el('table', 'followup-group-table'), head = el('thead'), hr = el('tr');
+      for (const label of ['分组 / 策略版本', '登记 / 入选', '1 小时中位涨幅', '6 小时中位涨幅', '24 小时中位涨幅']) hr.append(el('th', '', label)); head.append(hr); table.append(head); const body = el('tbody');
+      for (const group of allGroups.slice(0, 30)) {
+        const row = el('tr'), label = el('td'); label.append(followupChain(group.chain), badge(...(decisions[group.decision] || [scalar(group.decision), 'neutral'])), el('small', '', scalar(group.policyVersion))); row.append(label, el('td', '', `${count(group.count)} / ${count(group.selected)}`));
+        for (const seconds of [3600, 21600, 86400]) { const horizon = (Array.isArray(group.horizons) ? group.horizons : []).find(h => h.seconds === seconds), cell = el('td'); cell.append(gainNode(horizon?.medianGainPct), el('small', '', `覆盖 ${count(horizon?.covered)} / 到期 ${count(horizon?.mature)}`), el('small', '', `缺失 ${count(horizon?.missing)}`)); const boundary = hypotheses.find(item => item.chain === group.chain && item.decision === group.decision && item.policyVersion === group.policyVersion && item.seconds === seconds); if (finite(boundary?.purgedTrainingCount)) cell.append(el('small', '', `训练跨界剔除 ${count(boundary.purgedTrainingCount)}`)); row.append(cell); }
+        body.append(row);
+      } table.append(body); groups.append(table); groups.scrollLeft = groupScroll;
+    }
+    const body = $('followup-rows'); const scroll = $('followup-list').scrollLeft; const focused = body.contains(document.activeElement) ? document.activeElement.getAttribute('aria-label') : null; body.replaceChildren();
+    const items = Array.isArray(data.items) ? data.items : []; text('followup-count', `展示 ${count(items.length)} 个`); $('followup-empty').hidden = items.length > 0; $('followup-list').hidden = !items.length;
+    if (!loaded) { $('followup-empty').querySelector('h3').textContent = error ? '暂时无法读取记录' : '正在读取后续记录'; $('followup-empty').querySelector('p').textContent = '连接成功后展示真实采样记录。'; }
+    else { $('followup-empty').querySelector('h3').textContent = '开始积累后续证据'; $('followup-empty').querySelector('p').textContent = '新信号完成分析后登记；首个有效价格样本到达后显示后续涨跌。'; }
+    for (const item of items.slice(0, 30)) {
+      const p = item.performance || {}, initial = item.initial || {}, row = el('tr'), token = el('td'), name = scalar(item.name || item.symbol, '未命名代币');
+      const title = el('button', 'token-name', name); title.type = 'button'; title.setAttribute('aria-label', `查看 ${scalar(item.chain)} ${scalar(item.address)} 的后续复盘`); title.addEventListener('click', () => openFollowup(item, title)); token.append(title, followupChain(item.chain));
+      const address = scalar(item.address); const short = el('code', 'followup-address', address.length > 19 ? `${address.slice(0, 8)}…${address.slice(-7)}` : address); short.title = address; token.append(short); if (item.name && item.symbol && item.name !== item.symbol) token.append(el('div', 'cell-subtitle', scalar(item.symbol))); row.append(token);
+      const decision = el('td'); decision.append(badge(...(decisions[initial.decision] || ['待判断', 'neutral'])), el('div', 'cell-subtitle', followupStatus[p.status] || (item.selected ? '已入选' : '未入选')), el('div', 'cell-subtitle', `${count(p.samples)} 个报价`)); row.append(decision);
+      for (const field of ['maxGainPct', 'currentGainPct', 'maxDrawdownPct']) { const cell = el('td', 'numeric'); cell.append(field === 'maxDrawdownPct' ? el('span', `gain ${finite(p[field]) && p[field] > 0 ? 'negative' : 'missing'}`, finite(p[field]) ? `${p[field] > 0 ? '−' : ''}${percent(p[field]).replace(/^\+/, '')}` : '—') : gainNode(p[field])); row.append(cell); }
+      const horizons = el('td'); for (const seconds of [3600, 21600, 86400]) horizons.append(followupHorizon(item.horizons?.[String(seconds)], seconds, item.registeredAt)); row.append(horizons);
+      const actions = el('td'); actions.append(el('time', 'followup-time', date(p.latestAt, true)), gmgnTokenLink(item.chain, item.address)); const detail = el('button', 'text-button', '证据与时间线 ↗'); detail.type = 'button'; detail.setAttribute('aria-label', `查看 ${scalar(item.chain)} ${scalar(item.address)} 的后续时间线`); detail.addEventListener('click', () => openFollowup(item, detail)); actions.append(detail); row.append(actions); body.append(row);
+    }
+    $('followup-list').scrollLeft = scroll; if (focused) [...body.querySelectorAll('[aria-label]')].find(node => node.getAttribute('aria-label') === focused)?.focus({preventScroll: true});
+  }
+  function followupTradeLink(chain, hash) {
+    const evm = typeof hash === 'string' && /^0x[0-9a-f]{64}$/i.test(hash), sol = typeof hash === 'string' && /^[1-9A-HJ-NP-Za-km-z]{64,88}$/.test(hash);
+    const url = chain === 'bsc' && evm ? `https://bscscan.com/tx/${hash}` : chain === 'solana' && sol ? `https://solscan.io/tx/${hash}` : null;
+    if (!url) return el('p', 'followup-evidence-note', `交易标识 ${scalar(hash)}`);
+    const link = el('a', 'source-link', '查看交易记录 ↗'); link.href = url; link.target = '_blank'; link.rel = 'noopener noreferrer'; return link;
+  }
+  function followupWalletContext(evidence, chain) {
+    const node = el('div', 'followup-evidence-card'); node.append(el('h4', '', '在此时间点之前已取得的钱包样本'));
+    if (!evidence || evidence.coverage === 'unavailable') { node.append(el('p', 'followup-evidence-note', '当时尚无可用的钱包活动覆盖，不能把缺少记录解释为没有资金进入。')); return node; }
+    node.append(el('p', 'followup-evidence-note', `${date(evidence.fromAt, true)} 至 ${date(evidence.untilAt, true)} · ${count(evidence.evidenceCount)} 条证据${evidence.coverage === 'truncated' ? ' · 容量截断样本' : ' · 已采集样本'}`), kv('买入 / 卖出金额', `${usd(evidence.buyUsd)} / ${usd(evidence.sellUsd)}`), kv('采样净买入', usd(evidence.netBuyUsd)), kv('买入 / 卖出钱包', `${count(evidence.buyerCount)} / ${count(evidence.sellerCount)}`));
+    const tradeExamples = el('details', 'followup-trade-examples'); const trades = (Array.isArray(evidence.trades) ? evidence.trades : []).slice(0, 6); tradeExamples.append(el('summary', '', `查看 ${trades.length} 条交易原始证据`));
+    for (const trade of trades) {
+      const card = el('div', 'followup-evidence-card'); card.append(el('h4', '', `${trade.side === 'buy' ? '买入' : '卖出'} · ${usd(trade.volumeUsd)}`), addressNode(trade.wallet), kv('交易发生', date(trade.eventAt, true)), kv('本地发现', date(trade.observedAt, true)), el('p', 'followup-evidence-note', walletSource(trade.source)), followupTradeLink(chain, trade.txHash)); tradeExamples.append(card);
+    }
+    if (trades.length) node.append(tradeExamples);
+    node.append(el('p', 'followup-evidence-note', '金额仅覆盖已取得的交易；买入与价格突破的先后关系用于验证线索，不能单独证明拉盘、真实身份或完整资金流。')); return node;
+  }
+  function renderFollowupDetail(record) {
+    const container = $('detail-content'), wrapper = el('div', 'followup-detail'), initial = record.initial || {}, p = record.performance || {}, name = scalar(record.name || record.symbol, '未命名代币');
+    const heading = el('div', 'detail-token'), title = el('h2', '', name); title.id = 'detail-title'; heading.append(title); wrapper.append(heading, followupChain(record.chain), addressNode(record.address, 'detail-address'));
+    const links = el('div', 'detail-links'); links.append(gmgnTokenLink(record.chain, record.address)); wrapper.append(links);
+    const status = el('div', 'detail-pills'); status.append(badge(...(decisions[initial.decision] || ['初始判断未知', 'neutral'])), badge(followupStatus[p.status] || '等待采样', p.status === 'tracking' ? 'pass' : 'neutral')); wrapper.append(status);
+    const initialSection = section('首次判断 · 原样留档'); initialSection.append(kv('来源 / 策略版本', `${scalar(initial.source)} · ${scalar(initial.policyVersion)}`), kv('首次信号 / 完成判断', `${date(initial.receivedAt, true)} / ${date(initial.evaluatedAt, true)}`), kv('开始登记 / 观察截止', `${date(record.registeredAt, true)} / ${date(record.endsAt, true)}`));
+    initialSection.append(el('p', 'detail-small', '以下为登记时已知依据；后续取得的证据单独记录，不会改写首次判断。'));
+    if (initial.reasons?.length) initialSection.append(reasonList(initial.reasons));
+    for (const [key, label] of Object.entries(checkNames)) { const check = initial.checks?.[key]; if (!check) continue; const line = el('div', 'check-row'), top = el('div', 'check-top'); top.append(el('span', '', label), badge(key === 'narrative' ? '仅作参考' : check.status === 'pass' ? '通过' : check.status === 'fail' ? '未通过' : '证据不足', key === 'narrative' ? 'neutral' : check.status === 'pass' ? 'pass' : check.status === 'fail' ? 'fail' : 'watch')); line.append(top); if (check.reasons?.length) line.append(reasonList(check.reasons)); initialSection.append(line); }
+    wrapper.append(initialSection);
+    const result = section('后续表现 · 固定窗口对照'); const metrics = el('div', 'detail-metrics'); metrics.append(detailStat('采样最高涨幅', percent(p.maxGainPct), date(p.peakAt, true), p.maxGainPct < 0 ? 'negative' : 'positive'), detailStat('最新涨幅', percent(p.currentGainPct), date(p.latestAt, true), p.currentGainPct < 0 ? 'negative' : 'positive'), detailStat('峰后最大回撤', finite(p.maxDrawdownPct) ? `${p.maxDrawdownPct > 0 ? '−' : ''}${percent(p.maxDrawdownPct).replace(/^\+/, '')}` : '—', '从此前峰值计算', 'negative')); result.append(metrics);
+    if (Array.isArray(p.points) && p.points.length) { const chart = priceChart(p); chart.querySelector('svg')?.setAttribute('aria-label', `首次登记后价格曲线，共 ${p.points.length} 个报价样本`); result.append(chart); }
+    else result.append(el('p', 'detail-message', record.selected ? '还没有取得有效的新报价，暂时无法比较涨跌。' : '本币已保留首次判断，未进入有界报价采样队列，因此没有后续涨跌数据。'));
+    result.append(kv('首个报价 / 基准价', `${date(p.baselineAt, true)} / ${usd(p.baselinePriceUsd)}`), kv('有效报价 / 最大间隔', `${count(p.samples)} / ${finite(p.maxSampleGapSec) ? `${count(p.maxSampleGapSec)} 秒` : '—'}`));
+    if (p.baselineDelayed) result.append(el('p', 'detail-small', '首个报价迟到超过 10 分钟，该币不参与固定窗口结果统计。'));
+    if (p.baselineMarket || p.latestMarket) result.append(kv('流动性：基准 / 最近', `${usd(p.baselineMarket?.liquidityUsd)} / ${usd(p.latestMarket?.liquidityUsd)}`), kv('持币地址：基准 / 最近', `${count(p.baselineMarket?.holderCount)} / ${count(p.latestMarket?.holderCount)}`), kv('行情快照时间：基准 / 最近', `${date(p.baselineMarketAt, true)} / ${date(p.latestMarketAt, true)}`));
+    if (p.error) result.append(el('p', 'detail-small', `最新报价问题：${reasonNames[p.error] || scalar(p.error)}，累计失败 ${count(p.errorCount)} 次。`));
+    const horizons = el('div', 'followup-detail-horizons'); for (const seconds of [3600, 21600, 86400]) { const h = record.horizons?.[String(seconds)], box = el('div'); box.append(el('p', '', followupWindow(seconds)), gainNode(h?.gainPct), el('small', '', h ? `${date(h.at, true)} · 延迟 ${count(h.delaySec)} 秒` : '尚未完成 / 无准时报价')); horizons.append(box); } result.append(horizons, el('p', 'detail-small', '固定窗口从首次登记开始计时，允许窗口后 10 分钟内的首个报价；未覆盖显示 —。报价涨幅没有扣除滑点、税费，不代表实际收益。')); wrapper.append(result);
+    const evidence = section('涨前有哪些线索'); evidence.append(kv('首次合格钱包组 / 采样净买入', `${count(initial.qualifiedGroups)} / ${usd(initial.recentNetBuyUsd)}`));
+    for (const [key, label] of Object.entries(followupFeatures)) evidence.append(kv(label, initial.features?.[key] === true ? '首次判断时已出现' : initial.features?.[key] === false ? '首次判断时未出现' : '当时证据未知'));
+    for (const setup of (Array.isArray(initial.setups) ? initial.setups : []).slice(0, 8)) { const card = el('div', 'followup-evidence-card'); card.append(el('h4', '', walletSetupName(setup.route)), kv('当时路径状态', walletSetupStatuses[setup.status] || scalar(setup.status)), el('p', 'followup-evidence-note', '触发钱包'), addressNode(setup.wallet)); if (setup.leader && setup.leader !== setup.wallet) card.append(el('p', 'followup-evidence-note', '公开标记钱包'), addressNode(setup.leader)); evidence.append(card); }
+    for (const group of (Array.isArray(initial.walletGroups) ? initial.walletGroups : []).slice(0, 8)) { const card = el('div', 'followup-evidence-card'); card.append(el('h4', '', '首次钱包分组证据')); for (const [label, value] of [['分组标识', group.id], ['钱包数量', group.walletCount], ['聪明钱包持有人', group.smartCurrentHolders]]) if (value !== undefined) card.append(kv(label, scalar(value))); if (Array.isArray(group.basis)) card.append(reasonList(group.basis)); if (group.developerLinked === true) card.append(el('p', 'followup-evidence-note', '该组存在开发者关联线索')); for (const address of (Array.isArray(group.wallets) ? group.wallets : []).slice(0, 6)) if (typeof address === 'string') card.append(addressNode(address)); evidence.append(card); }
+    evidence.append(el('p', 'detail-small', '钱包分组和名人链接是待验证线索。时间线只采用该时刻之前本地已取得的交易；后来补查到的历史不会变成提前发现。')); wrapper.append(evidence);
+    if (initial.socialSignals?.length) wrapper.append(renderSocial({signals: initial.socialSignals}));
+    const timelineSection = section('价格变化与同时段证据'); const timeline = el('ol', 'followup-timeline'); const labels = {baseline: '建立首个有效报价基准', gain_50: '采样首次达到 +50%', gain_100: '采样首次达到 +100%', drawdown_30: '采样首次出现 30% 回撤', horizon_1h: '取得 1 小时窗口样本', horizon_6h: '取得 6 小时窗口样本', horizon_24h: '取得 24 小时窗口样本', wallet_sample: '后续钱包与行情证据快照'};
+    for (const event of (Array.isArray(record.timeline) ? record.timeline : []).slice(0, 32)) { const item = el('li'); item.append(el('time', '', date(event.at, true)), el('h4', '', labels[event.kind] || scalar(event.kind)), el('p', '', `报价 ${usd(event.priceUsd)} · 涨幅 ${percent(event.gainPct)} · 相对此前峰值回撤 ${finite(event.drawdownPct) ? percent(event.drawdownPct).replace(/^\+/, '') : '—'}`));
+      if (event.market) item.append(el('p', '', `流动性 ${usd(event.market.liquidityUsd)} · 持币地址 ${count(event.market.holderCount)}`));
+      if (event.walletEvidence) item.append(followupWalletContext(event.walletEvidence, record.chain)); else item.append(el('p', '', '此时点尚未留存可用的钱包交易快照。')); timeline.append(item); }
+    if (timeline.children.length) timelineSection.append(timeline); else timelineSection.append(el('p', 'detail-message', '收到首个有效报价后开始生成时间线。'));
+    timelineSection.append(el('p', 'detail-small', '时间线帮助检查“钱包买入先发生，还是上涨后才跟随”。上涨原因需要与未上涨样本和后续样本比较，单币事件顺序不会被写成确定因果。')); wrapper.append(timelineSection);
+    const openTradeExamples = new Set([...container.querySelectorAll('.followup-trade-examples')].flatMap((node, index) => node.open ? [index] : [])); [...wrapper.querySelectorAll('.followup-trade-examples')].forEach((node, index) => { node.open = openTradeExamples.has(index); });
+    const focus = container.contains(document.activeElement) ? document.activeElement.getAttribute('aria-label') : null; container.replaceChildren(wrapper); if (focus) [...container.querySelectorAll('[aria-label]')].find(node => node.getAttribute('aria-label') === focus)?.focus({preventScroll: true});
+  }
+
   async function openDetail(id, trigger, wallet) {
     if (typeof id !== 'string') return;
     closeNarrative();
-    state.returnFocus = trigger || document.activeElement; state.detailId = id; state.detailKind = wallet?.association ? 'association' : wallet?.profile ? 'profile' : wallet ? 'wallet' : 'scan'; state.detailWallet = wallet || null; state.detailGeneration++; state.walletEvidenceOpen = new Set();
-    text('detail-eyebrow', wallet ? 'WALLET RESEARCH' : 'SIGNAL DETAIL');
+    state.returnFocus = trigger || document.activeElement; state.detailId = id; state.detailKind = wallet?.followup ? 'followup' : wallet?.association ? 'association' : wallet?.profile ? 'profile' : wallet ? 'wallet' : 'scan'; state.detailWallet = wallet || null; state.detailGeneration++; state.walletEvidenceOpen = new Set();
+    text('detail-eyebrow', wallet?.followup ? 'SIGNAL FOLLOW-UP' : wallet ? 'WALLET RESEARCH' : 'SIGNAL DETAIL');
     $('drawer-backdrop').hidden = false; $('detail-drawer').hidden = false; $('app').inert = true; document.body.classList.add('drawer-open');
     const loading = el('p', 'drawer-loading', wallet ? '正在读取研究证据…' : '正在读取信号详情…'); loading.id = 'detail-title'; $('detail-content').replaceChildren(loading); $('detail-drawer').focus();
     await loadDetail(id);
@@ -1409,13 +1526,14 @@
     const wallet = state.detailKind === 'wallet' ? state.detailWallet : null;
     const association = state.detailKind === 'association' ? state.detailWallet : null;
     const profile = state.detailKind === 'profile' ? state.detailWallet : null;
+    const followup = state.detailKind === 'followup' ? state.detailWallet : null;
     try {
-      const record = await api(profile ? `/wallet-profiles/${encodeURIComponent(profile.chain)}/${encodeURIComponent(profile.address)}` : association ? `/wallet-associations/${encodeURIComponent(association.chain)}/${encodeURIComponent(association.leader)}/${encodeURIComponent(association.candidate)}` : wallet ? `/wallets/${encodeURIComponent(wallet.chain)}/${encodeURIComponent(wallet.address)}` : `/scans/${encodeURIComponent(id)}`);
-      if (state.detailId === id && generation === state.detailGeneration) { if (profile) renderWalletProfileDetail(record.profile || record); else if (association) renderAssociationDetail(record); else if (wallet) renderWalletResearchDetail(record); else { renderDetail(record); void loadWalletScreeningLedger(record, id, generation); } }
+      const record = await api(followup ? `/followup/${encodeURIComponent(followup.chain)}/${encodeURIComponent(followup.address)}` : profile ? `/wallet-profiles/${encodeURIComponent(profile.chain)}/${encodeURIComponent(profile.address)}` : association ? `/wallet-associations/${encodeURIComponent(association.chain)}/${encodeURIComponent(association.leader)}/${encodeURIComponent(association.candidate)}` : wallet ? `/wallets/${encodeURIComponent(wallet.chain)}/${encodeURIComponent(wallet.address)}` : `/scans/${encodeURIComponent(id)}`);
+      if (state.detailId === id && generation === state.detailGeneration) { if (followup) renderFollowupDetail(record); else if (profile) renderWalletProfileDetail(record.profile || record); else if (association) renderAssociationDetail(record); else if (wallet) renderWalletResearchDetail(record); else { renderDetail(record); void loadWalletScreeningLedger(record, id, generation); } }
     } catch (error) {
       if (error.status === 401) { showLogin('会话已结束，请重新登录。'); return; }
       if (state.detailId !== id || generation !== state.detailGeneration) return;
-      if (!quiet) $('detail-content').replaceChildren(el('h2', '', '详情暂不可用'), el('p', 'drawer-loading detail-error', error.status === 404 ? '这条记录已超出保留期或不存在。' : '连接异常，请关闭详情后重试。'));
+      if (!quiet) $('detail-content').replaceChildren(el('h2', '', '详情暂不可用'), el('p', 'drawer-loading detail-error', error.status === 404 ? followup ? '本币尚未在持续复盘模块中登记。模块上线前的旧信号不会补造首次价格或后续表现。' : '这条记录已超出保留期或不存在。' : '连接异常，请关闭详情后重试。'));
       else { const old = $('detail-stale'); if (!old) { const note = el('p', 'notice warning', '详情暂时无法更新，以下为最近成功读取的记录。'); note.id = 'detail-stale'; $('detail-content').prepend(note); } }
     }
   }

@@ -49,6 +49,11 @@ export class StrategyObservation {
       ORDER BY COALESCE(last_attempt_at,''),registered_at,chain,address LIMIT ?`).all(now.toISOString(),limit)
       .map(r=>({chain:r.chain as ScanToken['chain'],address:String(r.address)}));
   }
+  scheduled(now:Date):Array<ScanToken&{lastAttemptAt?:string}> {
+    return this.db.prepare('SELECT chain,address,last_attempt_at FROM strategy_comparisons WHERE ends_at>? ORDER BY COALESCE(last_attempt_at,\'\'),registered_at LIMIT 12')
+      .all(now.toISOString()).map(r=>({chain:r.chain as ScanToken['chain'],address:String(r.address),
+        ...(typeof r.last_attempt_at==='string'?{lastAttemptAt:r.last_attempt_at}:{})}));
+  }
   price(price:ScanPrice,now:Date):void {
     if(!['gmgn_token_info_sample','chain_pool_sample'].includes(price.source)||now.getTime()-Date.parse(price.observedAt)>120000)return;
     const row=this.db.prepare('SELECT record,last_attempt_at FROM strategy_comparisons WHERE chain=? AND address=? AND ends_at>?')

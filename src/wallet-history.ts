@@ -18,6 +18,15 @@ export interface WalletTradeObservation {
   amount?:string|null;amountUnit?:'human'|'atomic'|'unknown'|'vendor_quantity';usd?:string|null;
   priceUsd?:string|null;source:string;eventIndex?:number;
 }
+/** Observed vendor trades within one forward review window; never whole-market flow or ownership proof. */
+export interface FollowupWalletEvidence {
+  chain?:Chain;address?:string;
+  fromAt:string;untilAt:string;coverage:'sampled'|'truncated'|'unavailable';
+  trades:{evidenceId:string;txHash:string;wallet:string;side:'buy'|'sell';volumeUsd:number;
+    eventAt:string;observedAt:string;source:string}[];
+  buyUsd:number|null;sellUsd:number|null;netBuyUsd:number|null;buyerCount:number|null;sellerCount:number|null;
+  evidenceCount:number;excludedCount:number;limitations:string[];
+}
 export interface WalletLeaderObservation {
   address:string;rank?:number;period:'7d';realizedProfitUsd?:string|null;winRate?:number|null;
   labels?:string[];name?:string;twitter?:string;
@@ -253,6 +262,77 @@ export class WalletHistory {
       WHERE chain=? AND token_address=? AND kind='trade' AND observed_at>=? AND observed_at<=?
       ORDER BY observed_at DESC LIMIT 501`).all(target.chain,target.address,start,end);
     return {trades:rows.slice(0,500).flatMap(row=>{try{return [JSON.parse(String(row.data)) as WalletTradeObservation];}catch{return [];}}),truncated:rows.length>500};
+  }
+
+  /** Read-only event evidence known by this quote time; later wallet labels are deliberately not consulted. */
+  followupEvidence(value:WalletHistoryToken,fromAt:string,untilAt:string):FollowupWalletEvidence {
+    const target=this.target(value),start=at(fromAt),end=at(untilAt);
+    const result:FollowupWalletEvidence={fromAt:start??'',untilAt:end??'',coverage:'unavailable',trades:[],
+      buyUsd:null,sellUsd:null,netBuyUsd:null,buyerCount:null,sellerCount:null,evidenceCount:0,excludedCount:0,
+      limitations:['MONITORED_WALLET_SAMPLE_NOT_WHOLE_MARKET','NO_OBSERVATION_DOES_NOT_MEAN_NO_TRADE','VENDOR_REPORTED_NOT_OWNERSHIP_PROOF']};
+    if(!target||!start||!end||start>end||Date.parse(end)>this.now().getTime()||
+      (target.chain==='solana'?!bs58.decode(target.address).some(byte=>byte!==0):/^0x0{40}$/.test(target.address))) {
+      result.limitations.push('WALLET_REVIEW_WINDOW_INVALID');return result;
+    }
+    result.chain=target.chain;result.address=target.address;
+    try {
+      const rows=this.db.prepare(`SELECT id,chain,wallet,token_address,source,observed_at,data
+        FROM wh_observations INDEXED BY wh_exit_evidence
+        WHERE chain=? AND token_address=? AND kind='trade' AND observed_at>=? AND observed_at<=?
+        ORDER BY observed_at,id LIMIT 501`).all(target.chain,target.address,start,end);
+      if(rows.length>500) {
+        result.coverage='truncated';result.limitations.push('WALLET_OBSERVATIONS_LIMIT_500');return result;
+      }
+      type Evidence={trade:FollowupWalletEvidence['trades'][number];raw:WalletTradeObservation;copies:number;conflict:boolean};
+      const groups=new Map<string,Map<string,Evidence>>(),outsideWindow=new Set<string>();
+      for(const row of rows) {
+        let raw:WalletTradeObservation|undefined;
+        try {raw=this.trade(JSON.parse(String(row.data)) as WalletTradeObservation);}catch {raw=undefined;}
+        if(!raw||raw.chain!==target.chain||raw.tokenAddress!==target.address||raw.wallet!==row.wallet||
+          raw.source!==row.source||raw.observedAt!==row.observed_at||!['buy','sell'].includes(raw.side)||
+          raw.observedAt<start||raw.observedAt>end) {
+          result.excludedCount++;continue;
+        }
+        const groupKey=JSON.stringify([raw.txHash,raw.wallet,raw.side]);
+        if(raw.eventAt<start||raw.eventAt>end) {
+          // A contrary timestamp already observed in this window cannot be hidden by the event-time filter.
+          outsideWindow.add(groupKey);result.excludedCount++;continue;
+        }
+        if(!raw.usd) {result.excludedCount++;continue;}
+        const amount=Number(raw.usd);
+        if(!Number.isFinite(amount)||amount<=0||amount>1e12) {result.excludedCount++;continue;}
+        let group=groups.get(groupKey);if(!group) {group=new Map();groups.set(groupKey,group);}
+        const index=raw.eventIndex===undefined?'unindexed':String(raw.eventIndex),previous=group.get(index);
+        if(previous) {
+          previous.copies++;
+          if(previous.raw.eventAt!==raw.eventAt||previous.trade.volumeUsd!==amount)previous.conflict=true;
+          continue;
+        }
+        group.set(index,{copies:1,conflict:false,raw,trade:{evidenceId:String(row.id),txHash:raw.txHash,wallet:raw.wallet,
+          side:raw.side as 'buy'|'sell',volumeUsd:amount,eventAt:raw.eventAt,observedAt:raw.observedAt,source:raw.source}});
+      }
+      const trades:FollowupWalletEvidence['trades']=[];
+      for(const [groupKey,group] of groups) {
+        const entries=[...group.values()],unindexed=group.get('unindexed'),indexed=[...group.entries()]
+          .filter(([index])=>index!=='unindexed').map(([,entry])=>entry);
+        if(outsideWindow.has(groupKey)||entries.some(entry=>entry.conflict)||unindexed&&indexed.length&&
+          (indexed.length!==1||unindexed.trade.volumeUsd!==indexed[0].trade.volumeUsd||unindexed.raw.eventAt!==indexed[0].raw.eventAt)) {
+          result.excludedCount+=entries.reduce((n,entry)=>n+entry.copies,0);continue;
+        }
+        // A later indexed copy retains its own observation time; it does not backdate index knowledge.
+        trades.push(...(unindexed&&indexed.length?indexed:entries).map(entry=>entry.trade));
+      }
+      trades.sort((a,b)=>a.observedAt.localeCompare(b.observedAt)||a.evidenceId.localeCompare(b.evidenceId));
+      result.coverage='sampled';result.evidenceCount=trades.length;result.trades=trades.slice(0,40);
+      result.buyUsd=trades.filter(trade=>trade.side==='buy').reduce((sum,trade)=>sum+trade.volumeUsd,0);
+      result.sellUsd=trades.filter(trade=>trade.side==='sell').reduce((sum,trade)=>sum+trade.volumeUsd,0);
+      result.netBuyUsd=result.buyUsd-result.sellUsd;
+      result.buyerCount=new Set(trades.filter(trade=>trade.side==='buy').map(trade=>trade.wallet)).size;
+      result.sellerCount=new Set(trades.filter(trade=>trade.side==='sell').map(trade=>trade.wallet)).size;
+      if(result.excludedCount)result.limitations.push('INVALID_OR_AMBIGUOUS_OBSERVATIONS_EXCLUDED');
+      if(trades.length>40)result.limitations.push('EVIDENCE_EXAMPLES_LIMIT_40');
+      return result;
+    } catch {result.limitations.push('WALLET_REVIEW_READ_FAILED');return result;}
   }
   screeningWalletCandidates(now=new Date(),offset=0):WalletTradeObservation[] {
     const end=now.toISOString(),start=new Date(now.getTime()-600000).toISOString();

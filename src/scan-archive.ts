@@ -436,6 +436,12 @@ export class ScanArchive {
 
   get(id:string):ScanRecord|undefined {this.prune();const record=this.read(id);return record&&this.withObservation(record);}
 
+  /** Narrow local lookup for token labels; no charts, research payloads or network calls. */
+  tokenDisplay(id:string):{chain:Chain;address:string;name?:string;symbol?:string}|undefined {
+    const row=this.db.prepare("SELECT chain,address,json_extract(record,'$.name') AS name,json_extract(record,'$.symbol') AS symbol FROM scan_summaries WHERE id=?").get(id);
+    return row?{chain:row.chain as Chain,address:String(row.address),name:text(row.name,100),symbol:text(row.symbol,32)}:undefined;
+  }
+
   stats():ScanArchiveStats {
     this.prune();
     const result:ScanArchiveStats={total:0,eligible:0,tracking:0,

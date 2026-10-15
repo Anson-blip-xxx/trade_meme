@@ -3,6 +3,7 @@ import bs58 from 'bs58';
 import type {Fetcher} from '../http.js';
 import {parseSignal,type Chain,type Platform,type Signal} from '../types.js';
 import {DebotSessionError} from './debot-session.js';
+import {tokenDisplayText} from '../token-display.js';
 
 const CHANNELS:Record<Chain,number>={bsc:2,solana:1,robinhood:83};
 const PAGE_SIZE=20;
@@ -14,6 +15,8 @@ const object=(value:unknown):value is Record<string,unknown>=>
 
 export interface DebotSignalObservation {
   id:string;signal:Signal;observedAt:string;
+  /** Display-only labels from metadata already bound to this exact chain and CA. */
+  name?:string;symbol?:string;
   /** Vendor-reported entries, not independently verified buyers or wallet ownership. */
   walletCount:number;addressCount:number;aliases:string[];
   alertPriceUsd?:number;averageWalletVolumeUsd?:number;
@@ -110,6 +113,8 @@ export function normalizeDebotSignals(payload:unknown,chain:Chain,observedAt:Dat
     const launchpads=new Set(identities.filter(object).map(value=>value.launchpad).filter(value=>value!==undefined));
     if(launchpads.size>1){result.rejected++;continue;}
     const tokenMeta=identities[0];
+    const name=object(tokenMeta)?tokenDisplayText(tokenMeta.name,100):undefined;
+    const symbol=object(tokenMeta)?tokenDisplayText(tokenMeta.symbol,32):undefined;
     const sourceEventId='debot:signal:'+createHash('sha256')
       .update(JSON.stringify([chain,CHANNELS[chain],row.id])).digest('hex');
     if(seen.has(sourceEventId)){result.rejected++;continue;}
@@ -134,6 +139,7 @@ export function normalizeDebotSignals(payload:unknown,chain:Chain,observedAt:Dat
     const alertPriceUsd=object(row.token_trading_stat)?positive(row.token_trading_stat.price):undefined;
     const averageWalletVolumeUsd=positive(row.avg_wallet_volume);
     result.observations.push({id:row.id,signal,observedAt:observedAt.toISOString(),walletCount,
+      ...(name?{name}:{}),...(symbol?{symbol}:{}),
       addressCount:addresses.size,aliases:[...aliases],
       ...(vendorWallets.length?{vendorWallets}:{}),
       ...(alertPriceUsd!==undefined?{alertPriceUsd}:{}),

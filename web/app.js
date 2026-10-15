@@ -23,6 +23,35 @@
   const reasonNames = {
     OFFICIAL_FACTORY_CREATION_VERIFIED: '已验证来自配置中的官方发行工厂',
     SECURITY_FIELDS_UNVERIFIED: '部分安全字段尚未核实',
+    SECURITY_REPORT_MISSING: '安全报告暂未取得',
+    SOL_MINT_AUTHORITY_ACTIVE: '仍保留增发权限',
+    SOL_FREEZE_AUTHORITY_ACTIVE: '仍保留冻结账户权限',
+    SOL_MINT_UNVERIFIED: 'Solana 代币账户尚未核实',
+    SOL_MINT_NOT_INITIALIZED: '代币账户尚未初始化',
+    SOL_MUTABLE_TRANSFER_FEE: '转账手续费仍可修改',
+    SOL_EXCESSIVE_TRANSFER_FEE: '转账手续费超过规则上限',
+    SOL_EXTENSIONS_REQUIRE_REVIEW: '代币扩展权限需要进一步核验',
+    SOL_MINT_PERMISSIONS_CHECKED: '已核验链上增发、冻结等权限',
+    SOLANA_RPC_UNAVAILABLE: 'Solana 链上数据暂不可用',
+    GOPLUS_UNAVAILABLE: '补充安全报告暂不可用',
+    EVM_IS_HONEYPOT: '安全报告标记为蜜罐',
+    EVM_CANNOT_BUY: '合约存在买入限制',
+    EVM_CANNOT_SELL_ALL: '合约存在全量卖出限制',
+    EVM_IS_MINTABLE: '仍保留增发能力',
+    EVM_OWNER_CHANGE_BALANCE: '管理者可修改持有人余额',
+    EVM_HIDDEN_OWNER: '存在隐藏管理权限',
+    EVM_CAN_TAKE_BACK_OWNERSHIP: '管理权限可被重新取回',
+    EVM_TRANSFER_PAUSABLE: '代币转账可被暂停',
+    EVM_IS_BLACKLISTED: '存在黑名单控制',
+    EVM_IS_WHITELISTED: '存在白名单交易限制',
+    EVM_SLIPPAGE_MODIFIABLE: '交易税费仍可调整',
+    EXCESSIVE_BUY_TAX: '买入税超过规则上限',
+    EXCESSIVE_SELL_TAX: '卖出税超过规则上限',
+    KNOWN_COUNTERFEIT: '安全报告标记为仿冒代币',
+    WALLET_SAMPLE_UNVERIFIED: '钱包样本尚未完整核实',
+    SMART_WALLET_GROUP_SUPPORT_INSUFFICIENT: '合格聪明钱包组支持不足',
+    RECENT_SMART_ACCUMULATION_UNVERIFIED: '近期聪明钱包净买入尚未证实',
+    SMART_WALLET_ACCUMULATION_SUPPORTED: '已有合格钱包近期净买入支持',
     GMGN_REPORTED_FLAGS_CLEAR_PARTIAL_COVERAGE: 'GMGN 已覆盖的风险项未报告异常，但覆盖不完整',
     VENDOR_NARRATIVE_MISSING: '暂无供应商叙事材料，不作为开单阻断条件',
     SUPERSEDED: '更新的信号已接替本轮观察',
@@ -500,62 +529,172 @@
     if ((item.buyEligible === true || item.decision === 'BUY_CANDIDATE') && (!validUntil || validUntil <= debotRiskNow() || debotRiskStale())) return ['结论过期 · 待复核', 'watch'];
     return ['继续观察', 'watch'];
   }
+  const debotScoreData = new WeakMap();
+  let debotScorePopover = null;
+  let debotScoreCloseTimer;
+  let suppressDebotScoreFocus = false;
+  function debotScoreState(item) {
+    const score = item.score;
+    const value = finite(score?.value) && score.max === 100 ? Math.max(0, Math.min(100, score.value)) : null;
+    const blocked = score?.blocked === true || item.decision === 'REJECT' || ['safety', 'provenance', 'market'].some(key => item.checks?.[key]?.status === 'fail');
+    const expired = Boolean(score?.stale || debotRiskStale() || item.state === 'completed' && (!validDate(item.validUntil) || Date.parse(item.validUntil) <= debotRiskNow()));
+    const provisional = Boolean(score?.provisional || item.state !== 'completed');
+    return {value: blocked ? 0 : value, blocked, expired, provisional, label: blocked ? expired ? '历史阻断' : '风险阻断' : expired ? '历史分' : provisional ? '暂评' : value === null ? '待评分' : '核验评分'};
+  }
+  function closeDebotScore(restoreFocus = false) {
+    clearTimeout(debotScoreCloseTimer);
+    if (!debotScorePopover) return;
+    const {trigger, panel} = debotScorePopover;
+    debotScorePopover = null; trigger.setAttribute('aria-expanded', 'false'); trigger.removeAttribute('aria-describedby'); panel.remove();
+    if (restoreFocus && trigger.isConnected) { suppressDebotScoreFocus = true; trigger.focus({preventScroll: true}); suppressDebotScoreFocus = false; }
+  }
+  function positionDebotScore() {
+    if (!debotScorePopover) return;
+    const {trigger, panel} = debotScorePopover;
+    if (!trigger.isConnected) { closeDebotScore(); return; }
+    const rect = trigger.getBoundingClientRect();
+    panel.style.left = `${Math.max(12, Math.min(rect.left, window.innerWidth - panel.offsetWidth - 12))}px`;
+    panel.style.top = `${Math.max(12, rect.bottom + panel.offsetHeight + 10 < window.innerHeight ? rect.bottom + 9 : rect.top - panel.offsetHeight - 9)}px`;
+  }
+  function renderDebotScorePopover(item, panel) {
+    const scoreState = debotScoreState(item); panel.replaceChildren();
+    const title = el('div', 'debot-score-detail-heading');
+    title.append(el('strong', '', `${scoreState.value === null ? '—' : scoreState.value} / 100`), el('span', '', scoreState.label)); panel.append(title);
+    const components = Array.isArray(item.score?.components) ? item.score.components : [];
+    for (const [key, label] of debotRiskChecks) {
+      const component = components.find(value => value?.key === key);
+      const weight = finite(component?.weight) ? component.weight : {safety: 30, provenance: 15, market: 15, wallets: 40}[key];
+      const earned = finite(component?.earned) ? component.earned : 0;
+      const status = ['pass', 'fail'].includes(component?.status) ? component.status : 'unknown';
+      const row = el('div', `debot-score-component ${status}`);
+      row.append(el('span', '', label), el('span', '', `${earned} / ${weight}`), el('span', '', {pass: '已核验', fail: '未通过', unknown: '待核验'}[status])); panel.append(row);
+      if (status !== 'pass') {
+        const reasons = Array.isArray(item.checks?.[key]?.reasons) ? item.checks[key].reasons.filter(reason => typeof reason === 'string').slice(0, 2) : [];
+        if (reasons.length) panel.append(el('p', 'debot-score-component-reason', reasons.map(reason => reasonNames[reason] || reason).join('；')));
+      }
+    }
+    const note = scoreState.blocked ? `存在明确硬风险，总分归零；分项保留已有核验记录。${scoreState.expired ? '证据已过期，需要重新核验。' : ''}` : scoreState.expired ? '这是历史证据分，数据已过期，需要重新核验。' : scoreState.provisional ? '尚有未核实项目，暂评分只累计已通过项。' : '缺失或未通过的项目不计分，分数不改变最终风控结论。';
+    panel.append(el('p', 'debot-score-note', note), el('p', 'debot-score-note', '评分不是胜率，也不代表已下单。'));
+  }
+  function openDebotScore(trigger, pinned = false) {
+    const item = debotScoreData.get(trigger); if (!item) return;
+    if (debotScorePopover?.trigger === trigger) { debotScorePopover.pinned ||= pinned; return; }
+    closeDebotScore();
+    const panel = el('div', 'debot-score-popover'); panel.id = 'debot-score-popover'; panel.setAttribute('role', 'tooltip');
+    renderDebotScorePopover(item, panel); document.body.append(panel);
+    trigger.setAttribute('aria-expanded', 'true'); trigger.setAttribute('aria-describedby', panel.id);
+    debotScorePopover = {trigger, panel, eventId: item.eventId, pinned};
+    panel.addEventListener('pointerenter', () => clearTimeout(debotScoreCloseTimer));
+    panel.addEventListener('pointerleave', scheduleDebotScoreClose); positionDebotScore();
+  }
+  function scheduleDebotScoreClose() {
+    clearTimeout(debotScoreCloseTimer);
+    debotScoreCloseTimer = setTimeout(() => { if (debotScorePopover && !debotScorePopover.pinned && document.activeElement !== debotScorePopover.trigger) closeDebotScore(); }, 120);
+  }
+  function debotRiskScoreNode(item) {
+    const current = debotScoreState(item);
+    const tone = current.expired ? 'historical' : current.blocked ? 'blocked' : current.provisional ? 'provisional' : debotRiskConclusion(item)[1] === 'pass' ? 'passed' : 'observing';
+    const button = el('button', `debot-risk-score ${tone}`); button.type = 'button'; button.setAttribute('aria-expanded', 'false'); button.setAttribute('aria-label', `查看 ${scalar(item.address)} 的评分明细`);
+    const figure = el('span', 'debot-risk-score-value'); figure.append(el('strong', '', current.value === null ? '—' : String(current.value)), el('span', '', '/ 100'));
+    button.append(figure, el('span', 'debot-risk-score-label', current.label)); debotScoreData.set(button, item);
+    button.addEventListener('pointerenter', () => { if (matchMedia('(hover: hover)').matches) openDebotScore(button); });
+    button.addEventListener('pointerleave', scheduleDebotScoreClose);
+    button.addEventListener('focus', () => { if (!suppressDebotScoreFocus) openDebotScore(button); });
+    button.addEventListener('blur', () => { if (!debotScorePopover?.pinned) closeDebotScore(); });
+    button.addEventListener('click', event => { event.stopPropagation(); if (debotScorePopover?.trigger === button && debotScorePopover.pinned) closeDebotScore(); else openDebotScore(button, true); });
+    return button;
+  }
+  function rebindDebotScore(container) {
+    if (!debotScorePopover) return;
+    const nextRow = [...container.querySelectorAll('[data-event-id]')].find(node => node.dataset.eventId === debotScorePopover.eventId);
+    const next = nextRow?.querySelector('.debot-risk-score');
+    if (!next) { closeDebotScore(); return; }
+    debotScorePopover.trigger = next; next.setAttribute('aria-expanded', 'true'); next.setAttribute('aria-describedby', debotScorePopover.panel.id);
+    renderDebotScorePopover(debotScoreData.get(next), debotScorePopover.panel); positionDebotScore();
+  }
+  document.addEventListener('pointerdown', event => { if (debotScorePopover && !debotScorePopover.trigger.contains(event.target) && !debotScorePopover.panel.contains(event.target)) closeDebotScore(); });
+  document.addEventListener('keydown', event => { if (event.key === 'Escape' && debotScorePopover) { event.preventDefault(); closeDebotScore(true); } });
+  document.addEventListener('scroll', positionDebotScore, true);
+  window.addEventListener('resize', positionDebotScore);
   function renderDebotRisk() {
     const stale = debotRiskStale();
-    const signature = JSON.stringify([debotRisk.items, debotRisk.error, stale, debotRisk.lastSuccess, debotRisk.items.map(item => debotRiskConclusion(item)[0])]);
+    const signature = JSON.stringify([debotRisk.items, debotRisk.error, stale, debotRisk.lastSuccess, debotRisk.items.map(item => [debotRiskConclusion(item)[0], debotScoreState(item).expired])]);
     if (signature === debotRisk.signature) return;
     debotRisk.signature = signature;
     const container = $('debot-risk-items');
-    const scrollTop = container.scrollTop;
+    const scrollTop = container.scrollTop; const scrollLeft = container.scrollLeft;
     const active = container.contains(document.activeElement) ? document.activeElement : null;
     const focusKey = active?.closest('[data-event-id]')?.dataset.eventId;
     const focusLabel = active?.getAttribute('aria-label');
+    const scorePopoverState = debotScorePopover ? {eventId: debotScorePopover.eventId, pinned: debotScorePopover.pinned} : null;
     container.replaceChildren();
     text('debot-risk-count', count(debotRisk.items.length));
     const status = $('debot-risk-status'); status.className = `badge ${stale ? 'watch' : 'neutral'}`;
     status.textContent = !debotRisk.loaded ? debotRisk.error ? '暂不可用' : '读取中' : stale ? '数据过期' : '每 2 秒同步';
-    text('debot-risk-updated', debotRisk.lastSuccess ? `最近读取 ${time(new Date(debotRisk.lastSuccess).toISOString())} · 最新 12 条，可滚动查看 · 研究候选不代表已下单` : '每 2 秒更新最新 12 条，可滚动查看 · 研究候选不代表已下单');
+    text('debot-risk-updated', debotRisk.lastSuccess ? `最近读取 ${time(new Date(debotRisk.lastSuccess).toISOString())} · 最新 12 条 · 研究候选不代表已下单` : '每 2 秒更新最新 12 条 · 研究候选不代表已下单');
     const warning = $('debot-risk-warning'); warning.hidden = !debotRisk.error && !(debotRisk.loaded && stale);
     warning.textContent = debotRisk.error || '实时记录已超过 8 秒未更新，以下结论暂不能作为当前判断。';
     $('debot-risk-empty').hidden = debotRisk.items.length > 0;
     text('debot-risk-empty', debotRisk.loaded ? '尚未接收到可展示的 DeBot 信号，收到后将显示核验进度。' : debotRisk.error ? '连接恢复后将自动继续读取。' : '正在读取信号核验进度…');
-    for (const item of debotRisk.items) {
-      const card = el('article', 'debot-risk-card'); card.dataset.eventId = scalar(item.eventId, '');
-      const heading = el('div', 'debot-risk-heading'); const identity = el('div', 'debot-risk-identity');
-      identity.append(el('strong', '', chainName(item.chain)), el('time', '', `收到 ${time(item.receivedAt)}`));
-      const conclusion = debotRiskConclusion(item); heading.append(identity, badge(...conclusion));
-      const address = el('div', 'debot-risk-address'); address.append(addressNode(item.address), gmgnTokenLink(item.chain, item.address));
-      const timing = el('div', 'debot-risk-timing');
-      timing.append(el('span', '', `信号到达 ${debotRiskDuration(item.signalDelayMs)}`), el('span', '', `排队 ${debotRiskDuration(item.queueMs)}`), el('span', '', `分析 ${debotRiskDuration(item.analysisMs)}`));
-      const checks = el('div', 'debot-risk-checks'); const missing = [];
-      for (const [key, label] of debotRiskChecks) {
-        const check = item.checks?.[key]; const checkStatus = ['pass', 'fail'].includes(check?.status) ? check.status : 'unknown';
-        const checkNode = el('div', `debot-risk-check ${checkStatus}`);
-        checkNode.append(el('span', '', label), el('strong', '', {pass: '已核验', fail: '未通过', unknown: '待核验'}[checkStatus]));
-        const checkReasons = Array.isArray(check?.reasons) ? check.reasons.filter(reason => typeof reason === 'string') : [];
-        checkNode.title = [check?.checkedAt ? `检查时间 ${date(check.checkedAt, true)}` : '', finite(check?.elapsedMs) ? `耗时 ${debotRiskDuration(check.elapsedMs)}` : '', ...checkReasons.slice(0, 5).map(reason => reasonNames[reason] || reason)].filter(Boolean).join('\n');
-        if (checkStatus === 'unknown') missing.push(label);
-        checks.append(checkNode);
+    if (debotRisk.items.length) {
+      const table = el('table', 'debot-risk-table');
+      const caption = el('caption', 'sr-only', '实时信号风控：名称、所属链、百分制核验评分与分析结果'); table.append(caption);
+      const head = el('thead'); const header = el('tr');
+      for (const [label, name] of [['代币 / 所属链', 'token'], ['核验分', 'score'], ['所属链', 'chain'], ['核验项目', 'checks'], ['状态 / 主要原因', 'conclusion'], ['接收时间 / 耗时', 'timing'], ['操作', 'actions']]) { const cell = el('th', `debot-risk-${name}-cell`, label); cell.scope = 'col'; header.append(cell); }
+      head.append(header); const body = el('tbody'); table.append(head, body); container.append(table);
+      for (const item of debotRisk.items) {
+        const row = el('tr', 'debot-risk-row'); row.dataset.eventId = scalar(item.eventId, '');
+        const token = el('td', 'debot-risk-token-cell');
+        const name = typeof item.name === 'string' && item.name.trim() ? item.name.trim() : typeof item.symbol === 'string' && item.symbol.trim() ? item.symbol.trim() : '名称待获取';
+        const symbol = typeof item.symbol === 'string' && item.symbol.trim() && item.symbol.trim() !== name ? item.symbol.trim() : '';
+        const identity = el('div', 'debot-risk-token-name', name); identity.title = name; token.append(identity);
+        const tokenMeta = el('div', 'debot-risk-token-meta');
+        const chainPill = () => { const node = el('span', `debot-risk-chain ${chainClass(item.chain)}`); node.append(el('span', `chain-dot ${chainClass(item.chain)}`), document.createTextNode(chainName(item.chain))); return node; };
+        tokenMeta.append(chainPill()); if (symbol) { const symbolNode = el('span', 'debot-risk-symbol', symbol); symbolNode.title = symbol; tokenMeta.append(symbolNode); } token.append(tokenMeta);
+        const shortAddress = typeof item.address === 'string' && item.address.length > 16 ? `${item.address.slice(0, 6)}…${item.address.slice(-6)}` : scalar(item.address);
+        const address = el('div', 'debot-risk-address'); const code = el('code', '', shortAddress); code.title = scalar(item.address); address.append(code);
+        if (typeof item.address === 'string' && item.address) address.append(copyButton(item.address)); token.append(address);
+        const score = el('td', 'debot-risk-score-cell'); score.append(debotRiskScoreNode(item));
+        const chain = el('td', 'debot-risk-chain-cell'); chain.append(chainPill());
+        const checksCell = el('td', 'debot-risk-checks-cell'); const checks = el('div', 'debot-risk-checks'); const missing = [];
+        for (const [key, label] of debotRiskChecks) {
+          const check = item.checks?.[key]; const checkStatus = ['pass', 'fail'].includes(check?.status) ? check.status : 'unknown';
+          const checkNode = el('span', `debot-risk-check ${checkStatus}`);
+          checkNode.append(el('span', 'debot-risk-check-mark', {pass: '✓', fail: '×', unknown: '·'}[checkStatus]), el('span', '', label));
+          const checkReasons = Array.isArray(check?.reasons) ? check.reasons.filter(reason => typeof reason === 'string') : [];
+          const detail = [`${label}：${{pass: '已核验', fail: '未通过', unknown: '待核验'}[checkStatus]}`, check?.checkedAt ? `检查时间 ${date(check.checkedAt, true)}` : '', finite(check?.elapsedMs) ? `耗时 ${debotRiskDuration(check.elapsedMs)}` : '', ...checkReasons.slice(0, 5).map(reason => reasonNames[reason] || reason)].filter(Boolean).join('\n');
+          checkNode.title = detail; checkNode.setAttribute('aria-label', detail);
+          if (checkStatus === 'unknown') missing.push(label); checks.append(checkNode);
+        }
+        checksCell.append(checks);
+        const conclusion = debotRiskConclusion(item); const decision = el('td', 'debot-risk-conclusion-cell'); decision.append(badge(...conclusion));
+        const reasons = [...new Set([...debotRiskChecks.flatMap(([key]) => item.checks?.[key]?.status !== 'pass' && Array.isArray(item.checks?.[key]?.reasons) ? item.checks[key].reasons : []), ...(Array.isArray(item.reasons) ? item.reasons : [])])].filter(reason => typeof reason === 'string').slice(0, 4);
+        const summary = reasons.length ? reasons.map(reason => reasonNames[reason] || reason).join('；') : missing.length ? `待核验：${missing.join('、')}` : conclusion[0] === '研究候选' ? `有效至 ${time(item.validUntil)} · 未代表下单` : '详细结论见核验证据';
+        const reason = el('p', 'debot-risk-reason', summary); reason.title = summary; decision.append(reason);
+        const timing = el('td', 'debot-risk-timing-cell'); const received = el('time', '', time(item.receivedAt)); received.title = date(item.receivedAt, true); if (validDate(item.receivedAt)) received.dateTime = item.receivedAt;
+        timing.append(received, el('span', '', `到达 ${debotRiskDuration(item.signalDelayMs)}`), el('span', '', `分析 ${debotRiskDuration(item.analysisMs)}`)); timing.title = `排队 ${debotRiskDuration(item.queueMs)}\n分析 ${debotRiskDuration(item.analysisMs)}`;
+        const actions = el('td', 'debot-risk-actions-cell'); actions.append(gmgnTokenLink(item.chain, item.address));
+        if (typeof item.reportId === 'string' && item.reportId) {
+          const detail = el('button', 'text-button', '核验证据 ↗'); detail.type = 'button'; detail.setAttribute('aria-label', `查看 ${scalar(item.address)} 的核验证据`); detail.addEventListener('click', () => openDetail(item.reportId, detail)); actions.append(detail);
+        }
+        row.append(token, score, chain, checksCell, decision, timing, actions); body.append(row);
       }
-      card.append(heading, address, timing, checks);
-      const reasons = [...new Set([...debotRiskChecks.flatMap(([key]) => item.checks?.[key]?.status !== 'pass' && Array.isArray(item.checks?.[key]?.reasons) ? item.checks[key].reasons : []), ...(Array.isArray(item.reasons) ? item.reasons : [])])].filter(reason => typeof reason === 'string').slice(0, 4);
-      if (missing.length) card.append(el('p', 'debot-risk-missing', `缺项 / 待核验：${missing.join('、')}`));
-      if (reasons.length) card.append(reasonList(reasons));
-      const foot = el('div', 'debot-risk-foot');
-      const note = item.checks?.narrative ? '已有叙事检查 · 仅作参考' : '叙事非必需 · 不替代安全核验';
-      foot.append(el('span', '', conclusion[0] === '研究候选' ? `有效至 ${time(item.validUntil)} · 未代表下单` : note));
-      if (typeof item.reportId === 'string' && item.reportId) {
-        const detail = el('button', 'text-button', '查看核验证据 ↗'); detail.type = 'button'; detail.setAttribute('aria-label', `查看 ${scalar(item.address)} 的核验证据`); detail.addEventListener('click', () => openDetail(item.reportId, detail)); foot.append(detail);
-      }
-      card.append(foot); container.append(card);
     }
-    container.scrollTop = scrollTop;
+    container.scrollTop = scrollTop; container.scrollLeft = scrollLeft;
+    rebindDebotScore(container);
+    if (scorePopoverState && !debotScorePopover) {
+      const next = [...container.querySelectorAll('[data-event-id]')].find(node => node.dataset.eventId === scorePopoverState.eventId)?.querySelector('.debot-risk-score');
+      if (next) openDebotScore(next, scorePopoverState.pinned);
+    }
     if (focusKey && focusLabel) {
       const replacement = [...container.querySelectorAll('[data-event-id]')].find(node => node.dataset.eventId === focusKey);
+      suppressDebotScoreFocus = true;
       [...(replacement?.querySelectorAll('[aria-label]') || [])].find(node => node.getAttribute('aria-label') === focusLabel)?.focus({preventScroll: true});
+      suppressDebotScoreFocus = false;
     }
   }
   function stopDebotRiskPolling(clear = false) {
+    closeDebotScore();
     clearTimeout(debotRisk.timer); debotRisk.timer = null; debotRisk.generation++;
     debotRisk.controller?.abort(); debotRisk.controller = null;
     if (clear) { debotRisk.items = []; debotRisk.loaded = false; debotRisk.error = ''; debotRisk.lastSuccess = 0; debotRisk.serverNow = 0; debotRisk.signature = ''; renderDebotRisk(); }

@@ -5,6 +5,8 @@ import bs58 from 'bs58';
 import {createHash} from 'node:crypto';
 import type {Chain,Signal,Report,Status} from './types.js';
 import {fetchDebotSignalPage,DebotSignalError,type DebotSignalObservation,type DebotWalletDetails} from './providers/debot-signals.js';
+import {tokenDisplayText} from './token-display.js';
+import {scoreDebotRisk} from './debot-risk-score.js';
 
 type Page=Awaited<ReturnType<typeof fetchDebotSignalPage>>;
 interface Cycle {
@@ -16,6 +18,7 @@ export interface DebotScannerOptions {
   mode?:'anonymous_poll'|'authenticated_stream';
   onSignal:(signal:Signal,observedAt:string,context?:{detailsReady:Promise<void>})=>Promise<unknown>;shouldDefer?:()=>string|undefined;
   maxConcurrent?:number;parallelDetails?:boolean;
+  lookupDisplay?:(reportId:string)=>{chain:Chain;address:string;name?:string;symbol?:string}|undefined;
   fetchPage?:(chain:Chain)=>Promise<Page>;now?:()=>Date;
   fetchDetails?:(observation:DebotSignalObservation)=>Promise<DebotWalletDetails>;
 }
@@ -79,13 +82,32 @@ export class DebotScanner {
     const columns=new Set(this.db.prepare('PRAGMA table_info(debot_signals)').all().map(row=>String(row.name)));
     if(!columns.has('details'))this.db.exec('ALTER TABLE debot_signals ADD COLUMN details TEXT');
     if(!columns.has('details_error'))this.db.exec('ALTER TABLE debot_signals ADD COLUMN details_error TEXT');
-    for(const column of ['report_id','progress','verdict','dedup_key'])if(!columns.has(column))this.db.exec(`ALTER TABLE debot_signals ADD COLUMN ${column} TEXT`);
+    for(const column of ['report_id','progress','verdict','dedup_key','token_name','token_symbol'])if(!columns.has(column))this.db.exec(`ALTER TABLE debot_signals ADD COLUMN ${column} TEXT`);
     this.db.exec('CREATE INDEX IF NOT EXISTS debot_signals_dedup ON debot_signals(dedup_key)');
+    this.db.exec('CREATE INDEX IF NOT EXISTS debot_signals_token ON debot_signals(chain,address)');
     if(options.database!==':memory:')chmodSync(options.database,0o600);
     // A claimed event is never silently replayed after a crash. Its incomplete
     // analysis remains visible instead of creating another signal/order attempt.
     const prior=this.db.prepare('SELECT max(dispatched_at) AS at FROM debot_signals').get() as {at:string|null};
     if(prior.at)this.nextDispatchAt=Date.parse(prior.at)+this.dispatchIntervalMs();
+    // Bounded local-only migration. Names never require another vendor request.
+    if(options.lookupDisplay)for(const row of this.db.prepare(`SELECT id,report_id,chain,address FROM debot_signals
+      WHERE report_id IS NOT NULL AND (token_name IS NULL OR token_symbol IS NULL) ORDER BY observed_at DESC LIMIT 50`).all()){
+      try {
+        const display=options.lookupDisplay(String(row.report_id));
+        const expected=walletAddress(row.address,row.chain as Chain);
+        if(expected&&display&&display.chain===row.chain&&walletAddress(display.address,display.chain)===expected)
+          this.storeDisplay(String(row.id),String(row.chain),String(row.address),display);
+      }catch {/* Missing historical labels cannot stop live capture. */}
+    }
+  }
+
+  private storeDisplay(id:string,chain:string,address:string,value:{name?:unknown;symbol?:unknown}):void {
+    const name=tokenDisplayText(value.name,100),symbol=tokenDisplayText(value.symbol,32);
+    if(!(name||symbol)||!this.db.prepare('SELECT 1 FROM debot_signals WHERE id=? AND chain=? AND address=?').get(id,chain,address))return;
+    // A later bound label can fill older alerts for the same token. Existing labels and every decision stay immutable.
+    this.db.prepare(`UPDATE debot_signals SET token_name=COALESCE(token_name,?),token_symbol=COALESCE(token_symbol,?)
+      WHERE chain=? AND address=? AND (token_name IS NULL OR token_symbol IS NULL)`).run(name??null,symbol??null,chain,address);
   }
 
   bindReport(eventId:string,reportId:string):void {
@@ -108,6 +130,11 @@ export class DebotScanner {
     if(this.closed)return;
     const row=this.db.prepare("SELECT chain,address,dispatched_at,progress FROM debot_signals WHERE id=? AND state='dispatching'").get(eventId) as {chain:Chain;address:string;dispatched_at:string;progress:string|null}|undefined;
     if(!row||report.signal.sourceEventId!==eventId||report.signal.token.chain!==row.chain||report.signal.token.address!==row.address)return;
+    const snapshot=report.gmgn,info=snapshot?.info,expected=walletAddress(row.address,row.chain);
+    if(expected&&snapshot?.token.chain===row.chain&&walletAddress(snapshot.token.address,row.chain)===expected&&
+      object(info)&&walletAddress(info.address,row.chain)===expected&&
+      (info.chain===undefined||info.chain===row.chain||row.chain==='solana'&&info.chain==='sol'))
+      this.storeDisplay(eventId,row.chain,row.address,info);
     const checks={safety:report.safety,provenance:report.provenance,market:report.marketRisk,wallets:report.flow,narrative:report.narrative};
     const previous=row.progress?JSON.parse(row.progress):{};
     for(const [stage,check] of Object.entries(checks))if(check){
@@ -123,20 +150,23 @@ export class DebotScanner {
   recent(limit=12) {
     if(!Number.isInteger(limit)||limit<1||limit>50)throw new Error('DEBOT_SIGNAL_LIMIT_INVALID');
     const now=this.now();
-    const rows=this.db.prepare(`SELECT id,report_id,chain,address,occurred_at,observed_at,state,reason,dispatched_at,completed_at,progress,verdict
+    const rows=this.db.prepare(`SELECT id,report_id,chain,address,token_name,token_symbol,occurred_at,observed_at,state,reason,dispatched_at,completed_at,progress,verdict
       FROM debot_signals WHERE reason IS NULL OR reason NOT IN ('DEBOT_SIGNAL_STALE','DEBOT_DUPLICATE_TOKEN_ALERT')
       ORDER BY observed_at DESC LIMIT ?`).all(limit);
     return {now:now.toISOString(),items:rows.map(row=>{
       const receivedAt=String(row.observed_at),startedAt=row.dispatched_at?String(row.dispatched_at):undefined;
       const endedAt=row.completed_at?String(row.completed_at):row.state==='dispatching'?now.toISOString():undefined;
       const verdict=row.verdict?JSON.parse(String(row.verdict)):{};
+      const checks=row.progress?JSON.parse(String(row.progress)):{};
+      const reasons=[...reasonCodes(verdict.reasons),...reasonCodes(row.reason?[row.reason]:[])];
       return {eventId:String(row.id),reportId:row.report_id??undefined,chain:row.chain,address:row.address,
+        name:tokenDisplayText(row.token_name,100),symbol:tokenDisplayText(row.token_symbol,32),
         occurredAt:row.occurred_at,receivedAt,state:row.state,startedAt,completedAt:row.completed_at??undefined,
         signalDelayMs:Date.parse(receivedAt)-Date.parse(String(row.occurred_at)),
         queueMs:startedAt?Math.max(0,Date.parse(startedAt)-Date.parse(receivedAt)):undefined,
         analysisMs:startedAt&&endedAt?Math.max(0,Date.parse(endedAt)-Date.parse(startedAt)):undefined,
         ...verdict,buyEligible:row.state==='completed'&&verdict.buyEligible===true&&Date.parse(verdict.validUntil)>now.getTime(),
-        reasons:[...reasonCodes(verdict.reasons),...reasonCodes(row.reason?[row.reason]:[])],checks:row.progress?JSON.parse(String(row.progress)):{}};
+        reasons,checks,score:scoreDebotRisk({state:String(row.state),checks,decision:verdict.decision,validUntil:verdict.validUntil,reasons},now)};
     })};
   }
   private dispatchIntervalMs():number {return this.options.mode==='authenticated_stream'?0:60_000;}
@@ -299,7 +329,9 @@ export class DebotScanner {
   private record(observation:DebotSignalObservation):number {
     const signal=observation.signal;
     if(!this.chains.includes(signal.token.chain))return 0;
-    if(this.db.prepare('SELECT 1 FROM debot_signals WHERE id=?').get(signal.sourceEventId))return 0;
+    if(this.db.prepare('SELECT 1 FROM debot_signals WHERE id=?').get(signal.sourceEventId)){
+      this.storeDisplay(signal.sourceEventId,signal.token.chain,signal.token.address,observation);return 0;
+    }
     const count=this.db.prepare('SELECT count(*) AS n FROM debot_signals').get() as {n:number};
     if(count.n>=10_000) {
       // Preserve a recent deduplication horizon even when traffic exceeds capacity.
@@ -315,6 +347,7 @@ export class DebotScanner {
     this.db.prepare('INSERT INTO debot_signals(id,chain,address,occurred_at,observed_at,state,payload,reason,dedup_key) VALUES(?,?,?,?,?,?,?,?,?)')
       .run(signal.sourceEventId,signal.token.chain,signal.token.address,signal.occurredAt,observation.observedAt,
         stale||duplicate?'ignored':'pending',JSON.stringify(observation),stale?'DEBOT_SIGNAL_STALE':duplicate?'DEBOT_DUPLICATE_TOKEN_ALERT':null,dedupKey);
+    this.storeDisplay(signal.sourceEventId,signal.token.chain,signal.token.address,observation);
     return 1;
   }
 

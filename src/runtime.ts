@@ -133,6 +133,7 @@ export function createRuntime(config:Config) {
   const debotScanner:DebotScanner|undefined=config.debotScannerEnabled?new DebotScanner({database:config.debotSignalsDatabase,mode:config.debotTransport,
     chains:config.scannerChains,intervalSec:config.debotScannerIntervalSec,
     maxConcurrent:debotSession?2:1,parallelDetails:!!debotSession,
+    lookupDisplay:reportId=>archive?.tokenDisplay(reportId),
     maxAgeSec:debotSession?Math.min(120,config.maxSignalAgeSec):config.maxSignalAgeSec,onSignal,
     ...(debotSession?{fetchPage:(chain:Signal['token']['chain'])=>fetchDebotSignalPage(chain,{fetcher:debotSession.fetcher}),
       fetchDetails:(observation:Parameters<typeof fetchDebotWalletDetails>[0])=>fetchDebotWalletDetails(observation,{fetcher:debotSession.fetcher,signal:AbortSignal.timeout(4000)})}:{}),

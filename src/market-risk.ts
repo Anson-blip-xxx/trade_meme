@@ -37,8 +37,10 @@ export function assessMarketRisk(signal:Signal,snapshot:GmgnTokenSnapshot|undefi
     token:{...signal.token},sellabilityVerified:false,executionVerified:false,ownershipProven:false,
     source:SOURCE,warnings,missingFields:missing,normalized:{},riskObservations:{},
     concentrationExcludesPools:false,nonAtomicSnapshot:true};
-  let checkedAt=Number.isFinite(now.getTime())?now.toISOString():new Date(0).toISOString();
-  const result=(status:Check['status'],reasons:string[]):Check=>({status,reasons:[...new Set(reasons)],checkedAt,facts});
+  let checkedAt=Number.isFinite(now.getTime())?now.toISOString():new Date(0).toISOString(),diagnosticsBound=false;
+  const result=(status:Check['status'],reasons:string[]):Check=>({status,reasons:[...new Set([...reasons,
+    ...(status==='unknown'&&diagnosticsBound&&snapshot?.diagnostics.some(d=>['info','security','pool'].includes(d.section)&&
+      d.status==='unavailable'&&d.reason==='GMGN_RATE_LIMITED')?['GMGN_RATE_LIMITED']:[])])],checkedAt,facts});
   const min=policy.minLiquidityUsd??0,maxAge=policy.maxAgeSec??120,maxTax=policy.maxTaxRate??0.1;
   const caps=[policy.maxDevTeamHoldRate,policy.maxInsiderHoldRate,policy.maxBundlerVolumeRate];
   if(!Number.isFinite(now.getTime())||typeof min!=='number'||!Number.isFinite(min)||min<0||
@@ -56,6 +58,16 @@ export function assessMarketRisk(signal:Signal,snapshot:GmgnTokenSnapshot|undefi
   if(!Number.isFinite(stamp)||stamp>now.getTime()||now.getTime()-stamp>maxAge*1000)
     return result('unknown',['MARKET_SNAPSHOT_STALE']);
   checkedAt=new Date(stamp).toISOString();
+  // Diagnostics describe this request scope only. Wrong-token responses must not
+  // inject even a fixed operational reason into another asset's market result.
+  const responseBound=(row:unknown,key:string)=>row===undefined||object(row)&&
+    address(row[key],signal.token.chain)===token&&chainMatches(row.chain,signal.token.chain);
+  const infoPrice=object(snapshot.info)&&object(snapshot.info.price)?snapshot.info.price:undefined;
+  const infoPool=object(snapshot.info)&&object(snapshot.info.pool)?snapshot.info.pool:undefined;
+  diagnosticsBound=Array.isArray(snapshot.diagnostics)&&responseBound(snapshot.info,'address')&&
+    responseBound(snapshot.pool,'base_address')&&responseBound(snapshot.security,'address')&&
+    (!infoPrice||(!field(infoPrice,'address')||address(infoPrice.address,signal.token.chain)===token)&&chainMatches(infoPrice.chain,signal.token.chain))&&
+    (!infoPool||(!field(infoPool,'base_address')||address(infoPool.base_address,signal.token.chain)===token)&&chainMatches(infoPool.chain,signal.token.chain));
   const ok=(section:'info'|'pool'|'security')=>Array.isArray(snapshot.diagnostics)&&
     snapshot.diagnostics.some(d=>d.section===section&&d.status==='ok')&&
     !snapshot.diagnostics.some(d=>d.section===section&&d.status!=='ok');

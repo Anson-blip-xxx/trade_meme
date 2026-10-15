@@ -59,6 +59,23 @@ test('missing curve AMM fields remain unknown rather than a fabricated rug rejec
   assert.ok(result.reasons.includes('MARKET_CURVE_POOL_UNVERIFIED'));
 });
 
+test('missing pool retains a scoped rate-limit reason while wrong-token diagnostics cannot be imported',()=>{
+  const limited=()=>{const s=snapshot();delete s.pool;info(s).launchpad_status=1;
+    s.diagnostics=s.diagnostics.filter(d=>d.section!=='pool');
+    s.diagnostics.push({section:'pool',status:'unavailable',reason:'GMGN_RATE_LIMITED'});return s;};
+  const result=run(limited());assert.equal(result.status,'unknown');
+  assert.deepEqual(result.reasons,['MARKET_CURVE_POOL_UNVERIFIED','GMGN_RATE_LIMITED']);
+  for(const mutate of [(s:GmgnTokenSnapshot)=>{s.token={chain:'bsc',address:quote};},
+    (s:GmgnTokenSnapshot)=>{info(s).address=quote;},(s:GmgnTokenSnapshot)=>{info(s).price.address=quote;},
+    (s:GmgnTokenSnapshot)=>{info(s).pool.base_address=quote;},(s:GmgnTokenSnapshot)=>{s.pool={base_address:quote};},
+    (s:GmgnTokenSnapshot)=>{s.security={address:quote};},(s:GmgnTokenSnapshot)=>{info(s).chain='robinhood';}]){
+    const s=limited();mutate(s);const wrong=run(s);assert.equal(wrong.status,'unknown');
+    assert.equal(wrong.reasons.includes('GMGN_RATE_LIMITED'),false);
+  }
+  const wrongReason=limited();wrongReason.diagnostics.at(-1)!.reason='arbitrary upstream secret';
+  assert.deepEqual(run(wrongReason).reasons,['MARKET_CURVE_POOL_UNVERIFIED']);
+});
+
 test('missing snapshots and wrong top-level CA or chain never pass',()=>{
   assert.equal(assessMarketRisk(signal,undefined,now).status,'unknown');
   for(const identity of [{chain:'robinhood',address:token},{chain:'bsc',address:quote}]){

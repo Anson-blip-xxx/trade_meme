@@ -4,11 +4,16 @@ import type {Chain, Signal} from './types.js';
 import type {GmgnFeedPage} from './scanner.js';
 import {GmgnError, type GmgnClient} from './providers/gmgn-client.js';
 import {analyzeWallets} from './research/wallets.js';
-import type {WalletHistory, WalletTradeObservation} from './wallet-history.js';
+import type {WalletHistory, WalletTradeObservation, WalletTokenTraderObservation} from './wallet-history.js';
+import {parseWalletObserverCursor, type WalletObserverCursorState, type WalletObserverPending} from './wallet-observer-state.js';
 
 // Primary schemas: GMGNAI/gmgn-skills at 4575ef539e6a3115fa0481d41285cb79e77970bf:
 // gmgn-track/SKILL.md L259-278; gmgn-market/SKILL.md L134-141,L366-400;
 // gmgn-token/SKILL.md L374-424; gmgn-portfolio/SKILL.md L253-269.
+// Rechecked official gmgn-token/SKILL.md on 2026-10-16: limit<=100;
+// profit/unrealized_profit/buy_volume_cur/sell_volume_cur are documented sorts.
+// start_holding_at is acquisition, not first_buy_time. The response defines
+// profit as total PnL; ambiguous vendor ordering must not be renamed realized rank.
 const CHAINS: Chain[] = ['bsc', 'solana', 'robinhood'];
 const apiChain = (chain: Chain) => chain === 'solana' ? 'sol' : chain;
 type Token = {chain: Chain; address: string};
@@ -70,6 +75,25 @@ function eventTime(value: unknown, observedAt: string): string | undefined {
 }
 const hasMore = (raw: Obj): boolean | null => raw.next === '' || raw.next === null ? false : typeof raw.next === 'string' ? true : null;
 interface ParsedTrades {trades: WalletTradeObservation[]; received: number; rejected: number; hasMore: boolean | null; invalidReason?: string;}
+type TraderSort = 'profit' | 'unrealized_profit' | 'buy_volume_cur' | 'sell_volume_cur';
+const TRADER_SORTS: TraderSort[] = ['profit', 'unrealized_profit', 'buy_volume_cur', 'sell_volume_cur'];
+const TRADER_SCOPE = {profit: 'vendor_profit_order', unrealized_profit: 'vendor_unrealized_profit_order',
+  buy_volume_cur: 'vendor_buy_volume_order', sell_volume_cur: 'vendor_sell_volume_order'} as const;
+
+/** Documented acquisition time can include transfers. It is never a verified first buy. */
+function traderRow(row: unknown, target: Token, rank: number, observedAt: string, sort: TraderSort, limit: 20 | 100):
+  (WalletTokenTraderObservation & {researchCandidate: boolean}) | undefined {
+  if (!object(row) || !matchesChain(row, target.chain) ||
+      row.token_address !== undefined && address(row.token_address, target.chain) !== target.address ||
+      object(row.token) && (!matchesChain(row.token, target.chain) || address(row.token.address, target.chain) !== target.address)) return;
+  const wallet = address(row.address, target.chain); if (!wallet || wallet === target.address) return;
+  return {address: wallet, rank, profitUsd: decimal(row.profit, true), realizedProfitUsd: decimal(row.realized_profit, true),
+    unrealizedProfitUsd: decimal(row.unrealized_profit, true), labels: [...new Set([...labels(row.tags), ...labels(row.maker_token_tags)])],
+    firstAcquiredAt: eventTime(row.start_holding_at, observedAt), lastActiveAt: eventTime(row.last_active_timestamp, observedAt),
+    exitedAt: eventTime(row.end_holding_at, observedAt), buyVolumeUsd: decimal(row.buy_volume_cur),
+    sellVolumeUsd: decimal(row.sell_volume_cur), balance: decimal(row.balance ?? row.amount_cur), rankScope: TRADER_SCOPE[sort], sampleLimit: limit,
+    researchCandidate: row.addr_type !== 2 && row.addr_type !== '2' && !row.exchange};
+}
 
 /** Latest fetched page only; observedAt is not the historical trade timestamp. */
 export function normalizeWalletFeed(page: GmgnFeedPage): ParsedTrades {
@@ -125,7 +149,8 @@ export function normalizeWalletActivity(raw: unknown, chain: Chain, wallet: stri
 export interface WalletObserverOptions {
   history: Pick<WalletHistory, 'recordTrades' | 'captureAnalysis' | 'captureLeaders' | 'captureTokenRanks' |
     'captureTokenTraders' | 'recordCollection' | 'watchTargets' | 'markTargetChecked' | 'recordPrice' | 'refreshCoordination'> &
-    Partial<Pick<WalletHistory, 'associationTargets' | 'markAssociationTargetChecked' | 'captureFunding'>>;
+    Partial<Pick<WalletHistory, 'associationTargets' | 'markAssociationTargetChecked' | 'captureFunding' |
+      'getWalletObserverCursor' | 'setWalletObserverCursor'>>;
   client: Pick<GmgnClient, 'get' | 'cooldownUntil'> & Partial<Pick<GmgnClient, 'recordRateLimit'>>;
   config?: Config;
   chains?: Chain[];
@@ -161,6 +186,11 @@ export class WalletObserver {
   private marketCursor = new Map<Chain, number>();
   private associationCursor = new Map<string, number>();
   private associationRounds = new Map<Chain, number>();
+  private walletChecks = new Map<string, number>();
+  private pending?: WalletObserverPending;
+  private pendingByChain = new Map<Chain, WalletObserverPending>();
+  private checkpoint?: WalletObserverCursorState;
+  private cursorError?: string;
 
   constructor(options: WalletObserverOptions) {
     this.interval = options.intervalMs ?? 300_000; this.maxRequests = options.maxRequestsPerCycle ?? 9;
@@ -171,6 +201,10 @@ export class WalletObserver {
     if (!Array.isArray(chains) || !chains.length || chains.some(chain => !CHAINS.includes(chain))) throw new Error('WALLET_OBSERVER_CONFIG_INVALID');
     this.chains = [...new Set(chains)];
     this.history = options.history; this.client = options.client; this.now = options.now ?? (() => new Date());
+    try {
+      const saved = parseWalletObserverCursor(this.history.getWalletObserverCursor?.());
+      if (saved && JSON.stringify(saved.chains) === JSON.stringify(this.chains)) this.restoreCursor(saved);
+    } catch {this.cursorError = 'WALLET_OBSERVER_CURSOR_READ_FAILED';}
   }
 
   observeFeed(page: GmgnFeedPage) {
@@ -192,6 +226,11 @@ export class WalletObserver {
   getStatus() {
     return {running: this.running, inFlight: !!this.inFlight, intervalMs: this.interval,
       maxRequestsPerCycle: this.maxRequests, coverage: 'one_page_sample' as const,
+      marketSampling: {traderSorts: [...TRADER_SORTS], tradersPerPage: 100, walletSelection: 'least_checked_then_profit_or_early_acquisition',
+        earliestScope: 'earliest_acquisition_in_sample_not_verified_buy', acquisitionIncludesTransfers: true,
+        persistentCursor: !!this.history.getWalletObserverCursor && !!this.history.setWalletObserverCursor,
+        pendingTargets: [...this.pendingByChain.values()].map(value => ({chain: value.chain, address: value.address, kind: value.kind}))},
+      ...(this.cursorError ? {cursorError: this.cursorError} : {}),
       associationSampling: {enabled: !!this.history.associationTargets, alternatePerChain: true,
         anchorWindowHours: 24, traderPages: 2, tradersPerPage: 100, candidateWallets: 2,
         knownRelationshipPriorityEvery: 3, knownRelationshipsContinueAfterAnchorWindow: true,
@@ -227,7 +266,64 @@ export class WalletObserver {
     });
   }
 
+  private cursorState(): WalletObserverCursorState {
+    return {version: 1, chains: [...this.chains], cursor: this.cursor, rank: [...this.rankCursor], market: [...this.marketCursor],
+      associationRounds: [...this.associationRounds], wallets: [...this.walletCursor], associations: [...this.associationCursor],
+      walletChecks: [...this.walletChecks], ...(this.pendingByChain.size ? {pending: structuredClone([...this.pendingByChain.values()])} : {})};
+  }
+  private restoreCursor(state: WalletObserverCursorState): void {
+    this.cursor = state.cursor; this.rankCursor = new Map(state.rank); this.marketCursor = new Map(state.market);
+    this.associationRounds = new Map(state.associationRounds); this.walletCursor = new Map(state.wallets);
+    this.associationCursor = new Map(state.associations); this.walletChecks = new Map(state.walletChecks);
+    this.pendingByChain = new Map((state.pending ?? []).map(value => [value.chain, value]));
+    this.pending = this.pendingByChain.get(this.chains[this.cursor % this.chains.length]);
+  }
+  private saveCursor(state: WalletObserverCursorState): void {
+    try {
+      if (this.history.setWalletObserverCursor?.(state) === false) throw new Error('WALLET_OBSERVER_CURSOR_WRITE_FAILED');
+      this.cursorError = undefined;
+    } catch {this.cursorError = 'WALLET_OBSERVER_CURSOR_WRITE_FAILED'; throw new Error(this.cursorError);}
+  }
+  private retainPending(pending: WalletObserverPending): void {
+    this.pending = pending; this.pendingByChain.set(pending.chain, pending);
+    // Before the next asynchronous read, freeze the unfinished target without
+    // committing any counters staged by this cycle.
+    if (this.checkpoint) this.saveCursor({...this.checkpoint, pending: structuredClone([...this.pendingByChain.values()])});
+  }
   private async execute(generation: number): Promise<WalletObserverCycle> {
+    const checkpoint = this.cursorState(); this.checkpoint = checkpoint;
+    this.pending = this.pendingByChain.get(this.chains[this.cursor % this.chains.length]);
+    const report = await this.executeCycle(generation);
+    const retry = generation !== this.generation || report.status === 'cooldown' || report.reasons.some(value =>
+      /(?:_FAILED|_TIMEOUT|_MISSING|_ABORTED|_BUDGET_REACHED|_SCHEMA_INVALID)$/.test(value));
+    if (retry) {
+      const unfinished = new Map(this.pendingByChain); this.restoreCursor(checkpoint); this.pendingByChain = unfinished;
+      // A failed chain keeps its target, but cannot monopolize the scheduler.
+      // Shared cooldown with no request and cancelled cycles do not consume a turn.
+      if (generation === this.generation && report.requests > 0) {
+        this.cursor = checkpoint.cursor + 1;
+        try {this.saveCursor(this.cursorState());}
+        catch {this.cursor = checkpoint.cursor; if (!report.reasons.includes('WALLET_OBSERVER_CURSOR_WRITE_FAILED')) report.reasons.push('WALLET_OBSERVER_CURSOR_WRITE_FAILED');}
+      }
+    } else {
+      const completedPending = this.pending;
+      try {
+        if (this.pending) {
+          this.history.markTargetChecked(this.pending, this.now().toISOString());
+          if (this.pending.kind === 'association') this.history.markAssociationTargetChecked?.(this.pending as AssociationTarget, this.now().toISOString());
+        }
+        this.pendingByChain.delete(report.chain); this.pending = undefined; this.saveCursor(this.cursorState());
+      } catch {
+        this.restoreCursor(checkpoint);
+        if (completedPending) this.pendingByChain.set(report.chain, completedPending);
+        this.cursorError = 'WALLET_OBSERVER_CURSOR_WRITE_FAILED';
+        if (!report.reasons.includes(this.cursorError)) report.reasons.push(this.cursorError);
+      }
+    }
+    this.checkpoint = undefined;
+    return this.finish(report, generation);
+  }
+  private async executeCycle(generation: number): Promise<WalletObserverCycle> {
     const turn = this.cursor++, chain = this.chains[turn % this.chains.length], startedAt = this.now().toISOString();
     const associationTurn = Math.floor(turn / this.chains.length) % 2 === 0;
     const marketTurn = this.marketCursor.get(chain) ?? 0, preferRank = marketTurn % 2 === 0;
@@ -272,14 +368,13 @@ export class WalletObserver {
       // alternating rounds query past traders too, including untagged/exited
       // wallets, then verify their actual transactions before any inference.
       let anchors: AssociationTarget[] = [];
-      if (associationTurn) {
+      if (associationTurn && this.pending?.kind !== 'market') {
         const round = this.associationRounds.get(chain) ?? 0;
-        this.associationRounds.set(chain, round + 1);
         const mode = round % 3 === 2 ? 'known' : 'recent';
         anchors = this.history.associationTargets?.(chain, 5, mode) ?? [];
         if (mode === 'known' && !anchors.length) anchors = this.history.associationTargets?.(chain, 5, 'recent') ?? [];
       }
-      const anchor = anchors.find(value => {
+      const anchor = this.pending?.kind === 'association' && this.pending.chain === chain ? this.pending as AssociationTarget : anchors.find(value => {
         const historical = value.historicalRelationship === true;
         const candidate = address(value.candidateWallet, chain), leader = address(value.anchorWallet, chain);
         return value.chain === chain && address(value.address, chain) && leader &&
@@ -288,10 +383,11 @@ export class WalletObserver {
           (historical || Date.parse(value.anchorEventAt) >= this.now().getTime() - 86_400_000);
       });
       if (anchor) {
+        this.associationRounds.set(chain, (this.associationRounds.get(chain) ?? 0) + 1);
         report.collectionMode = 'kol_association'; target = {chain, address: anchor.address};
+        this.retainPending({...anchor, kind: 'association', ...(this.pending?.wallets ? {wallets: this.pending.wallets} : {})});
         await this.collectAssociation(anchor, report, attempt, reason, generation);
-        if (generation === this.generation) this.history.markAssociationTargetChecked?.(anchor, this.now().toISOString());
-        return this.finish(report, generation);
+        return report;
       }
       this.marketCursor.set(chain, marketTurn + 1);
       let rankedTargets: Token[] = [];
@@ -316,23 +412,24 @@ export class WalletObserver {
         const rankIndex = this.rankCursor.get(chain) ?? 0;
         target = rankedTargets[rankIndex % rankedTargets.length]; this.rankCursor.set(chain, rankIndex + 1);
       } else target = oldest;
-      if (!target) return this.finish(report, generation);
+      if (this.pending?.kind === 'market' && this.pending.chain === chain) target = this.pending;
+      if (!target) return report;
       target = {chain, address: address(target.address, chain)!};
+      this.retainPending({...target, kind: 'market', ...(this.pending?.wallets ? {wallets: this.pending.wallets} : {})});
+      const targetKey = `${chain}:${target.address}`, offset = this.walletCursor.get(targetKey) ?? 0;
+      const traderSort = TRADER_SORTS[offset % TRADER_SORTS.length], earlyTurn = offset % 2 === 1;
       const tradersRaw = await attempt('/v1/market/token_top_traders', {chain: apiChain(chain), address: target.address,
-        order_by: 'profit', direction: 'desc', limit: 20}, 5);
-      let traders: {address: string; rank: number; profitUsd: string | null; realizedProfitUsd: string | null; unrealizedProfitUsd: string | null; labels: string[]}[] = [];
+        order_by: traderSort, direction: 'desc', limit: 100}, 5);
+      let traders: (WalletTokenTraderObservation & {researchCandidate: boolean})[] = [];
       if (object(tradersRaw) && matchesChain(tradersRaw, chain) && Array.isArray(tradersRaw.list) &&
           (tradersRaw.token_address === undefined || address(tradersRaw.token_address, chain) === target.address) &&
           (tradersRaw.address === undefined || address(tradersRaw.address, chain) === target.address)) {
-        traders = tradersRaw.list.slice(0, 20).flatMap((row, index) => {
-          if (!object(row) || !matchesChain(row, chain) || row.token_address !== undefined && address(row.token_address, chain) !== target!.address ||
-              object(row.token) && address(row.token.address, chain) !== target!.address) return [];
-          const wallet = address(row.address, chain); if (!wallet) return [];
-          return [{address: wallet, rank: index + 1, profitUsd: decimal(row.profit, true), realizedProfitUsd: decimal(row.realized_profit, true),
-            unrealizedProfitUsd: decimal(row.unrealized_profit, true), labels: [...new Set([...labels(row.tags), ...labels(row.maker_token_tags)])]}];
+        const observedAt = this.now().toISOString();
+        traders = tradersRaw.list.slice(0, 100).flatMap((row, index) => {
+          const normalized = traderRow(row, target!, index + 1, observedAt, traderSort, 100); return normalized ? [normalized] : [];
         });
-        if (traders.length !== Math.min(tradersRaw.list.length, 20)) reason('GMGN_TRADERS_ROWS_INVALID');
-        this.history.captureTokenTraders(target, traders, {source: 'gmgn_token_profit_rank', observedAt: this.now().toISOString()});
+        if (traders.length !== Math.min(tradersRaw.list.length, 100)) reason('GMGN_TRADERS_ROWS_INVALID');
+        this.history.captureTokenTraders(target, traders, {source: `gmgn_token_${traderSort === 'profit' ? 'profit' : traderSort}_rank`, observedAt});
         report.accepted += traders.length;
       } else if (!halted && generation === this.generation) reason('GMGN_TRADERS_SCHEMA_INVALID');
       const info = await attempt('/v1/token/info', {chain: apiChain(chain), address: target.address}, 1);
@@ -350,14 +447,23 @@ export class WalletObserver {
         this.history.captureAnalysis(target, analysis, {source: 'gmgn_wallet_observer', observedAt: this.now().toISOString()});
       } else if (!halted && generation === this.generation) reason('GMGN_TOKEN_INFO_SCHEMA_INVALID');
       if (halted || generation !== this.generation) throw new ObserverHalt();
-      if (traders.length) {
-        const targetKey = `${chain}:${target.address}`, offset = this.walletCursor.get(targetKey) ?? 0;
-        const wallet = traders[offset % traders.length].address;
+      const candidates = traders.filter(row => row.researchCandidate).sort((a, b) => {
+        const checked = (row: WalletTokenTraderObservation) => this.walletChecks.get(`${targetKey}:${row.address}`) ?? -1;
+        return checked(a) - checked(b) || (earlyTurn ? (a.firstAcquiredAt ?? 'z').localeCompare(b.firstAcquiredAt ?? 'z') : 0) || a.rank - b.rank;
+      });
+      const wallet = this.pending?.wallets?.[0] ?? candidates[0]?.address;
+      if (wallet) {
+        this.retainPending({...target, kind: 'market', wallets: [wallet]});
         this.walletCursor.delete(targetKey); this.walletCursor.set(targetKey, offset + 1);
         if (this.walletCursor.size > 200) this.walletCursor.delete(this.walletCursor.keys().next().value!);
-        const activity = await attempt('/v1/user/wallet_activity', {chain: apiChain(chain), wallet_address: wallet, limit: 20}, 3);
+        const checkKey = `${targetKey}:${wallet}`;
+        this.walletChecks.delete(checkKey); this.walletChecks.set(checkKey, this.cursor);
+        if (this.walletChecks.size > 2_000) this.walletChecks.delete(this.walletChecks.keys().next().value!);
+        const activity = await attempt('/v1/user/wallet_activity', {chain: apiChain(chain), wallet_address: wallet,
+          ...(earlyTurn ? {token_address: target.address} : {}), limit: earlyTurn ? 100 : 20}, 3);
         if (activity !== undefined) {
-          const observedAt = this.now().toISOString(), parsed = normalizeWalletActivity(activity, chain, wallet, observedAt);
+          const observedAt = this.now().toISOString(), parsed = normalizeWalletActivity(activity, chain, wallet, observedAt,
+            earlyTurn ? target.address : undefined, earlyTurn ? 'gmgn_early_candidate_activity' : 'gmgn_wallet_activity');
           this.history.recordTrades(parsed.trades); report.accepted += parsed.trades.length;
           if (parsed.invalidReason) reason(parsed.invalidReason);
           else if (parsed.rejected) reason('WALLET_ACTIVITY_ROWS_INVALID');
@@ -375,12 +481,7 @@ export class WalletObserver {
         } else if (!halted && generation === this.generation) reason('GMGN_WALLET_STATS_SCHEMA_INVALID');
       }
     } catch (error) {if (!(error instanceof ObserverHalt)) reason('WALLET_HISTORY_WRITE_FAILED');}
-    finally {
-      if (target && generation === this.generation) {
-        try {this.history.markTargetChecked(target, this.now().toISOString());} catch {reason('WALLET_HISTORY_WRITE_FAILED');}
-      }
-    }
-    return this.finish(report, generation);
+    return report;
   }
 
   private async collectAssociation(anchor: AssociationTarget, report: WalletObserverCycle, request: ReadRequest,
@@ -407,18 +508,13 @@ export class WalletObserver {
         (raw.address === undefined || address(raw.address, chain) === target.address);
       const rows = valid ? (raw.list as unknown[]).slice(0, 100) : [];
       const traders = rows.flatMap((row, index) => {
-        if (!object(row) || !matchesChain(row, chain) ||
-            row.token_address !== undefined && address(row.token_address, chain) !== target.address ||
-            object(row.token) && address(row.token.address, chain) !== target.address) {rejected++; return [];}
-        const wallet = address(row.address, chain);
-        if (!wallet) {rejected++; return [];}
-        if (wallet !== anchor.anchorWallet && row.addr_type !== 2 && row.addr_type !== '2' && !row.exchange)
-          candidates.set(wallet, {wallet, firstAcquiredAt: eventTime(row.start_holding_at, observedAt)});
+        const normalized = traderRow(row, target, index + 1, observedAt, sort, 100);
+        if (!normalized || !object(row)) {rejected++; return [];}
+        const wallet = normalized.address;
+        if (wallet !== anchor.anchorWallet && normalized.researchCandidate)
+          candidates.set(wallet, {wallet, firstAcquiredAt: normalized.firstAcquiredAt});
         if (object(row.native_transfer)) this.captureFunding(target, wallet, row.native_transfer, observedAt, 'native_transfer');
-        return [{address: wallet, rank: index + 1, profitUsd: decimal(row.profit, true), realizedProfitUsd: decimal(row.realized_profit, true),
-          unrealizedProfitUsd: decimal(row.unrealized_profit, true), labels: [...new Set([...labels(row.tags), ...labels(row.maker_token_tags)])],
-          firstAcquiredAt: eventTime(row.start_holding_at, observedAt), exitedAt: eventTime(row.end_holding_at, observedAt),
-          buyVolumeUsd: decimal(row.buy_volume_cur), sellVolumeUsd: decimal(row.sell_volume_cur), balance: decimal(row.balance ?? row.amount_cur)}];
+        return [normalized];
       });
       if (valid) rejected += Math.max(0, (raw.list as unknown[]).length - 100);
       this.history.captureTokenTraders(target, traders, {source, observedAt}); report.accepted += traders.length;
@@ -455,7 +551,8 @@ export class WalletObserver {
     }
     this.associationCursor.delete(key); this.associationCursor.set(key, offset + Math.max(1, selected.length));
     if (this.associationCursor.size > 200) this.associationCursor.delete(this.associationCursor.keys().next().value!);
-    const wallets = anchor.historicalRelationship ? [...selected, anchor.anchorWallet] : [anchor.anchorWallet, ...selected];
+    const wallets = this.pending?.wallets ?? (anchor.historicalRelationship ? [...selected, anchor.anchorWallet] : [anchor.anchorWallet, ...selected]);
+    this.retainPending({...anchor, kind: 'association', wallets});
     for (const wallet of wallets) {
       // Once a candidate relation exists, observing its whole-wallet page can
       // discover a new token before a future public KOL buy. Keeping a token

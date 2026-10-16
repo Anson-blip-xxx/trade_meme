@@ -50,6 +50,7 @@ export interface Config extends z.infer<typeof schema> {
   meme?:{enabled:boolean;database:string;maxBytes:number;maxActive:number;activeWindowSec:number};
   ave?:{enabled:boolean;database:string;sessionPath:string;email?:string};
   corroboration?:{database:string;maxBytes:number};
+  tokenRankResearch?:{enabled:boolean;database:string;maxBytes:number;intervalSec:number;batchSize:number};
   watch:{enabled:boolean;windowSec:number;intervalSec:number;maxPerCycle:number};
   exitShadow:{enabled:boolean;database:string;maxBytes:number;staleAfterSec:number;maxPositions:number};
   chainStream:{enabled:boolean;database:string;maxBytes:number;maxWallets:number;maxPools:number;
@@ -150,6 +151,11 @@ export function readConfig(env:NodeJS.ProcessEnv=process.env): Config {
       maxBytes:z.coerce.number().int().min(16).max(16384).parse(env.WALLET_HISTORY_MAX_MB??512)*1024*1024,
       intervalSec:z.coerce.number().int().min(60).max(3600).parse(env.WALLET_OBSERVER_INTERVAL_SEC??300),
       maxRequestsPerCycle:z.coerce.number().int().min(1).max(10).parse(env.WALLET_OBSERVER_MAX_REQUESTS??9)},
+    tokenRankResearch:{enabled:z.enum(['true','false']).parse(env.TOKEN_RANK_RESEARCH_ENABLED??env.WALLET_RESEARCH_ENABLED??'false')==='true',
+      database:z.string().trim().refine(isPersistentOrderPath).parse(env.TOKEN_RANK_RESEARCH_DATABASE_PATH??`${env.WALLET_HISTORY_DATABASE_PATH??'data/wallet-history.sqlite'}.rank-research.sqlite`),
+      maxBytes:z.coerce.number().int().min(16).max(4096).parse(env.TOKEN_RANK_RESEARCH_MAX_MB??512)*1024*1024,
+      intervalSec:z.coerce.number().int().min(1).max(300).parse(env.TOKEN_RANK_RESEARCH_INTERVAL_SEC??15),
+      batchSize:z.coerce.number().int().min(1).max(2000).parse(env.TOKEN_RANK_RESEARCH_BATCH_SIZE??500)},
     walletProfiles:{enabled:z.enum(['true','false']).parse(env.WALLET_PROFILES_ENABLED??env.WALLET_RESEARCH_ENABLED??'false')==='true',
       database:z.string().trim().refine(isPersistentOrderPath).parse(env.WALLET_PROFILES_DATABASE_PATH??'data/wallet-profiles.sqlite'),
       maxBytes:z.coerce.number().int().min(16).max(4096).parse(env.WALLET_PROFILES_MAX_MB??512)*1024*1024,

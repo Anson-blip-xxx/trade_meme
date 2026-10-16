@@ -4,6 +4,7 @@ import {dirname} from 'node:path';
 import {createHash} from 'node:crypto';
 import bs58 from 'bs58';
 import {WalletAssociations,type WalletAssociationListOptions,type WalletAssociationTarget} from './wallet-associations.js';
+import {parseWalletObserverCursor,type WalletObserverCursorState} from './wallet-observer-state.js';
 export type {WalletAssociationSummary,WalletAssociationDetail,WalletAssociationStats,WalletAssociationTarget} from './wallet-associations.js';
 import type {Chain,Report} from './types.js';
 import type {WalletAnalysis,WalletRecord} from './research/wallet-types.js';
@@ -43,7 +44,8 @@ export interface WalletLeaderObservation {
 }
 export interface WalletTokenRankObservation {address:string;rank:number;interval:'1h';changeMetric:string|null;changeUnit:'vendor_unspecified';priceUsd?:number;}
 export interface WalletTokenTraderObservation {address:string;rank:number;profitUsd:string|null;realizedProfitUsd:string|null;unrealizedProfitUsd:string|null;labels?:string[];
-  firstAcquiredAt?:string;exitedAt?:string;buyVolumeUsd?:string|null;sellVolumeUsd?:string|null;balance?:string|null;}
+  firstAcquiredAt?:string;lastActiveAt?:string;exitedAt?:string;buyVolumeUsd?:string|null;sellVolumeUsd?:string|null;balance?:string|null;
+  rankScope?:'vendor_profit_order'|'vendor_unrealized_profit_order'|'vendor_buy_volume_order'|'vendor_sell_volume_order';sampleLimit?:20|100;}
 export interface WalletCollectionObservation {
   source:string;chain?:Chain;startedAt:string;completedAt:string;status:'ok'|'partial'|'cooldown'|'stopped';
   requests:number;accepted:number;rejected?:number;coverage:'one_page_sample';hasMore?:boolean|null;reason?:string;
@@ -174,6 +176,20 @@ export class WalletHistory {
   }
 
   recordTrade(input:WalletTradeObservation):void {this.recordTrades([input]);}
+
+  /** Bounded collector scheduling state, separate from all observed evidence. */
+  getWalletObserverCursor():WalletObserverCursorState|undefined {
+    const value=this.db.prepare("SELECT value FROM wh_meta WHERE key='wallet_observer_cursor_v1'").get()?.value;
+    if(typeof value!=='string'||Buffer.byteLength(value)>400_000)return;
+    try{return parseWalletObserverCursor(JSON.parse(value));}catch{return;}
+  }
+  setWalletObserverCursor(input:WalletObserverCursorState):boolean {
+    const value=parseWalletObserverCursor(input);if(!value)return false;
+    const serialized=JSON.stringify(value);
+    if(this.db.prepare("SELECT value FROM wh_meta WHERE key='wallet_observer_cursor_v1'").get()?.value===serialized)return this.error!==CAPACITY;
+    this.append(value,()=>this.db.prepare("INSERT INTO wh_meta(key,value) VALUES('wallet_observer_cursor_v1',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(serialized));
+    return this.error!==CAPACITY&&this.db.prepare("SELECT value FROM wh_meta WHERE key='wallet_observer_cursor_v1'").get()?.value===serialized;
+  }
   recordTrades(inputs:WalletTradeObservation[]):void {
     const normalized=Array.isArray(inputs)?inputs.slice(0,2_000).map(value=>this.trade(value)).filter((v):v is WalletTradeObservation=>!!v):[];
     if(!normalized.length) return;
@@ -295,8 +311,11 @@ export class WalletHistory {
       return [{chain:target.chain,wallet,tokenAddress:target.address,rank:row.rank,profitUsd:decimal(row.profitUsd),
         realizedProfitUsd:decimal(row.realizedProfitUsd),unrealizedProfitUsd:decimal(row.unrealizedProfitUsd),labels:labels(row.labels),
         firstAcquiredAt:at(row.firstAcquiredAt)&&at(row.firstAcquiredAt)!<=observed?at(row.firstAcquiredAt):undefined,
+        lastActiveAt:at(row.lastActiveAt)&&at(row.lastActiveAt)!<=observed?at(row.lastActiveAt):undefined,
         exitedAt:at(row.exitedAt)&&at(row.exitedAt)!<=observed?at(row.exitedAt):undefined,
         buyVolumeUsd:positiveDecimal(row.buyVolumeUsd),sellVolumeUsd:positiveDecimal(row.sellVolumeUsd),balance:positiveDecimal(row.balance),
+        rankScope:['vendor_profit_order','vendor_unrealized_profit_order','vendor_buy_volume_order','vendor_sell_volume_order'].includes(row.rankScope??'')?row.rankScope:undefined,
+        sampleLimit:row.sampleLimit===20||row.sampleLimit===100?row.sampleLimit:undefined,
         source:context.source,observedAt:observed,scope:'token_cumulative',verification:'vendor_claim'}];
     });
     this.append(values,()=>{this.putToken(target,observed);for(const value of values) {

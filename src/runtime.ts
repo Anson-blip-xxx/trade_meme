@@ -35,6 +35,7 @@ import {fetchMemeMarkets} from './meme-market-provider.js';
 import {SourceCorroboration} from './source-corroboration.js';
 import {AveScanner} from './ave-scanner.js';
 import {AveSessionClient} from './providers/ave-session.js';
+import {TokenRankResearchRunner} from './token-rank-runner.js';
 
 export function createRuntime(config:Config) {
   if(!isPersistentOrderPath(config.ordersDatabase)) throw new Error('PERSISTENT_ORDER_DATABASE_REQUIRED');
@@ -65,6 +66,10 @@ export function createRuntime(config:Config) {
     if(protectedPaths.some(existing=>sameDatabase(existing,path)))throw new Error('SOURCE_DATABASE_CONFLICT');
     protectedPaths.push(path);
   }
+  if(config.tokenRankResearch?.enabled&&[...protectedPaths,
+    ...(config.meme?[config.meme.database]:[]),...(config.corroboration?[config.corroboration.database]:[]),
+    ...(config.ave?[config.ave.database,config.ave.sessionPath]:[])].some(path=>sameDatabase(path,config.tokenRankResearch!.database)))
+    throw new Error('TOKEN_RANK_DATABASE_MUST_BE_SEPARATE');
   const providers=liveProviders(config,client);
   const archive=config.dashboard.enabled||config.watch.enabled||config.exitShadow.enabled||config.chainStream.enabled?new ScanArchive(config.dashboard.archivePath,{
     retentionDays:config.dashboard.retentionDays,trackingHours:config.dashboard.trackingHours,followupEnabled:true}):undefined;
@@ -103,6 +108,10 @@ export function createRuntime(config:Config) {
     catalyst:(signal,abort,snapshot)=>collectMemeCatalyst(signal,config,{signal:abort,snapshot}),
     corroboration:sourceEvidence?(token,now)=>sourceEvidence.assess(token,now):undefined,
     walletEvidence:(token,now)=>({evidence:walletHistory?.followupEvidence(token,new Date(now.getTime()-120000).toISOString(),now.toISOString())})}):undefined;
+  const tokenRankResearch=walletHistory&&config.tokenRankResearch?.enabled?new TokenRankResearchRunner({
+    ...config.tokenRankResearch,historyDatabase:config.walletResearch.database,
+    ...(memeObserver?{memeDatabase:config.meme!.database}:{}),
+    ...(sourceEvidence?{sourceDatabase:config.corroboration!.database}:{})}):undefined;
   const captureSource=(signal:Signal,at?:string,display?:{name?:string})=>{
     if(signal.source==='manual'||signal.source==='gmgn'&&!signal.sourceEventId.startsWith('gmgn:trade:'))return;
     try {
@@ -313,7 +322,7 @@ export function createRuntime(config:Config) {
     try {return {...exitShadow.summary(),captureError:exitCaptureError};}
     catch {return {enabled:true,mode:'shadow',liveReady:false,captureError:'EXIT_SHADOW_READ_FAILED'};}
   };
-  return {client,providers,store,orders,entry,scanner,debotScanner,debotStream,debotAuth,archive,tracking,walletHistory,walletObserver,walletResearchStatus,walletProfiles,walletProfilesStatus,walletScreening,watchRechecker,exitShadow,chainMonitor,chainStreamStatus,memeObserver,sourceEvidence,aveScanner,aveSession,
+  return {client,providers,store,orders,entry,scanner,debotScanner,debotStream,debotAuth,archive,tracking,walletHistory,walletObserver,walletResearchStatus,walletProfiles,walletProfilesStatus,walletScreening,watchRechecker,exitShadow,chainMonitor,chainStreamStatus,memeObserver,sourceEvidence,aveScanner,aveSession,tokenRankResearch,
     dashboardHome:()=>{
       const host=system?.get();
       return {now:new Date().toISOString(),entryMode:config.entryMode,stats:archive?.overviewStats(),
@@ -331,6 +340,7 @@ export function createRuntime(config:Config) {
       debotStream:debotStream?.getStatus(),
       meme:memeObserver?{...memeObserver.status(),captureError:memeCaptureError}:{enabled:false},
       ave:aveScanner?{...aveScanner.getStatus(),nominationCaptureError,session:aveSession?.getStatus()??{status:'required',authenticated:false,reason:'AVE_LOGIN_EMAIL_NOT_CONFIGURED'}}:{enabled:false},
+      tokenRankResearch:tokenRankResearch?.status()??{enabled:false},
       corroboration:sourceEvidence?{...sourceEvidence.status(),captureError:sourceCaptureError}:{enabled:false},
       tracking:tracking?.getStatus(),stats:archive?.stats(),archiveError:archiveCaptureError??store.observationError??archiveMaintenanceError,
       settings:dashboardSettings(config),balances:balances?.get()??[],system:system?.get(),walletResearch:walletResearchStatus(),exitProtection:protectionSummary(),chainStream:chainStreamStatus(),
@@ -342,7 +352,7 @@ export function createRuntime(config:Config) {
         for(const observation of debotScanner?.observationSeeds()??[])observeSignal(observation.signal,observation.observedAt,observation,false);
         memeObserver.start();
       }
-      chainMonitor?.start();tracking?.start();balances?.start();system?.start();walletProfiles?.start();walletScreening?.start(async signal=>{
+      chainMonitor?.start();tracking?.start();balances?.start();system?.start();walletProfiles?.start();tokenRankResearch?.start();walletScreening?.start(async signal=>{
         if(closed||active>=4||!config.gmgnApiKey?.trim()||client.cooldownUntil>Date.now()||scanner.getStatus().inFlight)return false;
         await onSignal(signal);
       });
@@ -374,6 +384,7 @@ export function createRuntime(config:Config) {
       await reconciler.stop();
       // Stop means no new work. Await current callback before closing its stores.
       while(active) await new Promise(resolve=>setTimeout(resolve,50));
+      await tokenRankResearch?.stop();
       await memeObserver?.close();
       await aveScanner?.close();sourceEvidence?.close();
       await walletScreening?.close();

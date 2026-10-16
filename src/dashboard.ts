@@ -50,6 +50,10 @@ export interface DashboardServices {
   sourceHistory?:(chain:Chain,address:string,options:{limit:number;offset:number;asOf?:string})=>unknown;
   memeSignals?:(options:DashboardPageOptions&{asOf?:string})=>unknown;
   memeDetail?:(chain:Chain,address:string,options:{limit:number;offset:number;asOf?:string})=>unknown;
+  tokenRankResearch?:(options:DashboardPageOptions&{asOf?:string})=>unknown;
+  tokenRankResearchDetail?:(chain:Chain,address:string,options:{limit:number;offset:number;asOf?:string})=>unknown;
+  tokenRankWallets?:(options:DashboardPageOptions&{asOf?:string;sort?:'early'|'realized'})=>unknown;
+  tokenRankWallet?:(chain:Chain,address:string,options:{limit:number;offset:number;asOf?:string})=>unknown;
   protectionDetail?:(id:string)=>unknown;
   walletHistory?:Pick<WalletHistory,'listWallets'|'getWallet'>;
   walletResearchStatus?:()=>unknown;
@@ -194,6 +198,14 @@ export function buildDashboard(config:Config,services:DashboardServices,assetDir
         send(res,200,services.memeSignals?.(options)??{now:new Date().toISOString(),asOf:options.asOf??new Date().toISOString(),
           status:{enabled:false},total:0,items:[],...options,hasMore:false});return;
       }
+      if(['/dashboard/api/token-rank-research','/dashboard/api/token-rank-research/wallets'].includes(url.pathname)){
+        const options={...pageOptions(url),...pageAsOf(url)};
+        if(options.asOf&&Date.parse(options.asOf)>Date.now())throw new Error('INVALID_FILTER');
+        const wallets=url.pathname.endsWith('/wallets'),sort=url.searchParams.get('sort')||undefined;
+        if(sort&&(!wallets||!['early','realized'].includes(sort)))throw new Error('INVALID_FILTER');
+        const result=wallets?services.tokenRankWallets?.({...options,...(sort?{sort:sort as 'early'|'realized'}:{})}):services.tokenRankResearch?.(options);
+        send(res,200,result??{now:new Date().toISOString(),asOf:options.asOf??new Date().toISOString(),ready:false,status:{enabled:false},total:0,items:[],...options,hasMore:false});return;
+      }
       if(url.pathname==='/dashboard/api/ave/signals'){
         const options={...pageOptions(url),...pageAsOf(url)};
         if(options.asOf&&Date.parse(options.asOf)>Date.now())throw new Error('INVALID_FILTER');
@@ -202,7 +214,9 @@ export function buildDashboard(config:Config,services:DashboardServices,assetDir
       }
       const memeMatch=url.pathname.match(/^\/dashboard\/api\/meme\/([^/]+)\/([^/]+)$/);
       const sourceMatch=url.pathname.match(/^\/dashboard\/api\/sources\/([^/]+)\/([^/]+)\/events$/);
-      const notificationMatch=memeMatch??sourceMatch??url.pathname.match(/^\/dashboard\/api\/debot\/tokens\/([^/]+)\/([^/]+)\/events$/);
+      const rankMatch=url.pathname.match(/^\/dashboard\/api\/token-rank-research\/([^/]+)\/([^/]+)$/);
+      const rankWalletMatch=url.pathname.match(/^\/dashboard\/api\/token-rank-research\/wallets\/([^/]+)\/([^/]+)$/);
+      const notificationMatch=memeMatch??sourceMatch??rankMatch??rankWalletMatch??url.pathname.match(/^\/dashboard\/api\/debot\/tokens\/([^/]+)\/([^/]+)\/events$/);
       if(notificationMatch){
         const chain=notificationMatch[1];let address:string;
         if(!['bsc','solana','robinhood'].includes(chain))throw new Error('INVALID_FILTER');
@@ -212,6 +226,11 @@ export function buildDashboard(config:Config,services:DashboardServices,assetDir
           else {if(!/^0x[0-9a-fA-F]{40}$/.test(address))throw new Error();address=address.toLowerCase();}
         }catch{throw new Error('INVALID_FILTER');}
         const options={...pageOptions(url),...pageAsOf(url)};
+        if(rankMatch||rankWalletMatch){
+          if(options.asOf&&Date.parse(options.asOf)>Date.now())throw new Error('INVALID_FILTER');
+          const result=rankWalletMatch?services.tokenRankWallet?.(chain as Chain,address,options):services.tokenRankResearchDetail?.(chain as Chain,address,options);
+          send(res,200,result??{[rankWalletMatch?'wallet':'token']:{chain,address},ready:false,asOf:options.asOf??new Date().toISOString(),total:0,items:[],...options,hasMore:false});return;
+        }
         if(memeMatch){send(res,200,services.memeDetail?.(chain as Chain,address,options)??{token:{chain,address},total:0,items:[],...options,hasMore:false});return;}
         if(sourceMatch){
           if(options.asOf&&Date.parse(options.asOf)>Date.now())throw new Error('INVALID_FILTER');

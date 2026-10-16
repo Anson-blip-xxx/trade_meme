@@ -26,6 +26,44 @@ async function fixture(overrides:Partial<DashboardServices>={}) {
 const login=(base:string,value=password,origin?:string)=>fetch(`${base}/dashboard/api/login`,{
   method:'POST',headers:{'content-type':'application/json',...(origin?{origin}:{})},body:JSON.stringify({password:value})});
 
+test('ranking research is authenticated and read-only with chain scoped stable pagination for tokens and wallets',async()=>{
+  const calls:unknown[]=[],headers={'x-dashboard-access':password},stamp='2026-10-15T08:00:00.000Z',address='0x'+'A'.repeat(40);
+  const page=(kind:string)=>(options:unknown)=>{calls.push({kind,options});return {items:[],total:0};};
+  const detail=(kind:string)=>(chain:string,address:string,options:unknown)=>{calls.push({kind,chain,address,options});return {items:[]};};
+  const f=await fixture({tokenRankResearch:page('tokens'),tokenRankWallets:page('wallets'),tokenRankResearchDetail:detail('token'),tokenRankWallet:detail('wallet'),
+    orders:()=>{throw new Error('RESEARCH_MUST_NOT_ACCESS_ORDERS');}});
+  try {
+    const routes=['token-rank-research','token-rank-research/wallets',`token-rank-research/bsc/${address}`,`token-rank-research/wallets/bsc/${address}`];
+    for(const route of routes){
+      assert.equal((await fetch(`${f.base}/dashboard/api/${route}`)).status,401);
+      for(const method of ['POST','PATCH','DELETE'])assert.equal((await fetch(`${f.base}/dashboard/api/${route}`,{method,headers})).status,405);
+      const res=await fetch(`${f.base}/dashboard/api/${route}?limit=7&offset=14&asOf=${stamp}${route===routes[0]?'&chain=bsc':route===routes[1]?'&chain=solana&sort=realized':''}`,{headers});
+      assert.equal(res.status,200);assert.equal(res.headers.get('cache-control'),'no-store');
+    }
+    assert.deepEqual(calls,[{kind:'tokens',options:{limit:7,offset:14,chain:'bsc',asOf:stamp}},
+      {kind:'wallets',options:{limit:7,offset:14,chain:'solana',asOf:stamp,sort:'realized'}},
+      {kind:'token',chain:'bsc',address:address.toLowerCase(),options:{limit:7,offset:14,asOf:stamp}},
+      {kind:'wallet',chain:'bsc',address:address.toLowerCase(),options:{limit:7,offset:14,asOf:stamp}}]);
+    for(const route of routes)for(const query of ['limit=0','limit=101','offset=-1','offset=1000001','chain=eth','asOf=invalid','asOf=2999-01-01T00:00:00.000Z'])
+      assert.equal((await fetch(`${f.base}/dashboard/api/${route}?${query}`,{headers})).status,400,`${route}?${query}`);
+    for(const route of ['token-rank-research?sort=realized','token-rank-research/wallets?sort=profit','token-rank-research/bsc/incomplete',`token-rank-research/wallets/eth/${address}`,`token-rank-research/solana/${address}`])
+      assert.equal((await fetch(`${f.base}/dashboard/api/${route}`,{headers})).status,400,route);
+    assert.equal(calls.length,4);
+  }finally{await f.close();}
+});
+
+test('unconfigured ranking research gives bounded empty pages and is not invoked by home',async()=>{
+  const headers={'x-dashboard-access':password},address='0x'+'1'.repeat(40),f=await fixture();
+  try {
+    for(const route of ['token-rank-research','token-rank-research/wallets',`token-rank-research/bsc/${address}`,`token-rank-research/wallets/bsc/${address}`]){
+      const data=await(await fetch(`${f.base}/dashboard/api/${route}?limit=5&offset=10`,{headers})).json();
+      assert.equal(data.ready,false);assert.deepEqual(data.items,[]);assert.equal(data.total,0);assert.equal(data.offset,10);assert.equal(data.limit,5);assert.equal(data.hasMore,false);assert.ok(Number.isFinite(Date.parse(data.asOf)));
+    }
+  }finally{await f.close();}
+  const isolated=await fixture({home:()=>({compact:true}),tokenRankResearch:()=>{throw new Error('MUST_BE_LAZY');},tokenRankWallets:()=>{throw new Error('MUST_BE_LAZY');}});
+  try{assert.deepEqual(await(await fetch(`${isolated.base}/dashboard/api/home`,{headers})).json(),{compact:true});}finally{await isolated.close();}
+});
+
 test('Ave signal pages and token source history are authenticated read-only bounded routes with stable filters',async()=>{
   const calls:unknown[]=[],headers={'x-dashboard-access':password},stamp='2026-10-15T08:00:00.000Z',address='0x'+'A'.repeat(40);
   const f=await fixture({aveSignals:options=>{calls.push({kind:'ave',...options});return {items:[],total:0};},

@@ -10,6 +10,7 @@ import type {WalletScreeningReport} from './wallet-screening.js';
 import {assessMeme,normalizeMemeMarket,sanitizeMemeMarketSample,type MemeMarketSample,type MemeAssessment} from './meme-assessment.js';
 import type {MemeCatalystSnapshot} from './meme-catalyst.js';
 import type {GmgnTokenSnapshot} from './providers/gmgn-safety.js';
+import type {SourceCorroborationAssessment} from './source-corroboration.js';
 
 type Token=Signal['token'];
 type Row=Record<string,any>;
@@ -21,6 +22,7 @@ export interface MemeObserverOptions {
   catalyst?:(signal:Signal,abort:AbortSignal,context?:GmgnTokenSnapshot)=>Promise<MemeCatalystSnapshot>;
   walletEvidence?:(token:Token,now:Date,signal:Signal)=>{evidence?:FollowupWalletEvidence;setups?:WalletScreeningReport};
   cooldownUntil?:()=>number;
+  corroboration?:(token:Token,now:Date)=>SourceCorroborationAssessment;
 }
 const hash=(v:unknown)=>createHash('sha256').update(JSON.stringify(v)).digest('hex');
 const parse=<T>(v:unknown):T|undefined=>{try{return v?JSON.parse(String(v)) as T:undefined;}catch{return;}};
@@ -65,6 +67,8 @@ export class MemeObserver {
         data TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS meme_catalysts_token ON meme_catalysts(chain,address,observed_at DESC);
       CREATE TABLE IF NOT EXISTS meme_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);`);
+    if(!this.db.prepare('PRAGMA table_info(meme_snapshots)').all().some(row=>row.name==='corroboration'))
+      this.db.exec('ALTER TABLE meme_snapshots ADD COLUMN corroboration TEXT');
     const pageSize=Number(this.db.prepare('PRAGMA page_size').get()!.page_size);
     this.db.exec(`PRAGMA max_page_count=${Math.floor(maxBytes/pageSize)}`);
     if(options.database!==':memory:')chmodSync(options.database,0o600);
@@ -134,10 +138,12 @@ export class MemeObserver {
       catalyst:parse<MemeCatalystSnapshot>(row.catalyst),walletEvidence:evidence.evidence,walletSetups:evidence.setups??parse<WalletScreeningReport>(row.wallet_context),
       previous:parse<MemeAssessment>(row.assessment)});
     const fingerprint=hash([token,sample.source,sample.observedAt]);
+    let corroboration:SourceCorroborationAssessment|undefined;
+    try{corroboration=this.options.corroboration?.(token,new Date(assessment.assessedAt));}catch{/* Unknown source coverage never alters safety or score. */}
     this.db.exec('SAVEPOINT meme_market');
     try {
-      this.db.prepare('INSERT INTO meme_snapshots(chain,address,observed_at,source,fingerprint,market,assessment) VALUES(?,?,?,?,?,?,?)')
-        .run(token.chain,token.address,sample.observedAt,sample.source,fingerprint,JSON.stringify(sample),JSON.stringify(assessment));
+      this.db.prepare('INSERT INTO meme_snapshots(chain,address,observed_at,source,fingerprint,market,assessment,corroboration) VALUES(?,?,?,?,?,?,?,?)')
+        .run(token.chain,token.address,sample.observedAt,sample.source,fingerprint,JSON.stringify(sample),JSON.stringify(assessment),corroboration?JSON.stringify(corroboration):null);
       this.db.prepare('UPDATE meme_tokens SET market=?,assessment=?,last_sample_at=?,sample_count=sample_count+1,error=NULL WHERE chain=? AND address=?')
         .run(JSON.stringify(sample),JSON.stringify(assessment),sample.observedAt,token.chain,token.address);
       this.db.exec('RELEASE meme_market');return true;
@@ -157,7 +163,10 @@ export class MemeObserver {
   private project(row:Row,active:Set<string>,full=false){
     const token={chain:row.chain as Chain,address:String(row.address)},now=this.now().getTime();
     const catalyst=parse<MemeCatalystSnapshot>(row.catalyst);
+    let corroboration:SourceCorroborationAssessment|undefined;
+    try{corroboration=this.options.corroboration?.(token,this.now());}catch{/* Independent source history remains optional. */}
     return {...token,name:row.name??undefined,symbol:row.symbol??undefined,firstSeenAt:row.first_seen_at,lastSignalAt:row.last_signal_at,
+      corroboration,
       lastSampleAt:row.last_sample_at??undefined,nextSampleAt:row.market_attempt_at?iso(time(row.market_attempt_at)+30000):undefined,
       observationState:time(row.last_signal_at)<now-this.windowMs?'expired':active.has(tokenKey(token))?'active':'waiting',
       sampleCount:Number(row.sample_count),stale:!row.last_sample_at||now-time(row.last_sample_at)>120000,
@@ -189,6 +198,7 @@ export class MemeObserver {
     const active=new Set(this.activeRows().map(r=>tokenKey({chain:r.chain,address:r.address})));
     return {token:row?this.project(row,active,true):{...token,observationState:'waiting',sampleCount:0},asOf,total,limit,offset,hasMore:offset+rows.length<total,
       items:rows.map(r=>({id:r.id,observedAt:r.observed_at,source:r.source,market:parse(r.market),assessment:parse(r.assessment),
+        corroboration:parse<SourceCorroborationAssessment>(r.corroboration),
         outcomes:this.outcomes(r,asOf)})),catalystHistory:this.db.prepare('SELECT observed_at,data FROM meme_catalysts WHERE chain=? AND address=? AND observed_at<=? ORDER BY observed_at DESC LIMIT 6')
         .all(token.chain,token.address,asOf).map(r=>({observedAt:r.observed_at,snapshot:parse(r.data)}))};
   }

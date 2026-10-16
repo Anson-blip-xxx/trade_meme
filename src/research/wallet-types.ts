@@ -112,5 +112,5 @@ export interface WalletAnalysisOptions {
 
 /** A vendor's nomination for bounded research; never ownership, smart-wallet or trade evidence. */
 export interface VendorWalletTargets {
-  provider:'debot';token:Signal['token'];checkedAt:string;addresses:string[];
+  provider:'debot'|'ave';token:Signal['token'];checkedAt:string;addresses:string[];
 }

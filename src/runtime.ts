@@ -4,7 +4,7 @@ import {Store} from './store.js';
 import {OrderStore} from './orders.js';
 import {EntryController} from './entry.js';
 import {GmgnClient} from './providers/gmgn-client.js';
-import {GmgnScanner} from './scanner.js';
+import {GmgnScanner,normalizeGmgnTrades} from './scanner.js';
 import {DebotScanner} from './debot-scanner.js';
 import {DebotStream} from './debot-stream.js';
 import {DebotSessionClient,DebotSessionError} from './providers/debot-session.js';
@@ -32,6 +32,9 @@ import {MemeObserver} from './meme-observer.js';
 import {normalizeMemeMarket} from './meme-assessment.js';
 import {collectMemeCatalyst} from './meme-catalyst.js';
 import {fetchMemeMarkets} from './meme-market-provider.js';
+import {SourceCorroboration} from './source-corroboration.js';
+import {AveScanner} from './ave-scanner.js';
+import {AveSessionClient} from './providers/ave-session.js';
 
 export function createRuntime(config:Config) {
   if(!isPersistentOrderPath(config.ordersDatabase)) throw new Error('PERSISTENT_ORDER_DATABASE_REQUIRED');
@@ -54,6 +57,14 @@ export function createRuntime(config:Config) {
     config.walletProfiles.database,config.walletScreening.database,config.chainStream.database,config.exitShadow.database,
     config.debotSignalsDatabase,config.debotSessionPath].some(path=>sameDatabase(path,config.meme!.database)))
     throw new Error('MEME_DATABASE_CONFLICT');
+  const protectedPaths=[config.ordersDatabase,config.dashboard.archivePath,config.walletResearch.database,config.walletProfiles.database,
+    config.walletScreening.database,config.chainStream.database,config.exitShadow.database,config.debotSignalsDatabase,config.debotSessionPath,
+    ...(config.meme?.enabled?[config.meme.database]:[])];
+  for(const path of [...(config.corroboration&&(config.meme?.enabled||config.ave?.enabled)?[config.corroboration.database]:[]),
+    ...(config.ave?.enabled?[config.ave.database,config.ave.sessionPath]:[])]){
+    if(protectedPaths.some(existing=>sameDatabase(existing,path)))throw new Error('SOURCE_DATABASE_CONFLICT');
+    protectedPaths.push(path);
+  }
   const providers=liveProviders(config,client);
   const archive=config.dashboard.enabled||config.watch.enabled||config.exitShadow.enabled||config.chainStream.enabled?new ScanArchive(config.dashboard.archivePath,{
     retentionDays:config.dashboard.retentionDays,trackingHours:config.dashboard.trackingHours,followupEnabled:true}):undefined;
@@ -75,6 +86,9 @@ export function createRuntime(config:Config) {
     intervalMs:config.walletResearch.intervalSec*1000,maxRequestsPerCycle:config.walletResearch.maxRequestsPerCycle}):undefined;
   let archiveCaptureError:string|undefined,walletCaptureError:string|undefined,walletIndexError:string|undefined,associationIndexError:string|undefined;
   let memeCaptureError:string|undefined;
+  let sourceCaptureError:string|undefined,nominationCaptureError:string|undefined;
+  const sourceEvidence=config.corroboration&&(config.meme?.enabled||config.ave?.enabled)
+    ?new SourceCorroboration(config.corroboration.database,{maxBytes:config.corroboration.maxBytes}):undefined;
   let backgroundGmgnAbort:AbortController|undefined;
   const memeObserver=config.meme?.enabled?new MemeObserver({...config.meme,marketBatch:fetchMemeMarkets,
     ...(config.gmgnApiKey?.trim()?{marketFallback:async(token:Signal['token'],abort:AbortSignal)=>{
@@ -87,8 +101,22 @@ export function createRuntime(config:Config) {
       }finally{backgroundGmgnAbort=undefined;}
     }}:{}),cooldownUntil:()=>client.cooldownUntil,
     catalyst:(signal,abort,snapshot)=>collectMemeCatalyst(signal,config,{signal:abort,snapshot}),
+    corroboration:sourceEvidence?(token,now)=>sourceEvidence.assess(token,now):undefined,
     walletEvidence:(token,now)=>({evidence:walletHistory?.followupEvidence(token,new Date(now.getTime()-120000).toISOString(),now.toISOString())})}):undefined;
-  const observeSignal=(signal:Signal,at?:string,display?:{name?:string;symbol?:string})=>{
+  const captureSource=(signal:Signal,at?:string,display?:{name?:string})=>{
+    if(signal.source==='manual'||signal.source==='gmgn'&&!signal.sourceEventId.startsWith('gmgn:trade:'))return;
+    try {
+      // This exact template is emitted by normalizeGmgnTrades only. The source
+      // ledger validates reference formats again and never promotes ownership.
+      const trade=signal.source==='gmgn'?/^GMGN 链上买入记录；交易 ([A-Za-z0-9]+)；钱包 ([A-Za-z0-9]+)；CA /.exec(signal.text):null;
+      const capture=sourceEvidence?.record(signal,at,{name:display?.name,
+        ...(trade?{txRefs:[{txHash:trade[1],wallet:trade[2],side:'buy' as const}]}:{}),
+        sourceUrl:signal.source==='ave'?'https://ave.ai/smart':signal.source==='debot'?'https://debot.ai/':'https://gmgn.ai/'});
+      sourceCaptureError=capture?.accepted===false?capture.reason:undefined;
+    }catch{sourceCaptureError='SOURCE_EVIDENCE_CAPTURE_FAILED';}
+  };
+  const observeSignal=(signal:Signal,at?:string,display?:{name?:string;symbol?:string},recordSource=true)=>{
+    if(recordSource)captureSource(signal,at,display);
     try{memeObserver?.register(signal,at,display);memeCaptureError=undefined;}catch{memeCaptureError='MEME_SIGNAL_CAPTURE_FAILED';}
   };
   const store=new Store(':memory:',item=>{
@@ -145,7 +173,7 @@ export function createRuntime(config:Config) {
   const onSignal=async(signal:Signal,firstReceivedAt?:string,context?:{detailsReady:Promise<void>;repeat?:boolean}):Promise<void>=>{
     backgroundGmgnAbort?.abort();
     if(closed||active>=4) throw new Error('RESEARCH_BUSY');
-    observeSignal(signal,firstReceivedAt);
+    observeSignal(signal,firstReceivedAt,undefined,false);
     store.prune(config.researchCacheTtlSec,config.researchCacheMax);
     const reserved=store.reserve(signal,undefined,'notification_copy',firstReceivedAt);
     if(reserved.conflict) throw new Error('EVENT_ID_PAYLOAD_CONFLICT');
@@ -158,14 +186,32 @@ export function createRuntime(config:Config) {
         ...(signal.source==='debot'?{onProgress:progress=>debotScanner?.recordProgress(signal.sourceEventId,progress)}:{})});
       if(!store.finish(item.id,report,item.claimId!)) throw new Error('PROCESSING_CLAIM_EXPIRED');
       if(signal.source==='debot')debotScanner?.recordReport(signal.sourceEventId,report);
+      if(signal.source==='ave')aveScanner?.recordReport(signal.sourceEventId,report);
       if(!closed)await entry.consider(report);
     } catch(error) {store.interrupt(item.id,item.claimId!);throw error;}
     finally {active--;}
   };
   const scanner=new GmgnScanner({client,chains:config.scannerChains,intervalMs:config.scannerIntervalSec*1000,
     maxAgeSec:config.maxSignalAgeSec,maxSignalsPerCycle:config.scannerMaxSignals,onSignal,
-    ...(walletObserver?{onFeed:walletObserver.observeFeed.bind(walletObserver)}:{})});
+    onFeed:page=>{
+      if(!page.errorReason)for(const signal of normalizeGmgnTrades(page.payload,page.chain,page.kind,
+        {now:new Date(page.fetchedAt),maxAgeSec:config.maxSignalAgeSec}))captureSource(signal,page.fetchedAt);
+      walletObserver?.observeFeed(page);
+    }});
   let debotAuth:DebotAuthManager|undefined;
+  const aveSession=config.ave?.enabled&&config.ave.email?new AveSessionClient({path:config.ave.sessionPath,email:config.ave.email}):undefined;
+  const aveScanner=config.ave?.enabled?new AveScanner({database:config.ave.database,chains:config.scannerChains,
+    fetcher:aveSession?.fetcher,onObservation:observation=>{
+      try {
+        const captured=walletHistory?.captureVendorNominations(observation.signal.token,{source:'ave',
+          eventId:observation.signal.sourceEventId,occurredAt:observation.signal.occurredAt,observedAt:observation.observedAt,
+          wallets:observation.vendorWallets??[]});
+        nominationCaptureError=captured?.reason;
+      }catch{nominationCaptureError='WALLET_NOMINATION_CAPTURE_FAILED';}
+      observeSignal(observation.signal,observation.observedAt,observation);
+    },
+    onSignal,shouldDefer:()=>closed?'SERVICE_STOPPING':!config.gmgnApiKey?.trim()?'GMGN_API_KEY_MISSING':
+      client.cooldownUntil>Date.now()?'GMGN_RATE_LIMITED':active>=2?'RESEARCH_BUSY':scanner.getStatus().inFlight?'SCANNER_BUSY':undefined}):undefined;
   const debotSession=config.debotScannerEnabled&&config.debotTransport==='authenticated_stream'?new DebotSessionClient({
     path:config.debotSessionPath,onAuthRequired:()=>{debotAuth?.setAuthenticated(false);debotStream?.invalidateSession();}}):undefined;
   const debotScanner:DebotScanner|undefined=config.debotScannerEnabled?new DebotScanner({database:config.debotSignalsDatabase,mode:config.debotTransport,
@@ -197,9 +243,9 @@ export function createRuntime(config:Config) {
     sessionPath:config.debotSessionPath,onAuthenticated:async()=>{
       await debotStream.stop();if(!closed)void debotStream.start();
     }});
-  if(debotScanner)providers.research=researchProvider(config,client,undefined,{
+  if(debotScanner||aveScanner)providers.research=researchProvider(config,client,undefined,{
     ...(walletScreening?{walletTargets:(signal:Signal)=>walletScreening.researchTargets(signal)}:{}),
-    vendorWalletTargets:signal=>debotScanner.vendorWalletTargets(signal)});
+    vendorWalletTargets:signal=>signal.source==='ave'?aveScanner?.vendorWalletTargets(signal):debotScanner?.vendorWalletTargets(signal)});
   const watchRechecker=archive&&config.watch.enabled?new WatchRechecker({archive,
     intervalMs:config.watch.intervalSec*1000,maxPerCycle:config.watch.maxPerCycle,
     shouldDefer:()=>closed?'SERVICE_STOPPING':!config.gmgnApiKey?.trim()?'GMGN_API_KEY_MISSING':
@@ -267,7 +313,7 @@ export function createRuntime(config:Config) {
     try {return {...exitShadow.summary(),captureError:exitCaptureError};}
     catch {return {enabled:true,mode:'shadow',liveReady:false,captureError:'EXIT_SHADOW_READ_FAILED'};}
   };
-  return {client,providers,store,orders,entry,scanner,debotScanner,debotStream,debotAuth,archive,tracking,walletHistory,walletObserver,walletResearchStatus,walletProfiles,walletProfilesStatus,walletScreening,watchRechecker,exitShadow,chainMonitor,chainStreamStatus,memeObserver,
+  return {client,providers,store,orders,entry,scanner,debotScanner,debotStream,debotAuth,archive,tracking,walletHistory,walletObserver,walletResearchStatus,walletProfiles,walletProfilesStatus,walletScreening,watchRechecker,exitShadow,chainMonitor,chainStreamStatus,memeObserver,sourceEvidence,aveScanner,aveSession,
     dashboardHome:()=>{
       const host=system?.get();
       return {now:new Date().toISOString(),entryMode:config.entryMode,stats:archive?.overviewStats(),
@@ -284,6 +330,8 @@ export function createRuntime(config:Config) {
       debotScanner:debotScanner?.getStatus()??{enabled:false,running:false},
       debotStream:debotStream?.getStatus(),
       meme:memeObserver?{...memeObserver.status(),captureError:memeCaptureError}:{enabled:false},
+      ave:aveScanner?{...aveScanner.getStatus(),nominationCaptureError,session:aveSession?.getStatus()??{status:'required',authenticated:false,reason:'AVE_LOGIN_EMAIL_NOT_CONFIGURED'}}:{enabled:false},
+      corroboration:sourceEvidence?{...sourceEvidence.status(),captureError:sourceCaptureError}:{enabled:false},
       tracking:tracking?.getStatus(),stats:archive?.stats(),archiveError:archiveCaptureError??store.observationError??archiveMaintenanceError,
       settings:dashboardSettings(config),balances:balances?.get()??[],system:system?.get(),walletResearch:walletResearchStatus(),exitProtection:protectionSummary(),chainStream:chainStreamStatus(),
       watchRecheck:watchRechecker?{enabled:true,...watchRechecker.getStatus()}:{enabled:false}}),
@@ -291,7 +339,7 @@ export function createRuntime(config:Config) {
     start(){
       if(closed) return;
       if(memeObserver){
-        for(const observation of debotScanner?.observationSeeds()??[])observeSignal(observation.signal,observation.observedAt,observation);
+        for(const observation of debotScanner?.observationSeeds()??[])observeSignal(observation.signal,observation.observedAt,observation,false);
         memeObserver.start();
       }
       chainMonitor?.start();tracking?.start();balances?.start();system?.start();walletProfiles?.start();walletScreening?.start(async signal=>{
@@ -305,6 +353,7 @@ export function createRuntime(config:Config) {
       if(config.gmgnApiKey?.trim())walletObserver?.start();
       if(config.scannerEnabled&&config.gmgnApiKey?.trim()) scanner.start();
       debotScanner?.start();
+      aveScanner?.start();
       if(debotStream) {
         void debotStream.start();
         debotSyncTimer=setInterval(()=>{if(debotStream.getStatus().authorized)void debotScanner?.runOnce();},60_000);
@@ -319,12 +368,14 @@ export function createRuntime(config:Config) {
     async close(){
       if(closed) return;closed=true;scanner.stop();clearInterval(sweep);clearInterval(reconcileTimer);clearInterval(walletIndexTimer);clearInterval(debotSyncTimer);
       await debotStream?.stop();
+      await aveScanner?.stop();
       await Promise.all([chainMonitor?.stop(),tracking?.stop(),balances?.stop(),walletObserver?.stop(),system?.stop(),watchRechecker?.stop(),debotScanner?.stop()]);
       await walletIndexWork;
       await reconciler.stop();
       // Stop means no new work. Await current callback before closing its stores.
       while(active) await new Promise(resolve=>setTimeout(resolve,50));
       await memeObserver?.close();
+      await aveScanner?.close();sourceEvidence?.close();
       await walletScreening?.close();
       await walletProfiles?.stop();
       await debotScanner?.close();

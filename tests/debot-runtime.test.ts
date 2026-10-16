@@ -13,7 +13,7 @@ test('DeBot collection reaches existing research and dashboard with original rec
   const directory=mkdtempSync(join(tmpdir(),'debot-runtime-'));
   const config=readConfig({DEBOT_SCANNER_ENABLED:'true',DEBOT_TRANSPORT:'anonymous_poll',DEBOT_SIGNALS_DATABASE_PATH:join(directory,'debot.sqlite'),
     ORDERS_DATABASE_PATH:join(directory,'orders.sqlite'),DASHBOARD_ENABLED:'true',SCAN_DATABASE_PATH:join(directory,'scans.sqlite'),
-    MEME_DATABASE_PATH:join(directory,'meme.sqlite'),SCANNER_CHAINS:'bsc',GMGN_API_KEY:'test-key-no-network',ENTRY_MODE:'off'});
+    SOURCE_EVIDENCE_DATABASE_PATH:join(directory,'sources.sqlite'),MEME_DATABASE_PATH:join(directory,'meme.sqlite'),SCANNER_CHAINS:'bsc',GMGN_API_KEY:'test-key-no-network',ENTRY_MODE:'off'});
   const originalFetch=globalThis.fetch;
   const token='0x'+'a'.repeat(40),created=Math.floor(Date.now()/1000)-120;
   let requests=0;

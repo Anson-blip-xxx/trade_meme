@@ -330,7 +330,7 @@ export async function analyzeWallets(signal: Signal, tokenInfo: unknown, client:
   let vendorRejection:string|undefined;
   if(vendor!==undefined) {
     const checkedAt=object(vendor)&&typeof vendor.checkedAt==='string'?Date.parse(vendor.checkedAt):NaN;
-    if(!validInfo||!object(vendor)||vendor.provider!=='debot'||!object(vendor.token)||vendor.token.chain!==chain||
+    if(!validInfo||!object(vendor)||!['debot','ave'].includes(vendor.provider)||!object(vendor.token)||vendor.token.chain!==chain||
       !address(vendor.token.address,chain)||address(vendor.token.address,chain)!==address(signal.token.address,chain)||
       /^0x0{40}$/i.test(signal.token.address)||signal.token.address==='11111111111111111111111111111111')
       vendorRejection='VENDOR_WALLET_TARGET_SCOPE_INVALID';
@@ -413,12 +413,12 @@ export async function analyzeWallets(signal: Signal, tokenInfo: unknown, client:
       ...(plan?{researchTargets:{source:'local_observations',requested:localTargetAddresses,selected:localTargetAddresses.filter(a=>selectedAddresses.has(a)),
         deferred:localTargetAddresses.filter(a=>!selectedAddresses.has(a)),balanceQueries:[...balanceNeeded].filter(a=>localTargetAddresses.includes(a)),truncated:plan.truncated,
         requestBudget:max*2,plannedRequests:max*2-requestsRemaining,weightedBudget:max*6,plannedWeight}}:{}),
-      ...(vendor!==undefined?{vendorWalletTargets:{provider:'debot',scope:'research_nomination_only',requested:vendorAddresses,
+      ...(vendor!==undefined?{vendorWalletTargets:{provider:vendor.provider,scope:'research_nomination_only',requested:vendorAddresses,
         selected:vendorAddresses.filter(a=>selectedAddresses.has(a)),deferred:vendorAddresses.filter(a=>!selectedAddresses.has(a)),
         balanceQueries:[...balanceNeeded].filter(a=>vendorAddresses.includes(a)),
         ...(vendorRejection?{reason:vendorRejection}:{}),requestBudget:max*2,plannedRequests:max*2-requestsRemaining,
         weightedBudget:max*6,plannedWeight,ownershipProven:false,buyEvidence:false,qualifiesAsSmart:false,
-        note:'DeBot 提名仅安排查询；钱包归属、聪明钱包资格及买入支持仍由独立研究判定。'}}:{}),
+        note:'供应商提名仅安排查询；钱包归属、聪明钱包资格及买入支持仍由独立研究判定。'}}:{}),
       sampleOnly: true, developerAddress: developer, developerFundingAddress: developerFunder, developerSource: 'vendor_claim',
       scopeBinding: 'chain_and_token_request_with_response_checks', realPersonIdentityVerified: false,
       rawResponses: raw, documentation: ['https://github.com/GMGNAI/gmgn-skills/blob/main/skills/gmgn-token/SKILL.md',

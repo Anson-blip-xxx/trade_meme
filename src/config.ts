@@ -48,6 +48,8 @@ export interface Config extends z.infer<typeof schema> {
   walletProfiles:{enabled:boolean;database:string;maxBytes:number;intervalSec:number;batchSize:number};
   walletScreening:{enabled:boolean;database:string;maxBytes:number};
   meme?:{enabled:boolean;database:string;maxBytes:number;maxActive:number;activeWindowSec:number};
+  ave?:{enabled:boolean;database:string;sessionPath:string;email?:string};
+  corroboration?:{database:string;maxBytes:number};
   watch:{enabled:boolean;windowSec:number;intervalSec:number;maxPerCycle:number};
   exitShadow:{enabled:boolean;database:string;maxBytes:number;staleAfterSec:number;maxPositions:number};
   chainStream:{enabled:boolean;database:string;maxBytes:number;maxWallets:number;maxPools:number;
@@ -129,7 +131,13 @@ export function readConfig(env:NodeJS.ProcessEnv=process.env): Config {
       retentionDays:z.coerce.number().int().min(1).max(365).parse(env.SCAN_RETENTION_DAYS??30),
       trackingHours:z.coerce.number().int().min(1).max(168).parse(env.PRICE_TRACKING_HOURS??24),
       sampleIntervalSec:z.coerce.number().int().min(30).max(3600).parse(env.PRICE_SAMPLE_INTERVAL_SEC??60)},
-    meme:{enabled:z.enum(['true','false']).parse(env.MEME_OBSERVER_ENABLED??env.DEBOT_SCANNER_ENABLED??'false')==='true',
+    ave:{enabled:z.enum(['true','false']).parse(env.AVE_SCANNER_ENABLED??'false')==='true',
+      database:z.string().trim().refine(isPersistentOrderPath).parse(env.AVE_SIGNALS_DATABASE_PATH??'data/ave-signals.sqlite'),
+      sessionPath:z.string().trim().refine(isPersistentOrderPath).parse(env.AVE_SESSION_PATH??'data/ave/session.json'),
+      email:env.AVE_LOGIN_EMAIL?.trim()?z.string().trim().email().max(254).parse(env.AVE_LOGIN_EMAIL):undefined},
+    corroboration:{database:z.string().trim().refine(isPersistentOrderPath).parse(env.SOURCE_EVIDENCE_DATABASE_PATH??'data/source-corroboration.sqlite'),
+      maxBytes:z.coerce.number().int().min(16).max(1024).parse(env.SOURCE_EVIDENCE_MAX_MB??128)*1024*1024},
+    meme:{enabled:z.enum(['true','false']).parse(env.MEME_OBSERVER_ENABLED??(env.DEBOT_SCANNER_ENABLED==='true'||env.AVE_SCANNER_ENABLED==='true'?'true':'false'))==='true',
       database:z.string().trim().refine(isPersistentOrderPath).parse(env.MEME_DATABASE_PATH??'data/meme-observations.sqlite'),
       maxBytes:z.coerce.number().int().min(16).max(4096).parse(env.MEME_MAX_MB??1024)*1024*1024,
       maxActive:z.coerce.number().int().min(1).max(300).parse(env.MEME_MAX_ACTIVE??180),

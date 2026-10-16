@@ -12,6 +12,16 @@ import type {WalletPressure,WalletPressureTrade,WalletTradeSource} from './adapt
 export interface WalletHistoryToken {chain:Chain;address:string;}
 export interface WalletHistoryOptions {maxBytes?:number;now?:()=>Date;}
 export interface WalletHistoryContext {source:string;observedAt:string;}
+export interface WalletVendorNominationInput {
+  source:'ave';eventId:string;occurredAt:string;observedAt:string;
+  wallets:{address:string;alias?:string;side?:'buy'|'sell';lastTradeAt?:string;chain?:Chain;tokenAddress?:string}[];
+}
+/** A durable provider nomination, separate from trades, performance, labels and ownership. */
+export interface WalletVendorNomination {
+  chain:Chain;wallet:string;tokenAddress:string;source:'ave';eventId:string;occurredAt:string;observedAt:string;
+  alias?:string;side?:'buy'|'sell';lastTradeAt?:string;
+  verification:'vendor_report';scope:'research_nomination_only';ownershipProven:false;buyEvidence:false;qualifiesAsSmart:false;
+}
 export interface WalletTradeObservation {
   chain:Chain;wallet:string;tokenAddress:string;txHash:string;
   side:'buy'|'sell'|'transferIn'|'transferOut'|'add'|'remove';eventAt:string;observedAt:string;
@@ -71,14 +81,15 @@ export interface WalletHistorySummary {
 export interface WalletHistoryDetail {
   wallet:WalletHistorySummary;timeline:WalletHistoryEvent[];holdings:WalletHoldingSnapshot[];fundingEdges:WalletFundingEdge[];
   vendorStats:WalletVendorStats[];gains:WalletGainEvidence[];
+  vendorNominations?:WalletVendorNomination[];
   tokenTraderSnapshots:({chain:Chain;wallet:string;tokenAddress:string;source:string;observedAt:string;scope:'token_cumulative';verification:'vendor_claim'}&Omit<WalletTokenTraderObservation,'address'>)[];
   coordinationEvidence:{sharedFunding:{address:string;wallet:string;observedAt:string}[];
     synchronized:{wallet:string;tokenAddress:string;distinctTransactions:number;windowSeconds:120}[]};
-  coverage:{sampleOnly:true;exactRealizedPnl:false;eventCount:number;observationCount:number;firstObservedAt:string;lastObservedAt:string};
+  coverage:{sampleOnly:true;exactRealizedPnl:false;eventCount:number;observationCount:number;nominationCount?:number;firstObservedAt:string;lastObservedAt:string};
 }
 export interface WalletHistoryListOptions {chain?:Chain;sort?:'profit'|'gain'|'coordination'|'recent';search?:string;limit?:number;offset?:number;}
 export interface WalletHistoryStats {
-  wallets:number;events:number;observations:number;tokens:number;prices:number;snapshots:number;fundingLinks:number;collections:number;coordinationPending:number;
+  wallets:number;events:number;observations:number;tokens:number;prices:number;snapshots:number;fundingLinks:number;collections:number;nominations?:number;coordinationPending:number;
   firstObservedAt?:string;lastObservedAt?:string;bytes:number;maxBytes:number;error?:string;sampleOnly:true;exactRealizedPnl:false;
 }
 
@@ -167,6 +178,61 @@ export class WalletHistory {
     const normalized=Array.isArray(inputs)?inputs.slice(0,2_000).map(value=>this.trade(value)).filter((v):v is WalletTradeObservation=>!!v):[];
     if(!normalized.length) return;
     this.append(normalized,()=>{for(const value of normalized) this.putTrade(value);});
+  }
+
+  /** Save all bounded full-address nominees before optional/early-vetoed research.
+   * Repeated deliveries never rewrite their first evidence or refresh wallet time.
+   * No trading token relation, trade, profit, funding or identity is inferred. */
+  captureVendorNominations(token:WalletHistoryToken,input:WalletVendorNominationInput):
+    {received:number;accepted:number;duplicates:number;rejected:number;reason?:string} {
+    const result={received:Array.isArray(input?.wallets)?input.wallets.length:0,accepted:0,duplicates:0,rejected:0} as
+      {received:number;accepted:number;duplicates:number;rejected:number;reason?:string};
+    const strictAt=(value:unknown):string|undefined=>typeof value==='string'&&
+      /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(value)&&at(value)===value?value:undefined;
+    const target=this.target(token),observed=strictAt(input?.observedAt),occurred=strictAt(input?.occurredAt);
+    if(!target||/^0x0{40}$/.test(target.address)||target.address==='11111111111111111111111111111111'||
+      input?.source!=='ave'||typeof input?.eventId!=='string'||!/^ave:signal:[a-f0-9]{64}$/.test(input.eventId)||
+      !Array.isArray(input.wallets)||!observed||!occurred||occurred>observed||Date.parse(observed)>this.now().getTime()) {
+      result.rejected=result.received;result.reason='WALLET_NOMINATION_INPUT_INVALID';return result;
+    }
+    const bound=this.db.prepare("SELECT chain,token_address,data FROM wh_observations WHERE event_id=? AND kind='vendor_nomination' LIMIT 1").get(input.eventId);
+    if(bound&&(bound.chain!==target.chain||bound.token_address!==target.address||
+      (JSON.parse(String(bound.data)) as WalletVendorNomination).occurredAt!==occurred)) {
+      result.rejected=result.received;result.reason='WALLET_NOMINATION_EVENT_SCOPE_CONFLICT';return result;
+    }
+    const values:{id:string;data:WalletVendorNomination}[]=[],seen=new Set<string>();
+    for(const raw of input.wallets.slice(0,100)) {
+      const wallet=object(raw)?addr(raw.address,target.chain):undefined;
+      const tradeAt=object(raw)&&raw.lastTradeAt!==undefined?strictAt(raw.lastTradeAt):undefined;
+      if(!object(raw)||!wallet||wallet===target.address||/^0x0{40}$/.test(wallet)||wallet==='11111111111111111111111111111111'||
+        raw.chain!==undefined&&raw.chain!==target.chain||raw.tokenAddress!==undefined&&addr(raw.tokenAddress,target.chain)!==target.address||
+        raw.side!==undefined&&!['buy','sell'].includes(raw.side)||
+        raw.alias!==undefined&&(typeof raw.alias!=='string'||raw.alias.length>2000)||
+        raw.lastTradeAt!==undefined&&(!tradeAt||tradeAt>observed)) {result.rejected++;continue;}
+      const id=digest(['vendor_nomination',input.source,input.eventId,target.chain,target.address,wallet]);
+      if(seen.has(id)||this.db.prepare('SELECT 1 FROM wh_observations WHERE id=?').get(id)){result.duplicates++;continue;}
+      seen.add(id);
+      const alias=clean(raw.alias,80);
+      values.push({id,data:{chain:target.chain,wallet,tokenAddress:target.address,source:'ave',eventId:input.eventId,
+        occurredAt:occurred,observedAt:observed,...(alias?{alias}:{}),...(raw.side?{side:raw.side}:{}),...(tradeAt?{lastTradeAt:tradeAt}:{}),
+        verification:'vendor_report',scope:'research_nomination_only',ownershipProven:false,buyEvidence:false,qualifiesAsSmart:false}});
+    }
+    result.rejected+=Math.max(0,input.wallets.length-100);
+    if(values.length)this.append(values,()=>{
+      const current=this.db.prepare("SELECT chain,token_address,data FROM wh_observations WHERE event_id=? AND kind='vendor_nomination' LIMIT 1").get(input.eventId);
+      if(current&&(current.chain!==target.chain||current.token_address!==target.address||
+        (JSON.parse(String(current.data)) as WalletVendorNomination).occurredAt!==occurred)) {
+        result.rejected+=values.length;result.reason='WALLET_NOMINATION_EVENT_SCOPE_CONFLICT';return;
+      }
+      for(const {id,data} of values){
+      // Recheck under the write transaction so a second process cannot refresh a duplicate wallet's time.
+      if(this.db.prepare('SELECT 1 FROM wh_observations WHERE id=?').get(id)){result.duplicates++;continue;}
+      this.putWallet(data.chain,data.wallet,data.observedAt,{});
+      this.observation('vendor_nomination',data,data.wallet,data.tokenAddress,data.eventId,id);result.accepted++;
+    }});
+    if(values.length&&this.error===CAPACITY){result.accepted=0;result.reason=CAPACITY;}
+    else if(result.rejected&&!result.reason)result.reason='WALLET_NOMINATION_RECORDS_REJECTED';
+    return result;
   }
 
   captureReport(report:Report):void {
@@ -490,10 +556,12 @@ export class WalletHistory {
     const observations=(kind:string,limit=100)=>this.db.prepare('SELECT data FROM wh_observations WHERE chain=? AND wallet=? AND kind=? ORDER BY observed_at DESC LIMIT ?')
       .all(chain,wallet,kind,limit).map(r=>JSON.parse(String(r.data)));
     const observationCount=Number(this.db.prepare('SELECT count(*) AS n FROM wh_observations WHERE chain=? AND wallet=?').get(chain,wallet)!.n);
+    const nominationCount=Number(this.db.prepare("SELECT count(*) AS n FROM wh_observations WHERE chain=? AND wallet=? AND kind='vendor_nomination'").get(chain,wallet)!.n);
     return {wallet:summary,timeline,holdings:observations('holding'),vendorStats:observations('stats'),tokenTraderSnapshots:observations('token_trader'),
+      vendorNominations:observations('vendor_nomination'),
       fundingEdges:this.db.prepare('SELECT data FROM wh_funding WHERE chain=? AND wallet=? ORDER BY observed_at DESC LIMIT 100').all(chain,wallet).map(r=>JSON.parse(String(r.data))),
       gains:this.gains(chain,wallet),coordinationEvidence,
-      coverage:{sampleOnly:true,exactRealizedPnl:false,eventCount:summary.observedEventCount,observationCount,
+      coverage:{sampleOnly:true,exactRealizedPnl:false,eventCount:summary.observedEventCount,observationCount,nominationCount,
         firstObservedAt:summary.firstObservedAt,lastObservedAt:summary.lastObservedAt}};
   }
 
@@ -503,6 +571,7 @@ export class WalletHistory {
     return {wallets:n('wh_wallets'),events:n('wh_events'),observations:n('wh_observations'),tokens:n('wh_tokens'),prices:n('wh_prices'),
       snapshots:n('wh_observations',"WHERE kind IN ('holding','stats','token_trader','token_rank')"),fundingLinks:n('wh_funding'),
       collections:n('wh_observations',"WHERE kind='collection'"),
+      nominations:n('wh_observations',"WHERE kind='vendor_nomination'"),
       coordinationPending:n('wh_metrics','WHERE coordination_dirty=1 OR coordination_checked_at IS NULL'),firstObservedAt:time.first?String(time.first):undefined,
       lastObservedAt:time.last?String(time.last):undefined,bytes:this.bytes(),maxBytes:this.maxBytes,error:this.error,
       sampleOnly:true,exactRealizedPnl:false};

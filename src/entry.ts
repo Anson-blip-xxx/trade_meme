@@ -64,6 +64,7 @@ function reason(error: unknown): string {
 }
 
 function eligibility(report: Report, config: Config, now: Date): string | undefined {
+  if(report.signal.source==='ave')return 'ENTRY_SOURCE_RESEARCH_ONLY';
   if (report.mode !== 'live') return 'ENTRY_DEMO_DISABLED';
   if (report.decision !== 'BUY_CANDIDATE' || report.buyEligible !== true) return 'ENTRY_NOT_CANDIDATE';
   if(report.flow?.reasons.includes('WALLET_SETUP_SUPPORT_WITHDRAWN'))return 'ENTRY_FLOW_NOT_PASSED';

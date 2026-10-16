@@ -46,6 +46,8 @@ export interface DashboardServices {
   debotAuth?:Pick<DebotAuthManager,'getStatus'|'sendCode'|'login'>;
   debotSignals?:(options?:DebotSignalListOptions)=>unknown;
   debotHistory?:(chain:Chain,address:string,options:{limit:number;offset:number;asOf?:string})=>unknown;
+  aveSignals?:(options:DashboardPageOptions&{asOf?:string})=>unknown;
+  sourceHistory?:(chain:Chain,address:string,options:{limit:number;offset:number;asOf?:string})=>unknown;
   memeSignals?:(options:DashboardPageOptions&{asOf?:string})=>unknown;
   memeDetail?:(chain:Chain,address:string,options:{limit:number;offset:number;asOf?:string})=>unknown;
   protectionDetail?:(id:string)=>unknown;
@@ -192,8 +194,15 @@ export function buildDashboard(config:Config,services:DashboardServices,assetDir
         send(res,200,services.memeSignals?.(options)??{now:new Date().toISOString(),asOf:options.asOf??new Date().toISOString(),
           status:{enabled:false},total:0,items:[],...options,hasMore:false});return;
       }
+      if(url.pathname==='/dashboard/api/ave/signals'){
+        const options={...pageOptions(url),...pageAsOf(url)};
+        if(options.asOf&&Date.parse(options.asOf)>Date.now())throw new Error('INVALID_FILTER');
+        send(res,200,services.aveSignals?.(options)??{now:new Date().toISOString(),asOf:options.asOf??new Date().toISOString(),
+          total:0,items:[],...options,hasMore:false});return;
+      }
       const memeMatch=url.pathname.match(/^\/dashboard\/api\/meme\/([^/]+)\/([^/]+)$/);
-      const notificationMatch=memeMatch??url.pathname.match(/^\/dashboard\/api\/debot\/tokens\/([^/]+)\/([^/]+)\/events$/);
+      const sourceMatch=url.pathname.match(/^\/dashboard\/api\/sources\/([^/]+)\/([^/]+)\/events$/);
+      const notificationMatch=memeMatch??sourceMatch??url.pathname.match(/^\/dashboard\/api\/debot\/tokens\/([^/]+)\/([^/]+)\/events$/);
       if(notificationMatch){
         const chain=notificationMatch[1];let address:string;
         if(!['bsc','solana','robinhood'].includes(chain))throw new Error('INVALID_FILTER');
@@ -204,6 +213,11 @@ export function buildDashboard(config:Config,services:DashboardServices,assetDir
         }catch{throw new Error('INVALID_FILTER');}
         const options={...pageOptions(url),...pageAsOf(url)};
         if(memeMatch){send(res,200,services.memeDetail?.(chain as Chain,address,options)??{token:{chain,address},total:0,items:[],...options,hasMore:false});return;}
+        if(sourceMatch){
+          if(options.asOf&&Date.parse(options.asOf)>Date.now())throw new Error('INVALID_FILTER');
+          send(res,200,services.sourceHistory?.(chain as Chain,address,options)??{token:{chain,address},asOf:options.asOf??new Date().toISOString(),
+            total:0,items:[],...options,hasMore:false,scope:'source_notifications_not_independent_wallets'});return;
+        }
         send(res,200,services.debotHistory?.(chain as Chain,address,options)??{chain,address,total:0,items:[],...options,hasMore:false});return;
       }
       if(url.pathname==='/dashboard/api/orders') {send(res,200,services.orders(pageOptions(url)));return;}

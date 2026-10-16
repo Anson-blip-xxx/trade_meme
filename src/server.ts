@@ -112,6 +112,8 @@ if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href) {
     debotSignals:options=>runtime.debotScanner?.list(options)??{now:new Date().toISOString(),items:[],total:0,
       limit:options?.limit??20,offset:options?.offset??0,hasMore:false},
     debotHistory:(chain,address,options)=>runtime.debotScanner?.notificationHistory(chain,address,options),
+    aveSignals:options=>runtime.aveScanner?.list(options),
+    sourceHistory:(chain,address,options)=>runtime.sourceEvidence?.history({chain,address},options),
     memeSignals:options=>runtime.memeObserver?.list(options),
     memeDetail:(chain,address,options)=>runtime.memeObserver?.detail({chain,address},options),
     chainStream:runtime.chainStreamStatus,protection:runtime.dashboardProtection,protectionDetail:id=>runtime.exitShadow?.detail(id),

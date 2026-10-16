@@ -29,7 +29,7 @@ export const VendorNarrativeSchema=z.object({
 });
 export type VendorNarrative=z.infer<typeof VendorNarrativeSchema>;
 export const SignalSchema = z.object({
-  source: z.enum(['debot', 'gmgn', 'manual']),
+  source: z.enum(['debot', 'gmgn', 'ave', 'manual']),
   sourceEventId: z.string().min(1).max(160),
   occurredAt: z.iso.datetime(),
   token: z.object({ chain: Chain, address: z.string().min(32).max(44) }).strict(),

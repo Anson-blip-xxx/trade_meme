@@ -5,6 +5,8 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
 import {MemeObserver,type MemeObserverOptions} from '../src/meme-observer.js';
+import {assessMeme} from '../src/meme-assessment.js';
+import {SourceCorroboration} from '../src/source-corroboration.js';
 import type {MemeMarketSample,MemeAssessment,MemeCatalystSnapshot} from '../src/meme-assessment.js';
 import type {Signal,Report,Check} from '../src/types.js';
 
@@ -175,5 +177,101 @@ test('catalyst queue database failures are contained and do not terminate market
     await observer.runOnce();assert.equal(observer.list().items[0].sampleCount,1);
     db.exec('DROP TRIGGER fail_catalyst');db.close();
     await observer.runCatalystOnce();assert.equal(observer.detail(token()).catalystHistory.length,1);
+  }finally{await f.close();}
+});
+
+test('new observer databases persist frozen source corroboration and restart without duplicate migration columns',async()=>{
+  const f=fixture(),ledger=new SourceCorroboration(':memory:',{now:()=>new Date(at(f.now()))});
+  f.options.corroboration=(target,now)=>ledger.assess(target,now);
+  try {
+    assert.equal(ledger.record(signal()).accepted,true);
+    const observer=f.create();observer.register(signal());assert.equal(observer.recordMarket(market()),true);
+    assert.equal(observer.detail(token()).items[0].corroboration?.classification,'single_source');
+    const frozen=f.rows()[0].corroboration;assert.equal(JSON.parse(String(frozen)).freshSourceCount,1);
+    await observer.close();const restarted=f.create();
+    assert.equal(f.rows()[0].corroboration,frozen);assert.equal(restarted.detail(token()).items[0].corroboration?.freshSources[0],'debot');
+    const db=new DatabaseSync(f.options.database,{readOnly:true});
+    try {assert.equal(db.prepare('PRAGMA table_info(meme_snapshots)').all().filter(row=>row.name==='corroboration').length,1);}finally{db.close();}
+  }finally{ledger.close();await f.close();}
+});
+
+test('legacy snapshot migration preserves original assessments and does not backfill old history with current source evidence',async()=>{
+  const f=fixture(),ledger=new SourceCorroboration(':memory:',{now:()=>new Date(at(f.now()))});
+  f.options.corroboration=(target,now)=>ledger.assess(target,now);
+  const original=JSON.stringify(assessMeme({token:token(),now:new Date(at()),samples:[market()]}));
+  try {
+    const db=new DatabaseSync(f.options.database);
+    db.exec(`CREATE TABLE meme_snapshots(id INTEGER PRIMARY KEY,chain TEXT,address TEXT,observed_at TEXT NOT NULL,
+      source TEXT NOT NULL,fingerprint TEXT UNIQUE,market TEXT,assessment TEXT NOT NULL)`);
+    db.prepare('INSERT INTO meme_snapshots VALUES(?,?,?,?,?,?,?,?)').run(1,'bsc',address(),at(),'dexscreener_pair','legacy',JSON.stringify(market()),original);
+    db.close();
+    f.advance(30);ledger.record(signal(1,30));ledger.record({...signal(1,30,'bsc','ave-current'),source:'ave'});
+    const observer=f.create();observer.register(signal(1,30));
+    assert.equal(f.rows()[0].assessment,original);assert.equal(f.rows()[0].corroboration,null);
+    const migrated=observer.detail(token());assert.equal(migrated.items[0].corroboration,undefined);
+    assert.equal('corroboration' in migrated.token&&migrated.token.corroboration?.classification,'cross_source');
+    assert.equal(observer.recordMarket(market(token(),30)),true);
+    assert.equal(observer.detail(token()).items[0].corroboration?.classification,'cross_source');
+    assert.equal(f.rows()[0].assessment,original);assert.equal(f.rows()[0].corroboration,null);
+    await observer.close();f.create();assert.equal(f.rows()[0].corroboration,null);assert.equal(f.rows().length,2);
+  }finally{ledger.close();await f.close();}
+});
+
+test('later cross-source evidence changes current detail while historical snapshots and as-of scores remain frozen',async()=>{
+  const f=fixture(),control=fixture(),ledger=new SourceCorroboration(':memory:',{now:()=>new Date(at(f.now()))});
+  f.options.corroboration=(target,now)=>ledger.assess(target,now);
+  try {
+    ledger.record(signal());const observer=f.create(),plain=control.create();
+    for(const instance of [observer,plain]){instance.register(signal());instance.recordMarket(market());}
+    f.advance(30);control.advance(30);for(const instance of [observer,plain])instance.recordMarket(market(token(),30,1.1));
+    const frozen=f.rows().map(row=>({id:row.id,assessment:row.assessment,corroboration:row.corroboration}));
+    f.advance(60);control.advance(60);
+    // A late ingestion claims an old notification and old receipt time. Only recordedAt is actual arrival.
+    assert.equal(ledger.record({...signal(1,10,'bsc','ave-late-ingestion'),source:'ave'},at(10)).accepted,true);
+    assert.equal(ledger.assess(token(),new Date(at(30))).classification,'single_source');
+    const current=observer.detail(token());
+    assert.equal('corroboration' in current.token&&current.token.corroboration?.classification,'cross_source');
+    assert.equal('assessment' in current.token&&(current.token.assessment as MemeAssessment).assessedAt,at(30));
+    const historical=observer.detail(token(),{asOf:at(30)});
+    assert.equal(historical.total,2);assert.ok(historical.items.every(item=>item.corroboration?.classification==='single_source'));
+    assert.deepEqual(historical.items.map(item=>item.assessment),plain.detail(token(),{asOf:at(30)}).items.map(item=>item.assessment));
+    for(const instance of [observer,plain])instance.recordMarket(market(token(),60,1.2));
+    assert.equal(observer.detail(token()).items[0].corroboration?.classification,'cross_source');
+    assert.equal(observer.detail(token()).items[0].corroboration?.scoreEffect,0);
+    assert.deepEqual(observer.detail(token()).items[0].assessment,plain.detail(token()).items[0].assessment);
+    assert.deepEqual(f.rows().slice(0,2).map(row=>({id:row.id,assessment:row.assessment,corroboration:row.corroboration})),frozen);
+    assert.equal(observer.detail(token(),{asOf:at(30)}).items[0].corroboration?.freshSourceCount,1);
+    f.advance(400);const expired=observer.detail(token());
+    assert.equal('corroboration' in expired.token&&expired.token.corroboration?.classification,'none');
+    assert.equal(expired.items[0].corroboration?.classification,'cross_source');
+  }finally{ledger.close();await f.close();await control.close();}
+});
+
+test('one hundred same-provider notices and delivery replays never become independent sources or a score bonus',async()=>{
+  const f=fixture(),control=fixture(),ledger=new SourceCorroboration(':memory:',{now:()=>new Date(at(f.now()))});
+  f.options.corroboration=(target,now)=>ledger.assess(target,now);
+  try {
+    ledger.record(signal());const observer=f.create(),plain=control.create();
+    for(const instance of [observer,plain]){instance.register(signal());instance.recordMarket(market());}
+    const initial=f.rows()[0].corroboration;f.advance(30);control.advance(30);
+    for(let i=1;i<=99;i++)assert.equal(ledger.record(signal(1,30,'bsc',`repeat-${i}`)).accepted,true);
+    for(let i=0;i<10;i++)assert.equal(ledger.record(signal(),at(30)).duplicate,true);
+    for(const instance of [observer,plain])instance.recordMarket(market(token(),30,1.05));
+    const latest=observer.detail(token()).items[0],evidence=latest.corroboration!;
+    assert.equal(evidence.classification,'single_source');assert.equal(evidence.freshSourceCount,1);
+    assert.equal(evidence.sources[0].notificationCount,100);assert.equal(evidence.independentEvidence,'unknown');assert.equal(evidence.scoreEffect,0);
+    assert.deepEqual(latest.assessment,plain.detail(token()).items[0].assessment);assert.equal(f.rows()[0].corroboration,initial);
+    assert.equal(observer.detail(token(),{asOf:at()}).items[0].corroboration?.sources[0].notificationCount,1);
+  }finally{ledger.close();await f.close();await control.close();}
+});
+
+test('source-ledger read failures stay optional and cannot stop observation or overwrite a completed safety gate',async()=>{
+  const f=fixture({corroboration:()=>{throw new Error('database unavailable');}});
+  try {
+    const observer=f.create();observer.captureReport(report());const gate=observer.list().items[0].gate;
+    await observer.runOnce();assert.equal(observer.detail(token()).items[0].corroboration,undefined);
+    assert.equal(f.rows()[0].corroboration,null);assert.deepEqual(observer.list().items[0].gate,gate);
+    f.advance(30);await observer.runOnce();assert.equal(observer.list().items[0].sampleCount,2);
+    assert.equal(observer.list().items[0].corroboration,undefined);assert.deepEqual(observer.list().items[0].gate,gate);
   }finally{await f.close();}
 });

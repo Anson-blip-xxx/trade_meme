@@ -57,7 +57,7 @@ export function decide(signal:Signal,receivedAt:string,config:Config,provenance:
   const flow=mergeWalletSupport(research?.flow,walletScreening,signal,now);
   const age=now.getTime()-Date.parse(signal.occurredAt);
   if(age< -30_000) reasons.push('SIGNAL_TIME_IN_FUTURE');
-  const maxSignalAgeSec=signal.source==='debot'?Math.min(120,config.maxSignalAgeSec):config.maxSignalAgeSec;
+  const maxSignalAgeSec=['debot','ave'].includes(signal.source)?Math.min(120,config.maxSignalAgeSec):config.maxSignalAgeSec;
   if(age>=maxSignalAgeSec*1000) reasons.push('SIGNAL_STALE');
   if(provenance.status!=='pass') reasons.push('PLATFORM_ORIGIN_NOT_VERIFIED');
   if(provenance.facts.modeSupported===false) reasons.push('LAUNCHPAD_MODE_NOT_SUPPORTED');
@@ -110,7 +110,7 @@ export async function evaluate(signal:Signal,config:Config,providers=liveProvide
 }={}):Promise<Report> {
   const clock=options.now??(()=>new Date()),start=clock(),receivedAt=options.receivedAt??start.toISOString();
   const age=start.getTime()-Date.parse(signal.occurredAt);
-  const maxAgeSec=signal.source==='debot'?Math.min(120,config.maxSignalAgeSec):config.maxSignalAgeSec;
+  const maxAgeSec=['debot','ave'].includes(signal.source)?Math.min(120,config.maxSignalAgeSec):config.maxSignalAgeSec;
   if(age>=maxAgeSec*1000||age< -30_000) {
     return decide(signal,receivedAt,config,unknown('SKIPPED_STALE_SIGNAL'),unknown('SKIPPED_STALE_SIGNAL'),
       {...unknown('SKIPPED_STALE_SIGNAL'),evidence:[]},start,options.mode,options.id);

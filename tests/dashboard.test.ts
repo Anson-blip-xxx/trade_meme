@@ -26,6 +26,39 @@ async function fixture(overrides:Partial<DashboardServices>={}) {
 const login=(base:string,value=password,origin?:string)=>fetch(`${base}/dashboard/api/login`,{
   method:'POST',headers:{'content-type':'application/json',...(origin?{origin}:{})},body:JSON.stringify({password:value})});
 
+test('Ave signal pages and token source history are authenticated read-only bounded routes with stable filters',async()=>{
+  const calls:unknown[]=[],headers={'x-dashboard-access':password},stamp='2026-10-15T08:00:00.000Z',address='0x'+'A'.repeat(40);
+  const f=await fixture({aveSignals:options=>{calls.push({kind:'ave',...options});return {items:[],total:0};},
+    sourceHistory:(chain,address,options)=>{calls.push({kind:'sources',chain,address,...options});return {items:[],token:{chain,address}};},
+    orders:()=>{throw new Error('SOURCE_ROUTES_MUST_NOT_TOUCH_ORDERS');}});
+  try {
+    for(const route of ['ave/signals',`sources/bsc/${address}/events`]){
+      assert.equal((await fetch(`${f.base}/dashboard/api/${route}`)).status,401);
+      for(const method of ['POST','PATCH','DELETE'])assert.equal((await fetch(`${f.base}/dashboard/api/${route}`,{method,headers})).status,405);
+    }
+    const ave=await fetch(`${f.base}/dashboard/api/ave/signals?limit=7&offset=14&chain=bsc&asOf=${stamp}`,{headers});
+    assert.equal(ave.status,200);assert.equal(ave.headers.get('cache-control'),'no-store');
+    assert.equal((await fetch(`${f.base}/dashboard/api/sources/bsc/${address}/events?limit=7&offset=14&asOf=${stamp}`,{headers})).status,200);
+    assert.deepEqual(calls,[{kind:'ave',limit:7,offset:14,chain:'bsc',asOf:stamp},{kind:'sources',chain:'bsc',address:address.toLowerCase(),limit:7,offset:14,asOf:stamp}]);
+    for(const path of ['ave/signals?limit=101','ave/signals?offset=-1','ave/signals?chain=eth','ave/signals?asOf=invalid','ave/signals?asOf=2999-01-01T00:00:00.000Z',
+      `sources/bsc/${address}/events?asOf=2999-01-01T00:00:00.000Z`,`sources/bsc/${address}/events?offset=1000001`,
+      `sources/eth/${address}/events`,'sources/bsc/incomplete/events',`sources/solana/${address}/events`])
+      assert.equal((await fetch(`${f.base}/dashboard/api/${path}`,{headers})).status,400,path);
+    assert.equal(calls.length,2);
+  }finally{await f.close();}
+});
+
+test('unconfigured Ave and source history provide valid empty pages without making provider calls',async()=>{
+  const f=await fixture(),headers={'x-dashboard-access':password};
+  try {
+    for(const route of ['ave/signals?limit=5&offset=10','sources/bsc/0x1111111111111111111111111111111111111111/events?limit=5&offset=10']){
+      const result=await (await fetch(`${f.base}/dashboard/api/${route}`,{headers})).json();
+      assert.deepEqual(result.items,[]);assert.equal(result.total,0);assert.equal(result.limit,5);assert.equal(result.offset,10);assert.equal(result.hasMore,false);
+      assert.ok(Number.isFinite(Date.parse(result.asOf)));
+    }
+  }finally{await f.close();}
+});
+
 test('Meme research pages validate scoped identity and stable pagination without touching orders',async()=>{
   const calls:unknown[]=[];
   const f=await fixture({memeSignals:options=>{calls.push(options);return {items:[],status:{researchOnly:true}};},

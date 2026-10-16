@@ -13,7 +13,7 @@ test('DeBot collection reaches existing research and dashboard with original rec
   const directory=mkdtempSync(join(tmpdir(),'debot-runtime-'));
   const config=readConfig({DEBOT_SCANNER_ENABLED:'true',DEBOT_TRANSPORT:'anonymous_poll',DEBOT_SIGNALS_DATABASE_PATH:join(directory,'debot.sqlite'),
     ORDERS_DATABASE_PATH:join(directory,'orders.sqlite'),DASHBOARD_ENABLED:'true',SCAN_DATABASE_PATH:join(directory,'scans.sqlite'),
-    SCANNER_CHAINS:'bsc',GMGN_API_KEY:'test-key-no-network',ENTRY_MODE:'off'});
+    MEME_DATABASE_PATH:join(directory,'meme.sqlite'),SCANNER_CHAINS:'bsc',GMGN_API_KEY:'test-key-no-network',ENTRY_MODE:'off'});
   const originalFetch=globalThis.fetch;
   const token='0x'+'a'.repeat(40),created=Math.floor(Date.now()/1000)-120;
   let requests=0;
@@ -44,11 +44,15 @@ test('DeBot collection reaches existing research and dashboard with original rec
     assert.equal(scan.buyEligible,false);assert.equal(scan.wallets,undefined);
     assert.equal(runtime.dashboardOrders().items.length,0);
     assert.equal(runtime.dashboardOverview().debotScanner.enabled,true);
+    assert.equal(runtime.memeObserver!.list().items[0].address,token);
+    assert.equal(runtime.memeObserver!.list().items[0].firstSeenAt,observed);
+    assert.equal(runtime.memeObserver!.list().items[0].sampleCount,0);
     await runtime.close();runtime=createRuntime(config);useLocalProviders();
     await runtime.debotScanner!.runOnce();await runtime.debotScanner!.dispatchOnce();
     assert.equal(runtime.archive!.list().total,1);assert.equal(runtime.store.list().length,0);
     assert.equal(runtime.debotScanner!.getStatus().dispatched,1);
     assert.equal(runtime.dashboardOverview().entryMode,'off');
+    assert.equal(runtime.memeObserver!.list().total,1);
   } finally {await runtime.close();globalThis.fetch=originalFetch;rmSync(directory,{recursive:true,force:true});}
 });
 

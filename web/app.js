@@ -8,6 +8,7 @@
   const chainSymbols = {bsc: 'BNB', solana: 'SOL', robinhood: 'ETH'};
   const views = {
     home: ['工作台总览', '观察信号、追踪结果、研究钱包，从需要的栏目开始。'],
+    meme: ['Meme 动态', '随热度、交易情绪、钱包接力与事件催化变化，持续更新当下的研究判断。'],
     risk: ['实时信号风控', '同链同币合并显示，保留每次通知的变化与核验进度。'],
     sources: ['信号来源', '管理 DeBot 登录，检查信号接收与实时订阅状态。'],
     associations: ['前置关联', '沿公开钱包之前的买入时序，寻找能够重复验证的关联线索。'],
@@ -305,7 +306,7 @@
     WALLET_SCREENING_SETUPS_TRUNCATED: '仅保留本轮优先级较高的有限条路径',
     WALLET_SCREENING_NO_MATCHING_PROFILE: '近期买入尚未匹配到有效的目标钱包画像',
   };
-  const state = {authenticated: false, view: 'home', home: null, refreshController: null, detailController: null, pageStates: {}, walletPages: {}, followupTab: 'records', followupRecords: null, learningPage: null, groupsPage: null, followupSummary: null, listPages: {followup: {offset: 0,total: 0,chain: '',decision: '',selected: '',asOf: ''}, orders: {offset: 0,total: 0,chain: ''}, protection: {offset: 0,total: 0,chain: ''}, learning: {offset: 0,total: 0,chain: '',decision: ''}, groups: {offset: 0,total: 0,chain: '',decision: ''}}, chain: '', decision: '', search: '', offset: 0, total: 0, items: [], orders: [], overview: null, refreshing: false, queued: false, queryVersion: 0, timer: null, searchTimer: null, lastSuccess: null, resourceErrors: {}, scansLoaded: false, ordersLoaded: false, detailId: null, detailKind: 'scan', detailWallet: null, detailGeneration: 0, returnFocus: null, walletEvidenceOpen: new Set(),
+  const state = {authenticated: false, view: 'home', home: null, refreshController: null, detailController: null, pageStates: {}, walletPages: {}, followupTab: 'records', followupRecords: null, learningPage: null, groupsPage: null, followupSummary: null, meme: null, memeLoaded: false, listPages: {meme: {offset: 0,total: 0,chain: '',asOf: ''}, followup: {offset: 0,total: 0,chain: '',decision: '',selected: '',asOf: ''}, orders: {offset: 0,total: 0,chain: ''}, protection: {offset: 0,total: 0,chain: ''}, learning: {offset: 0,total: 0,chain: '',decision: ''}, groups: {offset: 0,total: 0,chain: '',decision: ''}}, chain: '', decision: '', search: '', offset: 0, total: 0, items: [], orders: [], overview: null, refreshing: false, queued: false, queryVersion: 0, timer: null, searchTimer: null, lastSuccess: null, resourceErrors: {}, scansLoaded: false, ordersLoaded: false, detailId: null, detailKind: 'scan', detailWallet: null, detailGeneration: 0, returnFocus: null, walletEvidenceOpen: new Set(),
     walletSort: 'profiles', associationStatus: null, walletProfileStatus: null, walletProfilesReady: false, walletGroup: '', walletChain: '', walletSearch: '', walletOffset: 0, walletTotal: 0, walletItems: [], walletStatus: null, walletsLoaded: false, walletSearchTimer: null, protection: null, protectionLoaded: false, chainStream: null, chainStreamLoaded: false, followup: null, followupLoaded: false};
 
   const debotAuth = {status: null, busy: '', message: '', error: false, generation: 0};
@@ -653,7 +654,7 @@
     const blocked = score?.blocked === true || item.decision === 'REJECT' || ['safety', 'provenance', 'market'].some(key => item.checks?.[key]?.status === 'fail');
     const expired = Boolean(score?.stale || debotRiskStale() || item.state === 'completed' && (!validDate(item.validUntil) || Date.parse(item.validUntil) <= debotRiskNow()));
     const provisional = Boolean(score?.provisional || item.state !== 'completed');
-    return {value: blocked ? 0 : value, blocked, expired, provisional, label: blocked ? expired ? '历史阻断' : '风险阻断' : expired ? '历史分' : provisional ? '暂评' : value === null ? '待评分' : '核验评分'};
+    return {value: blocked ? 0 : value, blocked, expired, provisional, label: blocked ? expired ? '历史阻断' : '风险阻断' : expired ? '历史分' : provisional ? '暂评' : value === null ? '待核验' : '安全核验分'};
   }
   function closeDebotScore(restoreFocus = false) {
     clearTimeout(debotScoreCloseTimer);
@@ -688,7 +689,7 @@
       }
     }
     const note = scoreState.blocked ? `存在明确硬风险，总分归零；分项保留已有核验记录。${scoreState.expired ? '证据已过期，需要重新核验。' : ''}` : scoreState.expired ? '这是历史证据分，数据已过期，需要重新核验。' : scoreState.provisional ? '尚有未核实项目，暂评分只累计已通过项。' : '缺失或未通过的项目不计分，分数不改变最终风控结论。';
-    panel.append(el('p', 'debot-score-note', note), el('p', 'debot-score-note', '评分不是胜率，也不代表已下单。'));
+    panel.append(el('p', 'debot-score-note', note), el('p', 'debot-score-note', '安全核验分独立于 Meme 机会评价，不表示上涨潜力或胜率。'));
   }
   function openDebotScore(trigger, pinned = false) {
     const item = debotScoreData.get(trigger); if (!item) return;
@@ -754,7 +755,7 @@
       const table = el('table', 'debot-risk-table');
       const caption = el('caption', 'sr-only', '同链同币合并的实时信号风控：名称、所属链、百分制核验评分、通知变化与分析结果'); table.append(caption);
       const head = el('thead'); const header = el('tr');
-      for (const [label, name] of [['代币 / 所属链', 'token'], ['核验分', 'score'], ['所属链', 'chain'], ['核验项目', 'checks'], ['状态 / 主要原因', 'conclusion'], ['通知 / 本次变化', 'notifications'], ['首次 / 最近接收', 'timing'], ['操作', 'actions']]) { const cell = el('th', `debot-risk-${name}-cell`, label); cell.scope = 'col'; header.append(cell); }
+      for (const [label, name] of [['代币 / 所属链', 'token'], ['安全核验分', 'score'], ['所属链', 'chain'], ['核验项目', 'checks'], ['状态 / 主要原因', 'conclusion'], ['通知 / 本次变化', 'notifications'], ['首次 / 最近接收', 'timing'], ['操作', 'actions']]) { const cell = el('th', `debot-risk-${name}-cell`, label); cell.scope = 'col'; header.append(cell); }
       head.append(header); const body = el('tbody'); table.append(head, body); container.append(table);
       for (const item of debotRisk.items) {
         const row = el('tr', 'debot-risk-row'); row.dataset.eventId = scalar(item.eventId, '');
@@ -798,6 +799,7 @@
         }
         timing.append(el('span', '', `本轮分析 ${debotRiskDuration(item.analysisMs)}`)); timing.title = `到达 ${debotRiskDuration(item.signalDelayMs)}\n排队 ${debotRiskDuration(item.queueMs)}\n分析 ${debotRiskDuration(item.analysisMs)}`;
         const actions = el('td', 'debot-risk-actions-cell'); actions.append(gmgnTokenLink(item.chain, item.address));
+        actions.append(memeDetailButton(item, '机会变化 ↗'));
         const history = el('button', 'text-button', '通知历史 ↗'); history.type = 'button'; history.setAttribute('aria-label', `查看 ${scalar(item.address)} 的通知历史`); history.addEventListener('click', () => openDebotHistory(item, history)); actions.append(history);
         if (typeof item.reportId === 'string' && item.reportId) {
           const detail = el('button', 'text-button', '核验证据 ↗'); detail.type = 'button'; detail.setAttribute('aria-label', `查看 ${scalar(item.address)} 的核验证据`); detail.addEventListener('click', () => openDetail(item.reportId, detail)); actions.append(detail);
@@ -1046,6 +1048,7 @@
     const version = state.queryVersion, activeView = state.view, jobs = [];
     const add = (key, path, apply) => jobs.push({key, run: () => api(path, {signal: controller.signal}), apply});
     if (activeView === 'home') add('home', '/home', data => { state.home = data; renderHome(); });
+    if (activeView === 'meme') add('meme', `/meme?${listQuery('meme')}`, data => { state.meme = data; state.memeLoaded = true; savePage('meme', data); renderMeme(); });
     if (activeView === 'system' || activeView === 'sources') add('overview', '/overview', data => { state.overview = data; renderOverview(); });
     if (activeView === 'scans' || activeView === 'candidates') add('scans', `/scans?${scanQuery()}`, data => {
       state.items = Array.isArray(data.items) ? data.items : []; state.total = finite(data.total) ? data.total : state.items.length; state.scansLoaded = true; renderScans();
@@ -1087,6 +1090,7 @@
       if (!state.ordersLoaded && state.resourceErrors.orders) { $('orders-empty').hidden = false; $('orders-empty').querySelector('h3').textContent = '暂时无法读取订单'; }
       if (!state.walletsLoaded && state.resourceErrors.wallets) walletEmpty('暂时无法读取钱包档案', '连接恢复后会自动更新。');
       if (activeView === 'followup' && state.resourceErrors.followup) renderFollowupRecords();
+      if (activeView === 'meme' && state.resourceErrors.meme) { if (finite(state.meme?.offset)) state.listPages.meme.offset = state.meme.offset; renderMeme(); }
       if (activeView === 'protection' && state.resourceErrors.protection) renderProtection();
       networkState();
     } finally {
@@ -1137,7 +1141,7 @@
   $('wallet-search').addEventListener('input', () => { clearTimeout(state.walletSearchTimer); state.walletSearchTimer = setTimeout(() => { state.walletSearch = $('wallet-search').value.trim(); walletFiltersChanged(); }, 300); });
   $('wallet-previous-page').addEventListener('click', () => { state.walletOffset = Math.max(0, state.walletOffset - PAGE_SIZE); refreshQuery(); });
   $('wallet-next-page').addEventListener('click', () => { if (state.walletOffset + PAGE_SIZE < state.walletTotal) { state.walletOffset += PAGE_SIZE; refreshQuery(); } });
-  for (const key of ['risk','followup','protection','orders','groups','learning']) {
+  for (const key of ['risk','meme','followup','protection','orders','groups','learning']) {
     const page = key === 'risk' ? debotRisk : state.listPages[key];
     for (const [suffix,delta] of [['previous',-PAGE_SIZE],['next',PAGE_SIZE]]) $(`${key}-${suffix}-page`).addEventListener('click', () => {
       page.offset = Math.max(0, page.offset + delta);
@@ -1170,7 +1174,7 @@
     }
     document.querySelectorAll('[data-view]').forEach(button => { const active = button.dataset.view === view; button.classList.toggle('active', active); if (active) button.setAttribute('aria-current', 'page'); else button.removeAttribute('aria-current'); });
     text('breadcrumb-current', views[view][0]); $('page-title').replaceChildren(document.createTextNode(views[view][0]), el('span', 'title-dot', '.')); text('page-description', views[view][1]);
-    for (const key of ['home','orders','system','sources','protection','followup']) $(`${key}-panel`).hidden = view !== key;
+    for (const key of ['home','meme','orders','system','sources','protection','followup']) $(`${key}-panel`).hidden = view !== key;
     $('scans-panel').hidden = !['scans','candidates'].includes(view); $('debot-risk-panel').hidden = view !== 'risk';
     $('wallets-panel').hidden = !['wallets','associations'].includes(view); $('wallet-metrics').hidden = !['wallets','associations'].includes(view); $('scan-metrics').hidden = view !== 'home';
     $('scan-insights').hidden = view !== 'system'; $('workbench').classList.add('wallet-mode');
@@ -1180,6 +1184,7 @@
     if (view === 'risk') { debotRisk.signature = ''; renderDebotRisk(); if (load) syncDebotRiskPolling(); }
     if (view === 'followup') syncFollowupTab();
     if (view === 'home') renderHome();
+    if (view === 'meme') renderMeme();
     if (load && view !== 'risk') void refresh();
   }
   function renderHome() {
@@ -1729,6 +1734,282 @@
   function openDebotHistory(item, trigger) {
     return openDetail(`debot-history:${item.chain}:${item.address}`, trigger, {debotHistory: true, chain: item.chain, address: item.address, name: item.name || item.symbol, aggregation: item.aggregation, offset: 0, requestedOffset: 0, total: 0, asOf: '', loading: false});
   }
+  const memeStages = {warming: '升温', accelerating: '市场加速', contested: '分歧 / 争夺', crowded: '交易拥挤', fading: '退潮', quiet: '平静', insufficient: '尚待采样'};
+  const memeComponentLabels = {market_heat: '市场热度', trading_emotion: '交易情绪', wallet_relay: '钱包接力', catalyst: '事件催化'};
+  const memeReasonNames = {
+    "ACTIVITY_ACCELERATING": "近期成交活跃度正在加速",
+    "ACTIVITY_COOLING": "近期成交活跃度正在降温",
+    "ACTIVITY_FROM_FIVE_MINUTE_WINDOW": "交易活跃度采用供应商 5 分钟窗口",
+    "ACTIVITY_STEADY": "近期成交活跃度相对稳定",
+    "BUY_COUNT_DETERIORATING": "买入笔数占比相较前次下降",
+    "BUY_COUNT_DOMINANT": "样本买入笔数占优",
+    "BUY_FLOW_DETERIORATING": "买入金额占比相较前次下降",
+    "BUY_FLOW_DOMINANT": "近期买入金额占优",
+    "CATALYST_UNAVAILABLE_OR_STALE": "事件催化证据暂未取得或已过期",
+    "CA_MENTION_IS_NOT_ENDORSEMENT": "原帖提及合约不等于支持或背书",
+    "CELEBRITY_CA_MENTION_OBSERVED": "已取得名人关联原帖中的完整 CA 线索",
+    "CELEBRITY_PROFILE_LINK_NOT_BACKING": "项目填写名人链接不能证明本人支持",
+    "CONFLICTING_SAME_TIME_MARKET_SAMPLE": "同一时刻行情冲突，已排除冲突样本",
+    "EVIDENCE_COVERAGE_CHANGED": "本次证据覆盖范围发生变化",
+    "EXPERIMENTAL_UNCALIBRATED_RESEARCH_POINTS": "当前是未经收益校准的实验性研究分",
+    "EXTREME_CONCENTRATION_SCORE_CAPPED": "持仓过度集中，机会分已限制上限",
+    "FLOW_CONTESTED": "买卖金额接近，资金出现分歧",
+    "HOLDER_BASE_GROWING": "持币地址数量增加",
+    "HOLDER_BASE_SHRINKING": "持币地址数量减少",
+    "HOLDER_BASE_STABLE": "持币地址数量相对稳定",
+    "INSUFFICIENT_MEASURED_COVERAGE": "已取得的证据不足以形成总评分",
+    "LIQUIDITY_COMPARABLE": "流动性较前次未出现明显撤出",
+    "LIQUIDITY_UNKNOWN_SCORE_CAPPED": "流动性尚未核实，机会分已限制上限",
+    "LIQUIDITY_WITHDRAWING": "流动性较前次明显减少",
+    "MARKET_ACTIVITY_IS_NOT_SOCIAL_SENTIMENT": "市场成交活跃度不能代表社交情绪",
+    "MARKET_SAMPLES_TRUNCATED": "计算采用有界行情样本，较早样本未纳入",
+    "MARKET_SAMPLE_STALE": "最近行情样本已过期",
+    "MARKET_SAMPLE_UNAVAILABLE": "尚未取得有效行情样本",
+    "MARKET_TRADING_ACTIVE": "近期交易活跃",
+    "MARKET_TRADING_THIN": "近期交易较少",
+    "MISSING_DIMENSIONS_ARE_NOT_RENORMALIZED": "缺失维度保留缺口，不把已知维度放大至满分",
+    "NOW_MEASURED": "此前缺失的维度现已取得证据",
+    "NO_FRESH_WALLET_TRANSACTIONS": "近期监测钱包尚无可用交易证据",
+    "NO_PROFIT_PREDICTION": "评分不预测盈利或上涨幅度",
+    "NO_RECENT_TRADING_FLOW": "近期窗口没有观测到有效买卖",
+    "OBSERVED_PRICE_RISING": "本地采样价格正在上行",
+    "OBSERVED_PRICE_SOFTENING": "本地采样价格转弱",
+    "PAID_BOOST_NOT_ORGANIC_PROPAGATION": "付费推广不能视为自然传播",
+    "POOL_IDENTITY_MISSING_PRICE_TREND_UNAVAILABLE": "交易池身份缺失，不能计算可比价格趋势",
+    "POOL_OR_SOURCE_CHANGE_COMPARISONS_RESET": "交易池或数据来源变化，已重新建立比较区间",
+    "PRICE_HOLDING_SAMPLED_HIGH": "价格维持在近期采样高位附近",
+    "PROFILED_RELAY_OBSERVED": "已观察到画像钱包的接力路径",
+    "PROFILED_RELAY_PENDING": "画像钱包接力仍待后续证据",
+    "PROFILED_WALLET_WITHDRAWAL": "画像钱包路径出现退出或支持撤回",
+    "PROJECT_CELEBRITY_ASSOCIATION_UNVERIFIED": "项目方名人关联（未证实背书）",
+    "PULLBACK_RECOVERY_OBSERVED": "回撤后已出现一定价格修复",
+    "PULLBACK_RECOVERY_WEAK": "回撤后价格修复仍弱",
+    "ROLLING_VOLUME_WINDOWS_OVERLAP_NOT_ADDITIVE": "滚动成交量窗口存在重叠，不能累加",
+    "SAMPLED_CA_PROPAGATION_GROWING": "含完整 CA 的传播账号样本增加",
+    "SAMPLED_CA_PROPAGATION_LIMITED": "含完整 CA 的传播样本尚未扩张",
+    "SAMPLED_PEAK_NOT_MARKET_ATH": "采样高点不是全市场历史最高价",
+    "SAMPLED_PEAK_PULLBACK": "价格已从近期采样高点回撤",
+    "SAMPLED_WALLETS_SELLING": "监测钱包样本中的卖出占优",
+    "SAMPLED_WALLET_BUY_SUPPORT": "监测钱包样本仍有买入支持",
+    "SELL_COUNT_DOMINANT": "近期卖出笔数占优",
+    "SELL_FLOW_DOMINANT": "近期卖出金额占优",
+    "SINGLE_POOL_ACTIVITY_NOT_WHOLE_TOKEN": "行情只覆盖单个交易池，不代表本币全部交易",
+    "SOCIAL_POST_EVIDENCE_MISSING": "尚未取得可核实的社交原帖证据",
+    "SOCIAL_SAMPLE_NOT_COMPLETE_SEARCH": "社交样本不是完整全网搜索结果",
+    "SUPPLIER_AI_CLAIMS_UNVERIFIED": "供应商 AI 叙事中的说法尚未独立核实",
+    "SUPPLIER_NARRATIVE_CONTEXT_ONLY": "供应商叙事作为事件背景参考",
+    "THIN_LIQUIDITY_SCORE_CAPPED": "流动性过薄，机会分已限制上限",
+    "TRADE_COUNT_CONTESTED": "买卖笔数接近，交易方向出现分歧",
+    "TRADE_COUNT_IMBALANCE_NOT_DOLLAR_FLOW": "买卖笔数比例不能解释为买卖资金比例",
+    "VENDOR_OVERLAPPING_VOLUME_INCONSISTENT": "供应商重叠窗口的成交量存在不一致",
+    "VENDOR_TOKEN_ACTIVITY_SCOPE": "交易活跃度采用供应商代币统计口径",
+    "WAITING_FOR_COMPARABLE_SAMPLES": "等待第二个可比较的有效行情样本",
+    "WAITING_FOR_FRESH_MARKET": "等待新的有效行情样本",
+    "WALLET_ASSOCIATION_NOT_OWNERSHIP_PROOF": "钱包关联线索不能证明共同控制人",
+    "WALLET_DIVERSITY_IS_SAMPLED": "钱包数量仅反映已监测样本",
+    "WALLET_EVIDENCE_TRUNCATED": "钱包交易超过本轮保留范围，证据有截断",
+    "WALLET_EVIDENCE_UNAVAILABLE_OR_STALE": "近期钱包交易证据暂缺或已过期",
+    "WALLET_SAMPLE_NOT_WHOLE_MARKET": "监测钱包样本不代表全市场资金",
+    "CATALYST_AUTHORS_NOT_VERIFIED_INDEPENDENT_PEOPLE": "不同账号不一定属于不同真人",
+    "CATALYST_BUDGET_EXHAUSTED": "本轮叙事与原帖读取超时，后续重试",
+    "CATALYST_CANCELLED": "本轮催化证据读取已取消",
+    "CATALYST_CELEBRITY_ACCOUNT_IDS_UNVERIFIED": "部分名人账号身份尚未完成校验",
+    "CATALYST_NO_SENTIMENT_OR_ENDORSEMENT_INFERENCE": "不从这些样本推断全网情绪或名人背书",
+    "CATALYST_ORIGINAL_POSTS_UNAVAILABLE": "当前无法读取引用原帖",
+    "CATALYST_POST_CA_DOES_NOT_PROVE_CHAIN": "原帖包含 CA 不等于证明其所属链",
+    "CATALYST_REFERENCED_POSTS_PARTIALLY_RETRIEVED": "只取得部分引用原帖，传播覆盖有限",
+    "CATALYST_REFERENCE_IDS_NOT_OBSERVED_HEAT": "推文 ID 清单不代表已观测的热度",
+    "CATALYST_SOCIAL_SAMPLE_NOT_NETWORK_TOTAL": "当前社交样本不代表全网传播总量",
+    "CATALYST_SUPPLIER_GENERATED_AT_FUTURE": "供应商叙事生成时间异常，未作为新鲜证据",
+    "CATALYST_SUPPLIER_GENERATED_AT_UNKNOWN": "供应商未提供可验证的叙事生成时间",
+    "CATALYST_SUPPLIER_INVALID": "供应商叙事格式尚未核实",
+    "CATALYST_SUPPLIER_OPINIONS_NOT_FACTS": "供应商 AI 观点不是已核实的事实",
+    "CATALYST_SUPPLIER_SOURCE_MISMATCH": "供应商叙事来源与本币不匹配",
+    "CATALYST_SUPPLIER_STALE": "供应商叙事已超出新鲜度窗口",
+    "CATALYST_SUPPLIER_TOKEN_MISMATCH": "供应商叙事的合约身份与本币不符",
+    "CATALYST_SUPPLIER_UNAVAILABLE": "供应商叙事暂未取得",
+    "CATALYST_THIRD_PARTY_POST_COPIES": "部分原帖通过第三方副本读取",
+    "CATALYST_TIME_INVALID": "催化证据时间异常"
+};
+  function memeReason(value) {
+    if (typeof value !== 'string') return '';
+    const stage = value.match(/^STAGE_(WARMING|ACCELERATING|CONTESTED|CROWDED|FADING|QUIET|INSUFFICIENT)_TO_(WARMING|ACCELERATING|CONTESTED|CROWDED|FADING|QUIET|INSUFFICIENT)$/);
+    if (stage) return `阶段由「${memeStages[stage[1].toLowerCase()]}」转为「${memeStages[stage[2].toLowerCase()]}」`;
+    const component = value.match(/^(MARKET_HEAT|TRADING_EMOTION|WALLET_RELAY|CATALYST)_(UNAVAILABLE|NOW_MEASURED|IMPROVED|WEAKENED)$/);
+    if (component) return `${memeComponentLabels[component[1].toLowerCase()]}${{UNAVAILABLE:'证据现已缺失或过期',NOW_MEASURED:'新取得有效依据',IMPROVED:'较前次增强',WEAKENED:'较前次转弱'}[component[2]]}`;
+    return memeReasonNames[value] || reasonNames[value] || (/^[A-Z][A-Z0-9_]+$/.test(value) ? '本次采样存在未覆盖的依据' : value);
+  }
+  function memeReasons(values, fallback = '等待新的有效样本，暂不推断变化。') {
+    const node = el('ul', 'meme-reasons'), list = Array.isArray(values) ? values.filter(value => typeof value === 'string') : [];
+    for (const value of list.slice(0, 20)) { const line = el('li', '', memeReason(value)); line.title = value; node.append(line); }
+    if (!node.childNodes.length) node.append(el('li', '', fallback));
+    return node;
+  }
+  function memeStageTone(stage) { return ['warming','accelerating'].includes(stage) ? 'pass' : ['contested','crowded'].includes(stage) ? 'watch' : stage === 'fading' ? 'fail' : 'neutral'; }
+  function memeIsStale(item) { return item?.stale === true || validDate(item?.lastSampleAt) && Date.now() - Date.parse(item.lastSampleAt) > 120000; }
+  function memeScoreNode(assessment, stale = false) {
+    const box = el('div', `meme-score${stale ? ' historical' : ''}`), value = assessment?.score;
+    box.title = `仅累计已取得的研究依据，覆盖 ${count(assessment?.coverage?.knownPoints)} / 100；缺失维度不会重新放大，证据少时不作项目优劣结论。`;
+    box.append(el('strong', '', finite(value) ? count(value) : '—'), el('span', '', finite(value) ? '/ 100' : '尚待采样'));
+    const delta = assessment?.scoreDelta, note = el('small', `meme-score-delta ${finite(delta) && delta > 0 ? 'positive' : finite(delta) && delta < 0 ? 'negative' : ''}`,
+      stale && finite(value) ? '历史评分 · 行情已过期' : finite(delta) ? `较前次 ${delta > 0 ? '+' : ''}${count(delta)} 分` : '等待可比较的前次评分');
+    box.append(note); return box;
+  }
+  function memeDetailButton(item, label = '变化详情 ↗') {
+    const button = el('button', 'text-button meme-detail-button', label); button.type = 'button'; button.setAttribute('aria-label', `查看 ${scalar(item.address)} 的机会变化`);
+    button.addEventListener('click', () => openDetail(`meme:${item.chain}:${item.address}`, button, {meme: true,chain: item.chain,address: item.address,name: item.name,symbol: item.symbol,offset: 0,requestedOffset: 0,total: 0,asOf: ''}));
+    return button;
+  }
+  function memeIdentity(item) {
+    const node = el('div', 'meme-identity'), name = scalar(item.name || item.symbol, '未命名代币');
+    const title = el('strong', '', name); title.title = name; node.append(title);
+    const network = el('span', 'meme-token-meta'); network.append(el('span', `chain-dot ${chainClass(item.chain)}`), document.createTextNode(chainName(item.chain)));
+    if (item.symbol && item.symbol !== name) network.append(el('span', '', scalar(item.symbol))); node.append(network, addressNode(item.address)); return node;
+  }
+  function memeSummary(catalyst) {
+    if (!catalyst || typeof catalyst !== 'object') return '';
+    return typeof catalyst.supplier?.summary === 'string' ? catalyst.supplier.summary : typeof catalyst.summary === 'string' ? catalyst.summary : '';
+  }
+  function memeCoverageNode(assessment, compact = false) {
+    const coverage = assessment?.coverage || {}, node = el('div', `meme-coverage${compact ? ' compact' : ''}`);
+    node.append(el('strong', '', finite(coverage.knownPoints) ? `证据覆盖 ${count(coverage.knownPoints)} / ${count(coverage.maxPoints || 100)}` : '覆盖尚未建立'));
+    const windows = el('div', 'meme-window-badges');
+    for (const [key,label] of [['1m','1 分'],['5m','5 分'],['15m','15 分']]) { const window = coverage.windows?.[key], chip = el('span', window?.covered === true ? 'covered' : '', `${label} ${window?.covered === true ? '✓' : '—'}`); chip.title = window ? `${count(window.sampleCount)} 个样本 · 实际跨度 ${count(window.spanSec)} 秒` : '尚未形成覆盖'; windows.append(chip); }
+    node.append(windows); if (!compact) node.append(el('p', '', `已观测 ${count(coverage.samples)} 个样本 · 时间跨度 ${finite(coverage.observedSpanSec) ? coverage.observedSpanSec < 60 ? `${count(coverage.observedSpanSec)} 秒` : duration(coverage.observedSpanSec) : '—'}`)); return node;
+  }
+  function renderMeme() {
+    const data = state.meme || {}, items = Array.isArray(data.items) ? data.items : [], page = state.listPages.meme, status = data.status || {};
+    const rows = $('meme-rows'); rows.replaceChildren(); text('meme-count', count(data.total)); renderPager('meme');
+    const warning = $('meme-warning'); warning.hidden = !state.resourceErrors.meme; warning.textContent = '动态观察暂时无法更新，保留最近成功结果；连接恢复后自动重试。';
+    const statusBadge = $('meme-status'); statusBadge.className = `badge ${status.running === false || status.error ? 'watch' : 'neutral'}`;
+    statusBadge.textContent = status.running === false ? '持续观察待恢复' : status.running === true ? '持续观察运行中' : state.memeLoaded ? '动态研究 · 实验性' : '等待动态样本';
+    text('meme-updated', `${validDate(data.now) ? `最近读取 ${time(data.now)} · ` : ''}${page.offset ? '历史页暂停自动刷新' : '首页每 15 秒更新'} · 每页 ${PAGE_SIZE} 条`);
+    const service = $('meme-service'); service.replaceChildren();
+    for (const [key,label] of [['active','持续观察'],['waiting','等待采样席位'],['fresh','行情新鲜'],['stale','行情待更新']]) if (finite(status[key])) service.append(el('span', '', `${label} ${count(status[key])}`));
+    if (finite(status.maxActive)) service.append(el('span', '', `观察容量 ${count(status.active)} / ${count(status.maxActive)}`));
+    if (finite(status.catalystPending)) service.append(el('span', '', `催化快照有效 ${count(status.catalystFresh)} · 待采 ${count(status.catalystPending)} · 无有效材料 ${count(status.catalystUnknown)} · 过期 ${count(status.catalystStale)}`));
+    if (validDate(status.lastCycleAt)) service.append(el('span', '', `最近采集 ${time(status.lastCycleAt)}`));
+    if (status.error) service.append(el('span', 'negative', '部分采样暂不可用，已有样本保留'));
+    const empty = $('meme-empty'); empty.hidden = items.length > 0;
+    if (!items.length) { empty.querySelector('h3').textContent = state.resourceErrors.meme ? '暂时无法读取动态观察' : state.memeLoaded ? '当前筛选暂无动态观察' : '正在读取动态观察'; empty.querySelector('p').textContent = '新信号登记后持续采样；没有证据时不推断热度和情绪。'; }
+    for (const item of items) {
+      const assessment = item.assessment, row = el('tr', 'meme-row'); row.dataset.token = `${item.chain}:${item.address}`;
+      const token = el('td', 'meme-token-cell'); token.append(memeIdentity(item));
+      const score = el('td', 'meme-score-cell'); score.append(memeScoreNode(assessment, memeIsStale(item)));
+      const phase = el('td', 'meme-phase-cell'); phase.append(badge(memeStages[assessment?.stage] || '尚待采样', memeIsStale(item) ? 'neutral' : memeStageTone(assessment?.stage)));
+      phase.append(memeReasons(assessment?.changeReasons?.length ? assessment.changeReasons : assessment?.reasons));
+      const components = el('td', 'meme-components-cell');
+      for (const id of ['market_heat','trading_emotion','wallet_relay']) { const component = assessment?.components?.find(value => value?.id === id), line = el('div', 'meme-component-line'); line.append(el('span', '', memeComponentLabels[id]), el('strong', '', finite(component?.score) ? `${count(component.score)} / ${count(component.maxScore)}` : '证据不足')); if (Array.isArray(component?.reasons)) line.title = component.reasons.map(memeReason).join('\n'); components.append(line); }
+      const catalyst = el('td', 'meme-catalyst-cell'), summary = memeSummary(item.catalyst); catalyst.append(el('span', 'meme-social-label', memeSocialCaption(item.catalyst)));
+      if (summary) { const content = el('p', 'meme-catalyst-summary', summary); content.title = `${summary}\n点击变化详情查看完整留存内容与来源。`; catalyst.append(content); }
+      else catalyst.append(el('p', 'meme-muted', '叙事异步补充中；缺失不视为没有叙事。'));
+      const coverage = el('td', 'meme-sampling-cell'); coverage.append(el('span', `meme-observation-state${memeIsStale(item) ? ' stale' : ''}`, !validDate(item.lastSampleAt) ? '等待首次采样' : memeIsStale(item) ? '最近行情已过期' : {active: '持续观察',expired: '观察周期结束',waiting: '等待采样'}[item.observationState] || '等待采样'), el('time', '', `采样 ${date(item.lastSampleAt, true)}`), el('span', 'meme-sample-count', `${count(item.sampleCount)} 个样本`), memeCoverageNode(assessment, true));
+      if (item.error) { const issue = el('span', 'meme-sampling-error', '采样待重试'); issue.title = memeReason(item.error); coverage.append(issue); }
+      const actions = el('td', 'meme-actions-cell'); actions.append(memeDetailButton(item), gmgnTokenLink(item.chain, item.address));
+      row.append(token,score,phase,components,catalyst,coverage,actions); rows.append(row);
+    }
+  }
+  function memeMetricNodes(metrics) {
+    const node = el('details', 'meme-detail-metrics');
+    const ratio = value => finite(value) ? `${new Intl.NumberFormat('zh-CN',{maximumFractionDigits:1}).format(value*100)}%` : '—';
+    const fields = [
+      ['latestPriceUsd','最新采样价',usd],['liquidityUsd','流动性',usd],['holderCount','持币地址数',count],['top10HolderRate','前十地址持仓占比',ratio],
+      ['priceChange1mPct','本地覆盖 1 分钟价格变化',percent],['priceChange5mPct','本地覆盖 5 分钟价格变化',percent],['priceChange15mPct','本地覆盖 15 分钟价格变化',percent],
+      ['sampledGainPct','近期采样区间价格变化',percent],['sampledDrawdownPct','相对近期采样高点回撤',value=>`${count(value)}%`],['sampledRecoveryPct','回撤后的价格修复比例',value=>`${count(value)}%`],
+      ['holderChange','较前次持币地址变化',value=>`${value>0?'+':''}${count(value)}`],['liquidityChangePct','较前次流动性变化',percent],['activityAcceleration','近期成交活跃倍数',value=>`${count(value)} 倍`],
+      ['buys1m','1 分钟买入笔数',count],['sells1m','1 分钟卖出笔数',count],['buyShare1m','1 分钟买入金额占比',ratio],['previousBuyShare1m','前次 1 分钟买入金额占比',ratio],['volume1mUsd','1 分钟成交金额',usd],
+      ['buys5m','5 分钟买入笔数',count],['sells5m','5 分钟卖出笔数',count],['buyCountShare5m','5 分钟买入笔数占比',ratio],['previousBuyCountShare5m','前次 5 分钟买入笔数占比',ratio],['volume5mUsd','5 分钟成交金额',usd],
+      ['walletBuyUsd','监测钱包样本买入金额',usd],['walletSellUsd','监测钱包样本卖出金额',usd],['walletBuyerCount','监测样本买入钱包数',count],['walletSellerCount','监测样本卖出钱包数',count],
+      ['supportedWalletSetups','当前有支持的钱包路径数',count],['withdrawnWalletSetups','支持已撤回的钱包路径数',count],
+      ['socialAuthors5m','近 5 分钟 CA 原帖账号样本',count],['socialAuthorsPrevious5m','此前 5 分钟 CA 原帖账号样本',count],['exactCaAuthors','完整 CA 账号样本数',count],
+    ];
+    const present = fields.filter(([key]) => metrics?.[key] !== undefined);
+    if (!present.length) return el('p', 'detail-small', '尚无可展示的量化指标。');
+    node.append(el('summary', '', `展开交易、持仓与价格指标 · ${present.length} 项`));
+    for (const [key,label,format] of present) node.append(kv(label, format(metrics[key])));
+    return node;
+  }
+  function memeComponentsNode(assessment) {
+    const grid = el('div', 'meme-component-grid');
+    for (const component of Array.isArray(assessment?.components) ? assessment.components : []) {
+      const card = el('div', 'meme-component-card'); card.append(el('h4', '', memeComponentLabels[component.id] || scalar(component.label)), el('strong', '', finite(component.score) ? `${count(component.score)} / ${count(component.maxScore)}` : '证据不足'), el('small', '', `已覆盖依据 ${count(component.knownPoints)} / ${count(component.maxScore)}`), memeReasons(component.reasons, '尚未取得足够依据。')); grid.append(card);
+    }
+    return grid;
+  }
+  function memeExternalLink(value, label) {
+    const url = safeUrl(value); if (!url || new URL(url).pathname.startsWith('/api/')) return null;
+    const link = el('a', 'source-link', label); link.href = url; link.target = '_blank'; link.rel = 'noopener noreferrer'; return link;
+  }
+  function memeSocialCaption(catalyst) {
+    const diffusion = catalyst?.diffusion;
+    if (!diffusion || diffusion.status === 'unknown') return '社交传播：证据未知';
+    return `${validDate(catalyst.expiresAt) && Date.parse(catalyst.expiresAt)<Date.now()?'历史社交样本 · ':''}CA 原帖样本 ${count(diffusion.caPostCount)} 条 / ${count(diffusion.caAuthorCount)} 个账号`;
+  }
+  function memeCatalystNode(catalyst) {
+    const node = section('叙事与事件催化'), supplier = catalyst?.supplier, summary = memeSummary(catalyst);
+    node.append(el('p', 'meme-detail-summary', summary || '叙事正在异步补充；缺失不表示没有叙事。'));
+    node.append(kv('社交传播覆盖', memeSocialCaption(catalyst)),kv('社会情绪', '尚无可核实的全网情绪指标'));
+    if (catalyst?.observedAt) node.append(kv('证据取得时间',date(catalyst.observedAt,true)));
+    if (validDate(catalyst?.expiresAt) && Date.parse(catalyst.expiresAt) < Date.now()) node.append(el('p','notice warning','这批催化证据已过期，仅展示此前取得的内容；等待下一轮补充。'));
+    if (supplier) {
+      node.append(kv('叙事来源',`${scalar(supplier.provider).toUpperCase()} · AI 参考`),kv('供应商生成时间',date(supplier.generatedAt,true)),kv('叙事新鲜度',supplier.fresh===true?'时间在有效范围内':'生成时间未知或已过期'));
+      if (supplier.text) { const full=el('details','meme-supplier');full.append(el('summary','','展开平台叙事全文'),el('p','meme-detail-summary',supplier.text));node.append(full); }
+      const link=memeExternalLink(supplier.sourceUrl,'查看平台叙事来源 ↗');if(link)node.append(link);
+    }
+    const diffusion=catalyst?.diffusion;
+    if(diffusion&&diffusion.status!=='unknown') node.append(kv('最近 5 分钟 CA 样本',`${count(diffusion.recent5m?.postCount)} 条 / ${count(diffusion.recent5m?.authorCount)} 个账号`),kv('此前 5 分钟 CA 样本',`${count(diffusion.previous5m?.postCount)} 条 / ${count(diffusion.previous5m?.authorCount)} 个账号`));
+    node.append(el('p','detail-small','原帖样本来自可读取的引用或搜索结果，不代表全网覆盖；不同账号不等于不同真人。平台提供的推文 ID 数量不计为实际热度。'));
+    const celebrities=catalyst?.celebrities, signals=Array.isArray(celebrities?.signals)?celebrities.signals:[];
+    const social=el('div','meme-social-signals');social.append(el('h4','','名人与项目关联'));
+    if(!signals.length)social.append(el('p','detail-small','暂未取得可展示的名人关联证据。'));
+    for(const signal of signals){const card=el('div','social-evidence');card.append(el('strong','',scalar(signal.label||signal.person)),kv('关联方式',signal.relation==='ca_mention'?'原帖样本包含完整 CA':'项目填写的名人资料链接'),kv('数据来源',{project_link:'项目资料 · 未核实支持',first_party:'原帖来源',third_party:'第三方原帖副本'}[signal.verification]||'尚未核实'));if(signal.publishedAt)card.append(kv('原帖发布时间',date(signal.publishedAt,true)));const link=memeExternalLink(signal.sourceUrl,'查看关联证据 ↗');if(link)card.append(link);social.append(card);}
+    social.append(el('p','detail-small',`账号身份匹配覆盖：${{verified:'已配置身份校验',partial:'部分已配置',unverified:'尚未核实'}[celebrities?.accountIdentityCoverage]||'尚未核实'}。项目链接、衍生叙事和本人明确支持是不同证据；本系统未认定名人背书。`));node.append(social);
+    const posts=Array.isArray(catalyst?.posts)?catalyst.posts:[];
+    if(posts.length){const originals=el('details','meme-supplier');originals.append(el('summary','',`展开 ${count(posts.length)} 条已取得原帖证据`));for(const post of posts){const card=el('article','meme-post');card.append(badge(post.mentionsExactCa?'包含完整 CA':'上下文引用','neutral'),el('p','meme-post-text',scalar(post.text)),el('p','meme-post-meta',`${date(post.publishedAt,true)} · 账号 ID ${scalar(post.authorId)} · ${post.verification==='first_party'?'原始来源':'第三方副本'}`));const link=memeExternalLink(post.url,'查看原帖 ↗');if(link)card.append(link);originals.append(card);}node.append(originals);}
+    const evidence=catalyst?.evidence;if(evidence)node.append(kv('引用原帖取得情况',`${count(evidence.retrievedPostCount)} / ${count(evidence.requestedPostCount)} 条`));
+    const limits=[...(Array.isArray(catalyst?.reasons)?catalyst.reasons:[]),...(Array.isArray(evidence?.limitations)?evidence.limitations:[])];if(limits.length){const proof=el('details','meme-limitations');proof.append(el('summary','','催化证据范围与缺口'),memeReasons([...new Set(limits)]));node.append(proof);}
+    return node;
+  }
+  function renderMemeDetail(data) {
+    const history = state.detailWallet; if (!history?.meme) return;
+    const previousOffset = history.offset; history.offset = finite(data.offset) ? data.offset : history.requestedOffset; history.requestedOffset = history.offset; history.total = finite(data.total) ? data.total : 0; history.asOf = data.asOf || history.asOf;
+    const item = data.token || {}, assessment = item.assessment, wrapper = el('div', 'meme-detail'), heading = el('div', 'detail-token'), title = el('h2', '', `${scalar(item.name || item.symbol || history.name, '代币')} · 机会变化`); title.id = 'detail-title'; heading.append(title); wrapper.append(heading, el('div', 'token-meta', `${chainName(history.chain)} · 持续观察`), addressNode(history.address, 'detail-address'));
+    const links = el('div', 'detail-links'); links.append(gmgnTokenLink(history.chain, history.address, '在 GMGN 查看代币 ↗')); wrapper.append(links);
+    wrapper.append(el('p', 'meme-detail-note', '机会评价独立于安全核验。历史快照保留当时已知的依据，后来补齐的消息不会写回过去。通知次数不加分，机会分不直接触发开仓。'));
+    const current = section('当前机会与所处阶段'), hero = el('div', 'meme-detail-hero'); hero.append(memeScoreNode(assessment,memeIsStale(item)), badge(memeStages[assessment?.stage] || '尚待采样', memeIsStale(item) ? 'neutral' : memeStageTone(assessment?.stage))); current.append(hero, memeReasons(assessment?.changeReasons?.length ? assessment.changeReasons : assessment?.reasons), memeCoverageNode(assessment), kv('首次登记',date(item.firstSeenAt,true)),kv('最近收到信号',date(item.lastSignalAt,true)),kv('最近有效采样',date(item.lastSampleAt,true)),kv('本次判断时间',date(assessment?.assessedAt,true)));
+    if (memeIsStale(item) && finite(assessment?.score)) current.append(el('p', 'notice warning', '行情样本已过期。这里保留最近一次评分，不能视为当前市场判断。'));
+    current.append(memeComponentsNode(assessment), memeMetricNodes(assessment?.metrics));
+    if (assessment?.limitations?.length) { const limits = el('details', 'meme-limitations'); limits.append(el('summary', '', '证据范围与缺口'), memeReasons(assessment.limitations)); current.append(limits); }
+    wrapper.append(current, memeCatalystNode(item.catalyst));
+    if (Array.isArray(data.catalystHistory) && data.catalystHistory.length) {
+      const historyNode = el('details','meme-catalyst-history'); historyNode.append(el('summary','',`查看最近 ${count(data.catalystHistory.length)} 次催化证据快照`));
+      for (const event of data.catalystHistory) { const entry = el('details','meme-catalyst-history-entry'); entry.append(el('summary','',date(event.observedAt,true))); entry.addEventListener('toggle', () => { if (entry.open && !entry.dataset.loaded) { entry.dataset.loaded = 'true'; entry.append(memeCatalystNode(event.snapshot)); } }); historyNode.append(entry); }
+      wrapper.append(historyNode);
+    }
+    const snapshots = Array.isArray(data.items) ? data.items : [], chartMarket = snapshots[0]?.market, prices = snapshots.filter(value => numeric(value?.market?.priceUsd) > 0 && chartMarket?.poolAddress && value.market.poolAddress === chartMarket.poolAddress && value.market.source === chartMarket.source).map(value => ({at:value.observedAt,priceUsd:numeric(value.market.priceUsd)}));
+    const timeline = section('价格与判断时间线'), toolbar = el('div', 'debot-history-toolbar'), refresh = el('button', 'text-button', '读取最新观察'); refresh.type = 'button'; refresh.dataset.historyAction = 'refresh'; refresh.addEventListener('click', () => { history.requestedOffset = 0; history.asOf = ''; void loadDetail(state.detailId,true); }); toolbar.append(el('span', '', `按采样时间倒序 · 每页 ${PAGE_SIZE} 条`),refresh); timeline.append(toolbar);
+    if (prices.length) { const chart = priceChart({points:prices}); chart.querySelector('svg')?.setAttribute('aria-label',`当前页真实价格曲线，共 ${prices.length} 个报价样本`); timeline.append(chart,el('p','detail-small','曲线仅显示当前页同一来源、同一池的采样价格；不补齐间隔，也不代表全市场最高价。')); }
+    const list = el('ol','meme-timeline');
+    for (const snapshot of snapshots) {
+      const point = el('li','meme-snapshot'), a = snapshot.assessment || {}, top = el('div','meme-snapshot-top');
+      top.append(el('time','',date(snapshot.observedAt,true)),badge(memeStages[a.stage] || '尚待采样',memeStageTone(a.stage))); point.append(top);
+      const values = el('div','meme-snapshot-values'); values.append(el('strong','',finite(a.score) ? `${count(a.score)} 分` : '尚待采样'),el('span','',finite(a.scoreDelta) ? `变化 ${a.scoreDelta>0?'+':''}${count(a.scoreDelta)}` : '首次可比较结果待建立'),el('span','',`价格 ${usd(snapshot.market?.priceUsd)}`)); point.append(values,memeReasons(a.changeReasons?.length?a.changeReasons:a.reasons));
+      const outcomes = snapshot.outcomes;
+      if (outcomes?.scope === 'subsequent_observed_prices' && outcomes.notTradingReturn === true && Array.isArray(outcomes.items)) {
+        const outcomesNode = el('div','meme-outcomes'); outcomesNode.append(el('p','','此判断之后的采样价格变化'));
+        const outcomesGrid = el('div','meme-outcomes-grid');
+        for (const outcome of outcomes.items) { const result = el('div'); result.append(el('span','',{300:'5 分钟后',900:'15 分钟后',3600:'1 小时后'}[outcome.horizonSec] || `${count(outcome.horizonSec)} 秒后`),finite(outcome.returnPct)?gainNode(outcome.returnPct):el('strong','meme-muted','未知')); result.title=finite(outcome.returnPct)?`后续实际采样 ${date(outcome.observedAt,true)}`:'窗口尚未成熟或缺少准时报价'; outcomesGrid.append(result); }
+        outcomesNode.append(outcomesGrid,el('small','','后验观察，不属于当时已知信息；不是交易回报。未知表示窗口未成熟或缺少准时报价。')); point.append(outcomesNode);
+      }
+      const proof = el('details','meme-snapshot-proof'); proof.append(el('summary','',`当时证据 · 覆盖 ${count(a.coverage?.knownPoints)} / 100`),memeComponentsNode(a),memeMetricNodes(a.metrics));
+      if (memeSummary(snapshot.catalyst)) proof.append(el('p','meme-detail-summary',memeSummary(snapshot.catalyst))); if (a.limitations?.length) proof.append(memeReasons(a.limitations)); point.append(proof); list.append(point);
+    }
+    if (!snapshots.length) timeline.append(el('p','drawer-loading','尚未取得有效动态快照，采集恢复后继续观察。')); timeline.append(list);
+    const footer = el('div','table-footer debot-history-pagination'), controls=el('div','pagination'), previous=el('button','','←'), next=el('button','','→'); previous.type=next.type='button';previous.dataset.historyAction='previous';next.dataset.historyAction='next';previous.setAttribute('aria-label','机会历史上一页');next.setAttribute('aria-label','机会历史下一页'); previous.disabled=history.offset===0;next.disabled=data.hasMore===false||history.offset+PAGE_SIZE>=history.total;
+    previous.addEventListener('click',()=>{history.requestedOffset=Math.max(0,history.offset-PAGE_SIZE);void loadDetail(state.detailId,true);});next.addEventListener('click',()=>{history.requestedOffset=history.offset+PAGE_SIZE;void loadDetail(state.detailId,true);}); controls.append(previous,el('span','meme-history-page-number',`${Math.floor(history.offset/PAGE_SIZE)+1} / ${Math.max(1,Math.ceil(history.total/PAGE_SIZE))}`),next);footer.append(el('span','',`共 ${count(history.total)} 个快照 · 当前页 ${snapshots.length} 条`),controls);timeline.append(footer);wrapper.append(timeline);$('detail-content').replaceChildren(wrapper);
+    if(previousOffset!==history.offset){title.tabIndex=-1;title.focus({preventScroll:true});$('detail-drawer').scrollTop=0;}
+  }
+
   function renderDebotHistory(data) {
     const history = state.detailWallet;
     if (!history?.debotHistory) return;
@@ -1841,10 +2122,10 @@
   async function openDetail(id, trigger, wallet) {
     if (typeof id !== 'string') return;
     closeNarrative();
-    state.returnFocus = trigger || document.activeElement; state.detailId = id; state.detailKind = wallet?.debotHistory ? 'debot-history' : wallet?.protection ? 'protection' : wallet?.followup ? 'followup' : wallet?.association ? 'association' : wallet?.profile ? 'profile' : wallet ? 'wallet' : 'scan'; state.detailWallet = wallet || null; state.detailGeneration++; state.walletEvidenceOpen = new Set();
-    text('detail-eyebrow', wallet?.debotHistory ? 'NOTIFICATION HISTORY' : wallet?.protection ? 'PROTECTION EVIDENCE' : wallet?.followup ? 'SIGNAL FOLLOW-UP' : wallet ? 'WALLET RESEARCH' : 'SIGNAL DETAIL');
+    state.returnFocus = trigger || document.activeElement; state.detailId = id; state.detailKind = wallet?.meme ? 'meme' : wallet?.debotHistory ? 'debot-history' : wallet?.protection ? 'protection' : wallet?.followup ? 'followup' : wallet?.association ? 'association' : wallet?.profile ? 'profile' : wallet ? 'wallet' : 'scan'; state.detailWallet = wallet || null; state.detailGeneration++; state.walletEvidenceOpen = new Set();
+    text('detail-eyebrow', wallet?.meme ? 'MEME OPPORTUNITY TIMELINE' : wallet?.debotHistory ? 'NOTIFICATION HISTORY' : wallet?.protection ? 'PROTECTION EVIDENCE' : wallet?.followup ? 'SIGNAL FOLLOW-UP' : wallet ? 'WALLET RESEARCH' : 'SIGNAL DETAIL');
     $('drawer-backdrop').hidden = false; $('detail-drawer').hidden = false; $('app').inert = true; document.body.classList.add('drawer-open');
-    const loading = el('p', 'drawer-loading', wallet?.debotHistory ? '正在读取通知历史…' : wallet ? '正在读取研究证据…' : '正在读取信号详情…'); loading.id = 'detail-title'; $('detail-content').replaceChildren(loading); $('detail-drawer').focus();
+    const loading = el('p', 'drawer-loading', wallet?.meme ? '正在读取机会变化…' : wallet?.debotHistory ? '正在读取通知历史…' : wallet ? '正在读取研究证据…' : '正在读取信号详情…'); loading.id = 'detail-title'; $('detail-content').replaceChildren(loading); $('detail-drawer').focus();
     await loadDetail(id);
   }
   async function loadDetail(id, quiet = false) {
@@ -1855,18 +2136,19 @@
     const profile = state.detailKind === 'profile' ? state.detailWallet : null;
     const followup = state.detailKind === 'followup' ? state.detailWallet : null;
     const protection = state.detailKind === 'protection';
-    const history = state.detailKind === 'debot-history' ? state.detailWallet : null;
+    const meme = state.detailKind === 'meme' ? state.detailWallet : null;
+    const history = state.detailKind === 'debot-history' ? state.detailWallet : meme;
     const historyQuery = history ? new URLSearchParams({limit: String(PAGE_SIZE), offset: String(history.requestedOffset)}) : null;
     if (history?.asOf) historyQuery.set('asOf', history.asOf);
     if (history) { history.loading = true; $('detail-content').setAttribute('aria-busy', 'true'); $('detail-content').querySelectorAll('[data-history-action]').forEach(button => { button.disabled = true; }); }
     try {
-      const record = await api(history ? `/debot/tokens/${encodeURIComponent(history.chain)}/${encodeURIComponent(history.address)}/events?${historyQuery}` : protection ? `/protection/${encodeURIComponent(id)}` : followup ? `/followup/${encodeURIComponent(followup.chain)}/${encodeURIComponent(followup.address)}` : profile ? `/wallet-profiles/${encodeURIComponent(profile.chain)}/${encodeURIComponent(profile.address)}` : association ? `/wallet-associations/${encodeURIComponent(association.chain)}/${encodeURIComponent(association.leader)}/${encodeURIComponent(association.candidate)}` : wallet ? `/wallets/${encodeURIComponent(wallet.chain)}/${encodeURIComponent(wallet.address)}` : `/scans/${encodeURIComponent(id)}`, {signal: controller.signal});
-      if (!controller.signal.aborted && state.detailId === id && generation === state.detailGeneration) { if (history) renderDebotHistory(record); else if (protection) renderProtectionDetail(record); else if (followup) renderFollowupDetail(record); else if (profile) renderWalletProfileDetail(record.profile || record); else if (association) renderAssociationDetail(record); else if (wallet) renderWalletResearchDetail(record); else { renderDetail(record); void loadWalletScreeningLedger(record, id, generation); } }
+      const record = await api(meme ? `/meme/${encodeURIComponent(meme.chain)}/${encodeURIComponent(meme.address)}?${historyQuery}` : history ? `/debot/tokens/${encodeURIComponent(history.chain)}/${encodeURIComponent(history.address)}/events?${historyQuery}` : protection ? `/protection/${encodeURIComponent(id)}` : followup ? `/followup/${encodeURIComponent(followup.chain)}/${encodeURIComponent(followup.address)}` : profile ? `/wallet-profiles/${encodeURIComponent(profile.chain)}/${encodeURIComponent(profile.address)}` : association ? `/wallet-associations/${encodeURIComponent(association.chain)}/${encodeURIComponent(association.leader)}/${encodeURIComponent(association.candidate)}` : wallet ? `/wallets/${encodeURIComponent(wallet.chain)}/${encodeURIComponent(wallet.address)}` : `/scans/${encodeURIComponent(id)}`, {signal: controller.signal});
+      if (!controller.signal.aborted && state.detailId === id && generation === state.detailGeneration) { if (meme) renderMemeDetail(record); else if (history) renderDebotHistory(record); else if (protection) renderProtectionDetail(record); else if (followup) renderFollowupDetail(record); else if (profile) renderWalletProfileDetail(record.profile || record); else if (association) renderAssociationDetail(record); else if (wallet) renderWalletResearchDetail(record); else { renderDetail(record); void loadWalletScreeningLedger(record, id, generation); } }
     } catch (error) {
       if (controller.signal.aborted || state.detailId !== id || generation !== state.detailGeneration) return;
       if (error.status === 401) { showLogin('会话已结束，请重新登录。'); return; }
-      if (!quiet) $('detail-content').replaceChildren(el('h2', '', '详情暂不可用'), el('p', 'drawer-loading detail-error', error.status === 404 ? followup ? '本币尚未在持续复盘模块中登记。模块上线前的旧信号不会补造首次价格或后续表现。' : '这条记录已超出保留期或不存在。' : '连接异常，请关闭详情后重试。'));
-      else { const old = $('detail-stale'); if (!old) { const note = el('p', 'notice warning', history ? '通知历史暂时无法更新，仍显示此前成功读取的页。请重试。' : '详情暂时无法更新，以下为最近成功读取的记录。'); note.id = 'detail-stale'; $('detail-content').prepend(note); } }
+      if (!quiet) $('detail-content').replaceChildren(el('h2', '', '详情暂不可用'), el('p', 'drawer-loading detail-error', error.status === 404 ? meme ? '本币尚未登记动态观察，或记录已超出保留期。新信号到达后将重新观察。' : followup ? '本币尚未在持续复盘模块中登记。模块上线前的旧信号不会补造首次价格或后续表现。' : '这条记录已超出保留期或不存在。' : '连接异常，请关闭详情后重试。'));
+      else { const old = $('detail-stale'); if (!old) { const note = el('p', 'notice warning', meme ? '机会变化暂时无法更新，仍显示此前成功读取的页。请重试。' : history ? '通知历史暂时无法更新，仍显示此前成功读取的页。请重试。' : '详情暂时无法更新，以下为最近成功读取的记录。'); note.id = 'detail-stale'; $('detail-content').prepend(note); } }
     } finally {
       if (history && state.detailId === id && generation === state.detailGeneration && state.detailController === controller) {
         history.loading = false; $('detail-content').removeAttribute('aria-busy');

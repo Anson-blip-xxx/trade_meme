@@ -21,6 +21,7 @@ export interface DebotScannerOptions {
   mode?:'anonymous_poll'|'authenticated_stream';
   onSignal:(signal:Signal,observedAt:string,context?:{detailsReady:Promise<void>;repeat?:boolean})=>Promise<unknown>;shouldDefer?:()=>string|undefined;
   repeatCooldownSec?:number;
+  onObservation?:(observation:DebotSignalObservation)=>void;
   repeatEvidence?:(input:DebotRepeatEvidenceInput,signal:Signal)=>DebotRepeatEvidence;
   maxConcurrent?:number;parallelDetails?:boolean;
   lookupDisplay?:(reportId:string)=>{chain:Chain;address:string;name?:string;symbol?:string}|undefined;
@@ -409,8 +410,22 @@ export class DebotScanner {
 
   private record(observation:DebotSignalObservation):number {
     this.db.exec('SAVEPOINT debot_inbox_record');
-    try {const result=this.recordAtomic(observation);this.db.exec('RELEASE debot_inbox_record');return result;}
+    let result:number;
+    try {result=this.recordAtomic(observation);this.db.exec('RELEASE debot_inbox_record');}
     catch(error){this.db.exec('ROLLBACK TO debot_inbox_record; RELEASE debot_inbox_record');throw error;}
+    // Observation is independent of dispatch/dedup decisions, and cannot roll back the inbox.
+    const bound=this.db.prepare('SELECT chain,address FROM debot_signals WHERE id=?').get(observation.signal.sourceEventId);
+    if(bound&&bound.chain===observation.signal.token.chain&&bound.address===observation.signal.token.address)
+      try{this.options.onObservation?.(observation);}catch{/* Optional observer failure is isolated. */}
+    return result;
+  }
+  /** Resume only recent real notifications; their original timestamps remain unchanged. */
+  observationSeeds(limit=300):DebotSignalObservation[]{
+    if(this.closed)return [];
+    if(!Number.isInteger(limit)||limit<1||limit>1000)throw new Error('INVALID_FILTER');
+    return this.db.prepare('SELECT payload FROM debot_signals WHERE observed_at>=? ORDER BY observed_at DESC LIMIT ?')
+      .all(new Date(this.now().getTime()-7200000).toISOString(),limit)
+      .flatMap(row=>{try{return [JSON.parse(String(row.payload)) as DebotSignalObservation];}catch{return [];}}).reverse();
   }
   private recordAtomic(observation:DebotSignalObservation):number {
     let signal=observation.signal;

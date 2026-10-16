@@ -47,6 +47,7 @@ export interface Config extends z.infer<typeof schema> {
   walletResearch:{enabled:boolean;database:string;maxBytes:number;intervalSec:number;maxRequestsPerCycle:number};
   walletProfiles:{enabled:boolean;database:string;maxBytes:number;intervalSec:number;batchSize:number};
   walletScreening:{enabled:boolean;database:string;maxBytes:number};
+  meme?:{enabled:boolean;database:string;maxBytes:number;maxActive:number;activeWindowSec:number};
   watch:{enabled:boolean;windowSec:number;intervalSec:number;maxPerCycle:number};
   exitShadow:{enabled:boolean;database:string;maxBytes:number;staleAfterSec:number;maxPositions:number};
   chainStream:{enabled:boolean;database:string;maxBytes:number;maxWallets:number;maxPools:number;
@@ -128,6 +129,11 @@ export function readConfig(env:NodeJS.ProcessEnv=process.env): Config {
       retentionDays:z.coerce.number().int().min(1).max(365).parse(env.SCAN_RETENTION_DAYS??30),
       trackingHours:z.coerce.number().int().min(1).max(168).parse(env.PRICE_TRACKING_HOURS??24),
       sampleIntervalSec:z.coerce.number().int().min(30).max(3600).parse(env.PRICE_SAMPLE_INTERVAL_SEC??60)},
+    meme:{enabled:z.enum(['true','false']).parse(env.MEME_OBSERVER_ENABLED??env.DEBOT_SCANNER_ENABLED??'false')==='true',
+      database:z.string().trim().refine(isPersistentOrderPath).parse(env.MEME_DATABASE_PATH??'data/meme-observations.sqlite'),
+      maxBytes:z.coerce.number().int().min(16).max(4096).parse(env.MEME_MAX_MB??1024)*1024*1024,
+      maxActive:z.coerce.number().int().min(1).max(300).parse(env.MEME_MAX_ACTIVE??180),
+      activeWindowSec:z.coerce.number().int().min(60).max(86400).parse(env.MEME_ACTIVE_WINDOW_SEC??7200)},
     walletScreening:{enabled:z.enum(['true','false']).parse(env.WALLET_SCREENING_ENABLED??env.WALLET_PROFILES_ENABLED??env.WALLET_RESEARCH_ENABLED??'false')==='true',
       database:z.string().trim().refine(isPersistentOrderPath).parse(env.WALLET_SCREENING_DATABASE_PATH??`${env.WALLET_HISTORY_DATABASE_PATH??'data/wallet-history.sqlite'}.setups.sqlite`),
       maxBytes:z.coerce.number().int().min(1048576).max(1073741824).default(67108864).parse(env.WALLET_SCREENING_MAX_BYTES)},

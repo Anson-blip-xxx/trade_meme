@@ -28,6 +28,10 @@ import {existsSync,realpathSync,statSync} from 'node:fs';
 import {researchProvider} from './research.js';
 import type {DashboardPageOptions} from './dashboard.js';
 import {assessDebotRepeatEvidence} from './debot-repeat-evidence.js';
+import {MemeObserver} from './meme-observer.js';
+import {normalizeMemeMarket} from './meme-assessment.js';
+import {collectMemeCatalyst} from './meme-catalyst.js';
+import {fetchMemeMarkets} from './meme-market-provider.js';
 
 export function createRuntime(config:Config) {
   if(!isPersistentOrderPath(config.ordersDatabase)) throw new Error('PERSISTENT_ORDER_DATABASE_REQUIRED');
@@ -46,6 +50,10 @@ export function createRuntime(config:Config) {
     config.walletProfiles.database,config.walletScreening.database,config.chainStream.database,config.exitShadow.database,
     config.debotSignalsDatabase].some(path=>sameDatabase(path,config.debotSessionPath)))throw new Error('DEBOT_SESSION_PATH_CONFLICT');
   const client=new GmgnClient({apiKey:config.gmgnApiKey,minIntervalMs:config.gmgnMinIntervalMs});
+  if(config.meme?.enabled&&[config.ordersDatabase,config.dashboard.archivePath,config.walletResearch.database,
+    config.walletProfiles.database,config.walletScreening.database,config.chainStream.database,config.exitShadow.database,
+    config.debotSignalsDatabase,config.debotSessionPath].some(path=>sameDatabase(path,config.meme!.database)))
+    throw new Error('MEME_DATABASE_CONFLICT');
   const providers=liveProviders(config,client);
   const archive=config.dashboard.enabled||config.watch.enabled||config.exitShadow.enabled||config.chainStream.enabled?new ScanArchive(config.dashboard.archivePath,{
     retentionDays:config.dashboard.retentionDays,trackingHours:config.dashboard.trackingHours,followupEnabled:true}):undefined;
@@ -66,6 +74,23 @@ export function createRuntime(config:Config) {
   const walletObserver=walletHistory?new WalletObserver({history:walletHistory,client,config,chains:config.scannerChains,
     intervalMs:config.walletResearch.intervalSec*1000,maxRequestsPerCycle:config.walletResearch.maxRequestsPerCycle}):undefined;
   let archiveCaptureError:string|undefined,walletCaptureError:string|undefined,walletIndexError:string|undefined,associationIndexError:string|undefined;
+  let memeCaptureError:string|undefined;
+  let backgroundGmgnAbort:AbortController|undefined;
+  const memeObserver=config.meme?.enabled?new MemeObserver({...config.meme,marketBatch:fetchMemeMarkets,
+    ...(config.gmgnApiKey?.trim()?{marketFallback:async(token:Signal['token'],abort:AbortSignal)=>{
+      if(active||scanner.getStatus().inFlight)return;
+      backgroundGmgnAbort=new AbortController();
+      try {
+        const raw=await client.withSignal(AbortSignal.any([abort,backgroundGmgnAbort.signal,AbortSignal.timeout(1000)]))
+          .get('/v1/token/info',{chain:token.chain==='solana'?'sol':token.chain,address:token.address},1);
+        return normalizeMemeMarket(raw,token,new Date().toISOString());
+      }finally{backgroundGmgnAbort=undefined;}
+    }}:{}),cooldownUntil:()=>client.cooldownUntil,
+    catalyst:(signal,abort,snapshot)=>collectMemeCatalyst(signal,config,{signal:abort,snapshot}),
+    walletEvidence:(token,now)=>({evidence:walletHistory?.followupEvidence(token,new Date(now.getTime()-120000).toISOString(),now.toISOString())})}):undefined;
+  const observeSignal=(signal:Signal,at?:string,display?:{name?:string;symbol?:string})=>{
+    try{memeObserver?.register(signal,at,display);memeCaptureError=undefined;}catch{memeCaptureError='MEME_SIGNAL_CAPTURE_FAILED';}
+  };
   const store=new Store(':memory:',item=>{
     // The two research archives are independent observers; a failed archive must
     // neither suppress the other nor roll back the signal / affect order submission.
@@ -73,6 +98,8 @@ export function createRuntime(config:Config) {
     if(walletHistory&&item.status==='completed'&&item.report)try {
       walletHistory.captureReport(item.report);walletCaptureError=undefined;
     }catch {walletCaptureError='WALLET_HISTORY_WRITE_FAILED';}
+    if(item.status==='completed'&&item.report)try{memeObserver?.captureReport(item.report);memeCaptureError=undefined;}
+    catch{memeCaptureError='MEME_REPORT_CAPTURE_FAILED';}
   }),orders=new OrderStore(config.ordersDatabase);
   let exitCaptureError:string|undefined;
   const recordPrice=(price:ScanPrice)=>{
@@ -116,7 +143,9 @@ export function createRuntime(config:Config) {
   const reconciler=new OrderReconciler(orders,entry);
   let closed=false,active=0,archiveMaintenanceError:string|undefined;
   const onSignal=async(signal:Signal,firstReceivedAt?:string,context?:{detailsReady:Promise<void>;repeat?:boolean}):Promise<void>=>{
+    backgroundGmgnAbort?.abort();
     if(closed||active>=4) throw new Error('RESEARCH_BUSY');
+    observeSignal(signal,firstReceivedAt);
     store.prune(config.researchCacheTtlSec,config.researchCacheMax);
     const reserved=store.reserve(signal,undefined,'notification_copy',firstReceivedAt);
     if(reserved.conflict) throw new Error('EVENT_ID_PAYLOAD_CONFLICT');
@@ -144,6 +173,7 @@ export function createRuntime(config:Config) {
     maxConcurrent:debotSession?2:1,parallelDetails:!!debotSession,
     lookupDisplay:reportId=>archive?.tokenDisplay(reportId),
     maxAgeSec:debotSession?Math.min(120,config.maxSignalAgeSec):config.maxSignalAgeSec,onSignal,
+    onObservation:observation=>observeSignal(observation.signal,observation.observedAt,observation),
     repeatEvidence:(input,signal)=>{
       // Optional profile lookup must not hide independently observed sell trades.
       const walletTargets=(()=>{try{return walletScreening?.researchTargets(signal);}catch{return undefined;}})();
@@ -175,10 +205,12 @@ export function createRuntime(config:Config) {
     shouldDefer:()=>closed?'SERVICE_STOPPING':!config.gmgnApiKey?.trim()?'GMGN_API_KEY_MISSING':
       client.cooldownUntil>Date.now()?'GMGN_RATE_LIMITED':active>=4?'RESEARCH_BUSY':scanner.getStatus().inFlight?'SCANNER_BUSY':undefined,
     evaluate:async(signal,options)=>{
+      backgroundGmgnAbort?.abort();
       if(closed||active>=4)throw new Error('RESEARCH_BUSY');
       active++;
       try {
         const report=await evaluate(signal,config,providers,options);
+        try{memeObserver?.captureReport(report);memeCaptureError=undefined;}catch{memeCaptureError='MEME_REPORT_CAPTURE_FAILED';}
         if(walletHistory)try {walletHistory.captureReport(report);walletCaptureError=undefined;}
         catch {walletCaptureError='WALLET_HISTORY_WRITE_FAILED';}
         return report;
@@ -235,7 +267,7 @@ export function createRuntime(config:Config) {
     try {return {...exitShadow.summary(),captureError:exitCaptureError};}
     catch {return {enabled:true,mode:'shadow',liveReady:false,captureError:'EXIT_SHADOW_READ_FAILED'};}
   };
-  return {client,providers,store,orders,entry,scanner,debotScanner,debotStream,debotAuth,archive,tracking,walletHistory,walletObserver,walletResearchStatus,walletProfiles,walletProfilesStatus,walletScreening,watchRechecker,exitShadow,chainMonitor,chainStreamStatus,
+  return {client,providers,store,orders,entry,scanner,debotScanner,debotStream,debotAuth,archive,tracking,walletHistory,walletObserver,walletResearchStatus,walletProfiles,walletProfilesStatus,walletScreening,watchRechecker,exitShadow,chainMonitor,chainStreamStatus,memeObserver,
     dashboardHome:()=>{
       const host=system?.get();
       return {now:new Date().toISOString(),entryMode:config.entryMode,stats:archive?.overviewStats(),
@@ -251,12 +283,17 @@ export function createRuntime(config:Config) {
     dashboardOverview:()=>({now:new Date().toISOString(),entryMode:config.entryMode,scanner:scanner.getStatus(),
       debotScanner:debotScanner?.getStatus()??{enabled:false,running:false},
       debotStream:debotStream?.getStatus(),
+      meme:memeObserver?{...memeObserver.status(),captureError:memeCaptureError}:{enabled:false},
       tracking:tracking?.getStatus(),stats:archive?.stats(),archiveError:archiveCaptureError??store.observationError??archiveMaintenanceError,
       settings:dashboardSettings(config),balances:balances?.get()??[],system:system?.get(),walletResearch:walletResearchStatus(),exitProtection:protectionSummary(),chainStream:chainStreamStatus(),
       watchRecheck:watchRechecker?{enabled:true,...watchRechecker.getStatus()}:{enabled:false}}),
     dashboardOrders:(options:DashboardPageOptions={limit:20,offset:0})=>dashboardOrders(orders,options),
     start(){
       if(closed) return;
+      if(memeObserver){
+        for(const observation of debotScanner?.observationSeeds()??[])observeSignal(observation.signal,observation.observedAt,observation);
+        memeObserver.start();
+      }
       chainMonitor?.start();tracking?.start();balances?.start();system?.start();walletProfiles?.start();walletScreening?.start(async signal=>{
         if(closed||active>=4||!config.gmgnApiKey?.trim()||client.cooldownUntil>Date.now()||scanner.getStatus().inFlight)return false;
         await onSignal(signal);
@@ -287,6 +324,7 @@ export function createRuntime(config:Config) {
       await reconciler.stop();
       // Stop means no new work. Await current callback before closing its stores.
       while(active) await new Promise(resolve=>setTimeout(resolve,50));
+      await memeObserver?.close();
       await walletScreening?.close();
       await walletProfiles?.stop();
       await debotScanner?.close();

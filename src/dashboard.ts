@@ -46,6 +46,8 @@ export interface DashboardServices {
   debotAuth?:Pick<DebotAuthManager,'getStatus'|'sendCode'|'login'>;
   debotSignals?:(options?:DebotSignalListOptions)=>unknown;
   debotHistory?:(chain:Chain,address:string,options:{limit:number;offset:number;asOf?:string})=>unknown;
+  memeSignals?:(options:DashboardPageOptions&{asOf?:string})=>unknown;
+  memeDetail?:(chain:Chain,address:string,options:{limit:number;offset:number;asOf?:string})=>unknown;
   protectionDetail?:(id:string)=>unknown;
   walletHistory?:Pick<WalletHistory,'listWallets'|'getWallet'>;
   walletResearchStatus?:()=>unknown;
@@ -185,7 +187,13 @@ export function buildDashboard(config:Config,services:DashboardServices,assetDir
         send(res,200,services.debotSignals?.(options)??{now:new Date().toISOString(),asOf:options.asOf??new Date().toISOString(),
           total:0,limit:options.limit,offset:options.offset,hasMore:false,items:[]});return;
       }
-      const notificationMatch=url.pathname.match(/^\/dashboard\/api\/debot\/tokens\/([^/]+)\/([^/]+)\/events$/);
+      if(url.pathname==='/dashboard/api/meme'){
+        const options={...pageOptions(url),...pageAsOf(url)};
+        send(res,200,services.memeSignals?.(options)??{now:new Date().toISOString(),asOf:options.asOf??new Date().toISOString(),
+          status:{enabled:false},total:0,items:[],...options,hasMore:false});return;
+      }
+      const memeMatch=url.pathname.match(/^\/dashboard\/api\/meme\/([^/]+)\/([^/]+)$/);
+      const notificationMatch=memeMatch??url.pathname.match(/^\/dashboard\/api\/debot\/tokens\/([^/]+)\/([^/]+)\/events$/);
       if(notificationMatch){
         const chain=notificationMatch[1];let address:string;
         if(!['bsc','solana','robinhood'].includes(chain))throw new Error('INVALID_FILTER');
@@ -195,6 +203,7 @@ export function buildDashboard(config:Config,services:DashboardServices,assetDir
           else {if(!/^0x[0-9a-fA-F]{40}$/.test(address))throw new Error();address=address.toLowerCase();}
         }catch{throw new Error('INVALID_FILTER');}
         const options={...pageOptions(url),...pageAsOf(url)};
+        if(memeMatch){send(res,200,services.memeDetail?.(chain as Chain,address,options)??{token:{chain,address},total:0,items:[],...options,hasMore:false});return;}
         send(res,200,services.debotHistory?.(chain as Chain,address,options)??{chain,address,total:0,items:[],...options,hasMore:false});return;
       }
       if(url.pathname==='/dashboard/api/orders') {send(res,200,services.orders(pageOptions(url)));return;}

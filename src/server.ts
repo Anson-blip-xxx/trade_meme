@@ -112,6 +112,8 @@ if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href) {
     debotSignals:options=>runtime.debotScanner?.list(options)??{now:new Date().toISOString(),items:[],total:0,
       limit:options?.limit??20,offset:options?.offset??0,hasMore:false},
     debotHistory:(chain,address,options)=>runtime.debotScanner?.notificationHistory(chain,address,options),
+    memeSignals:options=>runtime.memeObserver?.list(options),
+    memeDetail:(chain,address,options)=>runtime.memeObserver?.detail({chain,address},options),
     chainStream:runtime.chainStreamStatus,protection:runtime.dashboardProtection,protectionDetail:id=>runtime.exitShadow?.detail(id),
     walletHistory:runtime.walletHistory,walletResearchStatus:runtime.walletResearchStatus,walletAssociations:runtime.walletHistory,
     walletProfiles:runtime.walletProfiles?.reader,walletProfilesStatus:runtime.walletProfilesStatus,walletScreening:runtime.walletScreening?.ledger}):undefined;

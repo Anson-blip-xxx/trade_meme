@@ -26,18 +26,37 @@ async function fixture(overrides:Partial<DashboardServices>={}) {
 const login=(base:string,value=password,origin?:string)=>fetch(`${base}/dashboard/api/login`,{
   method:'POST',headers:{'content-type':'application/json',...(origin?{origin}:{})},body:JSON.stringify({password:value})});
 
+test('Meme research pages validate scoped identity and stable pagination without touching orders',async()=>{
+  const calls:unknown[]=[];
+  const f=await fixture({memeSignals:options=>{calls.push(options);return {items:[],status:{researchOnly:true}};},
+    memeDetail:(chain,address,options)=>{calls.push({chain,address,...options});return {items:[],token:{chain,address}};},
+    orders:()=>{throw new Error('MUST_NOT_TOUCH_ORDERS');}});
+  const headers={'x-dashboard-access':password},stamp='2026-10-16T08:00:00.000Z',address='0x'+'A'.repeat(40);
+  try {
+    assert.equal((await fetch(`${f.base}/dashboard/api/meme?limit=7&offset=14&chain=bsc&asOf=${stamp}`,{headers})).status,200);
+    assert.deepEqual(calls[0],{limit:7,offset:14,chain:'bsc',asOf:stamp});
+    const detail=await (await fetch(`${f.base}/dashboard/api/meme/bsc/${address}?limit=7&offset=14&asOf=${stamp}`,{headers})).json();
+    assert.equal(detail.token.address,address.toLowerCase());
+    assert.deepEqual(calls[1],{chain:'bsc',address:address.toLowerCase(),limit:7,offset:14,asOf:stamp});
+    for(const path of ['meme?asOf=2026-02-31T00:00:00.000Z','meme/eth/'+address,'meme/bsc/invalid',
+      'meme/solana/'+address,'meme/bsc/'+address+'?offset=-1','meme/bsc/'+address+'?limit=101'])
+      assert.equal((await fetch(`${f.base}/dashboard/api/${path}`,{headers})).status,400,path);
+    assert.equal(calls.length,2);
+  }finally{await f.close();}
+});
+
 test('dashboard page routes enforce authentication, validate filters and pass bounded options to read-only services',async()=>{
   const calls:unknown[]=[];
   const service=(options:unknown)=>{calls.push(options);return {items:[],total:0};};
-  const f=await fixture({home:()=>({entryMode:'off',compact:true}),debotSignals:service,orders:service,protection:service});
+  const f=await fixture({home:()=>({entryMode:'off',compact:true}),debotSignals:service,memeSignals:service,orders:service,protection:service});
   try {
     const headers={'x-dashboard-access':password};
-    for(const route of ['home','debot/signals','followup/records','followup/groups','followup/learning','orders','protection','wallet-screening']) {
+    for(const route of ['home','meme','meme/bsc/0x1111111111111111111111111111111111114444','debot/signals','followup/records','followup/groups','followup/learning','orders','protection','wallet-screening']) {
       assert.equal((await fetch(`${f.base}/dashboard/api/${route}`)).status,401,route);
       assert.equal((await fetch(`${f.base}/dashboard/api/${route}`,{method:'POST',headers})).status,405,route);
     }
     assert.deepEqual(await (await fetch(`${f.base}/dashboard/api/home`,{headers})).json(),{entryMode:'off',compact:true});
-    for(const route of ['debot/signals','followup/records','followup/groups','followup/learning','orders','protection','wallet-screening'])
+    for(const route of ['meme','debot/signals','followup/records','followup/groups','followup/learning','orders','protection','wallet-screening'])
       for(const query of ['limit=0','limit=101','offset=-1','offset=1000001','offset=1.5','chain=eth'])
         assert.equal((await fetch(`${f.base}/dashboard/api/${route}?${query}`,{headers})).status,400,`${route}: ${query}`);
     for(const query of ['decision=BUY','selected=yes','status=any','asOf=2026-10-15'])

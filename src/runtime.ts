@@ -384,7 +384,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher}
     dashboardOrders:(options:DashboardPageOptions={limit:20,offset:0})=>dashboardOrders(orders,options),
     start(){
       if(closed) return;
-      try{exitShadow?.migrateActiveV1();}catch{exitCaptureError='EXIT_SHADOW_MIGRATION_FAILED';}
+      try{exitShadow?.migrateActiveToV3();}catch{exitCaptureError='EXIT_SHADOW_MIGRATION_FAILED';}
       maintainProtection();
       if(!exitMaintenanceTimer){exitMaintenanceTimer=setInterval(maintainProtection,15_000);exitMaintenanceTimer.unref();}
       if(memeObserver){

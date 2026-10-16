@@ -154,7 +154,7 @@
             </section>
 
             <section id="protection-panel" class="protection-panel" aria-labelledby="protection-title" hidden>
-              <div class="protection-mode-notice"><div><span class="badge watch">影子验证</span><strong>实盘保护未就绪</strong></div><p>这里前瞻记录动态保护线与模拟触发建议，不代表成交、真实持仓或已挂出的止盈单，也不会发送卖单。</p><p>每个观察对象以加入后收到的第一条新报价作为模拟起点，之后才累积峰值；不拿历史最高价回填。</p></div>
+              <div class="protection-mode-notice"><div><span class="badge watch">影子验证</span><strong>实盘保护未就绪</strong></div><p>这里前瞻记录动态保护线与模拟触发建议，不代表成交、真实持仓或已挂出的止盈单，也不会发送卖单。</p><p>V3 无固定持有时限，按行情持续保护；研究窗口截止或暂时缺价不触发清仓。每个观察对象以加入后的首条新现价建立模拟起点，之后才累积峰值。</p></div>
               <div class="metrics-grid protection-metrics" aria-label="止盈影子验证概览">
                 <article class="metric-card"><div class="metric-label">影子观察对象</div><div id="protection-total" class="metric-value">—</div><div class="metric-note">不代表实际开仓数量</div></article>
                 <article class="metric-card"><div class="metric-label">继续跟踪</div><div id="protection-active" class="metric-value">—</div><div class="metric-note">等待或持续接收新报价</div></article>

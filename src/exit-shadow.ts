@@ -4,7 +4,7 @@ import {mkdirSync,chmodSync,statSync} from 'node:fs';
 import {dirname} from 'node:path';
 import {randomUUID} from 'node:crypto';
 import bs58 from 'bs58';
-import {ADAPTIVE_SHADOW_V1,ADAPTIVE_SHADOW_V2,adaptiveExitPolicy,adaptiveExitDeadline,migrateAdaptiveExitV1,stepAdaptiveExit,type AdaptiveExitState,type WalletPressure} from './adaptive-exit.js';
+import {ADAPTIVE_SHADOW_V1,ADAPTIVE_SHADOW_V2,ADAPTIVE_SHADOW_V3,adaptiveExitPolicy,adaptiveExitDeadline,migrateAdaptiveExitToV3,stepAdaptiveExit,type AdaptiveExitState,type WalletPressure} from './adaptive-exit.js';
 import type {Chain} from './types.js';
 import type {ScanPrice,ScanToken} from './scan-archive.js';
 
@@ -23,8 +23,10 @@ export interface ShadowEvent {
 }
 export interface ShadowExitIntent {
   requestedAt:string;dueAt:string;reason:string;sellPctRemaining:100;remainingPctOfInitial:number;
-  peakPriceUsd:number;policyVersion:string;observedAt?:string;observedPriceUsd?:number;
+  peakPriceUsd:number;policyVersion:string;observedAt?:string;observedPriceUsd?:number;cancelledAt?:string;cancelReason?:string;
 }
+const continuousPolicy=(version:string)=>version===ADAPTIVE_SHADOW_V2.version||version===ADAPTIVE_SHADOW_V3.version;
+const timeExitReason=(reason:string)=>reason==='MAX_HOLDING_TIME_OBSERVED'||reason==='OBSERVATION_WINDOW_END_OBSERVED';
 const stamp=(value:unknown):value is string=>typeof value==='string'&&/^\d{4}-\d\d-\d\dT/.test(value)&&Number.isFinite(Date.parse(value));
 const clean=(value:unknown,max=80)=>typeof value==='string'?value.replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g,' ').trim().slice(0,max):undefined;
 const code=(value:unknown)=>typeof value==='string'&&/^[A-Z][A-Z0-9_]{0,99}$/.test(value)?value:'PRICE_SAMPLE_UNAVAILABLE';
@@ -94,18 +96,20 @@ export class ExitShadow {
     const at=new Date(price.observedAt).toISOString();
     let previous=this.current(target);
     if(previous&&at<=previous.last_price_at)return;
-    if(previous&&(JSON.parse(previous.state).shadowClosed||JSON.parse(previous.state).policyVersion!==ADAPTIVE_SHADOW_V2.version)&&Date.parse(previous.ends_at)<=now.getTime()&&seed&&seed.candidateId!==previous.candidate_id&&
+    if(previous&&(JSON.parse(previous.state).shadowClosed||!continuousPolicy(JSON.parse(previous.state).policyVersion))&&Date.parse(previous.ends_at)<=now.getTime()&&seed&&seed.candidateId!==previous.candidate_id&&
       stamp(seed.eligibleAt)&&Date.parse(seed.eligibleAt)>Date.parse(previous.eligible_at))previous=undefined;
     if(!previous&&(!seed||!stamp(seed.eligibleAt)||!stamp(seed.endsAt)||Date.parse(seed.eligibleAt)>Date.parse(at)||
       Date.parse(seed.endsAt)<=now.getTime()||typeof seed.candidateId!=='string'||! /^[A-Za-z0-9_-]{1,200}$/.test(seed.candidateId)))return;
     // A finished observation is not silently reopened for the same old candidate.
     const state=previous?JSON.parse(previous.state) as AdaptiveExitState:undefined;
-    if(previous&&state?.policyVersion!==ADAPTIVE_SHADOW_V2.version&&
+    if(previous&&state&&!continuousPolicy(state.policyVersion)&&
       (previous.phase==='ended'||Date.parse(previous.ends_at)<=now.getTime()))return;
     // Preserve all previous samples; only future comparison ticks after simulated closure are capped.
     if(previous&&state?.shadowClosed&&Date.parse(at)-Date.parse(previous.last_price_at)<60_000)return;
-    if(previous)this.ensureIntent(previous,now);
-    const policy=state?adaptiveExitPolicy(state.policyVersion):ADAPTIVE_SHADOW_V2;
+    // A failed deployment migration must never resume a retired time-exit policy.
+    if(state&&!state.shadowClosed&&state.policyVersion!==ADAPTIVE_SHADOW_V3.version)
+      this.fail('EXIT_SHADOW_POLICY_MIGRATION_REQUIRED');
+    const policy=state?adaptiveExitPolicy(state.policyVersion):ADAPTIVE_SHADOW_V3;
     if(!policy)this.fail('EXIT_SHADOW_STATE_INVALID');
     const observation={...target,priceUsd:price.priceUsd,observedAt:at,evaluatedAt:now.toISOString(),source:price.source,metadata:evidence,...(!previous?{observationEndsAt:seed!.endsAt}:{})};
     const result=stepAdaptiveExit(state,observation,pressure,policy);
@@ -154,12 +158,12 @@ export class ExitShadow {
             sellPct:e.sellPctRemaining,gainPct:e.observedGainPct,priceUsd:e.observedPriceUsd,
             protectionPriceUsd:e.protectionPriceUsd,remainingPct:e.remainingPctOfInitial,peakPriceUsd:e.peakPriceUsd,
             policyVersion:e.policyVersion,reasons:e.reasons});
-          const intent=this.intent(id);
+          const intent=this.activeIntent(id);
           if(e.kind==='full_exit'&&intent&&!intent.observedAt)this.db.prepare('UPDATE exit_shadow_exit_intents SET data=? WHERE position_id=?')
             .run(JSON.stringify({...intent,observedAt:e.observedAt,observedPriceUsd:e.observedPriceUsd}),id);
         }
         this.db.prepare('UPDATE exit_shadow_positions SET updated_at=?,phase=?,state=?,last_price_at=?,last_price=?,error=NULL,error_at=NULL WHERE id=?')
-          .run(now.toISOString(),next.shadowClosed?'triggered':this.intent(id)?'exit_pending':'tracking',JSON.stringify(next),at,price.priceUsd,id);
+          .run(now.toISOString(),next.shadowClosed?'triggered':this.activeIntent(id)?'exit_pending':'tracking',JSON.stringify(next),at,price.priceUsd,id);
         this.db.prepare('INSERT OR REPLACE INTO exit_shadow_meta VALUES (?,?)').run('last_sample_at',
           [this.meta('last_sample_at')??'',at].sort().at(-1)!);
         this.db.prepare("DELETE FROM exit_shadow_meta WHERE key='last_error'").run();
@@ -173,9 +177,8 @@ export class ExitShadow {
     if(!Number.isFinite(now.getTime())||now.getTime()>this.now().getTime())return;
     const row=this.current(target);if(!row||row.phase==='ended')return;
     const state=JSON.parse(row.state) as AdaptiveExitState;
-    if(state.shadowClosed||state.policyVersion!==ADAPTIVE_SHADOW_V2.version&&Date.parse(row.ends_at)<=now.getTime())return;
+    if(state.shadowClosed||!continuousPolicy(state.policyVersion)&&Date.parse(row.ends_at)<=now.getTime())return;
     if(now.getTime()<Date.parse(row.last_price_at)||row.error_at&&now.getTime()<=Date.parse(row.error_at))return;
-    this.ensureIntent(row,now);
     try {
       if(this.bytes()+16384>this.maxBytes)this.fail('EXIT_SHADOW_CAPACITY_REACHED');
       this.db.exec('BEGIN IMMEDIATE');
@@ -188,35 +191,48 @@ export class ExitShadow {
       this.fail(error instanceof Error&&error.message==='EXIT_SHADOW_CAPACITY_REACHED'?error.message:'EXIT_SHADOW_WRITE_FAILED');}
   }
 
-  /** Timer-only persistence: a missing quote can create an intent, never a closed position. */
+  /** Elapsed time alone never creates an exit intent. Missing prices remain an explicit data gap. */
   tick(now=this.now()):{pending:number;created:number} {
     if(!Number.isFinite(now.getTime())||now.getTime()>this.now().getTime())return {pending:0,created:0};
-    const rows=this.db.prepare("SELECT * FROM exit_shadow_positions WHERE phase='tracking' ORDER BY last_price_at,id LIMIT ?")
-      .all(this.maxPositions) as unknown as ShadowRow[];
-    let created=0;for(const row of rows)if(this.ensureIntent(row,now))created++;
-    return {created,pending:Number(this.db.prepare("SELECT count(*) AS n FROM exit_shadow_positions WHERE phase='exit_pending'").get()!.n)};
+    return {created:0,pending:Number(this.db.prepare("SELECT count(*) AS n FROM exit_shadow_positions WHERE phase='exit_pending'").get()!.n)};
   }
 
-  /** Explicit deployment action; historical v1 samples and ended episodes remain unchanged. */
-  migrateActiveV1(now=this.now()):{migrated:number} {
-    if(!Number.isFinite(now.getTime())||now.getTime()>this.now().getTime())return {migrated:0};
-    const rows=this.db.prepare("SELECT * FROM exit_shadow_positions WHERE phase='tracking' AND ends_at>? ORDER BY started_at,id LIMIT ?")
-      .all(now.toISOString(),this.maxPositions) as unknown as ShadowRow[];let migrated=0;
+  /** Prospective deployment migration. Finished history is never reopened or rewritten. */
+  migrateActiveToV3(now=this.now()):{migrated:number;cancelled:number} {
+    if(!Number.isFinite(now.getTime())||now.getTime()>this.now().getTime())return {migrated:0,cancelled:0};
+    const rows=this.db.prepare("SELECT * FROM exit_shadow_positions WHERE phase IN ('tracking','exit_pending') ORDER BY started_at,id LIMIT ?")
+      .all(this.maxPositions) as unknown as ShadowRow[];let migrated=0,cancelled=0;
     for(const row of rows){
-      const old=JSON.parse(row.state) as AdaptiveExitState,next=migrateAdaptiveExitV1(old,now.toISOString(),row.ends_at);if(!next)continue;
-      if(this.bytes()+JSON.stringify(next).length*4+16384>this.maxBytes)this.fail('EXIT_SHADOW_CAPACITY_REACHED');
+      const old=JSON.parse(row.state) as AdaptiveExitState;
+      if(old.shadowClosed||old.policyVersion===ADAPTIVE_SHADOW_V1.version&&Date.parse(row.ends_at)<=now.getTime())continue;
+      const next=migrateAdaptiveExitToV3(old,now.toISOString()),intent=this.activeIntent(row.id);
+      const cancel=!!(intent&&!intent.observedAt&&timeExitReason(intent.reason));
+      if(!next&&old.policyVersion!==ADAPTIVE_SHADOW_V3.version)this.fail('EXIT_SHADOW_STATE_INVALID');
+      if(!next&&!cancel)continue;
+      const state=next??old;
+      if(this.bytes()+JSON.stringify(state).length*4+16384>this.maxBytes)this.fail('EXIT_SHADOW_CAPACITY_REACHED');
       this.db.exec('BEGIN IMMEDIATE');try{
-        this.db.prepare('INSERT INTO exit_shadow_policy_history VALUES(?,?,?,?,?)')
-          .run(row.id,now.toISOString(),old.policyVersion,next.policyVersion,row.state);
-        this.db.prepare('UPDATE exit_shadow_positions SET state=?,updated_at=? WHERE id=?').run(JSON.stringify(next),now.toISOString(),row.id);
-        const event:ShadowEvent={at:now.toISOString(),kind:'policy_migrated',reason:'POLICY_MIGRATED_PROSPECTIVE',observationOnly:true,
-          previousPolicyVersion:old.policyVersion,policyVersion:next.policyVersion,effectiveAt:now.toISOString(),dueAt:adaptiveExitDeadline(next)?.dueAt,
-          remainingPct:next.remainingPctOfInitial,peakPriceUsd:next.peakPriceUsd};
-        this.db.prepare('INSERT INTO exit_shadow_events(position_id,at,data) VALUES(?,?,?)').run(row.id,event.at,JSON.stringify(event));
-        this.db.exec('COMMIT');migrated++;
+        const emit=(event:ShadowEvent)=>this.db.prepare('INSERT INTO exit_shadow_events(position_id,at,data) VALUES(?,?,?)').run(row.id,event.at,JSON.stringify(event));
+        if(next){
+          this.db.prepare('INSERT INTO exit_shadow_policy_history VALUES(?,?,?,?,?)')
+            .run(row.id,now.toISOString(),old.policyVersion,next.policyVersion,row.state);
+          emit({at:now.toISOString(),kind:'policy_migrated',reason:'POLICY_MIGRATED_PROSPECTIVE',observationOnly:true,
+            previousPolicyVersion:old.policyVersion,policyVersion:next.policyVersion,effectiveAt:now.toISOString(),
+            remainingPct:next.remainingPctOfInitial,peakPriceUsd:next.peakPriceUsd});
+        }
+        if(cancel){
+          this.db.prepare('UPDATE exit_shadow_exit_intents SET data=? WHERE position_id=?')
+            .run(JSON.stringify({...intent,cancelledAt:now.toISOString(),cancelReason:'TIME_EXIT_CANCELLED_BY_POLICY'}),row.id);
+          emit({at:now.toISOString(),kind:'time_exit_cancelled',reason:'TIME_EXIT_CANCELLED_BY_POLICY',observationOnly:true,
+            previousPolicyVersion:intent!.policyVersion,policyVersion:state.policyVersion,effectiveAt:now.toISOString(),
+            dueAt:intent!.dueAt,reasons:[intent!.reason],remainingPct:state.remainingPctOfInitial,peakPriceUsd:state.peakPriceUsd});
+        }
+        this.db.prepare('UPDATE exit_shadow_positions SET state=?,updated_at=?,phase=? WHERE id=?')
+          .run(JSON.stringify(state),now.toISOString(),cancel?'tracking':row.phase,row.id);
+        this.db.exec('COMMIT');if(next)migrated++;if(cancel)cancelled++;
       }catch{this.db.exec('ROLLBACK');this.fail('EXIT_SHADOW_WRITE_FAILED');}
     }
-    return {migrated};
+    return {migrated,cancelled};
   }
 
   /** Targets outlive the scan archive window until a new trusted price observes final closure. */
@@ -226,27 +242,14 @@ export class ExitShadow {
     const rows=this.db.prepare(`SELECT chain,address,
         MIN(CASE WHEN error_at>last_price_at THEN error_at ELSE last_price_at END) AS oldest
       FROM exit_shadow_positions
-      WHERE (phase IN ('tracking','exit_pending') AND json_extract(state,'$.policyVersion')=? AND json_extract(state,'$.shadowClosed')=0)
+      WHERE (phase IN ('tracking','exit_pending') AND json_extract(state,'$.policyVersion') IN (?,?) AND json_extract(state,'$.shadowClosed')=0)
         OR (phase='tracking' AND ends_at>? AND json_extract(state,'$.policyVersion')=?)
-      GROUP BY chain,address ORDER BY oldest,chain,address LIMIT ?`).all(ADAPTIVE_SHADOW_V2.version,now.toISOString(),ADAPTIVE_SHADOW_V1.version,take);
+      GROUP BY chain,address ORDER BY oldest,chain,address LIMIT ?`).all(ADAPTIVE_SHADOW_V2.version,ADAPTIVE_SHADOW_V3.version,now.toISOString(),ADAPTIVE_SHADOW_V1.version,take);
     return rows.map(row=>({chain:row.chain as Chain,address:String(row.address)}));
   }
 
-  private ensureIntent(row:ShadowRow,now:Date):boolean {
-    const state=JSON.parse(row.state) as AdaptiveExitState,deadline=adaptiveExitDeadline(state);
-    if(!deadline||state.shadowClosed||now.getTime()<Date.parse(deadline.dueAt)||this.intent(row.id))return false;
-    if(now.getTime()<Date.parse(state.lastEvaluatedAt))return false;
-    if(this.bytes()+16384>this.maxBytes)this.fail('EXIT_SHADOW_CAPACITY_REACHED');
-    const intent:ShadowExitIntent={requestedAt:now.toISOString(),dueAt:deadline.dueAt,reason:deadline.reason,sellPctRemaining:100,
-      remainingPctOfInitial:state.remainingPctOfInitial,peakPriceUsd:state.peakPriceUsd,policyVersion:state.policyVersion};
-    this.db.exec('BEGIN IMMEDIATE');try{
-      this.db.prepare('INSERT INTO exit_shadow_exit_intents VALUES(?,?)').run(row.id,JSON.stringify(intent));
-      this.db.prepare("UPDATE exit_shadow_positions SET phase='exit_pending',updated_at=? WHERE id=?").run(now.toISOString(),row.id);
-      const event:ShadowEvent={at:now.toISOString(),kind:'exit_pending',reason:deadline.reason,observationOnly:true,sellPct:100,
-        remainingPct:state.remainingPctOfInitial,peakPriceUsd:state.peakPriceUsd,policyVersion:state.policyVersion,dueAt:deadline.dueAt};
-      this.db.prepare('INSERT INTO exit_shadow_events(position_id,at,data) VALUES(?,?,?)').run(row.id,event.at,JSON.stringify(event));
-      this.db.exec('COMMIT');return true;
-    }catch{this.db.exec('ROLLBACK');this.fail('EXIT_SHADOW_WRITE_FAILED');}
+  private activeIntent(id:string):ShadowExitIntent|undefined {
+    const intent=this.intent(id);return intent?.cancelledAt?undefined:intent;
   }
   private intent(id:string):ShadowExitIntent|undefined {
     const row=this.db.prepare('SELECT data FROM exit_shadow_exit_intents WHERE position_id=?').get(id);
@@ -255,11 +258,11 @@ export class ExitShadow {
 
   summary(now=this.now()) {
     const at=now.toISOString(),cutoff=new Date(now.getTime()-this.staleMs).toISOString();
-    const counts=this.db.prepare(`SELECT count(*) AS positions,SUM(phase IN ('tracking','exit_pending') AND (ends_at>? OR json_extract(state,'$.policyVersion')='adaptive-shadow-v2')) AS active,
+    const counts=this.db.prepare(`SELECT count(*) AS positions,SUM(phase IN ('tracking','exit_pending') AND (ends_at>? OR json_extract(state,'$.policyVersion') IN ('adaptive-shadow-v2','adaptive-shadow-v3'))) AS active,
       SUM(phase='triggered') AS triggered,SUM(phase='exit_pending') AS pending,
-      SUM(phase IN ('tracking','exit_pending') AND (ends_at>? OR json_extract(state,'$.policyVersion')='adaptive-shadow-v2') AND (error IS NOT NULL OR last_price_at<?)) AS stale
+      SUM(phase IN ('tracking','exit_pending') AND (ends_at>? OR json_extract(state,'$.policyVersion') IN ('adaptive-shadow-v2','adaptive-shadow-v3')) AND (error IS NOT NULL OR last_price_at<?)) AS stale
       FROM exit_shadow_positions`).get(at,at,cutoff)!;
-    return {enabled:true,mode:'shadow' as const,liveReady:false,policyVersion:ADAPTIVE_SHADOW_V2.version,
+    return {enabled:true,mode:'shadow' as const,liveReady:false,policyVersion:ADAPTIVE_SHADOW_V3.version,
       status:{positions:Number(counts.positions),active:Number(counts.active??0),triggered:Number(counts.triggered??0),
         stale:Number(counts.stale??0),pending:Number(counts.pending??0),
         samples:Number(this.db.prepare('SELECT count(*) AS n FROM exit_shadow_samples').get()!.n),
@@ -295,15 +298,15 @@ export class ExitShadow {
     const state=JSON.parse(row.state) as AdaptiveExitState;
     const metrics=this.db.prepare('SELECT peak_price,max_gap_sec,last_source FROM exit_shadow_metrics WHERE position_id=?').get(row.id);
     const rawPeak=Number(metrics?.peak_price??row.last_price),rawGap=metrics?.max_gap_sec;
-    const deadline=adaptiveExitDeadline(state),intent=this.intent(row.id),closed=state.shadowClosed;
-    const exitPlan={policyVersion:state.policyVersion,effectiveAt:state.policyEffectiveAt,
-      maxHoldingAt:state.policyEffectiveAt?new Date(Date.parse(state.policyEffectiveAt)+ADAPTIVE_SHADOW_V2.maxHoldingMs!).toISOString():undefined,
+    const deadline=adaptiveExitDeadline(state),intent=this.activeIntent(row.id),closed=state.shadowClosed;
+    const exitPlan={policyVersion:state.policyVersion,effectiveAt:state.policyEffectiveAt,timeExitEnabled:state.policyVersion===ADAPTIVE_SHADOW_V2.version,
+      maxHoldingAt:state.policyVersion===ADAPTIVE_SHADOW_V2.version&&state.policyEffectiveAt?new Date(Date.parse(state.policyEffectiveAt)+ADAPTIVE_SHADOW_V2.maxHoldingMs!).toISOString():undefined,
       observationEndsAt:row.ends_at,scheduledExitAt:deadline?.dueAt,
-      status:closed?'observed_closed':state.policyVersion!==ADAPTIVE_SHADOW_V2.version?'legacy_policy':intent?'awaiting_fresh_price':'tracking',
+      status:closed?'observed_closed':!continuousPolicy(state.policyVersion)?'legacy_policy':intent?'awaiting_fresh_price':'tracking',
       intent,closedAt:closed?state.lastObservedAt:undefined};
     return {id:row.id,chain:row.chain,address:row.address,symbol:row.symbol??undefined,candidateId:row.candidate_id,
       eligibleAt:row.eligible_at,startedAt:row.started_at,updatedAt:row.updated_at,endsAt:row.ends_at,
-      phase:row.phase==='triggered'?'triggered':state.policyVersion===ADAPTIVE_SHADOW_V2.version?row.phase:Date.parse(row.ends_at)<=now.getTime()?'ended':row.phase,
+      phase:row.phase==='triggered'?'triggered':continuousPolicy(state.policyVersion)?row.phase:Date.parse(row.ends_at)<=now.getTime()?'ended':row.phase,
       policyVersion:state.policyVersion,exitPlan,
       health:row.error?'unavailable':now.getTime()-Date.parse(row.last_price_at)>this.staleMs?'stale':'fresh',
       lastPriceAt:row.last_price_at,priceSource:metrics?.last_source||undefined,maxGapSec:Number(rawGap??0),baselinePriceUsd:state.baselinePriceUsd,

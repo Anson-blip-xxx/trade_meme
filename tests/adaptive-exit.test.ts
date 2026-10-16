@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  ADAPTIVE_SHADOW_V1,ADAPTIVE_SHADOW_V2,adaptiveExitDeadline,migrateAdaptiveExitV1, stepAdaptiveExit,
+  ADAPTIVE_SHADOW_V1,ADAPTIVE_SHADOW_V2,ADAPTIVE_SHADOW_V3,adaptiveExitDeadline,migrateAdaptiveExitV1,migrateAdaptiveExitToV3, stepAdaptiveExit,
   type AdaptiveExitState, type PriceObservation, type WalletPressure, type WalletPressureTrade,
 } from '../src/adaptive-exit.js';
 
@@ -415,4 +415,108 @@ test('v1 policy remains unchanged and prospective migration cannot replay old qu
   assert.equal(migrateAdaptiveExitV1(migrated,at(402),at(1100)),undefined);
   assert.equal(stepAdaptiveExit(migrated,observation(101,402),undefined,ADAPTIVE_SHADOW_V2).event,undefined);
   assert.equal(stepAdaptiveExit(migrated,observation(101,761),undefined,ADAPTIVE_SHADOW_V2).event?.reasons[0],'MAX_HOLDING_TIME_OBSERVED');
+});
+
+
+test('v3 continuously rising observations remain open beyond six hours and the old observation horizon',()=>{
+  let state=stepAdaptiveExit(undefined,observation(100,0,{observationEndsAt:at(60)}),undefined,ADAPTIVE_SHADOW_V3).state!;
+  assert.equal(Object.hasOwn(ADAPTIVE_SHADOW_V3,'maxHoldingMs'),false);assert.equal(adaptiveExitDeadline(state),undefined);
+  for(let minute=1;minute<=1500;minute++){
+    const next=stepAdaptiveExit(state,observation(100+minute/10,minute,{observationEndsAt:at(60)}),undefined,ADAPTIVE_SHADOW_V3);
+    assert.equal(next.status,'observed');assert.equal(next.event,undefined);assert.equal(next.state?.shadowClosed,false);state=next.state!;
+  }
+  assert.equal(state.remainingPctOfInitial,100);assert.equal(state.lastObservedAt,at(1500));assert.equal(state.peakPriceUsd,250);
+});
+
+test('v3 does not call a slow positive recovery below an old peak stalled momentum; v2 keeps its historical rule',()=>{
+  for(const policy of [ADAPTIVE_SHADOW_V2,ADAPTIVE_SHADOW_V3]){
+    let state=stepAdaptiveExit(undefined,observation(100,0),undefined,policy).state!;
+    state=stepAdaptiveExit(state,observation(200,1),undefined,policy).state!;
+    for(let minute=2;minute<=31;minute++){
+      const price=182+(minute-2)*0.05;
+      const next=stepAdaptiveExit(state,observation(price,minute),undefined,policy);
+      assert.ok(next.state!.protectionPriceUsd<price);
+      if(policy===ADAPTIVE_SHADOW_V2&&minute===31){
+        assert.deepEqual(next.event?.reasons,['MOMENTUM_STALLED_OBSERVED']);
+        assert.equal(next.state?.shadowClosed,true);
+      }else{
+        assert.equal(next.event,undefined);assert.equal(next.state?.shadowClosed,false);
+      }
+      state=next.state!;
+    }
+    assert.equal(state.lastPriceUsd,183.45);
+    if(policy===ADAPTIVE_SHADOW_V3)assert.equal(state.remainingPctOfInitial,100);
+  }
+});
+
+test('v3 still recognizes sustained slow decline below a quiet peak using fresh momentum evidence',()=>{
+  let state=stepAdaptiveExit(undefined,observation(100,0),undefined,ADAPTIVE_SHADOW_V3).state!;
+  state=stepAdaptiveExit(state,observation(200,1),undefined,ADAPTIVE_SHADOW_V3).state!;
+  for(let minute=2;minute<=30;minute++){
+    const next=stepAdaptiveExit(state,observation(185-(minute-2)*0.05,minute),undefined,ADAPTIVE_SHADOW_V3);
+    assert.equal(next.event,undefined);state=next.state!;
+  }
+  const exit=stepAdaptiveExit(state,observation(183.55,31),undefined,ADAPTIVE_SHADOW_V3);
+  assert.ok(exit.state!.protectionPriceUsd<183.55);
+  assert.deepEqual(exit.event?.reasons,['MOMENTUM_STALLED_OBSERVED']);
+  assert.equal(exit.event?.kind,'full_exit');assert.equal(exit.event?.sellPctRemaining,100);
+  assert.equal(exit.event?.observedPriceUsd,183.55);assert.equal(exit.state?.remainingPctOfInitial,0);
+});
+
+test('v2 migration retains 72 percent and the past horizon only for audit; time cannot close the v3 remainder',()=>{
+  let old=stepAdaptiveExit(undefined,observation(1,0,{observationEndsAt:at(60)}),undefined,ADAPTIVE_SHADOW_V2).state!;
+  old=stepAdaptiveExit(old,observation(6,1),undefined,ADAPTIVE_SHADOW_V2).state!;
+  old=stepAdaptiveExit(old,observation(11,2),undefined,ADAPTIVE_SHADOW_V2).state!;
+  const before=JSON.stringify(old),migrated=migrateAdaptiveExitToV3(old,at(400))!;
+  assert.ok(migrated);assert.equal(JSON.stringify(old),before);assert.equal(migrated.remainingPctOfInitial,72);
+  for(const field of ['baselinePriceUsd','baselineAt','peakPriceUsd','peakAt','protectionPriceUsd','protectionActive','hardStopPriceUsd'] as const)
+    assert.equal(migrated[field],old[field]);
+  assert.deepEqual(migrated.suggestedStages,[500,1000]);assert.deepEqual(migrated.momentumObservations,old.momentumObservations);
+  assert.equal(migrated.policyEffectiveAt,at(400));assert.equal(migrated.momentumEffectiveAt,at(0));assert.equal(migrated.observationEndsAt,at(60));
+  assert.equal(adaptiveExitDeadline(migrated),undefined);
+  const recovered=stepAdaptiveExit(migrated,observation(11.5,401),undefined,ADAPTIVE_SHADOW_V3);
+  assert.equal(recovered.event,undefined);assert.equal(recovered.state?.remainingPctOfInitial,72);
+  const later=stepAdaptiveExit(recovered.state,observation(12,1500),undefined,ADAPTIVE_SHADOW_V3);
+  assert.equal(later.event,undefined);assert.equal(later.state?.shadowClosed,false);assert.equal(later.state?.remainingPctOfInitial,72);
+  // Reading the original version still reproduces its historical rule without rewriting its state.
+  assert.equal(stepAdaptiveExit(JSON.parse(before),observation(11.5,401),undefined,ADAPTIVE_SHADOW_V2).event?.reasons[0],'OBSERVATION_WINDOW_END_OBSERVED');
+  assert.equal(JSON.stringify(old),before);
+});
+
+test('v3 still exits all remaining holdings on a real dynamic drawdown or hard-stop observation',()=>{
+  let state=stepAdaptiveExit(undefined,observation(1,0),undefined,ADAPTIVE_SHADOW_V3).state!;
+  state=stepAdaptiveExit(state,observation(6,1),undefined,ADAPTIVE_SHADOW_V3).state!;
+  state=stepAdaptiveExit(state,observation(11,2),undefined,ADAPTIVE_SHADOW_V3).state!;
+  assert.equal(state.remainingPctOfInitial,72);
+  const retreat=stepAdaptiveExit(state,observation(8,3),undefined,ADAPTIVE_SHADOW_V3);
+  assert.equal(retreat.event?.reasons[0],'DYNAMIC_PROTECTION_OBSERVED');assert.equal(retreat.event?.sellPctRemaining,100);
+  assert.equal(retreat.event?.observedPriceUsd,8);assert.equal(retreat.state?.remainingPctOfInitial,0);
+  const stop=stepAdaptiveExit(stepAdaptiveExit(undefined,observation(100,0),undefined,ADAPTIVE_SHADOW_V3).state,observation(50,1),undefined,ADAPTIVE_SHADOW_V3);
+  assert.equal(stop.event?.reasons[0],'HARD_STOP_OBSERVED');assert.equal(stop.state?.shadowClosed,true);
+});
+
+test('v3 preserves existing v2 momentum evidence and requires a new quote before a behavior exit',()=>{
+  let old=stepAdaptiveExit(undefined,observation(100,0),undefined,ADAPTIVE_SHADOW_V2).state!;
+  old=stepAdaptiveExit(old,observation(200,1),undefined,ADAPTIVE_SHADOW_V2).state!;
+  for(let minute=2;minute<=30;minute++)old=stepAdaptiveExit(old,observation(185,minute),undefined,ADAPTIVE_SHADOW_V2).state!;
+  const before=JSON.stringify(old),migrated=migrateAdaptiveExitToV3(old,at(30.5))!;
+  assert.equal(migrated.shadowClosed,false);assert.deepEqual(migrated.momentumObservations,old.momentumObservations);
+  assert.equal(migrated.policyEffectiveAt,at(30.5));assert.equal(migrated.momentumEffectiveAt,at(0));
+  const replay=stepAdaptiveExit(migrated,observation(185,30.25,{evaluatedAt:at(31)}),undefined,ADAPTIVE_SHADOW_V3);
+  assert.equal(replay.ignoredReason,'TIME_REGRESSED');assert.equal(replay.event,undefined);
+  const exit=stepAdaptiveExit(migrated,observation(185,31),undefined,ADAPTIVE_SHADOW_V3);
+  assert.equal(exit.event?.reasons[0],'MOMENTUM_STALLED_OBSERVED');assert.equal(exit.event?.observedAt,at(31));
+  assert.equal(JSON.stringify(old),before);
+});
+
+test('v1 to v3 migration invents no momentum samples and invalid or already-closed migrations are rejected',()=>{
+  const old=seed(),migrated=migrateAdaptiveExitToV3(old,at(400))!;
+  assert.equal(migrated.policyVersion,'adaptive-shadow-v3');assert.equal(migrated.momentumEffectiveAt,at(400));assert.deepEqual(migrated.momentumObservations,[]);
+  assert.equal(stepAdaptiveExit(migrated,observation(101,401),undefined,ADAPTIVE_SHADOW_V3).event,undefined);
+  assert.equal(migrateAdaptiveExitToV3(migrated,at(402)),undefined);
+  assert.equal(migrateAdaptiveExitToV3(old,at(-1)),undefined);assert.equal(migrateAdaptiveExitToV3(old,'invalid'),undefined);
+  assert.equal(migrateAdaptiveExitToV3({...old,remainingPctOfInitial:72},at(400)),undefined);
+  const closed=stepAdaptiveExit(old,observation(50,1)).state!;assert.equal(migrateAdaptiveExitToV3(closed,at(400)),undefined);
+  const corrupt={...migrated,momentumEffectiveAt:at(401)};
+  assert.equal(stepAdaptiveExit(corrupt,observation(101,402),undefined,ADAPTIVE_SHADOW_V3).ignoredReason,'STATE_INVALID');
 });

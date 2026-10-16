@@ -6,7 +6,7 @@ import {tmpdir} from 'node:os';
 import {DatabaseSync} from 'node:sqlite';
 import {ExitShadow,type ExitShadowOptions,type ExitObservationSeed} from '../src/exit-shadow.js';
 import type {ScanPrice,ScanToken} from '../src/scan-archive.js';
-import {stepAdaptiveExit,type WalletPressure} from '../src/adaptive-exit.js';
+import {ADAPTIVE_SHADOW_V2,stepAdaptiveExit,type WalletPressure} from '../src/adaptive-exit.js';
 
 const start=Date.parse('2026-10-11T00:00:00.000Z');
 const token:ScanToken={chain:'bsc',address:`0x${'a'.repeat(40)}`};
@@ -35,7 +35,7 @@ test('shadow validates capacity settings and marks its persistent database priva
   const ctx=setup(t);
   assert.equal(statSync(ctx.path).mode&0o777,0o600);
   const summary=ctx.store.summary();
-  assert.equal(summary.mode,'shadow');assert.equal(summary.liveReady,false);
+  assert.equal(summary.policyVersion,'adaptive-shadow-v3');assert.equal(summary.mode,'shadow');assert.equal(summary.liveReady,false);
   assert.equal(summary.status.execution,'observation_only');
   assert.equal(summary.status.liveBlockReason,'ENTRY_UNATTENDED_PROTECTION_UNVERIFIED');
 });
@@ -136,19 +136,22 @@ test('the global last sample time is monotonic across tokens whose observed time
   assert.equal(store.summary().status.lastSampleAt,iso(start+60_000));
 });
 
-test('v2 window expiry closes only at a new trusted observation and a later candidate gets a separate baseline',t=>{
+test('observation expiry never closes an open position or resets it to a new candidate baseline',t=>{
   const ctx=setup(t),store=ctx.store,oldSeed=seed({endsAt:iso(start+300_000)});
   store.recordPrice(price(start),oldSeed);const oldId=store.list().items[0].id;
   ctx.clock.time=start+300_000;store.recordPrice(price(ctx.clock.time,200),oldSeed);
-  assert.equal(store.detail(oldId)?.sampleCount,2);assert.equal(store.detail(oldId)?.item.phase,'triggered');
-  assert.equal(store.detail(oldId)?.item.lastEvent?.reason,'OBSERVATION_WINDOW_END_OBSERVED');
-  ctx.clock.time+=1000;store.recordPrice(price(ctx.clock.time,200),seed({endsAt:iso(start+600_000)}));
-  assert.equal(store.summary().status.positions,1);
+  assert.equal(store.detail(oldId)?.sampleCount,2);assert.equal(store.detail(oldId)?.item.phase,'tracking');
+  assert.equal(store.detail(oldId)?.item.remainingPct,100);assert.equal(store.detail(oldId)?.item.exitPlan.scheduledExitAt,undefined);
+  ctx.clock.time+=1000;
   const later=seed({candidateId:'candidate-2',eligibleAt:iso(ctx.clock.time),endsAt:iso(start+600_000)});
-  store.recordPrice(price(ctx.clock.time,200),later);
+  store.recordPrice(price(ctx.clock.time,210),later);
+  assert.equal(store.summary().status.positions,1);assert.equal(store.detail(oldId)?.item.baselinePriceUsd,100);
+  ctx.clock.time+=1000;store.recordPrice(price(ctx.clock.time,50),later);
+  assert.equal(store.detail(oldId)?.item.phase,'triggered');assert.equal(store.detail(oldId)?.item.lastEvent?.reason,'HARD_STOP_OBSERVED');
+  ctx.clock.time+=1000;store.recordPrice(price(ctx.clock.time,60),later);
   const newItem=store.list().items.find(item=>item.id!==oldId)!;
-  assert.equal(store.summary().status.positions,2);assert.equal(newItem.baselinePriceUsd,200);
-  assert.equal(newItem.gainPct,0);assert.equal(newItem.candidateId,'candidate-2');assert.equal(store.detail(oldId)?.sampleCount,2);
+  assert.equal(store.summary().status.positions,2);assert.equal(newItem.baselinePriceUsd,60);
+  assert.equal(newItem.gainPct,0);assert.equal(newItem.candidateId,'candidate-2');assert.equal(store.detail(oldId)?.sampleCount,4);
 });
 
 test('a triggered shadow episode keeps comparison samples after restart but never emits a second full exit',t=>{
@@ -242,25 +245,28 @@ test('shadow performs zero network/order operations and persists normalized evid
 });
 
 
-test('deadline with all quotes missing persists an unfilled exit intent across restart and closes remaining holdings at recovered current price',t=>{
+test('elapsed days and missing quotes never liquidate the 72 percent remainder, including across restart',t=>{
   const ctx=setup(t);let store=ctx.store;
   store.recordPrice(price(start,1),seed());ctx.clock.time+=60_000;store.recordPrice(price(ctx.clock.time,6),undefined);
   ctx.clock.time+=60_000;store.recordPrice(price(ctx.clock.time,11),undefined);const id=store.list().items[0].id;
-  ctx.clock.time=start+6*3600_000;assert.equal(store.tick().created,1);store.recordError(token,'ALL_PRICE_SOURCES_UNAVAILABLE');
-  const waiting=store.detail(id)!;assert.equal(waiting.item.phase,'exit_pending');assert.equal(waiting.item.remainingPct,72);
-  assert.equal(waiting.item.exitPlan.status,'awaiting_fresh_price');assert.equal(waiting.item.exitPlan.intent?.observedPriceUsd,undefined);
-  assert.equal(waiting.item.exitPlan.intent?.sellPctRemaining,100);assert.equal(waiting.item.exitPlan.intent?.peakPriceUsd,11);
-  assert.equal(store.trackingTokens().length,1);assert.equal(store.tick().created,0);
+  ctx.clock.time=start+6*3600_000;assert.deepEqual(store.tick(),{created:0,pending:0});store.recordError(token,'ALL_PRICE_SOURCES_UNAVAILABLE');
+  const waiting=store.detail(id)!;assert.equal(waiting.item.phase,'tracking');assert.equal(waiting.item.remainingPct,72);
+  assert.equal(waiting.item.health,'unavailable');assert.equal(waiting.item.exitPlan.status,'tracking');
+  assert.equal(waiting.item.exitPlan.intent,undefined);assert.equal(waiting.item.exitPlan.timeExitEnabled,false);
+  assert.equal(waiting.item.exitPlan.maxHoldingAt,undefined);assert.equal(waiting.item.exitPlan.scheduledExitAt,undefined);
+  assert.equal(store.trackingTokens().length,1);
   assert.equal(ctx.query("SELECT id FROM exit_shadow_events WHERE json_extract(data,'$.kind')='full_exit'").length,0);
-  store.close();store=ctx.open();ctx.clock.time+=86400_000;assert.equal(store.tick().created,0);
-  assert.equal(store.trackingTokens().length,1);assert.equal(store.detail(id)?.item.phase,'exit_pending');
+  store.close();store=ctx.open();ctx.clock.time+=86400_000;assert.deepEqual(store.tick(),{created:0,pending:0});
+  assert.equal(store.trackingTokens().length,1);assert.equal(store.summary().status.active,1);assert.equal(store.summary().status.stale,1);
   store.recordPrice(price(ctx.clock.time-300_000,500),undefined);store.recordPrice({...price(ctx.clock.time,500),source:'historical_ath'},undefined);
   assert.equal(store.detail(id)?.item.remainingPct,72);
-  store.recordPrice(price(ctx.clock.time,12),undefined);const closed=store.detail(id)!;
+  store.recordPrice(price(ctx.clock.time,12),undefined);assert.equal(store.detail(id)?.item.remainingPct,72);
+  assert.equal(store.detail(id)?.item.phase,'tracking');assert.equal(store.summary().status.stale,0);
+  ctx.clock.time+=60_000;store.recordPrice(price(ctx.clock.time,0.5),undefined);const closed=store.detail(id)!;
   assert.equal(closed.item.remainingPct,0);assert.equal(closed.item.phase,'triggered');assert.equal(closed.item.exitPlan.status,'observed_closed');
-  assert.equal(closed.item.exitPlan.intent?.requestedAt,iso(start+6*3600_000));assert.equal(closed.item.exitPlan.intent?.observedPriceUsd,12);
-  assert.equal(closed.item.lastEvent?.priceUsd,12);assert.equal(closed.item.lastEvent?.sellPct,100);assert.equal(store.trackingTokens().length,0);
-  store.recordPrice(price(ctx.clock.time,12),undefined);assert.equal(ctx.query("SELECT id FROM exit_shadow_events WHERE json_extract(data,'$.kind')='full_exit'").length,1);
+  assert.equal(closed.item.exitPlan.intent,undefined);assert.equal(closed.item.lastEvent?.reason,'HARD_STOP_OBSERVED');
+  assert.equal(closed.item.lastEvent?.priceUsd,0.5);assert.equal(closed.item.lastEvent?.sellPct,100);assert.equal(store.trackingTokens().length,0);
+  store.recordPrice(price(ctx.clock.time,0.5),undefined);assert.equal(ctx.query("SELECT id FROM exit_shadow_events WHERE json_extract(data,'$.kind')='full_exit'").length,1);
 });
 
 test('explicit active v1 migration records prior state and only applies future policy; expired legacy remainder is never falsely closed',t=>{
@@ -272,8 +278,8 @@ test('explicit active v1 migration records prior state and only applies future p
     const old=stepAdaptiveExit(undefined,{...target,priceUsd:100,observedAt:iso(start),evaluatedAt:iso(start),source:'gmgn_token_info_sample'}).state!;
     db.prepare('UPDATE exit_shadow_positions SET state=? WHERE id=?').run(JSON.stringify(old),id);
   }
-  ctx.clock.time+=60_000;assert.equal(store.migrateActiveV1().migrated,1);assert.equal(store.migrateActiveV1().migrated,0);
-  const migrated=store.detail(active)!;assert.equal(migrated.item.policyVersion,'adaptive-shadow-v2');assert.equal(migrated.item.exitPlan.effectiveAt,iso(ctx.clock.time));
+  ctx.clock.time+=60_000;assert.equal(store.migrateActiveToV3().migrated,1);assert.equal(store.migrateActiveToV3().migrated,0);
+  const migrated=store.detail(active)!;assert.equal(migrated.item.policyVersion,'adaptive-shadow-v3');assert.equal(migrated.item.exitPlan.effectiveAt,iso(ctx.clock.time));
   assert.equal(migrated.item.remainingPct,100);assert.equal(migrated.sampleCount,1);
   assert.equal(store.detail(ended)?.item.phase,'ended');assert.equal(store.detail(ended)?.item.remainingPct,100);
   assert.equal(store.detail(ended)?.item.exitPlan.status,'legacy_policy');
@@ -282,6 +288,65 @@ test('explicit active v1 migration records prior state and only applies future p
   assert.equal(ctx.query("SELECT id FROM exit_shadow_events WHERE json_extract(data,'$.kind')='policy_migrated'").length,1);
   store.recordPrice(price(ctx.clock.time-1000,200),undefined);assert.equal(store.detail(active)?.sampleCount,1);
   db.close();
+});
+
+for(const reason of ['OBSERVATION_WINDOW_END_OBSERVED','MAX_HOLDING_TIME_OBSERVED'])
+test(`V2 ${reason} is cancelled prospectively with 72 percent remainder and prior evidence preserved`,t=>{
+  const ctx=setup(t);let store=ctx.store;
+  const endsAt=iso(start+(reason==='MAX_HOLDING_TIME_OBSERVED'?86400_000:300_000));
+  store.recordPrice(price(start,1),seed({endsAt}));const id=store.list().items[0].id;
+  let old=stepAdaptiveExit(undefined,{...price(start,1),evaluatedAt:iso(start),observationEndsAt:endsAt},undefined,ADAPTIVE_SHADOW_V2).state!;
+  for(const [at,value] of [[start+60000,6],[start+120000,11]])
+    old=stepAdaptiveExit(old,{...price(at,value),evaluatedAt:iso(at)},undefined,ADAPTIVE_SHADOW_V2).state!;
+  assert.equal(old.remainingPctOfInitial,72);
+  const db=new DatabaseSync(ctx.path);
+  db.prepare("UPDATE exit_shadow_positions SET state=?,phase='exit_pending',last_price_at=?,last_price=? WHERE id=?")
+    .run(JSON.stringify(old),old.lastObservedAt,old.lastPriceUsd,id);
+  const dueAt=iso(start+(reason==='MAX_HOLDING_TIME_OBSERVED'?6*3600_000:300_000));
+  const intent={requestedAt:dueAt,dueAt,reason,
+    sellPctRemaining:100,remainingPctOfInitial:72,peakPriceUsd:11,policyVersion:ADAPTIVE_SHADOW_V2.version};
+  db.prepare('INSERT INTO exit_shadow_exit_intents VALUES(?,?)').run(id,JSON.stringify(intent));
+  ctx.clock.time=start+7*3600_000;
+  assert.throws(()=>store.recordPrice(price(ctx.clock.time,12),undefined),/EXIT_SHADOW_POLICY_MIGRATION_REQUIRED/);
+  assert.equal(store.detail(id)?.item.remainingPct,72);assert.equal(store.detail(id)?.sampleCount,1);
+  assert.deepEqual(store.migrateActiveToV3(),{migrated:1,cancelled:1});
+  assert.deepEqual(store.migrateActiveToV3(),{migrated:0,cancelled:0});
+  const migrated=store.detail(id)!;
+  assert.equal(migrated.item.phase,'tracking');assert.equal(migrated.item.remainingPct,72);assert.equal(migrated.sampleCount,1);
+  assert.equal(migrated.item.protectionPriceUsd,old.protectionPriceUsd);assert.equal(migrated.item.exitPlan.intent,undefined);
+  assert.equal(migrated.item.exitPlan.timeExitEnabled,false);assert.equal(migrated.item.exitPlan.scheduledExitAt,undefined);
+  const next=JSON.parse(String(ctx.query('SELECT state FROM exit_shadow_positions WHERE id=?',id)[0].state));
+  assert.deepEqual(next.momentumObservations,old.momentumObservations);assert.deepEqual(next.suggestedStages,old.suggestedStages);
+  assert.equal(next.momentumEffectiveAt,old.policyEffectiveAt);assert.equal(next.policyEffectiveAt,iso(ctx.clock.time));
+  assert.deepEqual(JSON.parse(String(ctx.query('SELECT previous_state FROM exit_shadow_policy_history')[0].previous_state)),JSON.parse(JSON.stringify(old)));
+  const cancelled=JSON.parse(String(ctx.query('SELECT data FROM exit_shadow_exit_intents')[0].data));
+  assert.equal(cancelled.cancelledAt,iso(ctx.clock.time));assert.equal(cancelled.dueAt,intent.dueAt);
+  assert.equal(cancelled.observedAt,undefined);assert.equal(cancelled.observedPriceUsd,undefined);
+  assert.equal(ctx.query("SELECT id FROM exit_shadow_events WHERE json_extract(data,'$.kind')='time_exit_cancelled'").length,1);
+  db.close();store.close();store=ctx.open();assert.deepEqual(store.tick(),{created:0,pending:0});
+  store.recordPrice(price(ctx.clock.time,12),undefined);assert.equal(store.detail(id)?.item.remainingPct,72);
+  ctx.clock.time+=60000;store.recordPrice(price(ctx.clock.time,0.5),undefined);assert.equal(store.detail(id)?.item.remainingPct,0);
+  const audit=JSON.parse(String(ctx.query('SELECT data FROM exit_shadow_exit_intents')[0].data));
+  assert.equal(audit.observedAt,undefined);assert.equal(audit.observedPriceUsd,undefined);
+});
+
+test('migration leaves a previously closed V2 time-exit episode and its observed intent unchanged',t=>{
+  const ctx=setup(t),store=ctx.store;store.recordPrice(price(start),seed());const id=store.list().items[0].id;
+  let old=stepAdaptiveExit(undefined,{...price(start),evaluatedAt:iso(start)},undefined,ADAPTIVE_SHADOW_V2).state!;
+  const due=start+6*3600_000;
+  old=stepAdaptiveExit(old,{...price(due,110),evaluatedAt:iso(due)},undefined,ADAPTIVE_SHADOW_V2).state!;
+  assert.equal(old.shadowClosed,true);
+  const db=new DatabaseSync(ctx.path),state=JSON.stringify(old);
+  db.prepare("UPDATE exit_shadow_positions SET state=?,phase='triggered',last_price_at=?,last_price=? WHERE id=?")
+    .run(state,old.lastObservedAt,old.lastPriceUsd,id);
+  const intent=JSON.stringify({requestedAt:iso(due),dueAt:iso(due),reason:'MAX_HOLDING_TIME_OBSERVED',sellPctRemaining:100,
+    remainingPctOfInitial:100,peakPriceUsd:110,policyVersion:ADAPTIVE_SHADOW_V2.version,observedAt:iso(due),observedPriceUsd:110});
+  db.prepare('INSERT INTO exit_shadow_exit_intents VALUES(?,?)').run(id,intent);db.close();
+  ctx.clock.time=due+60000;assert.deepEqual(store.migrateActiveToV3(),{migrated:0,cancelled:0});
+  assert.equal(ctx.query('SELECT state FROM exit_shadow_positions WHERE id=?',id)[0].state,state);
+  assert.equal(ctx.query('SELECT data FROM exit_shadow_exit_intents WHERE position_id=?',id)[0].data,intent);
+  assert.equal(store.detail(id)?.item.policyVersion,ADAPTIVE_SHADOW_V2.version);assert.equal(store.detail(id)?.item.remainingPct,0);
+  assert.equal(ctx.query('SELECT * FROM exit_shadow_policy_history').length,0);
 });
 
 test('closed comparison capture is sampled at most once per minute without deleting old observations',t=>{

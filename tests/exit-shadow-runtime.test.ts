@@ -150,7 +150,7 @@ test('real runtime router keeps Dex observations flowing into archive and shadow
   }finally{await runtime.close();rmSync(dir,{recursive:true,force:true});}
 });
 
-test('runtime keeps expired protected tokens in its price targets and observes final closure only after a fresh restored quote',async t=>{
+test('runtime tracks remainder beyond archive expiry and exits on actual price risk instead of elapsed time',async t=>{
   const started=Date.parse('2026-10-17T01:00:00.000Z');t.mock.timers.enable({apis:['Date'],now:new Date(started)});
   const {dir,env}=fixture();let target='',current=1,available=true;const paths:string[]=[];
   const fetcher:Fetcher=async input=>{const url=String(input);paths.push(url);
@@ -165,14 +165,16 @@ test('runtime keeps expired protected tokens in its price targets and observes f
     t.mock.timers.setTime(started+60000);current=6;await runtime.tracking!.runOnce();
     t.mock.timers.setTime(started+120000);current=11;await runtime.tracking!.runOnce();
     assert.equal(runtime.exitShadow!.detail(id)?.item.remainingPct,72);
-    available=false;t.mock.timers.setTime(started+6*3600_000);assert.equal(runtime.exitShadow!.tick().created,1);
-    await runtime.tracking!.runOnce();assert.equal(runtime.exitShadow!.detail(id)?.item.phase,'exit_pending');
+    available=false;t.mock.timers.setTime(started+6*3600_000);assert.equal(runtime.exitShadow!.tick().created,0);
+    await runtime.tracking!.runOnce();assert.equal(runtime.exitShadow!.detail(id)?.item.phase,'tracking');
     assert.equal(runtime.exitShadow!.detail(id)?.item.remainingPct,72);assert.equal(runtime.dashboardOrders().items.length,0);
     t.mock.timers.setTime(started+2*86400_000);assert.equal(runtime.archive!.pendingTokens(200,new Date()).length,0);
     available=true;current=12;await runtime.tracking!.runOnce();
+    const ongoing=runtime.exitShadow!.detail(id)!;assert.equal(ongoing.item.phase,'tracking');assert.equal(ongoing.item.remainingPct,72);
+    assert.equal(ongoing.item.exitPlan.timeExitEnabled,false);assert.equal(ongoing.item.exitPlan.intent,undefined);
+    t.mock.timers.setTime(started+2*86400_000+60000);current=0.5;await runtime.tracking!.runOnce();
     const detail=runtime.exitShadow!.detail(id)!;assert.equal(detail.item.phase,'triggered');assert.equal(detail.item.remainingPct,0);
-    assert.equal(detail.item.exitPlan.intent?.observedPriceUsd,12);assert.equal(detail.item.lastEvent?.priceUsd,12);
-    assert.equal(detail.item.lastEvent?.reason,'MAX_HOLDING_TIME_OBSERVED');assert.equal(detail.item.liveReady,false);
+    assert.equal(detail.item.lastEvent?.priceUsd,0.5);assert.equal(detail.item.lastEvent?.reason,'HARD_STOP_OBSERVED');assert.equal(detail.item.liveReady,false);
     assert.equal(runtime.dashboardOrders().items.length,0);assert.equal(runtime.dashboardOverview().entryMode,'off');
     assert.ok(paths.filter(url=>url.includes(`/tokens/v1/bsc/${target}`)).length>=5);
   }finally{await runtime.close();rmSync(dir,{recursive:true,force:true});}

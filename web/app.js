@@ -1476,7 +1476,7 @@
   }
   function protectionPriceRoute(item,compact=false) {
     const route=item.priceRoute,state=priceRouteState(item),node=el('div',`protection-route${compact?' compact':''}`);node.append(badge(state.label,state.tone));
-    if(state.available){node.append(el('strong','',`${observedPriceSource(state.sample.source)} · ${usd(state.sample.priceUsd)}`),el('span','',`${{provider_update:'供应商行情时间',http_response:'本次响应获取时间',chain_sample:'链上采样时间'}[state.sample.timeBasis] || '记录采样时间'} ${date(state.sample.observedAt,true)}`),el('small','',`有效至 ${date(state.sample.validUntil,true)}`));
+    if(state.available){node.append(el('strong','',`${observedPriceSource(state.sample.source)} · ${usd(state.sample.priceUsd)}`),el('span','',`${{provider_update:'供应商行情时间',http_response:'HTTP观测时间（已扣缓存年龄）',chain_sample:'链上采样时间'}[state.sample.timeBasis] || '记录采样时间'} ${date(state.sample.observedAt,true)}`),el('small','',`有效至 ${date(state.sample.validUntil,true)}`));
       if(!compact)node.append(el('span','',`本地收到 ${date(state.sample.receivedAt,true)}`),el('p','','这是行情观测价，不是兑换成交报价。当前路由样本与保护模型最近采用的样本分别列示。'));
     }else if(!compact){node.append(el('p','',state.kind==='conflict'?'不同来源的有效样本出现价格冲突，当前不选其中任一价格作为新判断依据。':'尚无可用于本次判断的新鲜行情，旧样本不补造为实时价格。'));
       if(route?.reason)node.append(el('p','price-router-error',protectionReason(route.reason)));

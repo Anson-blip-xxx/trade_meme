@@ -55,7 +55,7 @@ export class StrategyObservation {
         ...(typeof r.last_attempt_at==='string'?{lastAttemptAt:r.last_attempt_at}:{})}));
   }
   price(price:ScanPrice,now:Date):void {
-    if(!['gmgn_token_info_sample','chain_pool_sample'].includes(price.source)||now.getTime()-Date.parse(price.observedAt)>120000)return;
+    if(!['gmgn_token_info_sample','chain_pool_sample','dexscreener_token_pairs_sample','ave_price_stream_sample','debot_token_info_sample'].includes(price.source)||now.getTime()-Date.parse(price.observedAt)>120000)return;
     const row=this.db.prepare('SELECT record,last_attempt_at FROM strategy_comparisons WHERE chain=? AND address=? AND ends_at>?')
       .get(price.chain,price.address,now.toISOString());if(!row)return;
     const value=JSON.parse(String(row.record)) as Comparison,p=value.performance,at=price.observedAt,ms=Date.parse(at);

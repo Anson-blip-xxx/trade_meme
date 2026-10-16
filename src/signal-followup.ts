@@ -198,7 +198,7 @@ export class SignalFollowup {
   }
   evidenceWindow(price:ScanPrice,observedAt:string):{fromAt:string;untilAt:string}|undefined {
     const token=identity(price),ms=time(observedAt);if(!token||ms===undefined||ms>Date.now()||observedAt!==price.observedAt||
-      !Number.isFinite(price.priceUsd)||price.priceUsd<=0||!['gmgn_token_info_sample','chain_pool_sample'].includes(price.source))return;
+      !Number.isFinite(price.priceUsd)||price.priceUsd<=0||!['gmgn_token_info_sample','chain_pool_sample','dexscreener_token_pairs_sample','ave_price_stream_sample','debot_token_info_sample'].includes(price.source))return;
     const row=this.db.prepare('SELECT record,last_attempt_at FROM signal_followups WHERE chain=? AND address=? AND selected=1 AND ends_at>?')
       .get(token.chain,token.address,new Date(ms).toISOString());if(!row)return;
     const value=JSON.parse(String(row.record)) as FollowupRecord,registered=Date.parse(value.registeredAt);
@@ -209,7 +209,7 @@ export class SignalFollowup {
   price(price:ScanPrice,now:Date,walletEvidence?:FollowupWalletEvidence):void {
     const token=identity(price),ms=time(price.observedAt),nowMs=now.getTime();
     if(!token||ms===undefined||ms>nowMs||nowMs-ms>120000||!Number.isFinite(price.priceUsd)||price.priceUsd<=0||
-      !['gmgn_token_info_sample','chain_pool_sample'].includes(price.source))return;
+      !['gmgn_token_info_sample','chain_pool_sample','dexscreener_token_pairs_sample','ave_price_stream_sample','debot_token_info_sample'].includes(price.source))return;
     const row=this.db.prepare('SELECT record,last_attempt_at FROM signal_followups WHERE chain=? AND address=? AND selected=1 AND ends_at>?')
       .get(token.chain,token.address,now.toISOString());if(!row)return;
     const value=JSON.parse(String(row.record)) as FollowupRecord,p=value.performance,registered=Date.parse(value.registeredAt);

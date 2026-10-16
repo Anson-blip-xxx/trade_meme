@@ -135,6 +135,9 @@ export class WalletSetupLedger {
       if(BASE_BUDGET+(count+1)*RECORD_BUDGET>this.maxBytes||this.bytes()+RECORD_BUDGET>this.maxBytes){this.full();continue;}
       this.db.prepare('INSERT INTO wsl_setups(id,chain,address,registered_at,expires_at,last_checked_at,state,data) VALUES (?,?,?,?,?,?,?,?)')
         .run(id,token.chain,token.address,now,item.expiresAt,now,item.state,JSON.stringify(item));
+      // A larger budget may restore admission after a previous capacity stop.
+      // Clear the persisted warning only after a new opportunity was accepted.
+      this.db.prepare("DELETE FROM wsl_meta WHERE key='capacity'").run();
     }
   }
   pending(limit=20):Token[] {

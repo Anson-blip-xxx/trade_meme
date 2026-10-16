@@ -222,6 +222,28 @@ test('capacity stops new records while preserving room for existing opportunity 
   }finally{f.ledger.close();}
 });
 
+test('expanded capacity clears its persisted warning after a new setup while preserving history',()=>{
+  const dir=mkdtempSync(join(tmpdir(),'wallet-setups-capacity-')),database=join(dir,'ledger.sqlite');
+  const clock={now:()=>new Date(iso(100))};let ledger=new WalletSetupLedger(database,{...clock,maxBytes:262144});
+  try{
+    for(let i=0;i<20;i++)ledger.record(report({trigger:event(90,{wallet,txHash:hash(900+i)})}));
+    const saved=ledger.list({limit:100}).items;
+    assert.ok(saved.length>0&&saved.length<20);assert.equal(ledger.status().capacityReached,true);
+    ledger.close();ledger=new WalletSetupLedger(database,{...clock,maxBytes:1048576});
+    assert.equal(ledger.status().capacityReached,true);
+    ledger.record(report({trigger:saved[0].proof.trigger}));
+    assert.equal(ledger.status().capacityReached,true,'an existing setup does not prove new admission recovered');
+    ledger.record(report({priorityScore:0,trigger:event(90,{wallet,txHash:hash(9999)})}));
+    assert.equal(ledger.status().capacityReached,true,'a rejected setup cannot clear the warning');
+    ledger.record(report({trigger:event(90,{wallet,txHash:hash(9999)})}));
+    assert.equal(ledger.status().records,saved.length+1);assert.equal(ledger.status().capacityReached,false);
+    const after=new Map(ledger.list({limit:100}).items.map(item=>[item.id,item]));
+    for(const item of saved)assert.deepEqual(after.get(item.id),item);
+    ledger.close();ledger=new WalletSetupLedger(database,{...clock,maxBytes:1048576});
+    assert.equal(ledger.status().capacityReached,false);assert.equal(ledger.status().records,saved.length+1);
+  }finally{ledger.close();rmSync(dir,{recursive:true,force:true});}
+});
+
 test('bounded evidence retains a later reduction when repeated leader buys fill the sample',()=>{
   const f=fixture();try{
     f.ledger.record(report());f.advance(200);f.ledger.observe(token,Array.from({length:30},(_,i)=>event(105+i)));

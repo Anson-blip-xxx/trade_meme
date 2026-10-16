@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  ADAPTIVE_SHADOW_V1, stepAdaptiveExit,
+  ADAPTIVE_SHADOW_V1,ADAPTIVE_SHADOW_V2,adaptiveExitDeadline,migrateAdaptiveExitV1, stepAdaptiveExit,
   type AdaptiveExitState, type PriceObservation, type WalletPressure, type WalletPressureTrade,
 } from '../src/adaptive-exit.js';
 
@@ -370,4 +370,49 @@ test('unrepresentable price arithmetic cannot advance state or manufacture an in
   assert.equal(result.ignoredReason, 'ARITHMETIC_INVALID');
   assert.equal(result.state, small);
   assert.equal(result.event, undefined);
+});
+
+
+test('v2 closes the final 72 percent at its forward planned maximum holding time without claiming a fill',()=>{
+  let state=stepAdaptiveExit(undefined,observation(1,0),undefined,ADAPTIVE_SHADOW_V2).state!;
+  state=stepAdaptiveExit(state,observation(6,1),undefined,ADAPTIVE_SHADOW_V2).state!;
+  state=stepAdaptiveExit(state,observation(11,2),undefined,ADAPTIVE_SHADOW_V2).state!;
+  assert.equal(state.remainingPctOfInitial,72);assert.equal(adaptiveExitDeadline(state)?.dueAt,at(360));
+  const step=stepAdaptiveExit(state,observation(12,360),undefined,ADAPTIVE_SHADOW_V2);
+  assert.equal(step.event?.kind,'full_exit');assert.equal(step.event?.sellPctRemaining,100);
+  assert.equal(step.event?.remainingPctOfInitial,0);assert.deepEqual(step.event?.reasons,['MAX_HOLDING_TIME_OBSERVED']);
+  assert.equal(step.event?.observedPriceUsd,12);assert.equal(step.event?.execution,'observation_only');
+});
+
+test('v2 price-confirmed momentum exit needs continuous sufficiently long samples and does not infer stagnation across missing quotes',()=>{
+  let state=stepAdaptiveExit(undefined,observation(100,0),undefined,ADAPTIVE_SHADOW_V2).state!;
+  state=stepAdaptiveExit(state,observation(200,1),undefined,ADAPTIVE_SHADOW_V2).state!;
+  const gap=stepAdaptiveExit(state,observation(185,32),undefined,ADAPTIVE_SHADOW_V2);
+  assert.equal(gap.event,undefined);assert.equal(gap.state?.momentumObservations?.length,1);
+  for(let n=2;n<=30;n++){
+    const step=stepAdaptiveExit(state,observation(185,n),undefined,ADAPTIVE_SHADOW_V2);assert.equal(step.event,undefined);state=step.state!;
+  }
+  const exit=stepAdaptiveExit(state,observation(185,31),undefined,ADAPTIVE_SHADOW_V2);
+  assert.equal(exit.event?.kind,'full_exit');assert.deepEqual(exit.event?.reasons,['MOMENTUM_STALLED_OBSERVED']);
+});
+
+test('v2 rising price is not stagnation, while a fixed observation deadline cannot be extended by later quotes',()=>{
+  let state=stepAdaptiveExit(undefined,observation(100,0,{observationEndsAt:at(60)}),undefined,ADAPTIVE_SHADOW_V2).state!;
+  for(let n=1;n<60;n++){
+    const step=stepAdaptiveExit(state,observation(100+n,n,{observationEndsAt:at(1000)}),undefined,ADAPTIVE_SHADOW_V2);
+    assert.equal(step.event,undefined);state=step.state!;
+  }
+  const end=stepAdaptiveExit(state,observation(160,60),undefined,ADAPTIVE_SHADOW_V2);
+  assert.equal(end.event?.reasons[0],'OBSERVATION_WINDOW_END_OBSERVED');assert.equal(adaptiveExitDeadline(state)?.dueAt,at(60));
+});
+
+test('v1 policy remains unchanged and prospective migration cannot replay old quotations or extend an existing migrated deadline',()=>{
+  const old=seed(),later=stepAdaptiveExit(old,observation(100,400));assert.equal(later.event,undefined);
+  const before=JSON.stringify(later.state),migrated=migrateAdaptiveExitV1(later.state!,at(401),at(1000))!;
+  assert.equal(JSON.stringify(later.state),before);assert.equal(migrated.policyVersion,'adaptive-shadow-v2');
+  assert.equal(migrated.baselineAt,at(0));assert.equal(migrated.policyEffectiveAt,at(401));assert.equal(adaptiveExitDeadline(migrated)?.dueAt,at(761));
+  assert.equal(stepAdaptiveExit(migrated,observation(100,400.5,{evaluatedAt:at(402)}),undefined,ADAPTIVE_SHADOW_V2).ignoredReason,'TIME_REGRESSED');
+  assert.equal(migrateAdaptiveExitV1(migrated,at(402),at(1100)),undefined);
+  assert.equal(stepAdaptiveExit(migrated,observation(101,402),undefined,ADAPTIVE_SHADOW_V2).event,undefined);
+  assert.equal(stepAdaptiveExit(migrated,observation(101,761),undefined,ADAPTIVE_SHADOW_V2).event?.reasons[0],'MAX_HOLDING_TIME_OBSERVED');
 });

@@ -120,7 +120,10 @@ if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href) {
     tokenRankWallet:(chain,address,options)=>runtime.tokenRankResearch?.reader.wallet(chain,address,options),
     memeSignals:options=>runtime.memeObserver?.list(options),
     memeDetail:(chain,address,options)=>runtime.memeObserver?.detail({chain,address},options),
-    chainStream:runtime.chainStreamStatus,protection:runtime.dashboardProtection,protectionDetail:id=>runtime.exitShadow?.detail(id),
+    chainStream:runtime.chainStreamStatus,protection:runtime.dashboardProtection,protectionDetail:id=>{
+      const detail=runtime.exitShadow?.detail(id);if(!detail)return;
+      return {...detail,priceRouter:runtime.priceRouter.getStatus(),item:{...detail.item,priceRoute:runtime.priceRouter.latest(detail.item)}};
+    },
     walletHistory:runtime.walletHistory,walletResearchStatus:runtime.walletResearchStatus,walletAssociations:runtime.walletHistory,
     walletProfiles:runtime.walletProfiles?.reader,walletProfilesStatus:runtime.walletProfilesStatus,walletScreening:runtime.walletScreening?.ledger}):undefined;
   const fatal=()=>{console.error('SERVICE_LISTEN_FAILED');process.exit(1);};

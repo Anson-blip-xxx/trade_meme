@@ -527,11 +527,11 @@ export class ScanArchive {
         .sort((a,b)=>(a.lastAttemptAt??'').localeCompare(b.lastAttemptAt??''))
         .filter(t=>{const key=`${t.chain}:${t.address}`;if(covered(t)||seen.has(key))return false;seen.add(key);return true;})
         .map(({chain,address})=>({chain,address}));
-      const take=Math.max(1,Math.min(3,limit)),reserved=controls.length?Math.min(eligible.length,Math.max(0,take-1)):Math.min(eligible.length,take);
+      const take=Math.max(1,Math.min(30,limit)),reserved=controls.length?Math.min(eligible.length,Math.max(0,take-1)):Math.min(eligible.length,take);
       return [...eligible.slice(0,reserved),...controls.slice(0,take-reserved),...eligible.slice(reserved)].slice(0,take);
     }
     const controls=this.comparison.pending(now).filter(t=>!covered(t)&&!eligible.some(e=>e.chain===t.chain&&e.address===t.address));
-    const take=Math.max(1,Math.min(3,limit));
+    const take=Math.max(1,Math.min(30,limit));
     return controls.length?[...eligible.slice(0,Math.max(0,take-1)),controls[0]]:eligible.slice(0,take);
   }
 

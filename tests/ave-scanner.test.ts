@@ -143,6 +143,24 @@ test('stop cancels collection and research waits, removes listeners and suppress
   assert.equal(observations.length,1);await scanner.close();release();await flush();
 });
 
+test('current-price subscriptions share signal socket, replace topics, and retain their provider frame clock',async()=>{
+  const socket=new Socket(),prices:{raw:unknown;receivedAt:string}[]=[];
+  const {scanner,observations}=setup({socketFactory:()=>socket,fetcher:async()=>Response.json({status:1,data:{list:[]}}),
+    onPriceFrame:(raw,receivedAt)=>{prices.push({raw,receivedAt});}});
+  try{
+    scanner.setPriceTokens([{chain:'bsc',address:ca},{chain:'bsc',address:ca},{chain:'bsc',address:'invalid'}]);
+    scanner.start();socket.emit('open');
+    assert.deepEqual(JSON.parse(socket.sent[1]).params,['pricev2',[`${ca}-bsc`]]);
+    scanner.setPriceTokens([{chain:'bsc',address:other}]);
+    assert.equal(JSON.parse(socket.sent[2]).method,'unsubscribe');assert.deepEqual(JSON.parse(socket.sent[2]).params,['pricev2',[`${ca}-bsc`]]);
+    assert.equal(JSON.parse(socket.sent[3]).method,'subscribe');assert.deepEqual(JSON.parse(socket.sent[3]).params,['pricev2',[`${other}-bsc`]]);
+    const frame={jsonrpc:'2.0',result:{status:'ok',data:{event:'pricev2',prices:[{chain:'bsc',token:other,time:base/1000-1,uprice:1}]}}};
+    socket.emit('message',{data:JSON.stringify(frame)});assert.deepEqual(prices,[{raw:frame,receivedAt:new Date(base).toISOString()}]);
+    assert.equal(observations.length,0);await scanner.stop();
+    socket.emit('message',{data:JSON.stringify(frame)});assert.equal(prices.length,1);
+  }finally{await scanner.close();}
+});
+
 test('stop between queue claim and callback microtask never starts queued research',async()=>{
   let calls=0;const {scanner}=setup({onSignal:async()=>{calls++;}});
   try{

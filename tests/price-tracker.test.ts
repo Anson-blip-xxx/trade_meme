@@ -262,3 +262,69 @@ test('configuration rejects unbounded work or invalid intervals', () => {
     {maxTokensPerCycle: 0}, {maxTokensPerCycle: 201}, {maxTokensPerCycle: 1.5}])
     assert.throws(() => new PriceTracker({archive: archive.archive, client: ctx.client, ...option}), /PRICE_TRACKER_CONFIG_INVALID/);
 });
+
+test('router integration records independent prices and keeps polling despite GMGN cooldown',async()=>{
+  const {MarketPriceRouter}=await import('../src/market-price-router.js');
+  const archive=memoryArchive([token()]),client=mockedClient(),second=deferred<void>();let time=instant,calls=0;
+  client.setCooldown(instant+300_000);
+  const router=new MarketPriceRouter({client:client.client,now:()=>new Date(time),maxDebotPerBatch:0,
+    fetcher:async()=>{time+=100;calls++;if(calls===2)second.resolve();return new Response(JSON.stringify([
+      {chainId:'bsc',baseToken:{address:token().address},pairAddress:token(9).address,priceUsd:'2',liquidity:{usd:10000}},
+    ]));}});
+  const tracker=new PriceTracker({archive:archive.archive,client:client.client,router,intervalMs:5,now:()=>new Date(time)});
+  const keepAlive=setTimeout(()=>second.resolve(),1000);
+  tracker.start();await second.promise;clearTimeout(keepAlive);
+  await new Promise(resolve=>setTimeout(resolve,1));await tracker.stop();
+  assert.ok(archive.samples.length>=2);assert.equal(archive.errors.length,0);assert.equal(client.calls.length,0);
+  assert.equal(tracker.getStatus().cooldownUntil,undefined);assert.equal(tracker.getStatus().lastCycle?.status,'ok');
+  assert.equal(router.getStatus().sources.gmgn.state,'cooldown');
+});
+
+test('router tracker shutdown cancels hung transport without late archive writes',async()=>{
+  const {MarketPriceRouter}=await import('../src/market-price-router.js');
+  const archive=memoryArchive([token()]),client=mockedClient();let signal:AbortSignal|null|undefined;
+  const router=new MarketPriceRouter({client:client.client,fetcher:async(_url,init)=>{signal=init?.signal;return new Promise(()=>{});}});
+  const tracker=new PriceTracker({archive:archive.archive,client:client.client,router});
+  tracker.start();await Promise.resolve();await tracker.stop();
+  assert.equal(signal?.aborted,true);assert.equal(archive.samples.length,0);assert.equal(archive.errors.length,0);
+  assert.equal(tracker.getStatus().lastCycle?.status,'stopped');assert.equal(client.calls.length,0);
+});
+
+test('router-backed tracking preserves genuine gaps and does not substitute signal or ATH prices',async()=>{
+  const {MarketPriceRouter}=await import('../src/market-price-router.js');
+  const archive=memoryArchive([token(),token(2)]),client=mockedClient();
+  const router=new MarketPriceRouter({client:client.client,maxGmgnPerBatch:0,maxDebotPerBatch:0,now:()=>new Date(instant),
+    fetcher:async()=>new Response(JSON.stringify([{chainId:'bsc',baseToken:{address:token().address},pairAddress:token(9).address,
+      priceUsd:'2',liquidity:{usd:10000}},{chainId:'bsc',baseToken:{address:token(2).address},pairAddress:token(8).address,ath_price:'99'}]))});
+  const tracker=new PriceTracker({archive:archive.archive,client:client.client,router,now:()=>new Date(instant)});
+  const cycle=await tracker.runOnce();assert.equal(cycle.recorded,1);assert.equal(cycle.errors,1);assert.equal(cycle.status,'partial');
+  assert.equal(archive.errors[0].token.address,token(2).address);assert.equal(archive.errors[0].reason,'PRICE_NO_FRESH_SOURCE');
+});
+
+test('router priority brings a newly protected token ahead of an old ring and reserves ordinary-token progress',async()=>{
+  const {MarketPriceRouter}=await import('../src/market-price-router.js');
+  const initial=Array.from({length:10},(_,i)=>token(i+1)),archive=memoryArchive(initial),client=mockedClient();
+  const batches:string[][]=[];let time=instant,protectedTokens:Token[]=[];
+  const router=new MarketPriceRouter({client:client.client,now:()=>new Date(time),maxDebotPerBatch:0,maxGmgnPerBatch:0,
+    fetcher:async input=>{time+=100;const addresses=String(input).split('/').at(-1)!.split(',');batches.push(addresses);
+      return new Response(JSON.stringify(addresses.map(address=>({chainId:'bsc',baseToken:{address},pairAddress:token(99).address,priceUsd:'2'}))));}});
+  const tracker=new PriceTracker({archive:archive.archive,client:client.client,router,maxTokensPerCycle:3,now:()=>new Date(time),
+    priorityTokens:at=>{assert.equal(at.getTime(),time);return protectedTokens;}});
+  await tracker.runOnce();assert.deepEqual(batches[0],initial.slice(0,3).map(t=>t.address));
+  archive.replace([...initial,token(50),token(51)]);protectedTokens=[token(50),token(51),token(52)];
+  await tracker.runOnce();assert.deepEqual(batches[1],[token(50),token(51),token(4)].map(t=>t.address));
+  await tracker.runOnce();assert.deepEqual(batches[2],[token(50),token(51),token(5)].map(t=>t.address));
+  await tracker.runOnce();assert.deepEqual(batches[3],[token(50),token(51),token(6)].map(t=>t.address));
+  assert.ok(!batches.flat().includes(token(52).address)); // a priority cannot introduce an untracked token
+});
+
+test('priority errors fall back to the ordinary ring and legacy GMGN sampling does not invoke priority callbacks',async()=>{
+  const {MarketPriceRouter}=await import('../src/market-price-router.js');
+  const archive=memoryArchive([token(),token(2)]),client=mockedClient();
+  const priorityTokens=()=>{throw new Error('private archive context');};
+  const router=new MarketPriceRouter({client:client.client,maxDebotPerBatch:0,maxGmgnPerBatch:0,fetcher:async()=>new Response('[]')});
+  const cycle=await new PriceTracker({archive:archive.archive,client:client.client,router,priorityTokens}).runOnce();
+  assert.ok(cycle.reasons.includes('PRICE_PRIORITY_UNAVAILABLE'));assert.equal(JSON.stringify(cycle).includes('private'),false);
+  const legacy=await new PriceTracker({archive:archive.archive,client:client.client,priorityTokens}).runOnce();
+  assert.equal(legacy.recorded,2);assert.equal(legacy.errors,0);
+});

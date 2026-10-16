@@ -5,6 +5,7 @@ import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {DebotSessionClient,DebotSessionError} from '../src/providers/debot-session.js';
 import type {Fetcher} from '../src/http.js';
+import {fetchDebotPrice,DebotPriceError} from '../src/providers/debot-price.js';
 
 const NOW=Date.parse('2026-10-15T03:00:00Z');
 const endpoint='https://debot.ai/api/community/signal/channel/list?chain=bsc';
@@ -22,6 +23,28 @@ function fixture(data:unknown=session()) {
   writeFileSync(path,JSON.stringify(data),{mode:0o600});
   return {path,cleanup:()=>rmSync(directory,{recursive:true,force:true})};
 }
+
+test('authenticated price requests retain cache Age and throttling while stripping all secret response headers',async()=>{
+  const f=fixture(),token={chain:'bsc' as const,address:'0x1111111111111111111111111111111111111111'};
+  let rateLimited=false;
+  const client=new DebotSessionClient({path:f.path,now:()=>new Date(NOW),fetcher:async input=>{
+    if(new URL(String(input)).pathname==='/api/user/info')return info();
+    return rateLimited?new Response('private',{status:429,headers:{'retry-after':'120'}}):
+      Response.json({code:0,data:{meta:token,market:{price:2}}},{headers:{age:'20','set-cookie':'private-response','x-private':'private-response'}});
+  }});
+  try{
+    const url=`https://debot.ai/api/market/token/info?chain=bsc&token=${token.address}`;
+    const response=await client.fetcher(url);assert.equal(response.headers.get('age'),'20');
+    assert.equal(response.headers.get('set-cookie'),null);assert.equal(response.headers.get('x-private'),null);
+    const price=await fetchDebotPrice(token,{fetcher:client.fetcher,now:()=>new Date(NOW)});
+    assert.equal(price?.observedAt,new Date(NOW-20_000).toISOString());
+    rateLimited=true;
+    await assert.rejects(fetchDebotPrice(token,{fetcher:client.fetcher,now:()=>new Date(NOW)}),e=>{
+      assert.ok(e instanceof DebotPriceError);assert.equal(e.reason,'DEBOT_PRICE_RATE_LIMITED');
+      assert.equal(e.cooldownUntil,NOW+120_000);assert.doesNotMatch(e.message,/private/);return true;
+    });
+  }finally{f.cleanup();}
+});
 
 test('the detail request cancellation also bounds its preceding session verification',async()=>{
   const f=fixture(),controller=new AbortController();const calls:string[]=[];

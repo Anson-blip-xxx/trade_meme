@@ -131,7 +131,7 @@ export function readConfig(env:NodeJS.ProcessEnv=process.env): Config {
       archivePath:z.string().trim().refine(isPersistentOrderPath).parse(env.SCAN_DATABASE_PATH??'data/scans.sqlite'),
       retentionDays:z.coerce.number().int().min(1).max(365).parse(env.SCAN_RETENTION_DAYS??30),
       trackingHours:z.coerce.number().int().min(1).max(168).parse(env.PRICE_TRACKING_HOURS??24),
-      sampleIntervalSec:z.coerce.number().int().min(30).max(3600).parse(env.PRICE_SAMPLE_INTERVAL_SEC??60)},
+      sampleIntervalSec:z.coerce.number().int().min(15).max(3600).parse(env.PRICE_SAMPLE_INTERVAL_SEC??15)},
     ave:{enabled:z.enum(['true','false']).parse(env.AVE_SCANNER_ENABLED??'false')==='true',
       database:z.string().trim().refine(isPersistentOrderPath).parse(env.AVE_SIGNALS_DATABASE_PATH??'data/ave-signals.sqlite'),
       sessionPath:z.string().trim().refine(isPersistentOrderPath).parse(env.AVE_SESSION_PATH??'data/ave/session.json'),

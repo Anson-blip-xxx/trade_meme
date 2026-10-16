@@ -198,6 +198,32 @@
     WALLET_ASSOCIATION_REFRESH_FAILED: '前置关联分析暂未完成',
     GMGN_ASSOCIATION_TRADERS_SCHEMA_INVALID: '关联交易者样本格式异常',
     GMGN_ASSOCIATION_TRADERS_ROWS_INVALID: '部分关联交易者记录无法核实',
+    PRICE_SOURCE_COOLDOWN: '该行情来源正在冷却，等待重试',
+    PRICE_SOURCE_TIMEOUT: '该行情来源本次响应超时',
+    PRICE_SAMPLE_REJECTED: '行情样本未通过身份、价格或时间校验',
+    PRICE_CLOCK_REGRESSED: '采样时钟出现倒退，本轮样本未使用',
+    DEX_PRICE_UNAVAILABLE: 'DexScreener 行情暂未取得',
+    DEX_PRICE_RATE_LIMITED: 'DexScreener 本次请求限流，等待重试',
+    DEX_PRICE_HTTP_ERROR: 'DexScreener 本次请求失败',
+    DEX_PRICE_STALE_RESPONSE: 'DexScreener 响应已过期，未作为新现价',
+    DEX_PRICE_SCHEMA_INVALID: 'DexScreener 行情格式未通过校验',
+    DEX_PRICE_TOO_LARGE: 'DexScreener 响应超过读取范围',
+    DEX_PRICE_NO_MATCHING_CURRENT_PRICE: 'DexScreener 暂无匹配合约的有效现价',
+    GMGN_PRICE_UNAVAILABLE: 'GMGN 行情暂未取得，其他来源独立读取',
+    DEBOT_PRICE_UNAVAILABLE: 'DeBot 现价暂未取得，其他来源独立读取',
+    EXIT_SHADOW_MAINTENANCE_FAILED: '影子退出计划维护暂未完成',
+    PRICE_NO_FRESH_SOURCE: '所有已覆盖来源目前均无有效期内的现价',
+    PRICE_SOURCE_CONFLICT: '不同来源现价差异超出核对范围，暂停使用',
+    PRICE_SAME_TIME_CONFLICT: '同一来源在相同时间报告不同价格，暂停使用',
+    PRICE_POOL_CONFLICT: '多个匹配池的价格存在冲突，暂停使用',
+    PRICE_ROUTER_STOPPED: '多源行情观察已停止',
+    PRICE_TOKEN_INVALID: '代币网络或完整合约地址尚未核实',
+    PRICE_REQUEST_CANCELLED: '本轮行情请求已取消，等待后续刷新',
+    MOMENTUM_STALLED_OBSERVED: '样本动量持续停滞，触发剩余部分的影子退出建议',
+    MAX_HOLDING_TIME_OBSERVED: '达到模拟持有时限，触发最终影子退出建议',
+    OBSERVATION_WINDOW_END_OBSERVED: '达到观察窗口截止，触发最终影子退出建议',
+    POLICY_MIGRATED_PROSPECTIVE: '新策略自登记生效时点起前瞻应用，历史收益不重算',
+    EXIT_AWAITING_FRESH_PRICE: '最终退出意图已保留，等待新的可信现价',
     HARD_STOP_OBSERVED: '样本价格达到硬止损线',
     DYNAMIC_PROTECTION_OBSERVED: '样本价格回落至动态保护线',
     PARTIAL_PROFIT_STAGE_OBSERVED: '样本涨幅达到分档止盈条件',
@@ -241,18 +267,18 @@
     CHAIN_BACKFILL_CONTINUING: '活动较多，已保存分页进度，下一轮接着补',
     CHAIN_BACKFILL_TRUNCATED: '补数达到单轮上限，历史尚未补全',
     CHAIN_BACKFILL_INVALID: '补数响应未通过校验，游标保持原位',
-    CHAIN_PRICE_RPC_FAILED: '池状态读取失败，报价回退 GMGN',
-    CHAIN_PRICE_DATA_STALE: '链上池数据过旧，报价回退 GMGN',
-    CHAIN_PRICE_ANCHOR_INVALID: '美元参照无法验证，报价回退 GMGN',
+    CHAIN_PRICE_RPC_FAILED: '链上池行情读取失败，需其他来源补充',
+    CHAIN_PRICE_DATA_STALE: '链上池行情已过期，需其他来源补充',
+    CHAIN_PRICE_ANCHOR_INVALID: '链上价格的美元参照无法验证',
     CHAIN_HTTP_RATE_LIMITED: '公共 RPC / 市场参照限流，等待冷却',
     CHAIN_RPC_REJECTED: 'RPC 拒绝了本次只读查询',
     CHAIN_HTTP_FAILED: 'RPC / 市场参照请求失败',
     CHAIN_HTTP_TIMEOUT: 'RPC / 市场参照请求超时',
-    CHAIN_USD_REFERENCE_UNAVAILABLE: '暂缺有效美元参照，报价回退 GMGN',
-    CHAIN_MARKET_REFERENCE_UNAVAILABLE: '池或美元参照暂不可用，报价回退 GMGN',
+    CHAIN_USD_REFERENCE_UNAVAILABLE: '链上行情暂缺有效美元参照',
+    CHAIN_MARKET_REFERENCE_UNAVAILABLE: '链上池或美元参照暂不可用',
     CHAIN_IDENTITY_MISMATCH: '节点链标识不匹配，暂停使用',
     CHAIN_STATUS_READ_FAILED: '链上状态读取失败',
-    POOL_PROTOCOL_UNSUPPORTED: '该池协议暂未适配，使用 GMGN 报价',
+    POOL_PROTOCOL_UNSUPPORTED: '该池协议暂未适配，需其他行情来源',
     CHAIN_STORE_CAPACITY: '链上事件档案达到容量上限，新增记录可能未保存',
     WALLET_TRIGGER_BUY_TOO_SMALL_OR_UNKNOWN: '触发买入金额过小或无法取得有效金额，暂不作为支持依据',
     WALLET_SCREENING_RESEARCH_PARAMETERS: '采用初版研究门槛，尚未校准预测能力',
@@ -1310,7 +1336,7 @@
     heading.append(title, badge(...(chain.state === 'live' && chain.identityVerified !== true ? ['连接待核验', 'watch'] : streamStateNames[chain.state] || ['状态未知', 'neutral']))); card.append(heading);
     card.append(el('p', `chain-identity ${chain.identityVerified === true ? 'positive' : 'attention-text'}`, chain.identityVerified === true ? (chain.chain === 'solana' ? '配对 HTTP 主网已核验' : 'HTTP / WS 主网已核验') : '网络标识尚未核验'));
     const subscriptions = el('div', 'chain-subscription-count'); subscriptions.append(el('strong', '', count(chain.activeSubscriptions)), el('span', '', `/ ${count(chain.desiredSubscriptions)} 个目标订阅`)); card.append(subscriptions);
-    card.append(kv('观察钱包 / 流动性池', `${count(chain.watchedWallets)} / ${count(chain.watchedPools)}`), kv('链上池报价覆盖', count(chain.coveredPrices)), kv('GMGN 报价回退对象', count(chain.fallbackTokens)), kv('尚未支持的池', count(chain.unsupportedPools)), kv('本次重连次数', count(chain.reconnects)), kv('最近连接消息', date(chain.lastMessageAt, true)), kv(chain.chain === 'solana' ? '最近 slot 通知' : '最近区块头通知', date(chain.lastHeadAt, true)), kv('最近链上报价', date(chain.latestPriceAt, true)));
+    card.append(kv('观察钱包 / 流动性池', `${count(chain.watchedWallets)} / ${count(chain.watchedPools)}`), kv('链上池报价覆盖', count(chain.coveredPrices)), kv('需其他行情源补充的对象', count(chain.fallbackTokens)), kv('尚未支持的池', count(chain.unsupportedPools)), kv('本次重连次数', count(chain.reconnects)), kv('最近连接消息', date(chain.lastMessageAt, true)), kv(chain.chain === 'solana' ? '最近 slot 通知' : '最近区块头通知', date(chain.lastHeadAt, true)), kv('最近链上报价', date(chain.latestPriceAt, true)));
     const gapComplete = chain.gap && [false, 0].includes(chain.gap.pending) && [false, 0].includes(chain.gap.incomplete);
     const gap = el('div', `chain-gap ${hasGapIssue(chain.gap?.incomplete) || hasGapIssue(chain.gap?.pending) ? 'attention' : gapComplete ? 'complete' : ''}`);
     gap.append(el('strong', '', `断线补数：${gapLabel(chain.gap)}`), el('p', '', `最近完成 ${date(chain.gap?.lastCompletedAt, true)}`)); card.append(gap);
@@ -1418,7 +1444,75 @@
     text('pagination-info', state.total ? `显示 ${state.items.length ? state.offset + 1 : 0}–${Math.min(state.offset + state.items.length, state.total)} 条，共 ${count(state.total)} 条` : '共 0 条记录');
     text('page-number', `${Math.floor(state.offset / PAGE_SIZE) + 1} / ${Math.max(1, Math.ceil(state.total / PAGE_SIZE))}`); $('previous-page').disabled = state.offset === 0; $('next-page').disabled = state.offset + PAGE_SIZE >= state.total;
   }
+  const observedPriceSources={chain_pool_sample:'链上池行情',gmgn_token_info_sample:'GMGN 行情',dexscreener_token_pairs_sample:'DexScreener 行情',ave_price_stream_sample:'Ave 行情推送',debot_price_stream_sample:'DeBot 行情推送',debot_token_info_sample:'DeBot 现价'};
+  const priceProviderNames={chain_pool:'链上池',dexscreener:'DexScreener',gmgn:'GMGN',ave:'Ave',debot:'DeBot'};
+  function observedPriceSource(value) {return observedPriceSources[value] || (priceProviderNames[value]?`${priceProviderNames[value]} 行情`:'来源尚未确认');}
+  function priceRouteState(item) {
+    const route=item.priceRoute,sample=route?.sample;
+    if(!route||typeof route!=='object')return {kind:'unknown',label:'当前行情来源待确认',tone:'neutral',available:false};
+    if(route.status==='conflict')return {kind:'conflict',label:'来源价格冲突 · 暂停使用',tone:'watch',available:false};
+    if(route.status!=='available')return {kind:'unavailable',label:'各来源暂未取得有效现价',tone:'watch',available:false};
+    const identity=sample?.chain===item.chain&&typeof sample?.address==='string'&&typeof item.address==='string'&&(item.chain==='solana'?sample.address===item.address:sample.address.toLowerCase()===item.address.toLowerCase());
+    const observed=validDate(sample?.observedAt)?.getTime(),until=validDate(sample?.validUntil)?.getTime();
+    if(!identity||sample?.scope!=='observed_spot_not_executable_quote'||!observedPriceSources[sample?.source]||!finite(sample?.priceUsd)||sample.priceUsd<=0||!observed||observed>Date.now()||!until)return {kind:'invalid',label:'行情样本待核实 · 暂停使用',tone:'watch',available:false};
+    if(until<=Date.now())return {kind:'expired',label:'行情样本已过期 · 等待刷新',tone:'watch',available:false};
+    return {kind:'available',label:'当前观测价可用',tone:'pass',available:true,sample};
+  }
+  function priceRouterSummary(router) {
+    const node=el('div','price-router-summary');node.append(el('strong','','行情来源与回退'));
+    if(!router||typeof router!=='object'){node.append(el('p','','尚未取得多源行情状态；旧样本保留在各币记录中。'));return node;}
+    node.append(badge(router.running?'行情观察运行中':'行情观察已停止',router.running?'neutral':'watch'));
+    const tags=el('div','price-router-tags');for(const [key,label] of Object.entries(priceProviderNames)){const source=router.sources?.[key];if(source)tags.append(badge(`${label} · ${{available:'最近成功',cooldown:'等待重试',unavailable:'暂未取得'}[source.state]||'未知'}`,source.state==='available'?'neutral':'watch'));}node.append(tags);
+    node.append(el('p','',`本次读取：缓存 ${count(router.cachedTokens)} 币 · 有效现价 ${count(router.freshTokens)} 币 · 来源冲突 ${count(router.conflictedTokens)} 币`));
+    node.append(el('p','price-router-note','单个来源失败不等于整体行情失效；每币的有效来源和时间见下方记录。'));
+    const fold=el('details','price-router-sources');fold.append(el('summary','','查看各来源最近请求状态'));
+    for(const [key,label] of Object.entries(priceProviderNames)){
+      const source=router.sources?.[key];if(!source)continue;const card=el('div','price-router-source');card.append(el('strong','',label),badge({available:'最近请求成功',cooldown:'冷却 / 等待重试',unavailable:'当前未取得数据'}[source.state] || '状态未知',source.state==='available'?'pass':'neutral'));
+      if(source.lastSuccessAt)card.append(el('span','',`最近成功 ${date(source.lastSuccessAt,true)}`));
+      if(source.cooldownUntil)card.append(el('span','',`重试不早于 ${date(source.cooldownUntil,true)}`));
+      if(source.lastError)card.append(el('span','price-router-error',protectionReason(source.lastError)));fold.append(card);
+    }
+    fold.append(el('p','price-router-note','这是各来源的最近请求状态，不代表每个币都已覆盖。某一来源失败不等于此币行情不可用；每币是否可用以有效期内的匹配样本为准。'));node.append(fold);return node;
+  }
+  function protectionPriceRoute(item,compact=false) {
+    const route=item.priceRoute,state=priceRouteState(item),node=el('div',`protection-route${compact?' compact':''}`);node.append(badge(state.label,state.tone));
+    if(state.available){node.append(el('strong','',`${observedPriceSource(state.sample.source)} · ${usd(state.sample.priceUsd)}`),el('span','',`${{provider_update:'供应商行情时间',http_response:'本次响应获取时间',chain_sample:'链上采样时间'}[state.sample.timeBasis] || '记录采样时间'} ${date(state.sample.observedAt,true)}`),el('small','',`有效至 ${date(state.sample.validUntil,true)}`));
+      if(!compact)node.append(el('span','',`本地收到 ${date(state.sample.receivedAt,true)}`),el('p','','这是行情观测价，不是兑换成交报价。当前路由样本与保护模型最近采用的样本分别列示。'));
+    }else if(!compact){node.append(el('p','',state.kind==='conflict'?'不同来源的有效样本出现价格冲突，当前不选其中任一价格作为新判断依据。':'尚无可用于本次判断的新鲜行情，旧样本不补造为实时价格。'));
+      if(route?.reason)node.append(el('p','price-router-error',protectionReason(route.reason)));
+    }
+    if(!compact&&Array.isArray(route?.sources)&&route.sources.length){const fold=el('details','price-route-candidates');fold.append(el('summary','',`已取得的来源样本 · ${Math.min(route.sources.length,5)} 条`));
+      for(const candidate of route.sources.slice(0,5)){const validUntil=validDate(candidate.validUntil),line=el('div','price-route-candidate');line.append(el('strong','',observedPriceSource(candidate.source)),el('span','',usd(candidate.priceUsd)),el('span','',`采样 ${date(candidate.observedAt,true)} · 有效至 ${date(candidate.validUntil,true)}`),badge('来源样本 · 仍须时效与一致性判断','neutral'));fold.append(line);}node.append(fold);
+    }
+    if(state.available){const until=Date.parse(state.sample.validUntil);setTimeout(()=>{if(node.isConnected&&Date.now()>=until)node.replaceWith(protectionPriceRoute(item,compact));},Math.min(2147483647,Math.max(1,until-Date.now()+10)));}
+    return node;
+  }
+  function protectionPhase(item) {
+    if(item.exitPlan?.status==='awaiting_fresh_price'||item.phase==='exit_pending')return ['待有效现价恢复后观察退出','watch'];
+    if(item.exitPlan?.status==='observed_closed'||item.phase==='triggered')return ['已记录模拟清仓','watch'];
+    if(item.phase==='ended')return [numeric(item.remainingPct)>0?'观察已结束 · 未记录最终清仓':'观察已结束','neutral'];
+    return ['影子跟踪中','neutral'];
+  }
+  function protectionExitPlan(item) {
+    const plan=item.exitPlan||{},intent=plan.intent,node=el('section','protection-exit-plan');node.append(el('h4','','自动最终清仓 · 影子观察'),badge(...protectionPhase(item)));
+    const remaining=numeric(item.remainingPct);node.append(kv('模拟剩余比例',`${plainPercent(remaining)} · 相对模拟初始仓位`),kv('采用的策略',scalar(plan.policyVersion||item.policyVersion,'未提供')));
+    if(plan.effectiveAt)node.append(kv('策略从此时开始生效',date(plan.effectiveAt,true)));
+    if(plan.status==='legacy_policy')node.append(el('p','','此条保留旧策略结果；结束观察且仍有剩余比例，不代表已经完成模拟清仓。'));
+    else if(plan.status==='tracking')node.append(el('p','','模型持续判断回撤、动量与观察时限；满足最终退出条件后，记录剩余部分的影子清仓建议。'));
+    if(plan.scheduledExitAt)node.append(kv('最晚计划观察退出时点',date(plan.scheduledExitAt,true)));
+    if(plan.maxHoldingAt)node.append(kv('持有时间上限',date(plan.maxHoldingAt,true)));
+    if(plan.observationEndsAt)node.append(kv('本次观察窗口截止',date(plan.observationEndsAt,true)));
+    if(intent){node.append(kv('最终退出意图原因',protectionReason(intent.reason)),kv('退出意图登记 / 到期',`${date(intent.requestedAt,true)} / ${date(intent.dueAt,true)}`),kv('拟退出比例',`${plainPercent(numeric(intent.sellPctRemaining))} 的当时剩余部分 · 相当于初始的 ${plainPercent(numeric(intent.remainingPctOfInitial))}`));
+      if(intent.observedAt&&finite(intent.observedPriceUsd))node.append(kv('用于退出观察的现价 / 时间',`${usd(intent.observedPriceUsd)} / ${date(intent.observedAt,true)}`));
+    }
+    if(plan.status==='awaiting_fresh_price'||item.phase==='exit_pending')node.append(el('p','protection-pending-note','最终退出意图已保留，模拟剩余比例尚未扣减。等待新的可信现价后再记录退出观察；旧价格不当作成交价，当前未发送卖单。'));
+    if(plan.status==='observed_closed'){node.append(kv('模拟清仓观察时间',date(plan.closedAt,true)),el('p','protection-pending-note','已将影子剩余比例归零，仅完成模型观察记录；没有真实卖出、成交回执或成交收益。'));}
+    if(!plan.status)node.append(el('p','','当前记录未提供最终退出计划，不能推定已经完成清仓。'));
+    return node;
+  }
+
   const protectionEventNames = {
+    policy_migrated: '策略前瞻升级', exit_pending: '登记最终退出意图', exit_intent: '登记最终退出意图',
     initialized: '建立模拟基准', protection_armed: '启动动态跟踪', partial_exit: '触发部分卖出建议', full_exit: '触发全部卖出建议',
     price_unavailable: '报价暂不可用', price_recovered: '报价恢复', observation_ended: '影子观察结束',
     baseline: '建立模拟基准', baseline_set: '建立模拟基准', started: '开始影子观察',
@@ -1443,6 +1537,8 @@
     const values = [];
     if (finite(numeric(event.sellPct))) values.push(`影子建议卖出当时剩余的 ${plainPercent(numeric(event.sellPct))}`);
     if (finite(numeric(event.gainPct))) values.push(`模拟浮盈 ${percent(numeric(event.gainPct))}`);
+    if (finite(numeric(event.remainingPct))) values.push(`模拟剩余 ${plainPercent(numeric(event.remainingPct))}（初始仓位口径）`);
+    if (event.effectiveAt) values.push(`策略生效 ${date(event.effectiveAt,true)}`);
     if (values.length) row.append(el('p', 'protection-event-values', values.join(' · ')));
     return row;
   }
@@ -1451,22 +1547,21 @@
     const identity = el('div', 'protection-identity'); const name = el('h3', '', item.symbol || '未命名代币');
     identity.append(name, el('div', 'token-meta', `${chainName(item.chain)} · 影子观察`));
     const actions = el('div', 'protection-card-actions');
-    actions.append(badge(item.phase === 'triggered' ? '已触发模拟建议' : item.phase === 'ended' ? '观察已结束' : finite(numeric(item.baselinePriceUsd)) ? '影子跟踪中' : '等待模拟基准', item.phase === 'triggered' ? 'watch' : 'neutral'), gmgnTokenLink(item.chain, item.address));
+    actions.append(badge(...protectionPhase(item)), gmgnTokenLink(item.chain, item.address));
     header.append(identity, actions); card.append(header, addressNode(item.address, 'detail-address'));
     const data = el('div', 'protection-value-grid'); const gain = numeric(item.gainPct), peak = numeric(item.peakGainPct);
-    data.append(protectionMetric('当前模拟涨幅', percent(gain), '相对影子基准，非持仓收益', finite(gain) ? gain < 0 ? 'negative' : 'positive' : ''), protectionMetric('观察期最高涨幅', percent(peak), '包含影子退出后的新报价', finite(peak) ? peak < 0 ? 'negative' : 'positive' : ''), protectionMetric(item.protectionActive === false ? '基础止损线（影子）' : '动态保护线', usd(item.protectionPriceUsd), finite(numeric(item.protectionGainPct)) ? `相对基准 ${percent(numeric(item.protectionGainPct))}` : '尚无有效保护线', 'protection-line-value'), protectionMetric('建议剩余比例', plainPercent(numeric(item.remainingPct)), '相对模拟初始仓位，非真实持仓'));
+    data.append(protectionMetric('最近样本模拟涨幅', percent(gain), '相对影子基准，非持仓收益', finite(gain) ? gain < 0 ? 'negative' : 'positive' : ''), protectionMetric('观察期最高涨幅', percent(peak), '包含影子退出后的新报价', finite(peak) ? peak < 0 ? 'negative' : 'positive' : ''), protectionMetric(item.protectionActive === false ? '基础止损线（影子）' : '动态保护线', usd(item.protectionPriceUsd), finite(numeric(item.protectionGainPct)) ? `相对基准 ${percent(numeric(item.protectionGainPct))}` : '尚无有效保护线', 'protection-line-value'), protectionMetric('模拟剩余比例', plainPercent(numeric(item.remainingPct)), '相对模拟初始仓位，非真实持仓'));
     card.append(data);
     const prices = el('div', 'protection-price-grid');
     prices.append(kv('模拟基准价', usd(item.baselinePriceUsd)), kv('最新样本价', usd(item.latestPriceUsd)), kv('峰值样本价', usd(item.peakPriceUsd)), kv('跟踪启动涨幅', percent(numeric(item.activationGainPct))), kv('当前跟踪回撤', plainPercent(numeric(item.trailPct))));
     if (finite(numeric(item.triggerPeakGainPct))) prices.append(kv(item.phase === 'triggered' ? '触发前模型峰值涨幅' : '当前模型峰值涨幅', percent(numeric(item.triggerPeakGainPct))));
-    card.append(prices, el('p', 'protection-window-note', '当前涨幅与观察期最高涨幅均相对影子基准计算，不是实际持仓收益。触发建议不代表成交；全部影子退出后模型停止更新，观察期最高涨幅仍会记录后续新报价。'));
-    const priceSource = {chain_pool_sample: '链上池报价（USD 参照价）', gmgn_token_info_sample: 'GMGN 回退报价'}[item.priceSource] || '报价来源未知';
-    const priceSourceRow = el('div', 'protection-price-source'); priceSourceRow.append(badge(priceSource, item.priceSource === 'chain_pool_sample' ? 'pass' : 'neutral'), el('span', '', item.priceSource === 'chain_pool_sample' ? '池内价格按 USD 参照价换算，不代表可成交美元价格。' : item.priceSource === 'gmgn_token_info_sample' ? '当前样本来自 GMGN 代币报价。' : '供应商未明确当前样本来源，不推定为链上报价。')); card.append(priceSourceRow);
+    card.append(prices, el('p', 'protection-window-note', '最近样本涨幅与观察期最高涨幅均相对影子基准计算，不是实际持仓收益。触发建议不代表成交；全部影子退出后模型停止更新，观察期最高涨幅仍会记录后续新报价。'));
+    card.append(protectionExitPlan(item),protectionPriceRoute(item));
     const health = el('div', `protection-health ${item.health === 'fresh' ? 'fresh' : 'attention'}`);
-    const healthLabel = {fresh: '行情样本正常', stale: '行情样本延迟', unavailable: '行情样本不可用'}[item.health] || '行情健康未知';
-    health.append(badge(healthLabel, item.health === 'fresh' ? 'pass' : 'watch'), el('span', '', `最近报价 ${date(item.lastPriceAt, true)}`));
-    if (finite(numeric(item.maxGapSec))) health.append(el('span', '', `最大报价间隔 ${count(numeric(item.maxGapSec))} 秒`));
-    if (item.health !== 'fresh') health.append(el('p', '', '显示的是最近已收到的样本与保护线，不能视为当前行情或实时可执行价格。'));
+    const healthLabel = {fresh:'模型最近采用的样本正常',stale:'模型样本已延迟',unavailable:'模型等待新行情样本'}[item.health] || '模型样本状态未知';
+    health.append(badge(healthLabel,item.health==='fresh'?'neutral':'watch'),el('span','',`${observedPriceSource(item.priceSource)} · 模型采用时间 ${date(item.lastPriceAt,true)}`));
+    if(finite(numeric(item.maxGapSec)))health.append(el('span','',`最大采样间隔 ${count(numeric(item.maxGapSec))} 秒`));
+    if(item.health!=='fresh')health.append(el('p','','上述涨幅与保护线来自最近已采用的历史样本，不能视为当前行情。路由恢复后仍需模型接收有效的新样本。'));
     card.append(health);
     const pressure = item.pressure || {}, pressureNode = el('div', 'protection-pressure');
     const pressureHeading = el('div', 'protection-pressure-heading'); pressureHeading.append(el('strong', '', '钱包卖压证据'), badge(pressure.status === 'observed' ? '已有样本' : '未知', pressure.status === 'observed' ? 'neutral' : 'watch')); pressureNode.append(pressureHeading);
@@ -1494,8 +1589,9 @@
     text('protection-total', count(status.positions)); text('protection-active', count(status.active)); text('protection-triggered', count(status.triggered)); text('protection-stale', count(status.stale)); text('protection-count', count(state.listPages.protection.total));
     const marker = $('protection-status-badge'); marker.className = `badge ${data?.enabled ? 'watch' : 'neutral'}`; marker.textContent = data ? data.enabled ? '仅影子验证' : '影子验证未启用' : '正在读取';
     text('protection-policy-note', `策略版本 ${scalar(data?.policyVersion)} · 实盘保护未就绪`);
+    $('protection-price-router').replaceChildren(priceRouterSummary(data?.priceRouter));
     text('protection-history-note', status.historyComplete === true ? '启用后成功获取的原始报价逐条保留；采样间隔内的行情仍未知。' : status.historyComplete === false ? '原始报价存档存在缺失，请结合记录异常复核。' : '原始采样保存状态尚未确认。');
-    text('protection-collection-status', data?.enabled ? `累计 ${count(status.samples)} 个价格样本 · ${count(status.events)} 条观察事件 · 最近采样 ${date(status.lastSampleAt, true)}` : data ? '尚未启用影子观察，当前页面不提供开启交易或挂单操作。' : '正在读取保护观察记录…');
+    text('protection-collection-status', data?.enabled ? `累计 ${count(status.samples)} 个价格样本 · ${count(status.events)} 条观察事件${finite(status.pending)?` · ${count(status.pending)} 条等待有效现价退出`:''} · 最近采样 ${date(status.lastSampleAt, true)}` : data ? '尚未启用影子观察，当前页面不提供开启交易或挂单操作。' : '正在读取保护观察记录…');
     const warnings = [];
     if (state.resourceErrors.protection) warnings.push('保护记录暂时无法更新；下方若有数据，仍为最近一次成功读取的结果。');
     for (const captureError of new Set([data?.captureError, state.overview?.exitProtection?.captureError].filter(Boolean))) warnings.push(`影子记录读写异常：${protectionReason(captureError)}。本页数据可能不完整或未更新。`);
@@ -1515,19 +1611,19 @@
   function renderProtectionRows(container, items) {
     if (!items.length) return;
     const scroll = el('div','table-scroll'), table = el('table','protection-table'), head = el('thead'), header = el('tr');
-    for (const label of ['代币 / 所属链','观察状态','当前模拟涨幅','采样最高涨幅','动态保护线','最近报价','操作']) header.append(el('th','',label)); head.append(header); table.append(head); const body = el('tbody');
+    for (const label of ['代币 / 所属链','退出状态 / 剩余','最近样本涨幅','采样最高涨幅','动态保护线','当前行情来源 / 时效','操作']) header.append(el('th','',label)); head.append(header); table.append(head); const body = el('tbody');
     for (const item of items) {
       const row = el('tr'), token = el('td'); token.append(el('strong','',item.symbol || item.name || '未命名代币'), el('div','token-meta',chainName(item.chain)), addressNode(item.address)); row.append(token);
-      const status = el('td'); status.append(badge(item.phase === 'triggered' ? '已触发模拟建议' : item.phase === 'ended' ? '观察已结束' : '影子跟踪', item.phase === 'triggered' ? 'watch' : 'neutral')); row.append(status);
+      const status = el('td'); status.append(badge(...protectionPhase(item)),el('p','protection-row-remaining',`模拟剩余 ${plainPercent(numeric(item.remainingPct))}`),el('small','protection-row-note','初始仓位口径 · 未执行交易'));if(item.exitPlan?.intent?.reason)status.append(el('small','protection-row-reason',protectionReason(item.exitPlan.intent.reason)));row.append(status);
       for (const value of [item.gainPct,item.peakGainPct]) { const cell = el('td','numeric'); cell.append(gainNode(numeric(value))); row.append(cell); }
-      row.append(el('td','numeric',usd(item.protectionPriceUsd)),el('td','cell-date',date(item.lastPriceAt,true)));
+      row.append(el('td','numeric',usd(item.protectionPriceUsd)));const quote=el('td','protection-quote-cell');quote.append(protectionPriceRoute(item,true),el('small','protection-row-note',`模型样本 ${date(item.lastPriceAt,true)}`));row.append(quote);
       const actions = el('td'), detail = el('button','text-button','保护详情 ↗'); detail.type='button'; detail.addEventListener('click',()=>openDetail(item.id,detail,{protection:true})); actions.append(gmgnTokenLink(item.chain,item.address),detail); row.append(actions); body.append(row);
     }
     table.append(body); scroll.append(table); container.append(scroll);
   }
   function renderProtectionDetail(record) {
     const item = record.item || record, title = el('h2','',`${item.symbol || item.name || '代币'} · 影子保护`); title.id='detail-title';
-    $('detail-content').replaceChildren(title,protectionCard(item,new Set()));
+    const body=[title,protectionCard(item,new Set())];if(record.priceRouter)body.push(priceRouterSummary(record.priceRouter));$('detail-content').replaceChildren(...body);
   }
   function renderOrders() {
     const body = $('order-rows'); body.replaceChildren(); text('orders-count', count(state.listPages.orders.total)); $('orders-empty').hidden = state.orders.length > 0;
@@ -1710,6 +1806,7 @@
         runtime.append(el('p', 'detail-small', '已完成复评统计执行次数，不是通过条件的数量。到期任务按队列逐条检查，调度运行中不代表每个币都已重新判断。'));
       }
     }
+    if(data.priceRouter)runtime.append(priceRouterSummary(data.priceRouter));
     const protection = data.exitProtection || {};
     policy.append(kv('动态止盈保护', protection.enabled ? '仅影子验证 · 不发送卖单' : '影子验证未启用'), kv('实盘保护就绪', '未就绪'), kv('保护策略版本', protection.policyVersion), kv('影子观察对象 / 触发建议', `${count(protection.status?.positions)} / ${count(protection.status?.triggered)}`));
     if (protection.captureError) policy.append(el('p', 'detail-message detail-error', `影子保护记录异常：${protectionReason(protection.captureError)}`));

@@ -6,7 +6,7 @@ import {tmpdir} from 'node:os';
 import {DatabaseSync} from 'node:sqlite';
 import {ExitShadow,type ExitShadowOptions,type ExitObservationSeed} from '../src/exit-shadow.js';
 import type {ScanPrice,ScanToken} from '../src/scan-archive.js';
-import type {WalletPressure} from '../src/adaptive-exit.js';
+import {stepAdaptiveExit,type WalletPressure} from '../src/adaptive-exit.js';
 
 const start=Date.parse('2026-10-11T00:00:00.000Z');
 const token:ScanToken={chain:'bsc',address:`0x${'a'.repeat(40)}`};
@@ -136,18 +136,19 @@ test('the global last sample time is monotonic across tokens whose observed time
   assert.equal(store.summary().status.lastSampleAt,iso(start+60_000));
 });
 
-test('expired episodes retain history and require a different later candidate to start a new baseline',t=>{
+test('v2 window expiry closes only at a new trusted observation and a later candidate gets a separate baseline',t=>{
   const ctx=setup(t),store=ctx.store,oldSeed=seed({endsAt:iso(start+300_000)});
   store.recordPrice(price(start),oldSeed);const oldId=store.list().items[0].id;
   ctx.clock.time=start+300_000;store.recordPrice(price(ctx.clock.time,200),oldSeed);
-  assert.equal(store.detail(oldId)?.sampleCount,1);assert.equal(store.detail(oldId)?.item.phase,'ended');
-  store.recordPrice(price(ctx.clock.time,200),seed({endsAt:iso(start+600_000)}));
+  assert.equal(store.detail(oldId)?.sampleCount,2);assert.equal(store.detail(oldId)?.item.phase,'triggered');
+  assert.equal(store.detail(oldId)?.item.lastEvent?.reason,'OBSERVATION_WINDOW_END_OBSERVED');
+  ctx.clock.time+=1000;store.recordPrice(price(ctx.clock.time,200),seed({endsAt:iso(start+600_000)}));
   assert.equal(store.summary().status.positions,1);
   const later=seed({candidateId:'candidate-2',eligibleAt:iso(ctx.clock.time),endsAt:iso(start+600_000)});
   store.recordPrice(price(ctx.clock.time,200),later);
   const newItem=store.list().items.find(item=>item.id!==oldId)!;
   assert.equal(store.summary().status.positions,2);assert.equal(newItem.baselinePriceUsd,200);
-  assert.equal(newItem.gainPct,0);assert.equal(newItem.candidateId,'candidate-2');assert.equal(store.detail(oldId)?.sampleCount,1);
+  assert.equal(newItem.gainPct,0);assert.equal(newItem.candidateId,'candidate-2');assert.equal(store.detail(oldId)?.sampleCount,2);
 });
 
 test('a triggered shadow episode keeps comparison samples after restart but never emits a second full exit',t=>{
@@ -174,7 +175,7 @@ test('capacity failures retain existing observations and persist incomplete-hist
   assert.equal(store.summary().status.historyComplete,false);assert.equal(store.summary().status.lastError,'EXIT_SHADOW_CAPACITY_REACHED');
   store.close();store=ctx.open();
   assert.equal(store.detail(id)?.sampleCount,1);assert.equal(store.summary().status.historyComplete,false);
-  assert.equal(store.summary().status.lastError,'EXIT_SHADOW_CAPACITY_REACHED');
+  assert.equal(store.summary().status.lastError,undefined);
   ctx.clock.time+=60_000;store.recordPrice(price(ctx.clock.time,110),undefined);
   assert.equal(store.detail(id)?.sampleCount,2);assert.equal(store.summary().status.lastError,undefined);
   assert.equal(store.summary().status.historyComplete,false);
@@ -238,4 +239,86 @@ test('shadow performs zero network/order operations and persists normalized evid
   const serialized=tables.map(name=>JSON.stringify(ctx.query(`SELECT * FROM ${name}`))).join('\n');
   assert.equal(serialized.includes(marker),false);
   assert.equal(serialized.includes('privateKey'),false);assert.equal(serialized.includes('rawResponse'),false);
+});
+
+
+test('deadline with all quotes missing persists an unfilled exit intent across restart and closes remaining holdings at recovered current price',t=>{
+  const ctx=setup(t);let store=ctx.store;
+  store.recordPrice(price(start,1),seed());ctx.clock.time+=60_000;store.recordPrice(price(ctx.clock.time,6),undefined);
+  ctx.clock.time+=60_000;store.recordPrice(price(ctx.clock.time,11),undefined);const id=store.list().items[0].id;
+  ctx.clock.time=start+6*3600_000;assert.equal(store.tick().created,1);store.recordError(token,'ALL_PRICE_SOURCES_UNAVAILABLE');
+  const waiting=store.detail(id)!;assert.equal(waiting.item.phase,'exit_pending');assert.equal(waiting.item.remainingPct,72);
+  assert.equal(waiting.item.exitPlan.status,'awaiting_fresh_price');assert.equal(waiting.item.exitPlan.intent?.observedPriceUsd,undefined);
+  assert.equal(waiting.item.exitPlan.intent?.sellPctRemaining,100);assert.equal(waiting.item.exitPlan.intent?.peakPriceUsd,11);
+  assert.equal(store.trackingTokens().length,1);assert.equal(store.tick().created,0);
+  assert.equal(ctx.query("SELECT id FROM exit_shadow_events WHERE json_extract(data,'$.kind')='full_exit'").length,0);
+  store.close();store=ctx.open();ctx.clock.time+=86400_000;assert.equal(store.tick().created,0);
+  assert.equal(store.trackingTokens().length,1);assert.equal(store.detail(id)?.item.phase,'exit_pending');
+  store.recordPrice(price(ctx.clock.time-300_000,500),undefined);store.recordPrice({...price(ctx.clock.time,500),source:'historical_ath'},undefined);
+  assert.equal(store.detail(id)?.item.remainingPct,72);
+  store.recordPrice(price(ctx.clock.time,12),undefined);const closed=store.detail(id)!;
+  assert.equal(closed.item.remainingPct,0);assert.equal(closed.item.phase,'triggered');assert.equal(closed.item.exitPlan.status,'observed_closed');
+  assert.equal(closed.item.exitPlan.intent?.requestedAt,iso(start+6*3600_000));assert.equal(closed.item.exitPlan.intent?.observedPriceUsd,12);
+  assert.equal(closed.item.lastEvent?.priceUsd,12);assert.equal(closed.item.lastEvent?.sellPct,100);assert.equal(store.trackingTokens().length,0);
+  store.recordPrice(price(ctx.clock.time,12),undefined);assert.equal(ctx.query("SELECT id FROM exit_shadow_events WHERE json_extract(data,'$.kind')='full_exit'").length,1);
+});
+
+test('explicit active v1 migration records prior state and only applies future policy; expired legacy remainder is never falsely closed',t=>{
+  const ctx=setup(t),store=ctx.store;
+  store.recordPrice(price(start),seed());const active=store.list().items[0].id;
+  store.recordPrice(price(start,100,other),seed({candidateId:'ended',endsAt:iso(start+30_000)}));const ended=store.list().items.find(i=>i.id!==active)!.id;
+  const db=new DatabaseSync(ctx.path);
+  for(const [id,target] of [[active,token],[ended,other]] as const){
+    const old=stepAdaptiveExit(undefined,{...target,priceUsd:100,observedAt:iso(start),evaluatedAt:iso(start),source:'gmgn_token_info_sample'}).state!;
+    db.prepare('UPDATE exit_shadow_positions SET state=? WHERE id=?').run(JSON.stringify(old),id);
+  }
+  ctx.clock.time+=60_000;assert.equal(store.migrateActiveV1().migrated,1);assert.equal(store.migrateActiveV1().migrated,0);
+  const migrated=store.detail(active)!;assert.equal(migrated.item.policyVersion,'adaptive-shadow-v2');assert.equal(migrated.item.exitPlan.effectiveAt,iso(ctx.clock.time));
+  assert.equal(migrated.item.remainingPct,100);assert.equal(migrated.sampleCount,1);
+  assert.equal(store.detail(ended)?.item.phase,'ended');assert.equal(store.detail(ended)?.item.remainingPct,100);
+  assert.equal(store.detail(ended)?.item.exitPlan.status,'legacy_policy');
+  assert.equal(ctx.query('SELECT * FROM exit_shadow_policy_history').length,1);
+  assert.equal(JSON.parse(String(ctx.query('SELECT previous_state FROM exit_shadow_policy_history')[0].previous_state)).policyVersion,'adaptive-shadow-v1');
+  assert.equal(ctx.query("SELECT id FROM exit_shadow_events WHERE json_extract(data,'$.kind')='policy_migrated'").length,1);
+  store.recordPrice(price(ctx.clock.time-1000,200),undefined);assert.equal(store.detail(active)?.sampleCount,1);
+  db.close();
+});
+
+test('closed comparison capture is sampled at most once per minute without deleting old observations',t=>{
+  const ctx=setup(t),store=ctx.store;store.recordPrice(price(start),seed());ctx.clock.time+=1000;
+  store.recordPrice(price(ctx.clock.time,50),undefined);const id=store.list().items[0].id;
+  for(let n=1;n<=59;n++){ctx.clock.time=start+1000+n*1000;store.recordPrice(price(ctx.clock.time,100+n),undefined);}
+  assert.equal(store.detail(id)?.sampleCount,2);ctx.clock.time=start+61_000;store.recordPrice(price(ctx.clock.time,200),undefined);
+  assert.equal(store.detail(id)?.sampleCount,3);assert.equal(Reflect.get(store.detail(id)!.samples[0],'priceUsd'),100);
+  assert.equal(store.summary().status.closedComparisonIntervalSec,60);
+});
+
+
+test('validated current spot source names are accepted while old DeBot signal-stream prices remain rejected',t=>{
+  const ctx=setup(t),store=ctx.store;
+  store.recordPrice({...price(start),source:'debot_price_stream_sample'},seed());assert.equal(store.list().items.length,0);
+  for(const [i,source] of ['dexscreener_token_pairs_sample','ave_price_stream_sample','debot_token_info_sample'].entries()){
+    ctx.clock.time=start+i*1000;store.recordPrice({...price(ctx.clock.time),source},seed());
+  }
+  assert.equal(store.summary().status.samples,3);assert.equal(store.list().items[0].priceSource,'debot_token_info_sample');
+});
+
+
+test('more than 200 protected targets rotate after failed and successful attempts, including across restart',t=>{
+  const ctx=setup(t);let store=ctx.store;
+  const targets:ScanToken[]=Array.from({length:201},(_,i)=>({chain:'bsc',address:'0x'+(i+1).toString(16).padStart(40,'0')}));
+  for(const target of targets)store.recordPrice(price(start,100,target),seed());
+  const initial=store.trackingTokens(200);assert.equal(initial.length,200);
+  assert.equal(initial[0].address,targets[0].address);assert.equal(initial.some(t=>t.address===targets[200].address),false);
+  ctx.clock.time+=1000;store.recordError(targets[0],'PRICE_NO_FRESH_SOURCE');
+  const afterFailure=store.trackingTokens(200);assert.equal(afterFailure[0].address,targets[1].address);
+  assert.equal(afterFailure.some(t=>t.address===targets[200].address),true);assert.equal(afterFailure.some(t=>t.address===targets[0].address),false);
+  ctx.clock.time+=1000;store.recordPrice(price(ctx.clock.time,105,targets[1]),undefined);
+  const afterSuccess=store.trackingTokens(200);assert.equal(afterSuccess[0].address,targets[2].address);
+  assert.equal(afterSuccess.some(t=>t.address===targets[0].address),true);assert.equal(afterSuccess.some(t=>t.address===targets[1].address),false);
+  assert.deepEqual(store.trackingTokens(2),targets.slice(2,4));
+  ctx.clock.time+=1000;store.recordError(targets[2],'PRICE_NO_FRESH_SOURCE');assert.deepEqual(store.trackingTokens(2),targets.slice(3,5));
+  store.close();store=ctx.open();assert.deepEqual(store.trackingTokens(2),targets.slice(3,5));
+  assert.equal(store.summary().status.positions,201);assert.equal(store.summary().status.triggered,0);
+  assert.equal(ctx.query("SELECT id FROM exit_shadow_events WHERE json_extract(data,'$.kind')='full_exit'").length,0);
 });

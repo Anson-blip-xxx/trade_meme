@@ -5,7 +5,7 @@ import type {Fetcher} from '../http.js';
 const ORIGIN='https://debot.ai';
 const INFO='/api/user/info';
 const PATHS=new Set([INFO,'/api/community/signal/channel/list',
-  '/api/community/signal/channel/wallets/profit','/api/community/signal/channel/token/alerts']);
+  '/api/community/signal/channel/wallets/profit','/api/community/signal/channel/token/alerts','/api/market/token/info']);
 const MAX_FILE=64*1024,MAX_RESPONSE=1024*1024;
 type Cookie={name:string;value:string;domain:string;path:string;expires:number;httpOnly:boolean;secure:boolean;sameSite:string};
 type SessionFile={version:1;createdAt:string;email:string;cookies:Cookie[];subToken:string};
@@ -65,7 +65,8 @@ export class DebotSessionClient {
       if(!cookieHeader){const error=failure('AUTH_REQUIRED');this.notifyAuthRequired(error);throw error;}
       const result=await this.read(url,cookieHeader,signal??undefined);
       if(!object(result.value)||typeof result.value.code!=='number')throw failure('RESPONSE_INVALID');
-      return new Response(result.text,{status:result.status,headers:{'content-type':'application/json'}});
+      return new Response(result.text,{status:result.status,headers:{'content-type':'application/json',
+        ...(result.cacheAge!==null?{age:result.cacheAge}:{})}});
     };
   }
 
@@ -116,7 +117,7 @@ export class DebotSessionClient {
     } finally {await handle?.close().catch(()=>{});}
   }
 
-  private async read(url:URL,cookieHeader:string,externalSignal?:AbortSignal):Promise<{value:unknown;text:string;status:number}> {
+  private async read(url:URL,cookieHeader:string,externalSignal?:AbortSignal):Promise<{value:unknown;text:string;status:number;cacheAge:string|null}> {
     const signal=externalSignal?AbortSignal.any([externalSignal,AbortSignal.timeout(10_000)]):AbortSignal.timeout(10_000);
     try {
       const response=await this.request(url,{method:'GET',credentials:'omit',redirect:'error',signal,
@@ -156,7 +157,8 @@ export class DebotSessionClient {
       let value:unknown;try {value=JSON.parse(text);}catch {throw failure('RESPONSE_INVALID');}
       if(object(value)&&(value.code===101||value.code===401||value.code===403))throw failure('AUTH_REQUIRED');
       if(object(value)&&value.code===429)throw new DebotSessionError('DEBOT_SESSION_RATE_LIMITED',this.now().getTime()+60_000);
-      return {value,text,status:response.status};
+      // Preserve only cache freshness metadata; never forward credentials or Set-Cookie.
+      return {value,text,status:response.status,cacheAge:response.headers.get('age')};
     } catch(error) {
       this.verified=undefined;
       if(error instanceof DebotSessionError) {

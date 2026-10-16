@@ -5,6 +5,8 @@ import {abortable,type Fetcher} from './http.js';
 import {parseSignal,type Chain,type Report,type Signal} from './types.js';
 import {scoreDebotRisk} from './debot-risk-score.js';
 import {fetchAveSignalPage,normalizeAveSignalPush,AveSignalError,type AveSignalObservation,type NormalizedAveSignals} from './providers/ave-signals.js';
+import {normalizePriceToken} from './market-price-normalizers.js';
+import type {ScanToken} from './scan-archive.js';
 
 export interface AveSocket {
   readyState:number;send(data:string):void;close(code?:number,reason?:string):void;
@@ -16,6 +18,7 @@ export interface AveScannerOptions {
   onObservation:(observation:AveSignalObservation)=>void;
   onSignal:(signal:Signal,firstObservedAt:string)=>Promise<unknown>;
   shouldDefer?:()=>string|undefined;socketFactory?:(url:string)=>AveSocket;
+  onPriceFrame?:(payload:unknown,receivedAt:string)=>void;
 }
 export interface AveSignalListOptions {limit?:number;offset?:number;chain?:Chain;asOf?:string;}
 type Row={id:string;chain:Chain;address:string;occurred_at:string;observed_at:string;payload:string;
@@ -38,6 +41,7 @@ export class AveScanner {
   private lastConnectedAt?:string;private lastMessageAt?:string;private lastSignalAt?:string;private lastPollAt?:string;
   private lastError?:string;private deferredReason?:string;private reconnects=0;private reconnectAttempt=0;
   private cooldownUntil=0;private nextDispatchAt=0;private lastPruned=0;private connectedAtMs=0;
+  private priceTokens:string[]=[];private subscribedPriceTokens:string[]=[];private priceRequestId=10;
 
   constructor(private readonly options:AveScannerOptions){
     this.now=options.now??(()=>new Date());this.chains=[...new Set(options.chains)];
@@ -62,6 +66,23 @@ export class AveScanner {
     this.prune();
   }
   private alive(generation:number){return !this.closed&&!this.stopped&&generation===this.generation;}
+  /** Bounded current-price topics share the already-open public socket. */
+  setPriceTokens(tokens:ScanToken[]):void {
+    if(this.closed)return;
+    this.priceTokens=[...new Set(tokens.flatMap(token=>{const t=normalizePriceToken(token);
+      return t&&this.chains.includes(t.chain)?[`${t.address}-${t.chain}`]:[];}))].slice(0,200);
+    this.syncPriceTopics();
+  }
+  private syncPriceTopics():void {
+    if(this.socket?.readyState!==1)return;
+    const add=this.priceTokens.filter(t=>!this.subscribedPriceTokens.includes(t));
+    const remove=this.subscribedPriceTokens.filter(t=>!this.priceTokens.includes(t));
+    try {
+      if(remove.length)this.socket.send(JSON.stringify({jsonrpc:'2.0',method:'unsubscribe',params:['pricev2',remove],id:++this.priceRequestId}));
+      if(add.length)this.socket.send(JSON.stringify({jsonrpc:'2.0',method:'subscribe',params:['pricev2',add],id:++this.priceRequestId}));
+      this.subscribedPriceTokens=[...this.priceTokens];
+    }catch{this.reconnect('AVE_PRICE_SUBSCRIBE_FAILED');}
+  }
   private prune(){
     const now=this.now().getTime();if(this.lastPruned&&now-this.lastPruned<60_000)return;
     this.db.prepare('DELETE FROM ave_signals WHERE observed_at<?').run(new Date(now-30*86400_000).toISOString());
@@ -214,6 +235,7 @@ export class AveScanner {
   private disconnect(){
     clearTimeout(this.heartbeatTimer);this.heartbeatTimer=undefined;
     const socket=this.socket;this.socket=undefined;
+    this.subscribedPriceTokens=[];
     if(socket){for(const [type,listener] of this.socketListeners)socket.removeEventListener(type,listener);
       try {socket.close(1000,'observer stopped');}catch {/* Transport already closed. */}}
     this.socketListeners=[];
@@ -237,13 +259,16 @@ export class AveScanner {
       this.connectionState='connected';this.lastConnectedAt=this.now().toISOString();this.connectedAtMs=this.now().getTime();
       try {socket.send(JSON.stringify({jsonrpc:'2.0',method:'subscribe',params:['signalsv2_public_monitor',this.chains.join(',')],id:1}));}
       catch {this.reconnect('AVE_STREAM_SUBSCRIBE_FAILED');}
+      this.syncPriceTopics();
     });
     on('message',(event:{data:unknown})=>{if(!current())return;
       if(typeof event.data!=='string'||Buffer.byteLength(event.data)>MAX_FRAME_BYTES){this.reconnect('AVE_STREAM_FRAME_INVALID');return;}
       // The observed public /ws endpoint answers JSON-RPC ping with plain text.
       if(event.data==='pong'){this.lastMessageAt=this.now().toISOString();this.reconnectAttempt=0;return;}
       let value:unknown;try {value=JSON.parse(event.data);}catch {this.lastError='AVE_STREAM_JSON_INVALID';return;}
-      this.lastMessageAt=this.now().toISOString();this.reconnectAttempt=0;this.acceptPush(value);
+      this.lastMessageAt=this.now().toISOString();this.reconnectAttempt=0;
+      try {this.options.onPriceFrame?.(value,this.lastMessageAt);}catch{this.lastError='AVE_PRICE_CALLBACK_FAILED';}
+      this.acceptPush(value);
     });
     on('error',()=>{if(current())this.reconnect('AVE_STREAM_TRANSPORT_ERROR');});
     on('close',()=>{if(current())this.reconnect('AVE_STREAM_DISCONNECTED');});

@@ -36,8 +36,10 @@ import {SourceCorroboration} from './source-corroboration.js';
 import {AveScanner} from './ave-scanner.js';
 import {AveSessionClient} from './providers/ave-session.js';
 import {TokenRankResearchRunner} from './token-rank-runner.js';
+import {MarketPriceRouter} from './market-price-router.js';
+import type {Fetcher} from './http.js';
 
-export function createRuntime(config:Config) {
+export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher}={}) {
   if(!isPersistentOrderPath(config.ordersDatabase)) throw new Error('PERSISTENT_ORDER_DATABASE_REQUIRED');
   if(config.gmgnApiKey?.trim()==='gmgn_solbscbaseethmonadtron') throw new Error('GMGN_DEMO_KEY_TEST_ONLY');
   const sameDatabase=(a:string,b:string)=>{
@@ -166,13 +168,33 @@ export function createRuntime(config:Config) {
       if(exitShadow)try {exitShadow.recordError(token,reason,now);}catch {exitCaptureError='EXIT_SHADOW_CAPTURE_FAILED';}
       if(archiveFailed)throw new Error('PRICE_ARCHIVE_WRITE_FAILED');
     };
+  // This independent spot observer never waits behind signal research on the GMGN queue.
+  const priceRouter=new MarketPriceRouter({client,fetcher:dependencies.priceFetcher,
+    debotFetcher:dependencies.priceFetcher??((input,init)=>debotSession?debotSession.fetcher(input,init):fetch(input,init))});
+  const mergeTokens=(...groups:ScanToken[][])=>[...new Map(groups.flat().map(t=>[`${t.chain}:${t.address}`,t])).values()];
+  let priceTargetError:string|undefined;
+  let subscribedPriceKeys=new Set<string>();
+  const streamPriceTokens=()=>{
+    const groups:ScanToken[][]=[];let failed:string|undefined;
+    try{groups.push(exitShadow?.trackingTokens(180)??[]);}catch{failed='EXIT_PRICE_TARGETS_UNAVAILABLE';}
+    try{groups.push(archive?.streamingTokens(new Date(),config.chainStream.maxPools)??[]);}catch{failed='ARCHIVE_PRICE_TARGETS_UNAVAILABLE';}
+    priceTargetError=failed;return mergeTokens(...groups).slice(0,200);
+  };
   const chainMonitor=config.chainStream.enabled?new ChainMonitor({config:config.chainStream,
-    tokens:()=>archive?.streamingTokens(new Date(),config.chainStream.maxPools)??[],wallets:(chain,limit)=>walletHistory?.streamWalletTargets(chain,limit)??[],onPrice:recordPrice}):undefined;
+    tokens:streamPriceTokens,wallets:(chain,limit)=>walletHistory?.streamWalletTargets(chain,limit)??[],onPrice:price=>{
+      if(priceRouter.observeChainSample(price)){
+        const route=priceRouter.latest(price);
+        if(route.status==='available')recordPrice(price);
+        else recordPriceError(price,route.reason??'PRICE_SOURCE_CONFLICT');
+      }
+    }}):undefined;
   const chainStreamStatus=()=>{try{return chainMonitor?.getStatus()??{enabled:false,running:false,mode:'observation_only',chains:[],recentEvents:[]};}
     catch{return {enabled:config.chainStream.enabled,mode:'observation_only',captureError:'CHAIN_STATUS_READ_FAILED',chains:[],recentEvents:[]};}};
   const tracking=archive?new PriceTracker({archive:{
-    pendingTokens:(limit,now)=>archive.trackingTokens(3,now,t=>!!chainMonitor?.covers(t)).slice(0,limit??3),
-    recordPrice,recordPriceError},client,intervalMs:config.dashboard.sampleIntervalSec*1000,maxTokensPerCycle:3}):undefined;
+    pendingTokens:(limit,now)=>mergeTokens(exitShadow?.trackingTokens(180,now)??[],
+      archive.trackingTokens(20,now,t=>!!chainMonitor?.covers(t))).slice(0,limit??200),
+    recordPrice,recordPriceError},client,router:priceRouter,priorityTokens:now=>exitShadow?.trackingTokens(20,now)??[],
+    intervalMs:config.dashboard.sampleIntervalSec*1000,maxTokensPerCycle:30}):undefined;
   const balances=config.dashboard.enabled?new DashboardBalances(config):undefined;
   const system=config.dashboard.enabled?new SystemMonitor(dirname(config.ordersDatabase)):undefined;
   orders.recover();
@@ -210,6 +232,9 @@ export function createRuntime(config:Config) {
   let debotAuth:DebotAuthManager|undefined;
   const aveSession=config.ave?.enabled&&config.ave.email?new AveSessionClient({path:config.ave.sessionPath,email:config.ave.email}):undefined;
   const aveScanner=config.ave?.enabled?new AveScanner({database:config.ave.database,chains:config.scannerChains,
+    onPriceFrame:(payload,receivedAt)=>{priceRouter.ingestAvePriceFrame(payload,receivedAt,sample=>{
+      if(subscribedPriceKeys.has(`${sample.chain}:${sample.address}`))recordPrice(sample);
+    });},
     fetcher:aveSession?.fetcher,onObservation:observation=>{
       try {
         const captured=walletHistory?.captureVendorNominations(observation.signal.token,{source:'ave',
@@ -322,7 +347,16 @@ export function createRuntime(config:Config) {
     try {return {...exitShadow.summary(),captureError:exitCaptureError};}
     catch {return {enabled:true,mode:'shadow',liveReady:false,captureError:'EXIT_SHADOW_READ_FAILED'};}
   };
-  return {client,providers,store,orders,entry,scanner,debotScanner,debotStream,debotAuth,archive,tracking,walletHistory,walletObserver,walletResearchStatus,walletProfiles,walletProfilesStatus,walletScreening,watchRechecker,exitShadow,chainMonitor,chainStreamStatus,memeObserver,sourceEvidence,aveScanner,aveSession,tokenRankResearch,
+  let exitMaintenanceTimer:ReturnType<typeof setInterval>|undefined;
+  const maintainProtection=()=>{
+    try{exitShadow?.tick();}catch{exitCaptureError='EXIT_SHADOW_MAINTENANCE_FAILED';}
+    try{
+      const targets=streamPriceTokens();
+      // A transient archive failure must not discard existing current-price subscriptions.
+      if(!priceTargetError){subscribedPriceKeys=new Set(targets.map(t=>`${t.chain}:${t.address}`));aveScanner?.setPriceTokens(targets);}
+    }catch{priceTargetError='PRICE_STREAM_TARGET_REFRESH_FAILED';}
+  };
+  return {client,providers,store,orders,entry,scanner,debotScanner,debotStream,debotAuth,archive,tracking,priceRouter,walletHistory,walletObserver,walletResearchStatus,walletProfiles,walletProfilesStatus,walletScreening,watchRechecker,exitShadow,chainMonitor,chainStreamStatus,memeObserver,sourceEvidence,aveScanner,aveSession,tokenRankResearch,
     dashboardHome:()=>{
       const host=system?.get();
       return {now:new Date().toISOString(),entryMode:config.entryMode,stats:archive?.overviewStats(),
@@ -332,9 +366,11 @@ export function createRuntime(config:Config) {
         settings:{scanRetentionDays:config.dashboard.retentionDays,trackingHours:config.dashboard.trackingHours,
           sampleIntervalSec:config.dashboard.sampleIntervalSec}};
     },
-    dashboardProtection:(options:DashboardPageOptions={limit:20,offset:0})=>exitShadow
-      ?{...exitShadow.page(options),captureError:exitCaptureError}
-      :{...protectionSummary(),items:[],total:0,limit:options.limit,offset:options.offset,hasMore:false},
+    dashboardProtection:(options:DashboardPageOptions={limit:20,offset:0})=>{
+      if(!exitShadow)return {...protectionSummary(),items:[],total:0,limit:options.limit,offset:options.offset,hasMore:false,priceRouter:priceRouter.getStatus()};
+      const page=exitShadow.page(options);
+      return {...page,items:page.items.map(item=>({...item,priceRoute:priceRouter.latest(item)})),captureError:exitCaptureError,priceRouter:{...priceRouter.getStatus(),captureError:priceTargetError}};
+    },
     dashboardOverview:()=>({now:new Date().toISOString(),entryMode:config.entryMode,scanner:scanner.getStatus(),
       debotScanner:debotScanner?.getStatus()??{enabled:false,running:false},
       debotStream:debotStream?.getStatus(),
@@ -342,12 +378,15 @@ export function createRuntime(config:Config) {
       ave:aveScanner?{...aveScanner.getStatus(),nominationCaptureError,session:aveSession?.getStatus()??{status:'required',authenticated:false,reason:'AVE_LOGIN_EMAIL_NOT_CONFIGURED'}}:{enabled:false},
       tokenRankResearch:tokenRankResearch?.status()??{enabled:false},
       corroboration:sourceEvidence?{...sourceEvidence.status(),captureError:sourceCaptureError}:{enabled:false},
-      tracking:tracking?.getStatus(),stats:archive?.stats(),archiveError:archiveCaptureError??store.observationError??archiveMaintenanceError,
+      tracking:tracking?.getStatus(),priceRouter:{...priceRouter.getStatus(),captureError:priceTargetError},stats:archive?.stats(),archiveError:archiveCaptureError??store.observationError??archiveMaintenanceError,
       settings:dashboardSettings(config),balances:balances?.get()??[],system:system?.get(),walletResearch:walletResearchStatus(),exitProtection:protectionSummary(),chainStream:chainStreamStatus(),
       watchRecheck:watchRechecker?{enabled:true,...watchRechecker.getStatus()}:{enabled:false}}),
     dashboardOrders:(options:DashboardPageOptions={limit:20,offset:0})=>dashboardOrders(orders,options),
     start(){
       if(closed) return;
+      try{exitShadow?.migrateActiveV1();}catch{exitCaptureError='EXIT_SHADOW_MIGRATION_FAILED';}
+      maintainProtection();
+      if(!exitMaintenanceTimer){exitMaintenanceTimer=setInterval(maintainProtection,15_000);exitMaintenanceTimer.unref();}
       if(memeObserver){
         for(const observation of debotScanner?.observationSeeds()??[])observeSignal(observation.signal,observation.observedAt,observation,false);
         memeObserver.start();
@@ -376,7 +415,8 @@ export function createRuntime(config:Config) {
       }
     },
     async close(){
-      if(closed) return;closed=true;scanner.stop();clearInterval(sweep);clearInterval(reconcileTimer);clearInterval(walletIndexTimer);clearInterval(debotSyncTimer);
+      if(closed) return;closed=true;scanner.stop();clearInterval(sweep);clearInterval(reconcileTimer);clearInterval(walletIndexTimer);clearInterval(debotSyncTimer);clearInterval(exitMaintenanceTimer);
+      priceRouter.close();
       await debotStream?.stop();
       await aveScanner?.stop();
       await Promise.all([chainMonitor?.stop(),tracking?.stop(),balances?.stop(),walletObserver?.stop(),system?.stop(),watchRechecker?.stop(),debotScanner?.stop()]);

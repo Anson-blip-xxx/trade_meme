@@ -1,22 +1,22 @@
-import bs58 from 'bs58';
 import {GmgnError, type GmgnClient} from './providers/gmgn-client.js';
 import type {ScanArchive, ScanToken, ScanPrice} from './scan-archive.js';
-import type {Chain} from './types.js';
+import {normalizePriceToken as normalizeToken,priceFromInfo,GMGN_PRICE_CHAINS as GMGN_CHAINS} from './market-price-normalizers.js';
+import type {MarketPriceRouter} from './market-price-router.js';
 
 // Verified 2026-10-09 against GMGNAI/gmgn-skills commit
 // 4575ef539e6a3115fa0481d41285cb79e77970bf/skills/gmgn-token/SKILL.md#L267-L272:
 // token info's current USD price is the STRING at price.price. Window prices
 // and ath_price describe earlier history and must never become our samples.
-const GMGN_CHAINS: Record<Chain, string> = {bsc: 'bsc', solana: 'sol', robinhood: 'robinhood'};
 const MAX_ACTIVE_TOKENS = 200;
 const SOURCE = 'gmgn_token_info_sample';
-const object = (value: unknown): value is Record<string, unknown> =>
-  value !== null && typeof value === 'object' && !Array.isArray(value);
 const key = (token: ScanToken) => `${token.chain}:${token.address}`;
 
 export interface PriceTrackerOptions {
   archive: Pick<ScanArchive, 'pendingTokens' | 'recordPrice' | 'recordPriceError'>;
   client: Pick<GmgnClient, 'get' | 'cooldownUntil'>;
+  router?: Pick<MarketPriceRouter,'read'>;
+  /** Protected positions receive bounded priority; reserve at least one ordinary ring slot. */
+  priorityTokens?: (now:Date)=>ScanToken[];
   intervalMs?: number;
   maxTokensPerCycle?: number;
   now?: () => Date;
@@ -43,55 +43,13 @@ export interface PriceTrackerStatus {
   lastCycle?: PriceTrackerCycle;
 }
 
-function normalizeToken(value: unknown): ScanToken | undefined {
-  if (!object(value) || typeof value.chain !== 'string' || !Object.hasOwn(GMGN_CHAINS, value.chain) ||
-      typeof value.address !== 'string') return;
-  const chain = value.chain as Chain;
-  if (chain === 'solana') {
-    if (value.address.length < 32 || value.address.length > 44) return;
-    try {
-      const bytes = bs58.decode(value.address);
-      if (bytes.length !== 32 || !bytes.some(byte => byte !== 0)) return;
-    } catch {return;}
-    return {chain, address: value.address};
-  }
-  if (!/^0x[0-9a-f]{40}$/i.test(value.address) || /^0x0{40}$/i.test(value.address)) return;
-  return {chain, address: value.address.toLowerCase()};
-}
-
-function priceFromInfo(raw: unknown, token: ScanToken): {priceUsd: number;market?:ScanPrice['market']} | {reason: string} {
-  if (!object(raw)) return {reason: 'PRICE_SCHEMA_INVALID'};
-  const returned = normalizeToken({chain: token.chain, address: raw.address});
-  if (!returned || returned.address !== token.address ||
-      (Object.hasOwn(raw, 'chain') && raw.chain !== GMGN_CHAINS[token.chain])) return {reason: 'PRICE_TOKEN_MISMATCH'};
-  if (!object(raw.price) || typeof raw.price.price !== 'string' || raw.price.price.length > 128 ||
-      !/^(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d{1,3})?$/.test(raw.price.price)) return {reason: 'PRICE_SCHEMA_INVALID'};
-  const priceUsd = Number(raw.price.price);
-  if (!Number.isFinite(priceUsd) || priceUsd <= 0) return {reason: 'PRICE_VALUE_INVALID'};
-  if (Object.hasOwn(raw.price,'address')&&normalizeToken({chain:token.chain,address:raw.price.address})?.address!==token.address||
-      Object.hasOwn(raw.price,'chain')&&raw.price.chain!==GMGN_CHAINS[token.chain]) return {reason:'PRICE_TOKEN_MISMATCH'};
-  // Reuse the current info response for follow-up context. Field meanings are
-  // documented in GMGNAI/gmgn-skills skills/gmgn-token/SKILL.md (2026-10-15).
-  // Unknown/invalid fields remain absent, rather than becoming zero observations.
-  const numeric=(value:unknown):number|undefined=>{
-    if(typeof value!=='number'&&(typeof value!=='string'||value.length>128||!/^\d+(?:\.\d+)?(?:e[+-]?\d{1,3})?$/i.test(value)))return;
-    const n=Number(value);return Number.isFinite(n)&&n>=0&&n<=1e15?n:undefined;
-  };
-  const liquidity=numeric(raw.liquidity),holders=numeric(raw.holder_count);
-  const concentration=object(raw.stat)?numeric(raw.stat.top_10_holder_rate):undefined;
-  const pool=normalizeToken({chain:token.chain,address:raw.biggest_pool_address});
-  const market:NonNullable<ScanPrice['market']>={
-    ...(liquidity!==undefined?{liquidityUsd:liquidity}:{}),
-    ...(holders!==undefined&&Number.isSafeInteger(holders)?{holderCount:holders}:{}),
-    ...(concentration!==undefined&&concentration<=1?{top10HolderRate:concentration}:{}),
-    ...(pool&&pool.address!==token.address?{poolAddress:pool.address}:{})};
-  return {priceUsd,...(Object.keys(market).length?{market}:{})};
-}
-
 /** Backend-only observation loop; does not quote a trade, sign, or submit orders. */
 export class PriceTracker {
   private readonly archive: PriceTrackerOptions['archive'];
   private readonly client: PriceTrackerOptions['client'];
+  private readonly router?: PriceTrackerOptions['router'];
+  private readonly priorityTokens?:PriceTrackerOptions['priorityTokens'];
+  private controller?:AbortController;
   private readonly intervalMs: number;
   private readonly maxTokens: number;
   private readonly now: () => Date;
@@ -109,7 +67,7 @@ export class PriceTracker {
     if (!Number.isSafeInteger(interval) || interval < 1 || interval > 3_600_000 ||
         !Number.isSafeInteger(maxTokens) || maxTokens < 1 || maxTokens > MAX_ACTIVE_TOKENS)
       throw new Error('PRICE_TRACKER_CONFIG_INVALID');
-    this.archive = options.archive; this.client = options.client;
+    this.archive = options.archive; this.client = options.client;this.router=options.router;this.priorityTokens=options.priorityTokens;
     this.intervalMs = interval; this.maxTokens = maxTokens; this.now = options.now ?? (() => new Date());
   }
 
@@ -141,7 +99,7 @@ export class PriceTracker {
 
   /** Runtime shutdown waits for the bounded shared-client GET and discards its late result. */
   async stop(): Promise<void> {
-    this.running = false; this.generation++;
+    this.running = false; this.generation++;this.controller?.abort();
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
     await this.inFlight?.catch(() => {});
@@ -160,6 +118,7 @@ export class PriceTracker {
   }
 
   private readCooldown(): void {
+    if(this.router)return; // A vendor cooldown cannot postpone independent market sources.
     const until = this.client.cooldownUntil;
     if (typeof until === 'number' && Number.isFinite(until) && until > 0 && until <= 8.64e15)
       this.cooldownUntil = Math.max(this.cooldownUntil, until);
@@ -193,13 +152,46 @@ export class PriceTracker {
     const queued = new Set(this.queue.map(key));
     for (const token of pending.values()) if (!queued.has(key(token))) this.queue.push(token);
     report.activeTokens = this.queue.length;
-    const selected = this.queue.slice(0, this.maxTokens);
+    let selected = this.queue.slice(0, this.maxTokens);
+    if(this.router&&this.priorityTokens&&this.maxTokens>1) {
+      try {
+        const priorities=new Map<string,ScanToken>();
+        for(const raw of this.priorityTokens(this.now()).slice(0,MAX_ACTIVE_TOKENS)) {
+          const token=normalizeToken(raw);if(token&&pending.has(key(token)))priorities.set(key(token),token);
+          if(priorities.size>=Math.min(20,this.maxTokens-1))break;
+        }
+        selected=[...priorities.values(),...this.queue.filter(token=>!priorities.has(key(token)))].slice(0,this.maxTokens);
+      }catch {report.errors++;reason('PRICE_PRIORITY_UNAVAILABLE');}
+    }
     report.deferred = this.queue.length - selected.length;
     const recordError = (token: ScanToken, code: string): boolean => {
       report.errors++; reason(code);
       try {this.archive.recordPriceError(token, code, this.now()); return true;}
       catch {reason('PRICE_ARCHIVE_WRITE_FAILED'); return false;}
     };
+    if(this.router) {
+      const controller=new AbortController();this.controller=controller;
+      for(const token of selected) {
+        const position=this.queue.findIndex(candidate=>key(candidate)===key(token));
+        if(position>=0)this.queue.push(...this.queue.splice(position,1));
+      }
+      try {
+        const result=await this.router.read(selected,{signal:controller.signal,onSample:sample=>{
+          if(controller.signal.aborted||generation!==this.generation)return;
+          try {this.archive.recordPrice(sample);report.recorded++;}
+          catch {report.errors++;reason('PRICE_ARCHIVE_WRITE_FAILED');controller.abort();}
+        }});
+        report.requests=Object.values(result.requests).reduce((sum,count)=>sum+count,0);
+        for(const code of Object.values(result.sourceErrors))if(code)reason(code);
+        if(generation!==this.generation||controller.signal.aborted)report.deferred+=selected.length-report.recorded;
+        else for(const gap of result.gaps)if(!recordError(gap.token,gap.reason))break;
+      } catch {
+        if(generation===this.generation&&!controller.signal.aborted) {
+          for(const token of selected)if(!recordError(token,'PRICE_ROUTER_UNAVAILABLE'))break;
+        }
+      } finally {if(this.controller===controller)this.controller=undefined;}
+      return finish();
+    }
     for (let index = 0; index < selected.length; index++) {
       if (generation !== this.generation) {report.deferred += selected.length - index; break;}
       const token = selected[index];

@@ -25,6 +25,14 @@ export interface AdaptiveExitPolicy {
   readonly maxWalletAgeMs: number;
   readonly maxWalletWindowMs: number;
   readonly maxWalletTrades: number;
+  readonly maxHoldingMs?:number;
+  readonly momentumMinimumHoldMs?:number;
+  readonly momentumPeakQuietMs?:number;
+  readonly momentumWindowMs?:number;
+  readonly momentumMinimumSpanMs?:number;
+  readonly momentumMinimumSamples?:number;
+  readonly momentumMaxChangePct?:number;
+  readonly momentumMinDrawdownPct?:number;
   readonly partialExits: readonly Readonly<{gainPct: number; sellPctRemaining: number}>[];
 }
 
@@ -48,6 +56,18 @@ export const ADAPTIVE_SHADOW_V1: AdaptiveExitPolicy = Object.freeze({
   ]),
 });
 
+/** New episodes only, or an explicit prospective migration; v1 observations are never replayed. */
+export const ADAPTIVE_SHADOW_V2:AdaptiveExitPolicy=Object.freeze({...ADAPTIVE_SHADOW_V1,
+  version:'adaptive-shadow-v2',maxHoldingMs:6*60*60_000,
+  momentumMinimumHoldMs:30*60_000,momentumPeakQuietMs:30*60_000,
+  momentumWindowMs:20*60_000,momentumMinimumSpanMs:15*60_000,momentumMinimumSamples:6,
+  momentumMaxChangePct:3,momentumMinDrawdownPct:5,
+});
+export function adaptiveExitPolicy(version:string):AdaptiveExitPolicy|undefined {
+  return version===ADAPTIVE_SHADOW_V1.version?ADAPTIVE_SHADOW_V1:version===ADAPTIVE_SHADOW_V2.version?ADAPTIVE_SHADOW_V2:undefined;
+}
+export interface AdaptiveExitDeadline {dueAt:string;reason:'MAX_HOLDING_TIME_OBSERVED'|'OBSERVATION_WINDOW_END_OBSERVED';}
+
 export interface PriceObservation {
   chain: Chain;
   address: string;
@@ -58,6 +78,8 @@ export interface PriceObservation {
   evaluatedAt: string;
   source: string;
   metadata?:PriceEvidence;
+  /** Accepted only when a new v2 shadow starts; later observations cannot extend it. */
+  observationEndsAt?:string;
 }
 
 export type WalletTradeSource = 'gmgn_wallet_activity' | 'gmgn_token_trades' |
@@ -126,10 +148,14 @@ export interface AdaptiveExitState {
   remainingPctOfInitial: number;
   shadowClosed: boolean;
   walletPressure?: WalletPressureSummary;
+  policyEffectiveAt?:string;
+  observationEndsAt?:string;
+  momentumObservations?:{observedAt:string;priceUsd:number}[];
 }
 
 export type AdaptiveExitReason = 'HARD_STOP_OBSERVED' | 'DYNAMIC_PROTECTION_OBSERVED' |
-  'PARTIAL_PROFIT_STAGE_OBSERVED' | 'WALLET_NET_SELLING_TIGHTENED';
+  'PARTIAL_PROFIT_STAGE_OBSERVED' | 'WALLET_NET_SELLING_TIGHTENED' |
+  'MOMENTUM_STALLED_OBSERVED' | 'MAX_HOLDING_TIME_OBSERVED' | 'OBSERVATION_WINDOW_END_OBSERVED';
 
 export interface AdaptiveExitEvent {
   policyVersion: string;
@@ -200,9 +226,11 @@ const median = (values: number[]) => {
 
 // Exact, named versions prevent silent changes to the meaning of persisted observations.
 function supportedPolicy(policy: AdaptiveExitPolicy): boolean {
-  if (!object(policy) || Object.keys(policy).length !== Object.keys(ADAPTIVE_SHADOW_V1).length) return false;
-  try {return Object.entries(ADAPTIVE_SHADOW_V1).every(([key, value]) =>
-    JSON.stringify(policy[key as keyof AdaptiveExitPolicy]) === JSON.stringify(value));} catch {return false;}
+  if(!object(policy))return false;
+  const expected=adaptiveExitPolicy(policy.version);
+  if(!expected||Object.keys(policy).length!==Object.keys(expected).length)return false;
+  try {return Object.entries(expected).every(([key,value])=>JSON.stringify(policy[key as keyof AdaptiveExitPolicy])===JSON.stringify(value));}
+  catch{return false;}
 }
 
 function validPressureSummary(value: unknown): boolean {
@@ -244,7 +272,33 @@ function validState(state: AdaptiveExitState, policy: AdaptiveExitPolicy): boole
     for (const stage of policy.partialExits) if (state.suggestedStages.includes(stage.gainPct)) remaining *= 1 - stage.sellPctRemaining / 100;
     if (Math.abs(remaining - state.remainingPctOfInitial) > 1e-9) return false;
   }
+  if(policy.version===ADAPTIVE_SHADOW_V2.version){
+    const effective=time(state.policyEffectiveAt);
+    if(!Number.isFinite(effective)||effective<baseline||effective>evaluated||
+      state.observationEndsAt!==undefined&&(!Number.isFinite(time(state.observationEndsAt))||time(state.observationEndsAt)<=effective)||
+      !Array.isArray(state.momentumObservations)||state.momentumObservations.length>32)return false;
+    let previous=-Infinity;
+    for(const sample of state.momentumObservations){const at=time(sample.observedAt);
+      if(!positive(sample.priceUsd)||!Number.isFinite(at)||at<effective||at>last||at<=previous)return false;previous=at;}
+  }
   return true;
+}
+
+/** A deadline is an intent, never an execution or an observed price. */
+export function adaptiveExitDeadline(state:AdaptiveExitState):AdaptiveExitDeadline|undefined {
+  if(state.policyVersion!==ADAPTIVE_SHADOW_V2.version||!validState(state,ADAPTIVE_SHADOW_V2))return;
+  const max=time(state.policyEffectiveAt!)+ADAPTIVE_SHADOW_V2.maxHoldingMs!,end=time(state.observationEndsAt);
+  return Number.isFinite(end)&&end<=max?{dueAt:new Date(end).toISOString(),reason:'OBSERVATION_WINDOW_END_OBSERVED'}:
+    {dueAt:new Date(max).toISOString(),reason:'MAX_HOLDING_TIME_OBSERVED'};
+}
+
+/** Explicit migration changes only future decisions and preserves old peaks/partial stages. */
+export function migrateAdaptiveExitV1(state:AdaptiveExitState,effectiveAt:string,endsAt:string):AdaptiveExitState|undefined {
+  const effective=time(effectiveAt),end=time(endsAt);
+  if(state.policyVersion!==ADAPTIVE_SHADOW_V1.version||!validState(state,ADAPTIVE_SHADOW_V1)||state.shadowClosed||
+    !Number.isFinite(effective)||effective<time(state.lastEvaluatedAt)||!Number.isFinite(end)||end<=effective)return;
+  return {...state,policyVersion:ADAPTIVE_SHADOW_V2.version,policyEffectiveAt:new Date(effective).toISOString(),
+    lastEvaluatedAt:new Date(effective).toISOString(),observationEndsAt:new Date(end).toISOString(),momentumObservations:[]};
 }
 
 function pressureSummary(pressure: WalletPressure | undefined, observation: PriceObservation, policy: AdaptiveExitPolicy):
@@ -301,7 +355,7 @@ export function stepAdaptiveExit(
   if (state !== undefined && !validState(state, policy)) return ignore('STATE_INVALID');
   if (state && state.policyVersion !== policy.version) return ignore('STATE_POLICY_MISMATCH');
   if (!object(observation) || !address(observation.address, observation.chain) || !positive(observation.priceUsd) ||
-      !['gmgn_token_info_sample','chain_pool_sample'].includes(observation.source)) return ignore('PRICE_INVALID');
+      !['gmgn_token_info_sample','chain_pool_sample','dexscreener_token_pairs_sample','ave_price_stream_sample','debot_token_info_sample'].includes(observation.source)) return ignore('PRICE_INVALID');
   if (observation.source==='chain_pool_sample'&&!priceEvidence(observation)) return ignore('PRICE_INVALID');
   const observed = time(observation.observedAt), evaluated = time(observation.evaluatedAt);
   if (![observed, evaluated].every(Number.isFinite)) return ignore('TIME_INVALID');
@@ -310,7 +364,8 @@ export function stepAdaptiveExit(
   if (state) {
     if (!sameToken(state, observation)) return ignore('IDENTITY_MISMATCH');
     const previousAt = time(state.lastObservedAt);
-    if (observed < previousAt || evaluated < time(state.lastEvaluatedAt)) return ignore('TIME_REGRESSED');
+    if (observed < previousAt || evaluated < time(state.lastEvaluatedAt) ||
+      state.policyVersion===ADAPTIVE_SHADOW_V2.version&&observed<time(state.policyEffectiveAt)) return ignore('TIME_REGRESSED');
     if (observed === previousAt) return ignore(state.lastPriceUsd === observation.priceUsd ? 'DUPLICATE_SAMPLE' : 'SAMPLE_CONFLICT');
     if (state.shadowClosed) return ignore('SHADOW_CLOSED');
   }
@@ -319,6 +374,8 @@ export function stepAdaptiveExit(
   if (!state) {
     const hardStopPriceUsd = observation.priceUsd * (1 - policy.hardStopDropPct / 100);
     if (!positive(hardStopPriceUsd) || hardStopPriceUsd >= observation.priceUsd) return ignore('ARITHMETIC_INVALID');
+    if(policy.version===ADAPTIVE_SHADOW_V2.version&&observation.observationEndsAt!==undefined&&
+      (!Number.isFinite(time(observation.observationEndsAt))||time(observation.observationEndsAt)<=observed))return ignore('TIME_INVALID');
     const initial: AdaptiveExitState = {
       schemaVersion: 1, policyVersion: policy.version, chain: observation.chain,
       address: normalized(observation.address, observation.chain), baselinePriceUsd: observation.priceUsd,
@@ -334,6 +391,8 @@ export function stepAdaptiveExit(
       lastSampleGapMs: 0, maxSampleGapMs: 0, gapCount: 0, samples: 1,
       suggestedStages: [], remainingPctOfInitial: 100, shadowClosed: false,
       ...(wallet.summary ? {walletPressure: wallet.summary} : {}),
+      ...(policy.version===ADAPTIVE_SHADOW_V2.version?{policyEffectiveAt:observation.observedAt,
+        observationEndsAt:observation.observationEndsAt,momentumObservations:[{observedAt:observation.observedAt,priceUsd:observation.priceUsd}]}:{}),
     };
     return {status: 'initialized', state: initial, ...common};
   }
@@ -366,14 +425,29 @@ export function stepAdaptiveExit(
     volatilityPctPerMinute: volatility, volatilityReturns: returns, lastSampleGapMs: gap,
     maxSampleGapMs: Math.max(state.maxSampleGapMs, gap), gapCount: state.gapCount + (longGap ? 1 : 0), samples: state.samples + 1,
     suggestedStages: [...state.suggestedStages], walletPressure: wallet.summary};
+  let momentumStalled=false;
+  if(policy.version===ADAPTIVE_SHADOW_V2.version){
+    const samples=longGap?[]:[...(state.momentumObservations??[])].filter(p=>time(p.observedAt)>=observed-policy.momentumWindowMs!);
+    const last=samples.at(-1);
+    if(last&&Math.floor(time(last.observedAt)/60_000)===Math.floor(observed/60_000))samples.pop();
+    samples.push({observedAt:observation.observedAt,priceUsd:observation.priceUsd});
+    next.momentumObservations=samples.slice(-32);
+    const first=next.momentumObservations[0],span=observed-time(first.observedAt);
+    momentumStalled=observed-time(state.policyEffectiveAt!)>=policy.momentumMinimumHoldMs!&&
+      observed-time(next.peakAt)>=policy.momentumPeakQuietMs!&&next.momentumObservations.length>=policy.momentumMinimumSamples!&&
+      span>=policy.momentumMinimumSpanMs!&&peakGain>=policy.minActivationGainPct&&
+      (1-observation.priceUsd/peak)*100>=policy.momentumMinDrawdownPct!&&
+      Math.abs((observation.priceUsd/first.priceUsd-1)*100)<=policy.momentumMaxChangePct!;
+  }
+  const deadline=adaptiveExitDeadline(next),deadlineReached=!!deadline&&observed>=time(deadline.dueAt);
   const hardStop = observation.priceUsd <= state.hardStopPriceUsd;
   const protectionHit = active && observation.priceUsd <= protection;
   const stages = policy.partialExits.filter(stage => gain >= stage.gainPct && !state.suggestedStages.includes(stage.gainPct));
-  if (!hardStop && !protectionHit && !stages.length) return {status: 'observed', state: next, ...common};
+  if (!hardStop && !protectionHit && !deadlineReached && !momentumStalled && !stages.length) return {status: 'observed', state: next, ...common};
   const reasons: AdaptiveExitReason[] = [];
   let sellPctRemaining: number;
-  if (hardStop || protectionHit) {
-    reasons.push(hardStop ? 'HARD_STOP_OBSERVED' : 'DYNAMIC_PROTECTION_OBSERVED');
+  if (hardStop || protectionHit || deadlineReached || momentumStalled) {
+    reasons.push(hardStop ? 'HARD_STOP_OBSERVED' : protectionHit ? 'DYNAMIC_PROTECTION_OBSERVED' : deadlineReached ? deadline!.reason : 'MOMENTUM_STALLED_OBSERVED');
     sellPctRemaining = 100; next.remainingPctOfInitial = 0; next.shadowClosed = true;
   } else {
     reasons.push('PARTIAL_PROFIT_STAGE_OBSERVED');

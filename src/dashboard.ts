@@ -60,6 +60,7 @@ export interface DashboardServices {
   protectionDetail?:(id:string)=>unknown;
   walletHistory?:Pick<WalletHistory,'listWallets'|'getWallet'>;
   walletResearchStatus?:()=>unknown;
+  walletResearchHints?:WalletHistory['researchSeedHints'];
   walletAssociations?:Pick<WalletHistory,'listAssociations'|'getAssociation'|'associationStats'>;
   walletProfiles?:Pick<WalletProfileReader,'list'|'get'>;
   walletProfilesStatus?:()=>unknown;
@@ -73,6 +74,10 @@ const loopback=(value?:string)=>['127.0.0.1','::1','::ffff:127.0.0.1'].includes(
 const cookieName='meme_dashboard_session';
 const lifetime=12*60*60*1000;
 export function buildDashboard(config:Config,services:DashboardServices,assetDirectory=resolve('web')) {
+  const withResearchHints=<T extends {chain:Chain;address:string}>(profile:T)=>{
+    const hints=services.walletResearchHints?.(profile.chain,profile.address);
+    return hints?.length?{...profile,researchSeeds:hints}:profile;
+  };
   const token=config.dashboard.token;
   if(!token||token.length<32||token===config.ingestToken||token===config.gmgnApiKey) throw new Error('DASHBOARD_SEPARATE_TOKEN_REQUIRED');
   const sessions=new Map<string,number>(),attempts=new Map<string,{count:number;expires:number}>();
@@ -278,7 +283,8 @@ export function buildDashboard(config:Config,services:DashboardServices,assetDir
           if(!/^\d{1,8}$/.test(raw)||Number(raw)>max)throw new Error('INVALID_FILTER');return Number(raw);};
         if(chain&&!['bsc','solana','robinhood'].includes(chain)||search.length>160||group&&!(WALLET_PROFILE_GROUPS as readonly string[]).includes(group))throw new Error('INVALID_FILTER');
         const limit=bounded('limit',25,100),offset=bounded('offset',0,1000000);if(limit<1)throw new Error('INVALID_FILTER');
-        send(res,200,services.walletProfiles?.list({chain:chain as any,group:group as any,search,limit,offset})??{ready:false,items:[],total:0});return;
+        const page=services.walletProfiles?.list({chain:chain as any,group:group as any,search,limit,offset})??{ready:false,items:[],total:0};
+        send(res,200,{...page,items:page.items.map(withResearchHints)});return;
       }
       const profileMatch=url.pathname.match(/^\/dashboard\/api\/wallet-profiles\/([^/]+)\/([^/]+)$/);
       if(profileMatch) {
@@ -289,7 +295,7 @@ export function buildDashboard(config:Config,services:DashboardServices,assetDir
           else {if(!/^0x[0-9a-fA-F]{40}$/.test(address))throw new Error();address=address.toLowerCase();}
         }catch {throw new Error('INVALID_FILTER');}
         const profile=services.walletProfiles?.get(chain as any,address);
-        send(res,profile?200:404,profile??{error:'NOT_FOUND'});return;
+        send(res,profile?200:404,profile?withResearchHints(profile):{error:'NOT_FOUND'});return;
       }
       if(url.pathname==='/dashboard/api/wallet-associations/status') {
         send(res,200,services.walletAssociations?{enabled:true,...services.walletAssociations.associationStats()}:{enabled:false});return;
@@ -337,7 +343,8 @@ export function buildDashboard(config:Config,services:DashboardServices,assetDir
           else {if(!/^0x[0-9a-fA-F]{40}$/.test(address))throw new Error();address=address.toLowerCase();}
         } catch {throw new Error('INVALID_FILTER');}
         const wallet=services.walletHistory?.getWallet(chain as any,address);
-        send(res,wallet?200:404,wallet?{...wallet,behaviorProfile:services.walletProfiles?.get(chain as any,address)}:{error:'NOT_FOUND'});return;
+        const profile=wallet?services.walletProfiles?.get(chain as any,address):undefined;
+        send(res,wallet?200:404,wallet?{...wallet,behaviorProfile:profile?withResearchHints(profile):undefined}:{error:'NOT_FOUND'});return;
       }
       if(url.pathname==='/dashboard/api/scans') {
         const chain=url.searchParams.get('chain')||undefined,decision=url.searchParams.get('decision')||undefined;

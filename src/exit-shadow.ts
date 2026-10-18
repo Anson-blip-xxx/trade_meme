@@ -7,6 +7,7 @@ import bs58 from 'bs58';
 import {ADAPTIVE_SHADOW_V1,ADAPTIVE_SHADOW_V2,ADAPTIVE_SHADOW_V3,adaptiveExitPolicy,adaptiveExitDeadline,migrateAdaptiveExitToV3,stepAdaptiveExit,type AdaptiveExitState,type WalletPressure} from './adaptive-exit.js';
 import type {Chain} from './types.js';
 import type {ScanPrice,ScanToken} from './scan-archive.js';
+import {shadowReturn} from './exit-shadow-return.js';
 
 export interface ExitObservationSeed {candidateId:string;eligibleAt:string;endsAt:string;symbol?:string;}
 export interface ExitShadowOptions {maxBytes?:number;staleAfterSec?:number;maxPositions?:number;now?:()=>Date;}
@@ -64,6 +65,8 @@ export class ExitShadow {
         source TEXT NOT NULL,context TEXT NOT NULL,PRIMARY KEY(position_id,at));
       CREATE TABLE IF NOT EXISTS exit_shadow_events(id INTEGER PRIMARY KEY,position_id TEXT NOT NULL,at TEXT NOT NULL,data TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS exit_shadow_event_position ON exit_shadow_events(position_id,id DESC);
+      CREATE INDEX IF NOT EXISTS exit_shadow_event_return ON exit_shadow_events(position_id,id)
+        WHERE json_extract(data,'$.kind') IN ('partial_exit','full_exit');
       CREATE TABLE IF NOT EXISTS exit_shadow_metrics(position_id TEXT PRIMARY KEY,peak_price REAL NOT NULL,
         max_gap_sec REAL NOT NULL,last_source TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS exit_shadow_exit_intents(position_id TEXT PRIMARY KEY,data TEXT NOT NULL);
@@ -299,6 +302,10 @@ export class ExitShadow {
     const metrics=this.db.prepare('SELECT peak_price,max_gap_sec,last_source FROM exit_shadow_metrics WHERE position_id=?').get(row.id);
     const rawPeak=Number(metrics?.peak_price??row.last_price),rawGap=metrics?.max_gap_sec;
     const deadline=adaptiveExitDeadline(state),intent=this.activeIntent(row.id),closed=state.shadowClosed;
+    const health=row.error?'unavailable':now.getTime()-Date.parse(row.last_price_at)>this.staleMs?'stale':'fresh';
+    const exits=this.db.prepare("SELECT data FROM exit_shadow_events WHERE position_id=? AND json_extract(data,'$.kind') IN ('partial_exit','full_exit') ORDER BY id LIMIT 33")
+      .all(row.id).map(event=>JSON.parse(String(event.data)) as ShadowEvent);
+    const returns=shadowReturn(state,exits,{priceUsd:row.last_price,at:row.last_price_at,health});
     const exitPlan={policyVersion:state.policyVersion,effectiveAt:state.policyEffectiveAt,timeExitEnabled:state.policyVersion===ADAPTIVE_SHADOW_V2.version,
       maxHoldingAt:state.policyVersion===ADAPTIVE_SHADOW_V2.version&&state.policyEffectiveAt?new Date(Date.parse(state.policyEffectiveAt)+ADAPTIVE_SHADOW_V2.maxHoldingMs!).toISOString():undefined,
       observationEndsAt:row.ends_at,scheduledExitAt:deadline?.dueAt,
@@ -307,8 +314,7 @@ export class ExitShadow {
     return {id:row.id,chain:row.chain,address:row.address,symbol:row.symbol??undefined,candidateId:row.candidate_id,
       eligibleAt:row.eligible_at,startedAt:row.started_at,updatedAt:row.updated_at,endsAt:row.ends_at,
       phase:row.phase==='triggered'?'triggered':continuousPolicy(state.policyVersion)?row.phase:Date.parse(row.ends_at)<=now.getTime()?'ended':row.phase,
-      policyVersion:state.policyVersion,exitPlan,
-      health:row.error?'unavailable':now.getTime()-Date.parse(row.last_price_at)>this.staleMs?'stale':'fresh',
+      policyVersion:state.policyVersion,exitPlan,returns,health,
       lastPriceAt:row.last_price_at,priceSource:metrics?.last_source||undefined,maxGapSec:Number(rawGap??0),baselinePriceUsd:state.baselinePriceUsd,
       latestPriceUsd:row.last_price,peakPriceUsd:rawPeak,gainPct:(row.last_price/state.baselinePriceUsd-1)*100,
       peakGainPct:(rawPeak/state.baselinePriceUsd-1)*100,triggerPeakGainPct:(state.peakPriceUsd/state.baselinePriceUsd-1)*100,

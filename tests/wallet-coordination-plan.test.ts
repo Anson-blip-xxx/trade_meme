@@ -39,8 +39,10 @@ test('the production coordination query searches the target wallet before lookin
     const plan = captured.prepare(`EXPLAIN QUERY PLAN ${captured.query()}`).all('bsc', address(1));
     const outer = plan.filter(row => row.parent === 0 && /^SEARCH [ab] /.test(String(row.detail))).map(row => String(row.detail));
     assert.equal(outer.length, 2);
-    assert.match(outer[0], /^SEARCH a USING INDEX \w+ \(chain=\? AND wallet=\?\)/);
-    assert.match(outer[1], /^SEARCH b USING INDEX \w+ \(chain=\? AND funding_address=\?\)/);
+    // Covering indexes can also apply shared/conflict exclusions; retain the
+    // essential wallet-first and exact-funder lookup checks for either form.
+    assert.match(outer[0], /^SEARCH a USING (?:COVERING )?INDEX \w+ \(chain=\? AND wallet=\?(?: AND [^)]+)?\)$/);
+    assert.match(outer[1], /^SEARCH b USING (?:COVERING )?INDEX \w+ \(chain=\? AND funding_address=\?(?: AND [^)]+)?\)$/);
     assert.ok(!outer.some(detail => /^SEARCH b .*\(chain=\?\)$/.test(detail)));
     assert.deepEqual(history.getWallet('bsc', address(3))!.coordinationEvidence.sharedFunding, []);
   } finally {history.close();}

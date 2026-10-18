@@ -150,7 +150,7 @@ export interface WalletObserverOptions {
   history: Pick<WalletHistory, 'recordTrades' | 'captureAnalysis' | 'captureLeaders' | 'captureTokenRanks' |
     'captureTokenTraders' | 'recordCollection' | 'watchTargets' | 'markTargetChecked' | 'recordPrice' | 'refreshCoordination'> &
     Partial<Pick<WalletHistory, 'associationTargets' | 'markAssociationTargetChecked' | 'captureFunding' |
-      'getWalletObserverCursor' | 'setWalletObserverCursor'>>;
+      'getWalletObserverCursor' | 'setWalletObserverCursor' | 'researchSeedTarget' | 'markResearchSeedChecked'>>;
   client: Pick<GmgnClient, 'get' | 'cooldownUntil'> & Partial<Pick<GmgnClient, 'recordRateLimit'>>;
   config?: Config;
   chains?: Chain[];
@@ -161,7 +161,7 @@ export interface WalletObserverOptions {
 export interface WalletObserverCycle {
   chain: Chain; status: 'ok' | 'partial' | 'cooldown' | 'stopped'; startedAt: string; completedAt: string;
   requests: number; accepted: number; reasons: string[]; coverage: 'one_page_sample';
-  collectionMode?: 'market_wallets' | 'kol_association';
+  collectionMode?: 'market_wallets' | 'kol_association' | 'external_seed_research';
 }
 class ObserverHalt extends Error {}
 
@@ -235,6 +235,8 @@ export class WalletObserver {
         anchorWindowHours: 24, traderPages: 2, tradersPerPage: 100, candidateWallets: 2,
         knownRelationshipPriorityEvery: 3, knownRelationshipsContinueAfterAnchorWindow: true,
         activityRowsPerWallet: 100, knownCandidateScope: 'whole_wallet_latest_page', wholeTokenTradeHistoryAvailable: false},
+      researchSeedSampling:{enabled:!!this.history.researchSeedTarget,scope:'research_hint_only',maxRequestsPerTurn:1,
+        eligibleEveryChainTurns:4,preservesAlternatingMarketTurn:true,minChainIntervalSec:1800},
       ...(this.resetAt() > this.now().getTime() ? {cooldownUntil: new Date(this.resetAt()).toISOString()} : {}),
       ...(this.lastFeedError ? {feedError: this.lastFeedError} : {}),
       ...(this.lastCycle ? {lastCycle: structuredClone(this.lastCycle)} : {})};
@@ -364,6 +366,31 @@ export class WalletObserver {
     };
     let target: Token | undefined;
     try {
+      // One existing market turn can research one imported lead. The list is
+      // not a smart/KOL classification, does not emit a signal, and never adds
+      // requests above the observer budget or interrupts an unfinished target.
+      // Cursor is persisted across restarts, including failed requested turns.
+      // Reserve the other market round for ordinary discovery even if every
+      // external query fails or the configured interval is very long.
+      const seedTurn=Math.floor(turn/this.chains.length)%4===3;
+      const seed=seedTurn&&!this.pending?this.history.researchSeedTarget?.(chain):undefined;
+      if(seed&&seed.chain===chain&&address(seed.address,chain)&&chain!=='solana'){
+        report.collectionMode='external_seed_research';
+        const raw=await attempt('/v1/user/wallet_activity',{chain:apiChain(chain),wallet_address:seed.address,limit:100},3);
+        if(generation!==this.generation)throw new ObserverHalt();
+        const observedAt=this.now().toISOString(),parsed=raw===undefined?undefined:
+          normalizeWalletActivity(raw,chain,seed.address,observedAt,undefined,'gmgn_research_seed_activity');
+        const invalidReason=parsed?.invalidReason??(parsed?.rejected?'WALLET_ACTIVITY_ROWS_INVALID':undefined)??
+          (raw===undefined?report.reasons.at(-1)??'GMGN_REQUEST_FAILED':undefined);
+        if(parsed){this.history.recordTrades(parsed.trades);report.accepted+=parsed.trades.length;}
+        if(invalidReason)reason(invalidReason);
+        const status=raw===undefined?'unavailable' as const:invalidReason?'partial' as const:'ok' as const;
+        if(report.requests>0)this.history.markResearchSeedChecked?.({...seed,status,accepted:parsed?.trades.length??0,reason:invalidReason});
+        this.history.recordCollection({source:'gmgn_research_seed_activity',chain,startedAt,completedAt:observedAt,
+          status:invalidReason?'partial':'ok',requests:report.requests,accepted:parsed?.trades.length??0,rejected:parsed?.rejected,
+          coverage:'one_page_sample',hasMore:parsed?.hasMore,reason:invalidReason});
+        return report;
+      }
       // Public KOL activity is an investigation anchor, not an endorsement. In
       // alternating rounds query past traders too, including untagged/exited
       // wallets, then verify their actual transactions before any inference.

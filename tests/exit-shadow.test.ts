@@ -85,6 +85,10 @@ test('restart preserves baseline, raised protection and partial stages without r
   store.recordPrice(price(ctx.clock.time,600),seed());
   ctx.clock.time+=60_000;store.recordPrice(price(ctx.clock.time,1100),undefined);
   assert.equal(store.detail(id)?.sampleCount,3);assert.equal(store.detail(id)?.item.remainingPct,72);
+  assert.equal(store.page().items[0].returns.status,'open');
+  assert.equal(store.detail(id)?.item.returns.realizedGainPct,180);
+  assert.equal(store.detail(id)?.item.returns.unrealizedGainPct,720);
+  assert.equal(store.detail(id)?.item.returns.totalGainPct,900);
   assert.equal(ctx.query("SELECT id FROM exit_shadow_events WHERE json_extract(data,'$.kind')='initialized'").length,1);
   assert.equal(ctx.query("SELECT id FROM exit_shadow_events WHERE json_extract(data,'$.kind')='partial_exit'").length,2);
 });
@@ -165,6 +169,8 @@ test('a triggered shadow episode keeps comparison samples after restart but neve
   assert.equal(detail.sampleCount,4);assert.equal(detail.item.latestPriceUsd,2);assert.equal(detail.item.remainingPct,0);
   assert.equal(detail.item.peakGainPct,900);assert.equal(detail.item.triggerPeakGainPct,0);
   assert.equal(detail.item.lastEvent?.kind,'full_exit');assert.equal(detail.item.lastEvent?.priceUsd,50);
+  assert.equal(detail.item.returns.finalGainPct,-50);assert.equal(detail.item.returns.closedAt,iso(start+60_000));
+  assert.equal(store.page().items[0].returns.finalGainPct,-50);
   assert.equal(ctx.query("SELECT id FROM exit_shadow_events WHERE json_extract(data,'$.kind')='full_exit'").length,1);
   ctx.clock.time+=600_000;store.recordPrice(price(ctx.clock.time,3),undefined);
   assert.equal(store.detail(id)?.item.maxGapSec,600);assert.equal(store.detail(id)?.sampleCount,5);

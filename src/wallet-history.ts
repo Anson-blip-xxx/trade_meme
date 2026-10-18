@@ -9,6 +9,7 @@ export type {WalletAssociationSummary,WalletAssociationDetail,WalletAssociationS
 import type {Chain,Report} from './types.js';
 import type {WalletAnalysis,WalletRecord} from './research/wallet-types.js';
 import type {WalletPressure,WalletPressureTrade,WalletTradeSource} from './adaptive-exit.js';
+import {WalletResearchSeeds,type WalletResearchSeedSnapshot,type WalletResearchSeedHint,type WalletResearchSeedCheck,type WalletResearchSeedStatus} from './wallet-research-seeds.js';
 
 export interface WalletHistoryToken {chain:Chain;address:string;}
 export interface WalletHistoryOptions {maxBytes?:number;now?:()=>Date;}
@@ -77,6 +78,7 @@ export interface WalletHistorySummary {
   chain:Chain;address:string;firstObservedAt:string;lastObservedAt:string;labels:string[];name?:string;twitter?:string;
   vendorVerification:'vendor_claim';observedEventCount:number;buyEvents:number;sellEvents:number;tokenCount:number;
   profit?:WalletVendorStats;gain?:WalletGainEvidence;
+  researchSeeds?:WalletResearchSeedHint[];
   coordination:{score:number;sharedFundingPeers:number;synchronizedPeers:number;evidenceCount:number;ownership:'unknown';scope:'heuristic';
     status:'pending'|'stale'|'current';checkedAt?:string};
 }
@@ -93,6 +95,7 @@ export interface WalletHistoryListOptions {chain?:Chain;sort?:'profit'|'gain'|'c
 export interface WalletHistoryStats {
   wallets:number;events:number;observations:number;tokens:number;prices:number;snapshots:number;fundingLinks:number;collections:number;nominations?:number;coordinationPending:number;
   firstObservedAt?:string;lastObservedAt?:string;bytes:number;maxBytes:number;error?:string;sampleOnly:true;exactRealizedPnl:false;
+  researchSeeds?:WalletResearchSeedStatus;
 }
 
 const object=(v:unknown):v is Record<string,unknown>=>v!==null&&typeof v==='object'&&!Array.isArray(v);
@@ -125,6 +128,7 @@ export class WalletHistory {
   private readonly maxBytes:number;
   private error?:string;
   private readonly associations:WalletAssociations;
+  private readonly researchSeeds:WalletResearchSeeds;
   constructor(private readonly path:string,options:WalletHistoryOptions={}) {
     this.maxBytes=options.maxBytes??512*1024*1024;this.now=options.now??(()=>new Date());
     if(!Number.isSafeInteger(this.maxBytes)||this.maxBytes<16_384) throw new Error('WALLET_HISTORY_CONFIG_INVALID');
@@ -176,6 +180,7 @@ export class WalletHistory {
       this.error=undefined;this.db.prepare("UPDATE wh_meta SET value='' WHERE key='error'").run();
     }
     this.associations=new WalletAssociations(this.db,(evidence,write)=>this.append(evidence,write),this.now);
+    this.researchSeeds=new WalletResearchSeeds(this.db,(evidence,write)=>this.append(evidence,write),this.now);
     this.db.exec('CREATE INDEX IF NOT EXISTS wh_assoc_candidate ON wh_assoc_relations(chain,candidate,first_at)');
     this.db.exec(`CREATE INDEX IF NOT EXISTS wh_stream_relations ON wh_assoc_relations(chain,token_count DESC,forward_count DESC,updated_at DESC,candidate,leader) WHERE token_count>0 AND dirty=0;
       CREATE INDEX IF NOT EXISTS wh_stream_recent_wallets ON wh_wallets(chain,last_at DESC,address);`);
@@ -183,6 +188,16 @@ export class WalletHistory {
   }
 
   recordTrade(input:WalletTradeObservation):void {this.recordTrades([input]);}
+
+  importResearchSeeds(snapshot:WalletResearchSeedSnapshot):void {this.researchSeeds.import(snapshot);}
+  researchSeedHints(chain:Chain,address:string):WalletResearchSeedHint[] {return this.researchSeeds.hints(chain,address);}
+  researchSeedStatus():WalletResearchSeedStatus {return this.researchSeeds.status();}
+  researchSeedTarget(chain:Chain):{chain:Chain;address:string}|undefined {
+    // If evidence/checkpoints cannot be retained, do not keep querying a lead
+    // whose persistent cooldown could not be saved.
+    return this.error===CAPACITY?undefined:this.researchSeeds.target(chain);
+  }
+  markResearchSeedChecked(check:WalletResearchSeedCheck):void {this.researchSeeds.checked(check);}
 
   /** Bounded collector scheduling state, separate from all observed evidence. */
   getWalletObserverCursor():WalletObserverCursorState|undefined {
@@ -600,7 +615,7 @@ export class WalletHistory {
       nominations:n('wh_observations',"WHERE kind='vendor_nomination'"),
       coordinationPending:n('wh_metrics','WHERE coordination_dirty=1 OR coordination_checked_at IS NULL'),firstObservedAt:time.first?String(time.first):undefined,
       lastObservedAt:time.last?String(time.last):undefined,bytes:this.bytes(),maxBytes:this.maxBytes,error:this.error,
-      sampleOnly:true,exactRealizedPnl:false};
+      sampleOnly:true,exactRealizedPnl:false,researchSeeds:this.researchSeeds.status()};
   }
   close():void {this.db.close();}
 
@@ -733,6 +748,7 @@ export class WalletHistory {
     return {chain,address:wallet,firstObservedAt:String(row.first_at),lastObservedAt:String(row.last_at),labels:profile.labels,
       name:profile.name,twitter:profile.twitter,vendorVerification:'vendor_claim',observedEventCount:Number(row.event_count??0),buyEvents:Number(row.buy_count??0),
       sellEvents:Number(row.sell_count??0),tokenCount:Number(row.token_count??0),profit,gain:row.gain_data?JSON.parse(String(row.gain_data)):undefined,
+      researchSeeds:this.researchSeeds.hints(chain,wallet),
       coordination:this.coordinationSummary(evidence,!checkedAt?'pending':Number(row.coordination_dirty)?'stale':'current',checkedAt)};
   }
   private coordinationSummary(evidence:WalletHistoryDetail['coordinationEvidence'],status:WalletHistorySummary['coordination']['status'],checkedAt?:string):WalletHistorySummary['coordination'] {

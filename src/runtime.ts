@@ -19,6 +19,7 @@ import {ChainMonitor} from './chain-monitor.js';
 import {PriceTracker} from './price-tracker.js';
 import {DashboardBalances,dashboardOrders,dashboardSettings} from './dashboard-data.js';
 import {WalletHistory} from './wallet-history.js';
+import {loadBundledWalletResearchSeeds} from './wallet-research-seeds.js';
 import {WalletObserver} from './wallet-observer.js';
 import {WalletProfileRunner} from './wallet-profile-runner.js';
 import {WalletScreeningService} from './wallet-screening-service.js';
@@ -79,6 +80,9 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher}
     retentionDays:config.dashboard.retentionDays,trackingHours:config.dashboard.trackingHours,followupEnabled:true}):undefined;
   if(config.watch.enabled)archive?.configureWatch({windowSec:config.watch.windowSec,intervalSec:config.watch.intervalSec,maxSignalAgeSec:config.maxSignalAgeSec});
   const walletHistory=config.walletResearch.enabled?new WalletHistory(config.walletResearch.database,{maxBytes:config.walletResearch.maxBytes}):undefined;
+  let walletSeedsError:string|undefined;
+  if(walletHistory)try {walletHistory.importResearchSeeds(loadBundledWalletResearchSeeds());}
+  catch {walletSeedsError='WALLET_RESEARCH_SEEDS_IMPORT_FAILED';}
   const walletProfiles=walletHistory&&config.walletProfiles.enabled?new WalletProfileRunner({
     ...config.walletProfiles,historyDatabase:config.walletResearch.database,
     ...(config.chainStream.enabled?{chainDatabase:config.chainStream.database}:{})}):undefined;
@@ -342,7 +346,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher}
         try {walletStats=walletHistory?.stats();}catch {walletStats={error:'WALLET_HISTORY_READ_FAILED'};}
         walletStatsAt=Date.now();
       }
-      return {enabled:config.walletResearch.enabled,store:walletStats,statsComputedAt:new Date(walletStatsAt).toISOString(),observer:walletObserver?.getStatus(),profiles:walletProfilesStatus(),screening:walletScreening?.status(),
+      return {enabled:config.walletResearch.enabled,store:walletStats,seedsError:walletSeedsError,statsComputedAt:new Date(walletStatsAt).toISOString(),observer:walletObserver?.getStatus(),profiles:walletProfilesStatus(),screening:walletScreening?.status(),
         localIndex:{inFlight:!!walletIndexWork,...walletIndexTimings},captureError:walletCaptureError??walletIndexError??associationIndexError,
         settings:{intervalSec:config.walletResearch.intervalSec,maxRequestsPerCycle:config.walletResearch.maxRequestsPerCycle,
           maxBytes:config.walletResearch.maxBytes,retention:'persistent_no_expiry',scope:'vendor_pages_and_observed_wallet_snapshots'}};

@@ -1636,6 +1636,47 @@
     const node = el('div', 'protection-value'); node.append(el('span', '', label), el('strong', tone, value));
     if (hint) node.append(el('small', '', hint)); return node;
   }
+  function protectionReturns(item) {
+    const value=item.returns;
+    if(!value||value.mode!=='shadow'||value.execution!=='observation_only'||value.basis!=='initial_principal_pct'||value.costsIncluded!==false)return;
+    return value;
+  }
+  function protectionReturnCell(item) {
+    const value=protectionReturns(item),cell=el('td','protection-return-cell');
+    const closed=value?.status==='closed'&&value.remainingPctOfInitial===0&&finite(value.finalGainPct);
+    const label=closed?'最终收益（模拟）':value?.status==='open'?'合计收益（模拟）':'收益暂不可核算';
+    const total=closed?value.finalGainPct:value?.status==='open'?value.totalGainPct:undefined;
+    cell.append(el('strong','protection-return-label',label),gainNode(total));
+    if(value?.status==='open'){
+      cell.append(el('small','protection-row-note',`已实现 ${percent(value.realizedGainPct)} · 浮动 ${finite(value.unrealizedGainPct)?percent(value.unrealizedGainPct):'待新报价'}`));
+      if(value.valuationAt)cell.append(el('small','protection-row-note',`估值 ${date(value.valuationAt,true)}`));
+    }else if(closed)cell.append(el('small','protection-row-note',`全部模拟退出 ${date(value.closedAt,true)}`));
+    else cell.append(el('small','protection-row-note','退出记录不足或校验未通过，未知不记为零'));
+    cell.append(el('small','protection-row-note','按初始本金 · 未扣费用滑点'));return cell;
+  }
+  function protectionReturnDetail(item) {
+    const value=protectionReturns(item),node=el('section','protection-return-detail');
+    node.append(el('h4','','保护收益核算 · 模拟毛收益'));
+    if(!value||value.status==='unavailable'){
+      node.append(el('p','','当前退出记录不足或校验未通过，无法核算最终收益；不会将缺失记录补成零收益。'));return node;
+    }
+    const closed=value.status==='closed'&&value.remainingPctOfInitial===0&&finite(value.finalGainPct),grid=el('div','protection-return-grid');
+    const metric=(label,amount,hint)=>protectionMetric(label,percent(amount),hint,finite(amount)?amount<0?'negative':'positive':'');
+    grid.append(metric('已实现收益（模拟）',value.realizedGainPct,'逐次退出的收益贡献相加'),metric('剩余浮动收益（模拟）',value.unrealizedGainPct,closed?'模拟仓位已全部退出':finite(value.unrealizedGainPct)?`采用样本 ${date(value.valuationAt,true)}`:'等待新的有效报价'),metric(closed?'最终收益（模拟）':'合计收益（模拟）',closed?value.finalGainPct:value.totalGainPct,closed?`已冻结于 ${date(value.closedAt,true)}`:'已实现 + 剩余浮动，尚非最终收益'));
+    node.append(grid,el('p','','均按模拟初始本金计算：每次退出的初始仓位比例 × 该次样本价格涨跌幅，再加剩余仓位的浮动收益。不含费用、滑点与税费，不是实盘成交利润。'));
+    if(closed)node.append(el('p','','最终收益在全部模拟退出时确定；退出后的报价及新高只用于对照，不再改写该收益。'));
+    if(Array.isArray(value.exits)&&value.exits.length){
+      const fold=el('details','protection-return-exits');fold.append(el('summary','',`分批退出明细 · ${value.exits.length} 次`));
+      const list=el('ol','protection-event-list');
+      for(const exit of value.exits.slice(0,32)){
+        const row=el('li','protection-event'),head=el('div','protection-event-heading');
+        head.append(el('strong','',exit.kind==='full_exit'?'全部模拟退出':'部分模拟退出'),el('time','',date(exit.at,true)));row.append(head);
+        row.append(el('p','',`卖出当时剩余 ${plainPercent(exit.sellPctRemaining)}，折合初始仓位 ${plainPercent(exit.soldPctOfInitial)}；该次收益贡献 ${percent(exit.contributionGainPct)}`),el('p','protection-event-values',`触发样本价 ${usd(exit.priceUsd)} · 相对基准涨幅 ${percent(exit.gainPct)} · 退出后剩余 ${plainPercent(exit.remainingPctOfInitial)}`));list.append(row);
+      }
+      fold.append(list);node.append(fold);
+    }
+    return node;
+  }
   function protectionEvent(event) {
     const row = el('li', 'protection-event'); const head = el('div', 'protection-event-heading');
     head.append(el('strong', '', protectionEventNames[event.kind] || scalar(event.kind, '观察事件')), el('time', '', date(event.at, true))); row.append(head);
@@ -1659,7 +1700,7 @@
     header.append(identity, actions); card.append(header, addressNode(item.address, 'detail-address'));
     const data = el('div', 'protection-value-grid'); const gain = numeric(item.gainPct), peak = numeric(item.peakGainPct);
     data.append(protectionMetric('最近样本模拟涨幅', percent(gain), '相对影子基准，非持仓收益', finite(gain) ? gain < 0 ? 'negative' : 'positive' : ''), protectionMetric('观察期最高涨幅', percent(peak), '包含影子退出后的新报价', finite(peak) ? peak < 0 ? 'negative' : 'positive' : ''), protectionMetric(item.protectionActive === false ? '基础止损线（影子）' : '动态保护线', usd(item.protectionPriceUsd), finite(numeric(item.protectionGainPct)) ? `相对基准 ${percent(numeric(item.protectionGainPct))}` : '尚无有效保护线', 'protection-line-value'), protectionMetric('模拟剩余比例', plainPercent(numeric(item.remainingPct)), '相对模拟初始仓位，非真实持仓'));
-    card.append(data);
+    card.append(protectionReturnDetail(item),data);
     const prices = el('div', 'protection-price-grid');
     prices.append(kv('模拟基准价', usd(item.baselinePriceUsd)), kv('最新样本价', usd(item.latestPriceUsd)), kv('峰值样本价', usd(item.peakPriceUsd)), kv('跟踪启动涨幅', percent(numeric(item.activationGainPct))), kv('当前跟踪回撤', plainPercent(numeric(item.trailPct))));
     if (finite(numeric(item.triggerPeakGainPct))) prices.append(kv(item.phase === 'triggered' ? '触发前模型峰值涨幅' : '当前模型峰值涨幅', percent(numeric(item.triggerPeakGainPct))));
@@ -1719,10 +1760,11 @@
   function renderProtectionRows(container, items) {
     if (!items.length) return;
     const scroll = el('div','table-scroll'), table = el('table','protection-table'), head = el('thead'), header = el('tr');
-    for (const label of ['代币 / 所属链','退出状态 / 剩余','最近样本涨幅','采样最高涨幅','动态保护线','当前行情来源 / 时效','操作']) header.append(el('th','',label)); head.append(header); table.append(head); const body = el('tbody');
+    for (const label of ['代币 / 所属链','退出状态 / 剩余','保护收益（模拟毛收益）','最近样本涨幅','采样最高涨幅','动态保护线','当前行情来源 / 时效','操作']) header.append(el('th','',label)); head.append(header); table.append(head); const body = el('tbody');
     for (const item of items) {
       const row = el('tr'), token = el('td'); token.append(el('strong','',item.symbol || item.name || '未命名代币'), el('div','token-meta',chainName(item.chain)), addressNode(item.address)); row.append(token);
       const status = el('td'); status.append(badge(...protectionPhase(item)),el('p','protection-row-remaining',`模拟剩余 ${plainPercent(numeric(item.remainingPct))}`),el('small','protection-row-note','初始仓位口径 · 未执行交易'));if(item.exitPlan?.intent?.reason&&!(protectionContinuous(item)&&protectionTimeExit(item.exitPlan.intent.reason)))status.append(el('small','protection-row-reason',protectionReason(item.exitPlan.intent.reason)));row.append(status);
+      row.append(protectionReturnCell(item));
       for (const value of [item.gainPct,item.peakGainPct]) { const cell = el('td','numeric'); cell.append(gainNode(numeric(value))); row.append(cell); }
       row.append(el('td','numeric',usd(item.protectionPriceUsd)));const quote=el('td','protection-quote-cell');quote.append(protectionPriceRoute(item,true),el('small','protection-row-note',`模型样本 ${date(item.lastPriceAt,true)}`));row.append(quote);
       const actions = el('td'), detail = el('button','text-button','保护详情 ↗'); detail.type='button'; detail.addEventListener('click',()=>openDetail(item.id,detail,{protection:true})); actions.append(gmgnTokenLink(item.chain,item.address),detail); row.append(actions); body.append(row);
@@ -2992,6 +3034,7 @@
     for (const profile of state.walletItems) {
       const card = el('article', 'wallet-profile-card'); const heading = el('div', 'profile-card-heading'); const identity = el('div', 'profile-card-identity'); identity.append(badge(chainName(profile.chain), 'neutral'), addressNode(profile.address));
       const action = el('button', 'association-evidence-button', '查看画像'); action.type = 'button'; action.setAttribute('aria-label', `查看钱包画像 ${profile.address}`); action.addEventListener('click', () => openWalletProfile(profile, action)); heading.append(identity, action); card.append(heading);
+      const seeds=walletResearchSeeds(profile,true);if(seeds)card.append(seeds);
       card.append(walletRoleSummary(profile));
       const groups = el('div', 'profile-memberships'); for (const group of profileGroups(profile).filter(item => !['follower_pattern', 'precursor_pattern', 'mixed_pattern'].includes(item.id))) { const tag = badge(profileGroupName(group.id), profileGroupTone(group.id)); tag.title = `${scalar(group.reason, '')} · 首次入组 ${date(group.firstObservedAt, true)}`; groups.append(tag); } if (!groups.childNodes.length) groups.append(badge('暂无其他历史线索', 'neutral')); card.append(groups);
       const metrics = profile.metrics || {}, associations = metrics.associations || {}, chain = metrics.chain || {};
@@ -3065,6 +3108,7 @@
   }
   function renderWalletProfileDetail(profile) {
     const fragment = document.createDocumentFragment(); const title = el('h2', '', '钱包行为画像'); title.id = 'detail-title'; fragment.append(title, el('p', 'association-detail-note', `${chainName(profile.chain)} · 持续更新的研究记录 · 归属未知`), addressNode(profile.address, 'detail-address'), walletRoleSection(profile), profileEvidenceSection(profile));
+    const seeds=walletResearchSeeds(profile);if(seeds)fragment.append(seeds);
     const metrics = profile.metrics || {}, associations = metrics.associations || {}, chain = metrics.chain || {};
     const summary = section('观测依据'); summary.append(kv('买入 / 卖出活动', `${count(metrics.buyEvents)} / ${count(metrics.sellEvents)}`), kv('已观测活动 / 代币', `${count(metrics.observedEvents)} / ${count(metrics.distinctTokens)}`), kv('最近交易事件时间', date(metrics.lastEventAt, true)), kv('关联公开钱包 / 代币', `${count(associations.leaders)} / ${count(associations.distinctTokens)}`), kv('后续验证代币', count(associations.forwardTokens)), kv('供应商 7 日已实现收益', usd(metrics.vendorProfit?.realizedProfitUsd)), kv('买入后采样最高涨幅', percent(metrics.observedGain?.maxGainPct)), el('p', 'wallet-section-note', '供应商收益不是本地核算利润；采样涨幅以观测到买入后的报价为基准，不是钱包实际收益。'));
     if (metrics.observedGain?.tokenAddress) summary.append(el('p', 'detail-small', '采样涨幅对应代币'), addressNode(metrics.observedGain.tokenAddress), gmgnTokenLink(profile.chain, metrics.observedGain.tokenAddress)); fragment.append(summary);
@@ -3099,7 +3143,23 @@
     const last = observer.lastCycle?.completedAt || observer.lastCompletedAt || observer.lastObservedAt;
     const explanations = Array.isArray(observer.lastCycle?.reasons) ? observer.lastCycle.reasons.filter(value => typeof value === 'string').slice(0, 3).map(value => reasonNames[value] || value) : [];
     text('wallet-observer-note', `${label}${last ? ` · 最近一轮 ${date(last, true)}` : ''}${finite(observer.lastCycle?.accepted) ? ` · 接收 ${observer.lastCycle.accepted} 个样本` : ''}${finite(stats.coordinationPending) ? ` · 协同待分析 ${count(stats.coordinationPending)} 个钱包` : ''}${observer.lastCycle?.collectionMode === 'kol_association' ? ' · 最近一轮为公开钱包关联调查' : ''}${explanations.length ? ` · 采集说明：${explanations.join('；')}` : ''}`);
+    renderResearchSeedStatus(stats.researchSeeds,data.seedsError);
     renderWalletScreeningStatus();
+  }
+  function renderResearchSeedStatus(data,error) {
+    let node=$('wallet-research-seed-status');if(!node){node=el('details','wallet-research-seed-status');node.id='wallet-research-seed-status';$('wallet-observer-note').after(node);}
+    const failed=Boolean(error),valid=data?.scope==='research_hint_only'&&data?.verification==='unverified_external_list';
+    node.replaceChildren();node.hidden=!valid&&!failed;if(node.hidden)return;
+    if(failed){node.open=true;node.append(el('summary','','外部研究名单 · 导入异常'),el('p','wallet-seed-attention','外部名单本次导入未完成，补充调查可能不完整；已有钱包证据继续保留。'));if(!valid)return;}
+    else node.append(el('summary','',`外部研究名单 · ${count(data.totalAddresses)} 个地址 · ${(Array.isArray(data.chains)?data.chains:[]).some(chain=>chain.lastResult&&chain.lastResult.status!=='ok')?'部分补查待恢复 · ':''}仅作辅助线索`));
+    for(const chain of (Array.isArray(data.chains)?data.chains:[]).slice(0,3)){
+      const result=chain.lastResult,status={ok:'最近调查完成',partial:'最近调查部分完成',unavailable:'最近调查暂未取得数据'}[result?.status];
+      const reason=result?.reason&&Object.hasOwn(reasonNames,result.reason)?reasonNames[result.reason]:result?.reason?'本轮数据未完整取得，等待后续补查':undefined;
+      node.append(el('p','',`${chainName(chain.chain)}：本地已见 ${count(chain.observedWallets)} 个 · 有买卖记录 ${count(chain.withTrades)} 个 · 有买入 ${count(chain.withBuys)} 个 · 有供应商盈利 ${count(chain.withVendorProfit)} 个 · 有采样涨幅 ${count(chain.withSampledGain)} 个`),el('p','',`补充调查 ${count(chain.checkedWallets)} 个 · 最近 ${date(chain.lastCheckedAt,true)}`));
+      if(result)node.append(el('p',result.status==='ok'?'':'wallet-seed-attention',`${status||'最近调查状态待确认'}${finite(result.accepted)?` · 接收 ${count(result.accepted)} 个样本`:''}${reason?` · ${reason}`:''}`));
+    }
+    for(const source of (Array.isArray(data.sources)?data.sources:[]).slice(0,10))node.append(el('p','',`来源 ${scalar(source.sourceId)} · ${count(source.addresses)} 个去重地址 · 导入 ${date(source.importedAt,true)}${typeof source.commit==='string'&&/^[a-f0-9]{40}$/i.test(source.commit)?` · 版本 ${source.commit.slice(0,12)}`:''}`));
+    node.append(el('p','','同一 EVM 地址在各链分别积累证据；名单标注不证明归属或盈利能力，不直接提高开单评分。'));
   }
   function renderWalletScreeningStatus() {
     let node = $('wallet-screening-status');
@@ -3113,6 +3173,23 @@
     else if (data?.error) node.append(el('strong', '', '后续观察可能未更新，请检查运行状态。'));
   }
   function walletLabel(label) { return {smart: '聪明钱标签', kol: 'KOL 标签', bundler: '捆绑标签', rat_trader: '老鼠仓标签', developer: '开发者标签', exchange_or_pool: '交易所 / 池子'}[label] || scalar(label); }
+  function walletResearchSeeds(wallet,compact=false) {
+    const seeds=(Array.isArray(wallet.researchSeeds)?wallet.researchSeeds:[]).slice(0,10).filter(seed=>seed?.verification==='unverified_external_list'&&seed.scope==='research_hint_only'&&seed.ownershipProven===false&&seed.qualifiesAsSmart===false);
+    if(!seeds.length)return;
+    const node=el(compact?'div':'section',`wallet-research-seeds${compact?' compact':' detail-section'}`);
+    node.append(badge('外部研究名单 · 未核实','neutral'));
+    for(const seed of seeds.slice(0,compact?1:10)){
+      const row=el('div','wallet-seed-source'),labels=(Array.isArray(seed.labels)?seed.labels:[]).filter(label=>typeof label==='string').slice(0,10);row.append(el('p','',`原名单标注：${labels.length?labels.join('、'):'未提供名称'}`));
+      if(!compact){
+        if(Array.isArray(seed.groups)&&seed.groups.length)row.append(el('p','',`原名单分组：${seed.groups.filter(group=>typeof group==='string').slice(0,10).join('、')}`));
+        try{const url=new URL(seed.sourceUrl);if(url.protocol==='https:'&&url.hostname==='github.com'&&url.pathname.startsWith('/nopapername/oooooyoung/')&&!url.username&&!url.password){const link=el('a','gmgn-link','查看原名单 ↗');link.href=url.href;link.target='_blank';link.rel='noopener noreferrer';row.append(link);}}catch{}
+        if(typeof seed.commit==='string'&&/^[a-f0-9]{40}$/i.test(seed.commit))row.append(el('small','',`导入版本 ${seed.commit.slice(0,12)}`));
+      }
+      node.append(row);
+    }
+    if(!compact)node.append(el('p','wallet-section-note','名单用于提供调查线索。原标注与分组未验证，不证明归属、聪明钱包资格或可跟单能力，也不会替换本地行为画像。'));
+    return node;
+  }
   function walletMoney(value) { const n = numeric(value); return el('span', `gain ${n === undefined ? 'missing' : n >= 0 ? 'positive' : 'negative'}`, usd(value)); }
   function openWallet(wallet, trigger) { return openDetail(`wallet:${wallet.chain}:${wallet.address}`, trigger, {chain: wallet.chain, address: wallet.address}); }
   function renderWalletList() {
@@ -3124,7 +3201,7 @@
       const row = el('tr'); const identity = el('td'); const top = el('div', 'token-top'); const name = wallet.name || '未标记钱包';
       top.append(el('span', `token-avatar ${chainClass(wallet.chain)}`, wallet.name ? Array.from(String(wallet.name))[0]?.toUpperCase() : 'W'));
       const heading = el('div', 'token-heading'); const link = el('button', 'token-name', name); link.type = 'button'; link.addEventListener('click', () => openWallet(wallet, link)); heading.append(link, el('div', 'token-meta', `${chainName(wallet.chain)} · 归属未核实`)); top.append(heading); identity.append(top, addressNode(wallet.address));
-      const labels = el('div', 'wallet-label-line'); for (const label of Array.isArray(wallet.labels) ? wallet.labels.slice(0, 3) : []) labels.append(badge(walletLabel(label), 'neutral')); if (labels.childNodes.length) identity.append(labels); row.append(identity);
+      const labels = el('div', 'wallet-label-line'); for (const label of Array.isArray(wallet.labels) ? wallet.labels.slice(0, 3) : []) labels.append(badge(walletLabel(label), 'neutral')); if (labels.childNodes.length) identity.append(labels);const seeds=walletResearchSeeds(wallet,true);if(seeds)identity.append(seeds); row.append(identity);
       const profit = el('td', 'numeric'); profit.append(walletMoney(wallet.profit?.realizedProfitUsd)); profit.append(el('div', 'cell-subtitle', wallet.profit ? `统计时间 ${date(wallet.profit.snapshotAt || wallet.profit.observedAt)}` : '未获取供应商统计')); row.append(profit);
       const gain = el('td', 'numeric'); gain.append(gainNode(wallet.gain?.maxGainPct)); gain.append(el('div', 'cell-subtitle', wallet.gain ? `峰值 ${date(wallet.gain.peakAt)}` : '等待买入后的报价')); row.append(gain);
       const activity = el('td'); activity.append(el('div', '', `买 ${count(wallet.buyEvents)} / 卖 ${count(wallet.sellEvents)}`), el('div', 'cell-subtitle', `${count(wallet.tokenCount)} 个代币 · ${count(wallet.observedEventCount)} 条活动`)); row.append(activity);
@@ -3171,6 +3248,7 @@
     const wallet = data.wallet || {}; const fragment = document.createDocumentFragment(); const name = wallet.name || '未标记钱包';
     const heading = el('div', 'detail-token'); heading.append(el('span', `token-avatar ${chainClass(wallet.chain)}`, wallet.name ? Array.from(String(wallet.name))[0]?.toUpperCase() : 'W')); const titleGroup = el('div'); const title = el('h2', '', name); title.id = 'detail-title'; titleGroup.append(title, el('div', 'token-meta', `${chainName(wallet.chain)} · 本地钱包研究档案`)); heading.append(titleGroup); fragment.append(heading, addressNode(wallet.address, 'detail-address'));
     const labels = el('div', 'detail-pills'); labels.append(badge('钱包研究 · 归属未核实', 'watch')); for (const label of Array.isArray(wallet.labels) ? wallet.labels : []) labels.append(badge(walletLabel(label), 'neutral')); fragment.append(labels);
+    const seeds=walletResearchSeeds(wallet);if(seeds)fragment.append(seeds);
     if (data.behaviorProfile) fragment.append(walletRoleSection(data.behaviorProfile), profileEvidenceSection(data.behaviorProfile));
     const metrics = el('div', 'detail-metrics wallet-research-detail'); metrics.append(detailStat('GMGN 7 日已实现收益', usd(wallet.profit?.realizedProfitUsd), '整个钱包 · 供应商报告', numeric(wallet.profit?.realizedProfitUsd) < 0 ? 'negative' : 'positive'), detailStat('买入后采样最高涨幅', percent(wallet.gain?.maxGainPct), '样本观测值 · 非实际收益', 'positive'), detailStat('已观测活动', count(wallet.observedEventCount), `买 ${count(wallet.buyEvents)} / 卖 ${count(wallet.sellEvents)}`)); fragment.append(metrics);
     const coverage = data.coverage || {}; const observed = section('观察范围与身份线索');

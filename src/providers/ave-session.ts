@@ -19,7 +19,11 @@ export interface AveSessionStatus {
   status:'authenticated'|'required'|'unavailable';authenticated:boolean;email:string;
   expiresAt?:string;verifiedAt?:string;reason?:string;cooldownUntil?:string;
 }
-export interface AveSessionOptions {path:string;email:string;fetcher?:Fetcher;now?:()=>Date;}
+export interface AveSessionOptions {
+  path:string;email:string;fetcher?:Fetcher;now?:()=>Date;
+  /** Secondary consumers may verify existing credentials, but session renewal belongs to the scanner. */
+  readOnly?:boolean;
+}
 export class AveSessionError extends Error {
   constructor(readonly reason:string,readonly retryAfterSec?:number){super(reason);this.name='AveSessionError';}
 }
@@ -152,6 +156,7 @@ export class AveSessionClient {
     return {...this.status,...(this.requestCooldownUntil>this.now().getTime()?{cooldownUntil:new Date(this.requestCooldownUntil).toISOString()}:{})};
   }
   async saveSession(value:AveSessionFile):Promise<void> {
+    if(this.options.readOnly)throw failure('READ_ONLY');
     if(!sameEmail(value.email,this.options.email))throw failure('EMAIL_MISMATCH');
     await saveAveSession(this.options.path,value);this.verified=undefined;this.invalidFingerprint=undefined;
     this.mark('required','AVE_SESSION_NOT_VERIFIED');
@@ -232,6 +237,7 @@ export class AveSessionClient {
     this.authWork=this.verifyFile(signal).finally(()=>{this.authWork=undefined;});return this.authWork;
   }
   private async renew(file:Loaded,type:'acc'|'ref',signal:AbortSignal):Promise<Loaded> {
+    if(this.options.readOnly)throw failure('READ_ONLY_REFRESH_REQUIRED');
     const refresh=file.data.refreshToken;if(!refresh)throw failure('AUTH_REQUIRED');
     const expires=jwtTime(refresh).expires;if(expires!==undefined&&expires<=this.now().getTime())throw failure('REFRESH_EXPIRED');
     try {
@@ -255,12 +261,13 @@ export class AveSessionClient {
     if(this.verified?.fingerprint===file.fingerprint&&this.verified.until>now)return file;
     this.verified=undefined;
     const refresh=jwtTime(file.data.refreshToken);
-    if(refresh.expires!==undefined&&refresh.expires>now&&refresh.expires-now<=86400000&&now-this.lastRefreshRef>=600000)
+    if(!this.options.readOnly&&refresh.expires!==undefined&&refresh.expires>now&&refresh.expires-now<=86400000&&now-this.lastRefreshRef>=600000)
       file=await this.renew(file,'ref',signal);
     const access=jwtTime(file.data.accessToken);
     const threshold=Math.min(120000,access.issued&&access.expires?Math.max(0,(access.expires-access.issued)/2):120000);
     const renewAccess=!file.data.accessToken||this.invalidFingerprint===file.fingerprint||access.expires!==undefined&&access.expires-now<=threshold;
     if(renewAccess) {
+      if(this.options.readOnly)throw failure('READ_ONLY_REFRESH_REQUIRED');
       if(!file.data.refreshToken)throw failure('AUTH_REQUIRED');
       try{file=await this.renew(file,'acc',signal);}catch(error){
         if(!(error instanceof AveSessionError)||error.reason!=='AVE_SESSION_AUTH_REQUIRED')throw error;

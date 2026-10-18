@@ -164,6 +164,11 @@ export class WalletHistory {
     if(!this.db.prepare('PRAGMA table_info(wh_funding)').all().some(column=>column.name==='snapshot_at')) {
       this.db.exec("ALTER TABLE wh_funding ADD COLUMN snapshot_at TEXT; UPDATE wh_funding SET snapshot_at=COALESCE(json_extract(data,'$.snapshotAt'),observed_at)");
     }
+    // Coordination needs only these scalar fields. Keep its nested evidence
+    // checks off the growing raw funding JSON table, including contrary copies.
+    this.db.exec(`CREATE INDEX IF NOT EXISTS wh_funding_coord_wallet ON wh_funding(chain,wallet,funding_address,snapshot_at,observed_at,conflict,shared);
+      CREATE INDEX IF NOT EXISTS wh_funding_coord_address ON wh_funding(chain,funding_address,shared,conflict,wallet,snapshot_at,observed_at);
+      CREATE INDEX IF NOT EXISTS wh_metrics_coord_queue ON wh_metrics(coordination_dirty,COALESCE(coordination_checked_at,''),chain,address);`);
     this.db.exec('CREATE INDEX IF NOT EXISTS wh_funding_asof ON wh_funding(chain,wallet,funding_address,snapshot_at,observed_at)');
     this.error=String(this.db.prepare("SELECT value FROM wh_meta WHERE key='error'").get()?.value??'')||undefined;
     const previousLimit=Number(this.db.prepare("SELECT value FROM wh_meta WHERE key='capacity_limit'").get()?.value??0);
@@ -172,6 +177,8 @@ export class WalletHistory {
     }
     this.associations=new WalletAssociations(this.db,(evidence,write)=>this.append(evidence,write),this.now);
     this.db.exec('CREATE INDEX IF NOT EXISTS wh_assoc_candidate ON wh_assoc_relations(chain,candidate,first_at)');
+    this.db.exec(`CREATE INDEX IF NOT EXISTS wh_stream_relations ON wh_assoc_relations(chain,token_count DESC,forward_count DESC,updated_at DESC,candidate,leader) WHERE token_count>0 AND dirty=0;
+      CREATE INDEX IF NOT EXISTS wh_stream_recent_wallets ON wh_wallets(chain,last_at DESC,address);`);
     if(this.bytes()>=this.maxBytes) this.error=CAPACITY;
   }
 
@@ -436,9 +443,9 @@ export class WalletHistory {
     const cap=Math.max(1,Math.min(30,Math.trunc(limit))),result=new Set<string>();
     const add=(v:unknown)=>{const a=addr(v,chain);if(a&&result.size<cap)result.add(a);};
     // Prioritize observed early-wallet / leader relationships; a relationship remains a hypothesis.
-    for(const r of this.db.prepare(`SELECT candidate,leader FROM wh_assoc_relations WHERE chain=? AND token_count>0 AND dirty=0
+    for(const r of this.db.prepare(`SELECT candidate,leader FROM wh_assoc_relations INDEXED BY wh_stream_relations WHERE chain=? AND token_count>0 AND dirty=0
       ORDER BY token_count DESC,forward_count DESC,updated_at DESC LIMIT ?`).all(chain,cap)) {add(r.candidate);add(r.leader);}
-    if(result.size<cap)for(const r of this.db.prepare('SELECT address FROM wh_wallets WHERE chain=? ORDER BY last_at DESC LIMIT ?').all(chain,cap))add(r.address);
+    if(result.size<cap)for(const r of this.db.prepare('SELECT address FROM wh_wallets INDEXED BY wh_stream_recent_wallets WHERE chain=? ORDER BY last_at DESC LIMIT ?').all(chain,cap))add(r.address);
     return [...result];
   }
   markAssociationTargetChecked(target:Pick<WalletAssociationTarget,'chain'|'address'|'anchorWallet'|'candidateWallet'|'historicalRelationship'>,observedAt=this.now().toISOString()):void {
@@ -600,7 +607,7 @@ export class WalletHistory {
   /** Bounded background refresh; listing wallets never performs graph self-joins. */
   refreshCoordination(limit=10):void {
     const n=Number.isSafeInteger(limit)?Math.max(1,Math.min(20,limit)):10;
-    const dirty=this.db.prepare("SELECT chain,address FROM wh_metrics WHERE coordination_dirty=1 ORDER BY COALESCE(coordination_checked_at,''),chain,address LIMIT ?").all(n);
+    const dirty=this.db.prepare("SELECT chain,address FROM wh_metrics INDEXED BY wh_metrics_coord_queue WHERE coordination_dirty=1 ORDER BY COALESCE(coordination_checked_at,''),chain,address LIMIT ?").all(n);
     const updates=dirty.map(row=>({chain:row.chain as Chain,wallet:String(row.address),data:this.coordination(row.chain as Chain,String(row.address))}));
     if(!updates.length) return;
     this.append(updates,()=>{for(const update of updates) {
@@ -738,12 +745,12 @@ export class WalletHistory {
     // Keep the target wallet as the outer loop. An ordinary JOIN can start with
     // every funding snapshot on the chain before applying the wallet constraint.
     const sharedFunding=this.db.prepare(`SELECT DISTINCT b.wallet,a.funding_address,MAX(a.observed_at,b.observed_at) AS observed
-      FROM wh_funding a CROSS JOIN wh_funding b ON a.chain=b.chain AND a.funding_address=b.funding_address AND a.wallet<>b.wallet
+      FROM wh_funding a INDEXED BY wh_funding_coord_wallet CROSS JOIN wh_funding b INDEXED BY wh_funding_coord_address ON a.chain=b.chain AND a.funding_address=b.funding_address AND a.wallet<>b.wallet
       WHERE a.chain=? AND a.wallet=? AND a.shared=0 AND b.shared=0 AND a.conflict=0 AND b.conflict=0
-        AND NOT EXISTS(SELECT 1 FROM wh_funding s WHERE s.chain=a.chain AND s.funding_address=a.funding_address AND s.shared=1)
-        AND NOT EXISTS(SELECT 1 FROM wh_funding x WHERE x.chain=a.chain AND x.wallet=a.wallet AND x.funding_address=a.funding_address
+        AND NOT EXISTS(SELECT 1 FROM wh_funding s INDEXED BY wh_funding_coord_address WHERE s.chain=a.chain AND s.funding_address=a.funding_address AND s.shared=1)
+        AND NOT EXISTS(SELECT 1 FROM wh_funding x INDEXED BY wh_funding_coord_wallet WHERE x.chain=a.chain AND x.wallet=a.wallet AND x.funding_address=a.funding_address
           AND (x.snapshot_at>a.snapshot_at OR (x.snapshot_at=a.snapshot_at AND (x.observed_at>a.observed_at OR x.conflict=1))))
-        AND NOT EXISTS(SELECT 1 FROM wh_funding x WHERE x.chain=b.chain AND x.wallet=b.wallet AND x.funding_address=b.funding_address
+        AND NOT EXISTS(SELECT 1 FROM wh_funding x INDEXED BY wh_funding_coord_wallet WHERE x.chain=b.chain AND x.wallet=b.wallet AND x.funding_address=b.funding_address
           AND (x.snapshot_at>b.snapshot_at OR (x.snapshot_at=b.snapshot_at AND (x.observed_at>b.observed_at OR x.conflict=1))))
       LIMIT 50`).all(chain,wallet).map(row=>({address:String(row.funding_address),wallet:String(row.wallet),observedAt:String(row.observed)}));
     const synchronized=this.db.prepare(`WITH seeds AS (SELECT * FROM wh_events WHERE chain=? AND wallet=? AND side IN ('buy','sell') ORDER BY event_at DESC LIMIT 200)

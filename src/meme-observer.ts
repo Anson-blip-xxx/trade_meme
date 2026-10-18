@@ -11,6 +11,7 @@ import {assessMeme,normalizeMemeMarket,sanitizeMemeMarketSample,type MemeMarketS
 import type {MemeCatalystSnapshot} from './meme-catalyst.js';
 import type {GmgnTokenSnapshot} from './providers/gmgn-safety.js';
 import type {SourceCorroborationAssessment} from './source-corroboration.js';
+import {ReviewSamplingPlanReader,type ReviewSamplingPlan,type ReviewSamplingSource} from './review-sampling.js';
 
 type Token=Signal['token'];
 type Row=Record<string,any>;
@@ -23,6 +24,7 @@ export interface MemeObserverOptions {
   walletEvidence?:(token:Token,now:Date,signal:Signal)=>{evidence?:FollowupWalletEvidence;setups?:WalletScreeningReport};
   cooldownUntil?:()=>number;
   corroboration?:(token:Token,now:Date)=>SourceCorroborationAssessment;
+  samplingPlanPath?:string;
 }
 const hash=(v:unknown)=>createHash('sha256').update(JSON.stringify(v)).digest('hex');
 const parse=<T>(v:unknown):T|undefined=>{try{return v?JSON.parse(String(v)) as T:undefined;}catch{return;}};
@@ -35,29 +37,43 @@ function validToken(token:Token):Token|undefined {
 }
 function time(value:unknown):number {return typeof value==='string'&&/^\d{4}-\d\d-\d\dT/.test(value)?Date.parse(value):NaN;}
 const iso=(n:number)=>new Date(n).toISOString();
+// This projection is covered by meme_tokens_sampling. Active-set scheduling and
+// status must not deserialize each token's large wallet or catalyst evidence.
+const samplingFields="chain,address,last_signal_at,first_seen_at,market_attempt_at,last_sample_at,catalyst_attempt_at,fallback_attempt_at,json_extract(signal,'$.source') AS sampling_source,json_extract(catalyst,'$.status') AS sampling_catalyst_status,json_extract(catalyst,'$.expiresAt') AS sampling_catalyst_expires_at,catalyst IS NULL AS sampling_catalyst_missing";
 
 /** Continuous observation, independent of entry eligibility and the control cohort.
  * Only supplied read functions are available. This class cannot place an order. */
 export class MemeObserver {
   private readonly db:DatabaseSync;private readonly now:()=>Date;
-  private readonly maxActive:number;private readonly windowMs:number;
+  private readonly maxActive:number;private readonly windowMs:number;private readonly maxBytes:number;
+  private readonly samplingReader:ReviewSamplingPlanReader;
   private running=false;private closed=false;private marketWork?:Promise<void>;private catalystWork?:Promise<void>;
   private timer?:ReturnType<typeof setTimeout>;private socialTimer?:ReturnType<typeof setTimeout>;
   private marketAbort?:AbortController;private socialAbort?:AbortController;
   private lastCycleAt?:string;private error?:string;private catalystError?:string;private nextPrune=0;private dexCooldown=0;
+  private storagePressure=false;private usedBytes=0;private storageCheckedAt?:string;private reclaimedSnapshots=0;
   constructor(private readonly options:MemeObserverOptions){
     this.now=options.now??(()=>new Date());this.maxActive=options.maxActive??180;this.windowMs=(options.activeWindowSec??7200)*1000;
+    this.samplingReader=new ReviewSamplingPlanReader(options.samplingPlanPath,{now:this.now});
     const maxBytes=options.maxBytes??1024*1024*1024;
     if(!Number.isInteger(this.maxActive)||this.maxActive<1||this.maxActive>300||this.windowMs<60000||this.windowMs>86400000||maxBytes<1048576)
       throw new Error('MEME_OBSERVER_CONFIG_INVALID');
+    this.maxBytes=maxBytes;
     if(options.database!==':memory:')mkdirSync(dirname(options.database),{recursive:true,mode:0o700});
     this.db=new DatabaseSync(options.database);
+    const pageSize=Number(this.db.prepare('PRAGMA page_size').get()!.page_size);
+    this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=1500; PRAGMA max_page_count=${Math.floor(maxBytes/pageSize)}`);
+    // Recover space before a new index/schema migration needs additional pages.
+    if(this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meme_snapshots'").get())this.reclaimSpace();
     this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=1500;
       CREATE TABLE IF NOT EXISTS meme_tokens(chain TEXT,address TEXT,first_seen_at TEXT NOT NULL,last_signal_at TEXT NOT NULL,
         signal TEXT NOT NULL,name TEXT,symbol TEXT,market_attempt_at TEXT,fallback_attempt_at TEXT,catalyst_attempt_at TEXT,last_sample_at TEXT,
         sample_count INTEGER NOT NULL DEFAULT 0,market TEXT,assessment TEXT,catalyst TEXT,social_context TEXT,wallet_context TEXT,gate TEXT,error TEXT,
         PRIMARY KEY(chain,address));
       CREATE INDEX IF NOT EXISTS meme_tokens_active ON meme_tokens(last_signal_at DESC);
+      CREATE INDEX IF NOT EXISTS meme_tokens_sampling ON meme_tokens(last_signal_at DESC,chain,address,first_seen_at,
+        market_attempt_at,last_sample_at,catalyst_attempt_at,fallback_attempt_at,json_extract(signal,'$.source'),
+        json_extract(catalyst,'$.status'),json_extract(catalyst,'$.expiresAt'),catalyst IS NULL);
       CREATE TABLE IF NOT EXISTS meme_signals(id TEXT PRIMARY KEY,observed_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS meme_snapshots(id INTEGER PRIMARY KEY,chain TEXT,address TEXT,observed_at TEXT NOT NULL,
         source TEXT NOT NULL,fingerprint TEXT UNIQUE,market TEXT,assessment TEXT NOT NULL);
@@ -66,11 +82,15 @@ export class MemeObserver {
       CREATE TABLE IF NOT EXISTS meme_catalysts(id INTEGER PRIMARY KEY,chain TEXT,address TEXT,observed_at TEXT NOT NULL,
         data TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS meme_catalysts_token ON meme_catalysts(chain,address,observed_at DESC);
+      CREATE TABLE IF NOT EXISTS meme_sampling_plans(plan_id TEXT PRIMARY KEY,first_applied_at TEXT NOT NULL,record TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS meme_sampling_selections(plan_id TEXT NOT NULL,channel TEXT NOT NULL,chain TEXT NOT NULL,address TEXT NOT NULL,
+        source TEXT NOT NULL,reason TEXT NOT NULL,first_selected_at TEXT NOT NULL,last_selected_at TEXT NOT NULL,
+        selections INTEGER NOT NULL,signal_observed_at TEXT NOT NULL,PRIMARY KEY(plan_id,channel,chain,address,source,reason));
+      CREATE INDEX IF NOT EXISTS meme_sampling_selection_token ON meme_sampling_selections(chain,address,first_selected_at DESC);
+      CREATE INDEX IF NOT EXISTS meme_sampling_selection_retention ON meme_sampling_selections(last_selected_at);
       CREATE TABLE IF NOT EXISTS meme_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);`);
     if(!this.db.prepare('PRAGMA table_info(meme_snapshots)').all().some(row=>row.name==='corroboration'))
       this.db.exec('ALTER TABLE meme_snapshots ADD COLUMN corroboration TEXT');
-    const pageSize=Number(this.db.prepare('PRAGMA page_size').get()!.page_size);
-    this.db.exec(`PRAGMA max_page_count=${Math.floor(maxBytes/pageSize)}`);
     if(options.database!==':memory:')chmodSync(options.database,0o600);
   }
   register(signal:Signal,receivedAt=this.now().toISOString(),display:{name?:string;symbol?:string}={}):boolean {
@@ -121,10 +141,45 @@ export class MemeObserver {
     }
   }
   private row(token:Token):Row|undefined {return this.db.prepare('SELECT * FROM meme_tokens WHERE chain=? AND address=?').get(token.chain,token.address);}
-  private activeRows():Row[] {return this.db.prepare('SELECT * FROM meme_tokens WHERE last_signal_at>=? ORDER BY last_signal_at DESC,chain,address LIMIT ?')
-    .all(iso(this.now().getTime()-this.windowMs),this.maxActive);}
+  private activeRows():Row[] {
+    const plan=this.samplingReader.read().plan,cutoff=iso(this.now().getTime()-this.windowMs);
+    if(!plan)return this.db.prepare(`SELECT ${samplingFields} FROM meme_tokens INDEXED BY meme_tokens_sampling WHERE last_signal_at>=? ORDER BY last_signal_at DESC,chain,address LIMIT ?`)
+      .all(cutoff,this.maxActive);
+    // Two bounded pools: old attempts cannot be hidden by the latest maxActive
+    // alerts, while a deficient cohort can enter even beyond the fair pool.
+    const order="MAX(COALESCE(market_attempt_at,''),COALESCE(last_sample_at,'')),first_seen_at,chain,address";
+    const fair=this.db.prepare(`SELECT ${samplingFields} FROM meme_tokens INDEXED BY meme_tokens_sampling WHERE last_signal_at>=? ORDER BY ${order} LIMIT 600`).all(cutoff);
+    const clauses=plan.cohorts.filter(c=>c.weight===2).map(c=>({cohort:c,deficit:c.missing/c.total}));
+    const priority=clauses.length?this.db.prepare(`SELECT ${samplingFields} FROM meme_tokens INDEXED BY meme_tokens_sampling WHERE last_signal_at>=? ORDER BY CASE ${clauses.map(()=>"WHEN chain=? AND json_extract(signal,'$.source')=? THEN ?").join(' ')} ELSE 0 END DESC,${order} LIMIT 600`)
+      .all(cutoff,...clauses.flatMap(({cohort,deficit})=>[cohort.chain,cohort.source,deficit])):[];
+    const source=(row:Row):ReviewSamplingSource|undefined=>row.sampling_source;
+    const deficit=(row:Row)=>{const c=plan.cohorts.find(c=>c.chain===row.chain&&c.source===source(row));return c?.total?c.missing/c.total:0;};
+    const seen=new Set<string>(),selected:Row[]=[];
+    const add=(row:Row,reason:'FAIR_ROTATION'|'COVERAGE_DEFICIT')=>{
+      const key=`${row.chain}:${row.address}`;if(seen.has(key)||selected.length>=this.maxActive)return;
+      seen.add(key);selected.push({...row,samplingSelection:{plan,source:source(row)??'manual',reason}});
+    };
+    fair.slice(0,Math.ceil(this.maxActive/2)).forEach(row=>add(row,'FAIR_ROTATION'));
+    priority.filter(row=>deficit(row)>0).forEach(row=>add(row,'COVERAGE_DEFICIT'));
+    fair.forEach(row=>add(row,'FAIR_ROTATION'));
+    return selected;
+  }
+  private auditSampling(rows:Row[],channel:'market'|'catalyst',selectedAt:string):void {
+    this.db.exec('SAVEPOINT meme_sampling');
+    try {
+      for(const row of rows){
+        const selection=row.samplingSelection as {plan:ReviewSamplingPlan;source:ReviewSamplingSource;reason:string}|undefined;
+        if(!selection)continue;
+        this.db.prepare('INSERT OR IGNORE INTO meme_sampling_plans VALUES(?,?,?)').run(selection.plan.id,selectedAt,JSON.stringify(selection.plan));
+        this.db.prepare(`INSERT INTO meme_sampling_selections VALUES(?,?,?,?,?,?,?,?,1,?) ON CONFLICT(plan_id,channel,chain,address,source,reason)
+          DO UPDATE SET last_selected_at=excluded.last_selected_at,selections=selections+1`)
+          .run(selection.plan.id,channel,row.chain,row.address,selection.source,selection.reason,selectedAt,selectedAt,row.last_signal_at);
+      }
+      this.db.exec('RELEASE meme_sampling');
+    }catch(error){this.db.exec('ROLLBACK TO meme_sampling; RELEASE meme_sampling');throw error;}
+  }
   recordMarket(sample:MemeMarketSample):boolean {
-    if(this.closed)return false;
+    if(this.closed||this.storagePressure)return false;
     const token=validToken(sample.token),at=time(sample.observedAt),now=this.now().getTime();
     if(!token||!Number.isFinite(at)||at>now||now-at>120000||!Number.isFinite(sample.priceUsd)||(sample.priceUsd??0)<=0)return false;
     const validated=sanitizeMemeMarketSample(sample,token,now);if(!validated?.priceUsd)return false;sample=validated;
@@ -150,6 +205,7 @@ export class MemeObserver {
     }catch(error){this.db.exec('ROLLBACK TO meme_market; RELEASE meme_market');throw error;}
   }
   recordCatalyst(snapshot:MemeCatalystSnapshot):void {
+    if(this.closed||this.storagePressure)return;
     const token=validToken(snapshot.token),at=time(snapshot.observedAt),now=this.now().getTime();
     if(this.closed||!token||!this.row(token)||!Number.isFinite(at)||at>now||now-at>120000||!Number.isFinite(time(snapshot.expiresAt))||time(snapshot.expiresAt)<=now)return;
     const previous=parse<MemeCatalystSnapshot>(this.row(token)?.catalyst);if(previous&&time(previous.observedAt)>=at)return;
@@ -200,7 +256,12 @@ export class MemeObserver {
       items:rows.map(r=>({id:r.id,observedAt:r.observed_at,source:r.source,market:parse(r.market),assessment:parse(r.assessment),
         corroboration:parse<SourceCorroborationAssessment>(r.corroboration),
         outcomes:this.outcomes(r,asOf)})),catalystHistory:this.db.prepare('SELECT observed_at,data FROM meme_catalysts WHERE chain=? AND address=? AND observed_at<=? ORDER BY observed_at DESC LIMIT 6')
-        .all(token.chain,token.address,asOf).map(r=>({observedAt:r.observed_at,snapshot:parse(r.data)}))};
+        .all(token.chain,token.address,asOf).map(r=>({observedAt:r.observed_at,snapshot:parse(r.data)})),
+      samplingAudit:this.db.prepare(`SELECT plan_id,channel,source,reason,first_selected_at,last_selected_at,selections,signal_observed_at
+        FROM meme_sampling_selections WHERE chain=? AND address=? AND first_selected_at<=? ORDER BY first_selected_at DESC,plan_id,channel,reason LIMIT 12`)
+        .all(token.chain,token.address,asOf).map(r=>({planId:r.plan_id,channel:r.channel,source:r.source,reason:r.reason,
+          firstSelectedAt:r.first_selected_at,signalObservedAt:r.signal_observed_at,
+          ...(String(r.last_selected_at)<=asOf?{lastSelectedAt:r.last_selected_at,selections:r.selections}:{})}))};
   }
   private outcomes(row:Row,asOf:string){
     const market=parse<MemeMarketSample>(row.market),result:{horizonSec:number;returnPct:number|null;observedAt?:string}[]=[];
@@ -217,14 +278,19 @@ export class MemeObserver {
   status(){
     const recent=Number(this.db.prepare('SELECT count(*) AS n FROM meme_tokens WHERE last_signal_at>=?').get(iso(this.now().getTime()-this.windowMs))!.n);
     const active=this.activeRows(),fresh=active.filter(row=>row.last_sample_at&&this.now().getTime()-time(row.last_sample_at)<=120000).length;
-    const catalysts=active.map(row=>parse<MemeCatalystSnapshot>(row.catalyst)),now=this.now().getTime();
-    const catalystFresh=catalysts.filter(c=>c&&c.status!=='unknown'&&time(c.expiresAt)>now).length;
-    const catalystPending=catalysts.filter(c=>!c).length,catalystUnknown=catalysts.filter(c=>c?.status==='unknown').length;
+    const now=this.now().getTime();
+    const catalystFresh=active.filter(row=>!row.sampling_catalyst_missing&&row.sampling_catalyst_status!=='unknown'&&time(row.sampling_catalyst_expires_at)>now).length;
+    const catalystPending=active.filter(row=>row.sampling_catalyst_missing).length,catalystUnknown=active.filter(row=>row.sampling_catalyst_status==='unknown').length;
+    const sampling=this.samplingReader.read();
     return {enabled:true,running:this.running,active:active.length,waiting:Math.max(0,recent-active.length),fresh,stale:active.length-fresh,
+      samplingPlan:{status:sampling.status,reason:sampling.reason,scope:'research_sampling_only',candidateLimit:1200,
+        ...(sampling.plan?{id:sampling.plan.id,policyVersion:sampling.plan.policyVersion,effectiveAt:sampling.plan.effectiveAt,
+          expiresAt:sampling.plan.expiresAt,fairShare:sampling.plan.fairShare,cohorts:sampling.plan.cohorts}:{})},
       catalystFresh,catalystPending,catalystUnknown,catalystStale:active.length-catalystFresh-catalystPending-catalystUnknown,
       catalystMinRetrySec:600,catalystQueueIntervalSec:15,
       maxActive:this.maxActive,activeWindowSec:this.windowMs/1000,intervalSec:5,targetSampleIntervalSec:30,
       lastCycleAt:this.lastCycleAt,error:this.catalystError??this.error,marketInFlight:!!this.marketWork,catalystInFlight:!!this.catalystWork,
+      storage:{maxBytes:this.maxBytes,usedBytes:this.usedBytes,checkedAt:this.storageCheckedAt,pressure:this.storagePressure,reclaimedSnapshots:this.reclaimedSnapshots},
       experimental:true,tradingEnabled:false,retentionDays:30,maxSnapshots:250000,learningScope:'frozen_features_and_subsequent_sampled_returns'};
   }
   runOnce():Promise<void>{
@@ -234,14 +300,20 @@ export class MemeObserver {
       .finally(()=>{this.marketWork=undefined;this.marketAbort=undefined;});return this.marketWork;
   }
   private async collect(signal:AbortSignal){
-    const now=this.now().getTime();this.prune();if(this.dexCooldown>now)return;
+    const now=this.now().getTime();this.prune();if(this.storagePressure||this.dexCooldown>now)return;
     const due=this.activeRows().filter(r=>!r.market_attempt_at||now-time(r.market_attempt_at)>=30000)
       .sort((a,b)=>String(a.market_attempt_at??'').localeCompare(String(b.market_attempt_at??''))||String(b.last_signal_at).localeCompare(String(a.last_signal_at)));
     const first=due[0];if(!first)return;
     const rows=due.filter(row=>row.chain===first.chain).slice(0,30);
+    // Only the actual request batch needs pool metadata; do not load the full
+    // active set's evidence merely to choose its next thirty observations.
+    const pools=new Map(this.db.prepare(`SELECT chain,address,json_extract(market,'$.poolAddress') pool FROM meme_tokens WHERE (chain,address) IN (VALUES ${rows.map(()=>'(?,?)').join(',')})`)
+      .all(...rows.flatMap(row=>[row.chain,row.address])).map(row=>[tokenKey({chain:row.chain as Token['chain'],address:String(row.address)}),row.pool]));
+    this.auditSampling(rows,'market',iso(now));
     for(const row of rows)this.db.prepare('UPDATE meme_tokens SET market_attempt_at=? WHERE chain=? AND address=?').run(iso(now),row.chain,row.address);
     let samples:MemeMarketSample[]=[];
-    try {samples=await this.options.marketBatch(rows.map(row=>({chain:row.chain,address:row.address,poolAddress:parse<MemeMarketSample>(row.market)?.poolAddress})),signal);}
+    try {samples=await this.options.marketBatch(rows.map(row=>{const pool=pools.get(tokenKey({chain:row.chain,address:row.address}));
+      return {chain:row.chain,address:row.address,poolAddress:typeof pool==='string'?pool:undefined};}),signal);}
     catch(error){if(error instanceof Error&&error.message==='MEME_MARKET_RATE_LIMITED')this.dexCooldown=now+60000;this.error='MEME_MARKET_BATCH_UNAVAILABLE';}
     if(signal.aborted||this.closed)return;
     const requested=new Set(rows.map(row=>tokenKey({chain:row.chain,address:row.address}))),received=new Set<string>();
@@ -270,23 +342,56 @@ export class MemeObserver {
     return this.catalystWork;
   }
   private async collectCatalyst(abort:AbortSignal):Promise<void>{
+    if(this.storagePressure)return;
     const now=this.now().getTime(),row=this.activeRows().filter(r=>!r.catalyst_attempt_at||now-time(r.catalyst_attempt_at)>=600000)
       .sort((a,b)=>String(a.catalyst_attempt_at??'').localeCompare(String(b.catalyst_attempt_at??''))||String(b.last_signal_at).localeCompare(String(a.last_signal_at)))[0];
     if(!row)return;
+    const context=this.db.prepare('SELECT signal,social_context FROM meme_tokens WHERE chain=? AND address=?').get(row.chain,row.address);if(!context)return;
+    this.auditSampling([row],'catalyst',iso(now));
     this.db.prepare('UPDATE meme_tokens SET catalyst_attempt_at=? WHERE chain=? AND address=?').run(iso(now),row.chain,row.address);
-    const snapshot=await this.options.catalyst!(JSON.parse(row.signal),abort,parse<GmgnTokenSnapshot>(row.social_context));
+    const snapshot=await this.options.catalyst!(JSON.parse(String(context.signal)),abort,parse<GmgnTokenSnapshot>(context.social_context));
     if(!abort.aborted&&!this.closed&&snapshot.token.chain===row.chain&&snapshot.token.address===row.address){
       this.recordCatalyst(snapshot);this.catalystError=undefined;
     }
   }
+  /** Free pages are reusable even while the SQLite file remains physically large.
+   * Each cycle deletes at most 10,000 oldest research snapshots, with a bounded
+   * transaction per batch; no VACUUM or unrelated wallet-history deletion. */
+  private reclaimSpace():void {
+    const pageSize=Number(this.db.prepare('PRAGMA page_size').get()!.page_size);
+    const measure=()=>Math.max(0,Number(this.db.prepare('PRAGMA page_count').get()!.page_count)-Number(this.db.prepare('PRAGMA freelist_count').get()!.freelist_count))*pageSize;
+    let used=measure();this.usedBytes=used;this.storageCheckedAt=this.now().toISOString();
+    if(used<this.maxBytes*0.8&&!this.storagePressure)return;
+    this.storagePressure=true;
+    for(let batch=0;batch<10&&used>this.maxBytes*0.7;batch++){
+      this.db.exec('SAVEPOINT meme_space_recovery');let deleted=0;
+      try {
+        deleted=Number(this.db.prepare('DELETE FROM meme_snapshots WHERE id IN (SELECT id FROM meme_snapshots ORDER BY observed_at,id LIMIT 1000)').run().changes);
+        this.db.exec('RELEASE meme_space_recovery');
+      }catch(error){this.db.exec('ROLLBACK TO meme_space_recovery; RELEASE meme_space_recovery');this.error='MEME_OBSERVATION_STORAGE_PRESSURE';throw error;}
+      this.reclaimedSnapshots+=deleted;used=measure();if(!deleted)break;
+    }
+    this.usedBytes=used;this.storagePressure=used>this.maxBytes*0.7;
+    if(this.storagePressure)this.error='MEME_OBSERVATION_STORAGE_PRESSURE';
+    else if(this.error==='MEME_OBSERVATION_STORAGE_PRESSURE')this.error=undefined;
+  }
   private prune(){
     const now=this.now().getTime();if(now<this.nextPrune)return;this.nextPrune=now+60000;
     this.db.prepare('DELETE FROM meme_snapshots WHERE observed_at<?').run(iso(now-30*86400000));
-    this.db.exec('DELETE FROM meme_snapshots WHERE id IN (SELECT id FROM meme_snapshots ORDER BY id DESC LIMIT -1 OFFSET 250000)');
+    this.trimRows('meme_snapshots',250000);
     this.db.prepare('DELETE FROM meme_catalysts WHERE observed_at<?').run(iso(now-30*86400000));
-    this.db.exec('DELETE FROM meme_catalysts WHERE id IN (SELECT id FROM meme_catalysts ORDER BY id DESC LIMIT -1 OFFSET 20000)');
+    this.trimRows('meme_catalysts',20000);
     this.db.prepare('DELETE FROM meme_signals WHERE observed_at<?').run(iso(now-30*86400000));
     this.db.prepare('DELETE FROM meme_tokens WHERE last_signal_at<?').run(iso(now-30*86400000));
+    this.db.prepare('DELETE FROM meme_sampling_selections WHERE last_selected_at<?').run(iso(now-30*86400000));
+    this.db.prepare('DELETE FROM meme_sampling_plans WHERE first_applied_at<? AND plan_id NOT IN (SELECT plan_id FROM meme_sampling_selections)').run(iso(now-30*86400000));
+    this.reclaimSpace();if(this.storagePressure)this.nextPrune=now+1000;
+  }
+  private trimRows(table:'meme_snapshots'|'meme_catalysts',limit:number):void {
+    // COUNT uses a narrow secondary index. OFFSET over the rowid table would
+    // visit every large JSON row even when the table is below its row budget.
+    const excess=Math.min(10000,Number(this.db.prepare(`SELECT count(*) n FROM ${table}`).get()!.n)-limit);
+    if(excess>0)this.db.prepare(`DELETE FROM ${table} WHERE id IN (SELECT id FROM ${table} ORDER BY id LIMIT ?)`).run(excess);
   }
   start(){
     if(this.running||this.closed)return;this.running=true;

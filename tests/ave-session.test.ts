@@ -169,6 +169,50 @@ test('refresh-token renewal is supported even before a still-valid access token 
   }finally{f.cleanup();}
 });
 
+test('read-only consumer verifies existing access without refreshing a near-expiry refresh token or changing its file',async()=>{
+  const initial=session({refreshToken:jwt(NOW+12*3600000)}),f=fixture(initial),calls:Parameters<typeof verifiedFetch>[0]=[];
+  const before=readFileSync(f.path,'utf8'),beforeStat=lstatSync(f.path);
+  try {
+    const client=new AveSessionClient({path:f.path,email:EMAIL,readOnly:true,now:()=>new Date(NOW),fetcher:verifiedFetch(calls)});
+    assert.equal((await client.verify()).authenticated,true);
+    assert.equal((await client.fetcher(FEED)).status,200);
+    assert.deepEqual(calls.map(c=>c.path),[WALLETS,USER,'/v2api/signals/v2/public/multi_chain/list']);
+    assert.equal(readFileSync(f.path,'utf8'),before);
+    assert.equal(lstatSync(f.path).mtimeMs,beforeStat.mtimeMs);assert.equal(lstatSync(f.path).ino,beforeStat.ino);
+    await assert.rejects(client.saveSession(session({accessToken:'new-private-token'})),reason('READ_ONLY'));
+    assert.equal(readFileSync(f.path,'utf8'),before);assert.equal(client.getStatus().authenticated,true);
+  }finally{f.cleanup();}
+});
+
+test('read-only consumer fails safely when access requires renewal and never issues a request or persists tokens',async()=>{
+  for(const accessToken of [undefined,jwt(NOW-1),jwt(NOW+30000)]) {
+    const f=fixture(session({accessToken,refreshToken:jwt(NOW+12*3600000)})),calls:Parameters<typeof verifiedFetch>[0]=[];
+    const before=readFileSync(f.path,'utf8'),beforeStat=lstatSync(f.path);
+    try {
+      const client=new AveSessionClient({path:f.path,email:EMAIL,readOnly:true,now:()=>new Date(NOW),fetcher:verifiedFetch(calls)});
+      const status=await client.verify();assert.equal(status.authenticated,false);assert.equal(status.status,'unavailable');
+      assert.equal(status.reason,'AVE_SESSION_READ_ONLY_REFRESH_REQUIRED');
+      await assert.rejects(client.fetcher(FEED),reason('READ_ONLY_REFRESH_REQUIRED'));assert.equal(calls.length,0);
+      assert.equal(readFileSync(f.path,'utf8'),before);assert.equal(lstatSync(f.path).mtimeMs,beforeStat.mtimeMs);
+    }finally{f.cleanup();}
+  }
+});
+
+test('read-only consumer cannot renew rejected credentials and can recover after the session owner replaces them',async()=>{
+  const f=fixture(),calls:Parameters<typeof verifiedFetch>[0]=[],before=readFileSync(f.path,'utf8');let denied=true;
+  try {
+    const client=new AveSessionClient({path:f.path,email:EMAIL,readOnly:true,now:()=>new Date(NOW),fetcher:verifiedFetch(calls,()=>denied?
+      new Response('secret-upstream',{status:401}):new Response('{"status":1,"data":{"list":[]}}'))});
+    await assert.rejects(client.fetcher(FEED),reason('AUTH_REQUIRED'));
+    await assert.rejects(client.fetcher(FEED),reason('READ_ONLY_REFRESH_REQUIRED'));
+    assert.equal(calls.length,3);assert.equal(calls.some(c=>c.path===REFRESH),false);assert.equal(readFileSync(f.path,'utf8'),before);
+    await saveAveSession(f.path,session({accessToken:jwt(NOW+7200000)}));denied=false;
+    assert.equal((await client.fetcher(FEED)).status,200);assert.equal(client.getStatus().authenticated,true);
+    assert.equal(calls.some(c=>c.path===REFRESH),false);
+    assert.deepEqual(calls.slice(3).map(c=>c.path),[WALLETS,USER,'/v2api/signals/v2/public/multi_chain/list']);
+  }finally{f.cleanup();}
+});
+
 test('401 immediately clears authenticated status; a subsequent read refreshes and verifies before reuse',async()=>{
   const f=fixture(),calls:Parameters<typeof verifiedFetch>[0]=[];let denied=true;
   try {

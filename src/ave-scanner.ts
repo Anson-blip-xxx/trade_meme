@@ -7,6 +7,7 @@ import {scoreDebotRisk} from './debot-risk-score.js';
 import {fetchAveSignalPage,normalizeAveSignalPush,AveSignalError,type AveSignalObservation,type NormalizedAveSignals} from './providers/ave-signals.js';
 import {normalizePriceToken} from './market-price-normalizers.js';
 import type {ScanToken} from './scan-archive.js';
+import {VendorPerformanceLedger} from './vendor-performance-ledger.js';
 
 export interface AveSocket {
   readyState:number;send(data:string):void;close(code?:number,reason?:string):void;
@@ -42,6 +43,7 @@ export class AveScanner {
   private lastError?:string;private deferredReason?:string;private reconnects=0;private reconnectAttempt=0;
   private cooldownUntil=0;private nextDispatchAt=0;private lastPruned=0;private connectedAtMs=0;
   private priceTokens:string[]=[];private subscribedPriceTokens:string[]=[];private priceRequestId=10;
+  private readonly performance:VendorPerformanceLedger;private vendorPerformanceError?:string;
 
   constructor(private readonly options:AveScannerOptions){
     this.now=options.now??(()=>new Date());this.chains=[...new Set(options.chains)];
@@ -57,9 +59,15 @@ export class AveScanner {
       CREATE INDEX IF NOT EXISTS ave_signals_queue ON ave_signals(state,occurred_at);
       CREATE INDEX IF NOT EXISTS ave_signals_observed ON ave_signals(observed_at,id);
       CREATE INDEX IF NOT EXISTS ave_signals_token ON ave_signals(chain,address,dispatched_at);
+      CREATE TABLE IF NOT EXISTS review_retention_watermarks(source TEXT PRIMARY KEY,pruned_through TEXT NOT NULL);
+      CREATE TRIGGER IF NOT EXISTS ave_review_retention AFTER DELETE ON ave_signals BEGIN
+        INSERT INTO review_retention_watermarks(source,pruned_through) VALUES('ave',OLD.observed_at)
+          ON CONFLICT(source) DO UPDATE SET pruned_through=MAX(pruned_through,excluded.pruned_through);
+      END;
       UPDATE ave_signals SET state='interrupted',reason='AVE_SIGNAL_INTERRUPTED' WHERE state='dispatching';`);
     const size=Number(this.db.prepare('PRAGMA page_size').get()!.page_size);
     this.db.exec(`PRAGMA max_page_count=${Math.floor(64*1024*1024/size)}`);
+    this.performance=new VendorPerformanceLedger(this.db,this.now);
     if(options.database!==':memory:')chmodSync(options.database,0o600);
     const at=this.db.prepare('SELECT max(dispatched_at) AS at FROM ave_signals').get()?.at;
     if(typeof at==='string')this.nextDispatchAt=Date.parse(at)+1000;
@@ -114,7 +122,13 @@ export class AveScanner {
       !parseDate(observation.observedAt)||Date.parse(observation.observedAt)>now+30_000||
       Date.parse(signal.occurredAt)>now+30_000||!/^\d{1,16}$/.test(observation.id))throw new Error('AVE_SIGNAL_INPUT_INVALID');
     const serialized=JSON.stringify(observation);if(Buffer.byteLength(serialized)>64_000)throw new Error('AVE_SIGNAL_INPUT_INVALID');
-    if(this.db.prepare('SELECT 1 FROM ave_signals WHERE id=?').get(signal.sourceEventId))return;
+    const existing=this.db.prepare('SELECT chain,address FROM ave_signals WHERE id=?').get(signal.sourceEventId);
+    if(existing&&(existing.chain!==signal.token.chain||existing.address!==signal.token.address))return;
+    // Display-only peak changes survive duplicate suppression without becoming
+    // another notification, price sample, callback or research task.
+    if(observation.vendorPerformance)try {this.performance.record(observation);this.vendorPerformanceError=undefined;}
+    catch {this.vendorPerformanceError='VENDOR_PERFORMANCE_PERSIST_FAILED';}
+    if(existing)return;
     const stale=now-Date.parse(signal.occurredAt)>MAX_AGE_MS;
     this.db.exec('SAVEPOINT ave_record');
     try {
@@ -226,6 +240,7 @@ export class AveScanner {
     return {enabled:true,running:this.running,mode:'public_signal_stream' as const,connected:this.connectionState==='connected',
       connectionState:this.connectionState,lastConnectedAt:this.lastConnectedAt,lastMessageAt:this.lastMessageAt,
       lastSignalAt:this.lastSignalAt,lastPollAt:this.lastPollAt,lastError:this.lastError,deferredReason:this.deferredReason,
+      vendorPerformanceError:this.vendorPerformanceError,
       reconnects:this.reconnects,cooldownUntil:this.cooldownUntil>this.now().getTime()?new Date(this.cooldownUntil).toISOString():undefined,
       stored:rows.reduce((sum,r)=>sum+Number(r.n),0),pending:(count.pending??0)+(count.dispatching??0),completed:count.completed??0,
       ignored:count.ignored??0,failed:count.failed??0,interrupted:count.interrupted??0,inFlight:!!this.dispatching||!!this.collecting,

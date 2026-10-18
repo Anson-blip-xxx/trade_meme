@@ -10,6 +10,7 @@ import {scoreDebotRisk} from './debot-risk-score.js';
 import {DebotNotificationLedger} from './debot-notification-ledger.js';
 import {assessDebotRepeatEvidence,type DebotRepeatEvidence,type DebotRepeatEvidenceInput,type DebotScopedWalletDetails} from './debot-repeat-evidence.js';
 import {promoteDebotRiskUpdates} from './debot-repeat-scheduler.js';
+import {VendorPerformanceLedger} from './vendor-performance-ledger.js';
 
 type Page=Awaited<ReturnType<typeof fetchDebotSignalPage>>;
 interface Cycle {
@@ -69,6 +70,7 @@ export class DebotScanner {
   private closed=false;
   private readonly notifications:DebotNotificationLedger;
   private nextRiskCheckAt=0;
+  private readonly performance:VendorPerformanceLedger;private vendorPerformanceError?:string;
 
   constructor(private readonly options:DebotScannerOptions) {
     this.now=options.now??(()=>new Date());this.intervalSec=options.intervalSec??30;
@@ -90,6 +92,11 @@ export class DebotScanner {
       );
       CREATE INDEX IF NOT EXISTS debot_signals_queue ON debot_signals(state,occurred_at);
       CREATE INDEX IF NOT EXISTS debot_signals_observed ON debot_signals(observed_at);
+      CREATE TABLE IF NOT EXISTS review_retention_watermarks(source TEXT PRIMARY KEY,pruned_through TEXT NOT NULL);
+      CREATE TRIGGER IF NOT EXISTS debot_review_retention AFTER DELETE ON debot_signals BEGIN
+        INSERT INTO review_retention_watermarks(source,pruned_through) VALUES('debot',OLD.observed_at)
+          ON CONFLICT(source) DO UPDATE SET pruned_through=MAX(pruned_through,excluded.pruned_through);
+      END;
       UPDATE debot_signals SET state='interrupted',reason='DEBOT_SIGNAL_INTERRUPTED' WHERE state='dispatching';`);
     const columns=new Set(this.db.prepare('PRAGMA table_info(debot_signals)').all().map(row=>String(row.name)));
     if(!columns.has('details'))this.db.exec('ALTER TABLE debot_signals ADD COLUMN details TEXT');
@@ -104,6 +111,7 @@ export class DebotScanner {
     if(!columns.has('analyzed'))this.db.exec("ALTER TABLE debot_signals ADD COLUMN analyzed INTEGER NOT NULL DEFAULT 0; UPDATE debot_signals SET analyzed=1 WHERE state='completed' AND dispatched_at IS NOT NULL");
     this.db.exec('CREATE INDEX IF NOT EXISTS debot_signals_notification ON debot_signals(notification_key)');
     this.notifications=new DebotNotificationLedger(this.db,this.now);
+    this.performance=new VendorPerformanceLedger(this.db,this.now);
     if(options.database!==':memory:')chmodSync(options.database,0o600);
     // A claimed event is never silently replayed after a crash. Its incomplete
     // analysis remains visible instead of creating another signal/order attempt.
@@ -255,7 +263,7 @@ export class DebotScanner {
       intervalSec:this.intervalSec,stored:rows.reduce((n,r)=>n+Number(r.n),0),pending:(counts.pending??0)+(counts.dispatching??0),
       dispatched:counts.completed??0,ignored:counts.ignored??0,failed:counts.failed??0,interrupted:counts.interrupted??0,
       lastObservedAt:latest.at??undefined,lastCycle:this.lastCycle?structuredClone(this.lastCycle):undefined,
-      lastError:this.lastError,deferredReason:this.deferredReason,
+      lastError:this.lastError,deferredReason:this.deferredReason,vendorPerformanceError:this.vendorPerformanceError,
       detailsReceived:Number(detailStats.received),detailsFailed:Number(detailStats.failed),
       lastAnalysisQueueDelayMs:latestDispatch?Math.max(0,Date.parse(latestDispatch.dispatched_at)-Date.parse(latestDispatch.observed_at)):undefined,
       cooldownUntil:this.cooldownUntil>this.now().getTime()?new Date(this.cooldownUntil).toISOString():undefined};
@@ -415,8 +423,11 @@ export class DebotScanner {
     catch(error){this.db.exec('ROLLBACK TO debot_inbox_record; RELEASE debot_inbox_record');throw error;}
     // Observation is independent of dispatch/dedup decisions, and cannot roll back the inbox.
     const bound=this.db.prepare('SELECT chain,address FROM debot_signals WHERE id=?').get(observation.signal.sourceEventId);
-    if(bound&&bound.chain===observation.signal.token.chain&&bound.address===observation.signal.token.address)
+    if(bound&&bound.chain===observation.signal.token.chain&&bound.address===observation.signal.token.address){
+      if(observation.vendorPerformance)try{this.performance.record(observation);this.vendorPerformanceError=undefined;}
+      catch{this.vendorPerformanceError='VENDOR_PERFORMANCE_PERSIST_FAILED';}
       try{this.options.onObservation?.(observation);}catch{/* Optional observer failure is isolated. */}
+    }
     return result;
   }
   /** Resume only recent real notifications; their original timestamps remain unchanged. */

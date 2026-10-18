@@ -242,6 +242,11 @@ export class ScanArchive {
       CREATE INDEX IF NOT EXISTS scan_summaries_token ON scan_summaries(chain,address);
       CREATE INDEX IF NOT EXISTS scan_summaries_received ON scan_summaries(received_at);
       CREATE INDEX IF NOT EXISTS scan_summaries_eligible ON scan_summaries(eligible_at);
+      CREATE TABLE IF NOT EXISTS review_retention_watermarks(source TEXT PRIMARY KEY,pruned_through TEXT NOT NULL);
+      CREATE TRIGGER IF NOT EXISTS scans_review_retention AFTER DELETE ON scan_summaries BEGIN
+        INSERT INTO review_retention_watermarks(source,pruned_through) VALUES('scans',OLD.received_at)
+          ON CONFLICT(source) DO UPDATE SET pruned_through=MAX(pruned_through,excluded.pruned_through);
+      END;
       CREATE TABLE IF NOT EXISTS watch_jobs (
         id TEXT PRIMARY KEY,chain TEXT NOT NULL,address TEXT NOT NULL,state TEXT NOT NULL,
         first_received_at TEXT NOT NULL,occurred_at TEXT NOT NULL,ends_at TEXT NOT NULL,

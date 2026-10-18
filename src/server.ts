@@ -108,6 +108,7 @@ if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href) {
   const server=buildServer(config,runtime.store,runtime.providers,runtime);
   const dashboard=config.dashboard.enabled&&runtime.archive?buildDashboard(config,{
     archive:runtime.archive,home:runtime.dashboardHome,overview:runtime.dashboardOverview,orders:runtime.dashboardOrders,
+    dailyReview:options=>runtime.dailyReview?.page(options),
     debotAuth:runtime.debotAuth,
     debotSignals:options=>runtime.debotScanner?.list(options)??{now:new Date().toISOString(),items:[],total:0,
       limit:options?.limit??20,offset:options?.offset??0,hasMore:false},

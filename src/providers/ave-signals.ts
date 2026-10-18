@@ -1,3 +1,4 @@
+import {normalizeAvePerformance,type VendorSignalPerformance} from './vendor-performance.js';
 import {createHash} from 'node:crypto';
 import bs58 from 'bs58';
 import {abortable,type Fetcher} from '../http.js';
@@ -18,7 +19,7 @@ export interface AveSignalObservation {
   kind?:string;vendorWalletCount?:number;vendorWallets?:AveVendorWalletSnapshot[];
   /** Supplier summary and links are context, not independently verified endorsement. */
   headline?:string;socialUrl?:string;firstSignalAt?:string;vendorHistoryCount?:number;
-  alertMarketCapUsd?:number;currentPriceUsd?:number;
+  alertMarketCapUsd?:number;currentPriceUsd?:number;vendorPerformance?:VendorSignalPerformance;
 }
 export interface NormalizedAveSignals {
   observations:AveSignalObservation[];received:number;rejected:number;reason?:string;next?:string;
@@ -104,12 +105,13 @@ export function normalizeAveSignals(payload:unknown,observedAt:Date,chains:reado
     const symbol=tokenDisplayText(raw.symbol,40),name=tokenDisplayText(raw.name,100),headline=tokenDisplayText(raw.headline,2000);
     const socialUrl=social(raw.twitter_url),first=seconds(raw.first_signal_time,observedAt),vendorHistoryCount=integer(raw.history_count,true);
     const vendorWalletCount=integer(raw.action_count,true),alertMarketCapUsd=positive(raw.mc),currentPriceUsd=positive(raw.current_price_usd);
+    const vendorPerformance=normalizeAvePerformance(raw,observedAt);
     result.observations.push({id:String(id),signal,observedAt:observedAt.toISOString(),kind:raw.tag,
       ...(symbol?{symbol}:{}),...(name?{name}:{}),...(headline?{headline}:{}),...(socialUrl?{socialUrl}:{}),
       ...(first!==undefined&&first<=at?{firstSignalAt:new Date(first*1000).toISOString()}:{}),
       ...(vendorHistoryCount!==undefined?{vendorHistoryCount}:{}),...(vendorWalletCount!==undefined?{vendorWalletCount}:{}),
       ...(vendorWallets.length?{vendorWallets}:{}),...(alertMarketCapUsd!==undefined?{alertMarketCapUsd}:{}),
-      ...(currentPriceUsd!==undefined?{currentPriceUsd}:{})});
+      ...(currentPriceUsd!==undefined?{currentPriceUsd}:{}),...(vendorPerformance?{vendorPerformance}:{})});
   }
   result.rejected+=Math.max(0,rows.length-PAGE_SIZE);
   if(result.rejected)result.reason='AVE_SIGNAL_RECORDS_REJECTED';

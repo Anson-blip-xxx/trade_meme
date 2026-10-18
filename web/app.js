@@ -16,6 +16,7 @@
     candidates: ['条件后追踪', '回看曾通过研究判断的信号，观察此后的价格表现。'],
     followup: ['持续复盘', '保留当时判断，持续比较后续表现，用时间顺序与对照样本验证上涨线索。'],
     rankResearch: ['榜单研究', '持续记录上榜代币，比较热度之前的入场线索与已实现盈利钱包，积累跨币证据。'],
+    dailyReview: ['每日复盘', '每天北京时间 09:00 回看信号、后续涨幅与未进入开单的原因，留下可验证的研究调整。'],
     wallets: ['钱包研究', '回查公开钱包之前的买入者，持续验证跨币时序与资金联系。'],
     protection: ['止盈保护', '前瞻验证动态保护线与触发建议，观察利润回撤时策略会如何响应。'],
     orders: ['订单记录', '核对实际订单、执行结果与退出保护状态。'],
@@ -121,6 +122,7 @@
     WALLET_SUPPORT_NOT_PASSED: '钱包与资金流证据尚未通过',
     SIGNAL_STALE: '信号已超出有效时间窗',
     DECISION_EXPIRED: '本次研究判断已过期',
+    DECISION_AFTER_OBSERVED_PEAK: '缺少采样峰值前的可用判断，后来的检查不能倒推当时原因',
     GMGN_WALLET_RESEARCH_UNAVAILABLE: '暂时无法获取 GMGN 钱包研究数据',
     GMGN_RATE_LIMITED: 'GMGN 请求受到限流',
     DEBOT_SIGNAL_STORE_FULL: 'DeBot 信号存储已达到容量上限',
@@ -341,6 +343,7 @@
   state.ave = null; state.aveLoaded = false; state.listPages.ave = {offset: 0,total: 0,chain: '',asOf: ''};
   state.rankResearchTab='tokens'; state.rankWallets=null; state.rankWalletsLoaded=false; state.listPages.rankWallets={offset:0,total:0,chain:'',sort:'early',asOf:''};
   state.rankResearch = null; state.rankResearchLoaded = false; state.listPages.rankResearch = {offset: 0,total: 0,chain: '',asOf: ''};
+  state.dailyReview=null;state.dailyReviewLoaded=false;state.dailyReviewSelection=null;state.listPages.dailyReview={offset:0,total:0,chain:'',date:'',sort:'gain',reportDate:'',reportId:'',pinned:false};
   const debotRisk = {offset: 0, total: 0, chain: '', state: '', asOf: '', items: [], loaded: false, error: '', lastSuccess: 0, serverNow: 0, timer: null, controller: null, generation: 0, signature: ''};
   const debotAuthErrors = {
     DEBOT_AUTH_DISABLED: 'DeBot 登录功能尚未启用。',
@@ -1055,7 +1058,9 @@
   function listQuery(key) {
     const page = key === 'risk' ? debotRisk : state.listPages[key];
     const q = new URLSearchParams({limit: String(PAGE_SIZE), offset: String(page.offset)});
-    for (const field of ['chain', 'decision', 'selected', 'state', 'sort']) if (page[field]) q.set(field, page[field]);
+    for (const field of ['chain', 'decision', 'selected', 'state', 'sort', 'date']) if (page[field]) q.set(field, page[field]);
+    if(key==='dailyReview'&&(page.pinned||page.offset>0)&&!page.date&&page.reportDate)q.set('date',page.reportDate);
+    if(key==='dailyReview'&&(page.pinned||page.offset>0)&&page.reportId)q.set('runId',page.reportId);
     if (page.offset > 0 && page.asOf) q.set('asOf', page.asOf);
     return q.toString();
   }
@@ -1079,6 +1084,7 @@
     const version = state.queryVersion, activeView = state.view, jobs = [];
     const add = (key, path, apply) => jobs.push({key, run: () => api(path, {signal: controller.signal}), apply});
     if (activeView === 'home') add('home', '/home', data => { state.home = data; renderHome(); });
+    if(activeView==='dailyReview')add('dailyReview',`/daily-review?${listQuery('dailyReview')}`,data=>{state.dailyReview=data;state.dailyReviewLoaded=true;state.listPages.dailyReview.reportDate=data.report?.date||'';state.listPages.dailyReview.reportId=data.report?.id||'';state.dailyReviewSelection={date:state.listPages.dailyReview.date,chain:state.listPages.dailyReview.chain,sort:state.listPages.dailyReview.sort,pinned:state.listPages.dailyReview.pinned,reportDate:state.listPages.dailyReview.reportDate,reportId:state.listPages.dailyReview.reportId};savePage('dailyReview',data);renderDailyReview();});
     if (activeView === 'meme') add('meme', `/meme?${listQuery('meme')}`, data => { state.meme = data; state.memeLoaded = true; savePage('meme', data); renderMeme(); });
     if (activeView === 'rankResearch' && state.rankResearchTab==='tokens') add('rankResearch', `/token-rank-research?${listQuery('rankResearch')}`, data => { state.rankResearch = data; state.rankResearchLoaded = true; savePage('rankResearch', data); renderRankResearch(); });
     if (activeView === 'rankResearch' && state.rankResearchTab==='wallets') add('rankWallets', `/token-rank-research/wallets?${listQuery('rankWallets')}`, data=>{state.rankWallets=data;state.rankWalletsLoaded=true;savePage('rankWallets',data);renderRankResearch();});
@@ -1129,22 +1135,24 @@
       if (activeView === 'rankResearch' && state.resourceErrors.rankResearch) { if (finite(state.rankResearch?.offset)) state.listPages.rankResearch.offset = state.rankResearch.offset; renderRankResearch(); }
       if (activeView === 'rankResearch' && state.resourceErrors.rankWallets) { if (finite(state.rankWallets?.offset)) state.listPages.rankWallets.offset=state.rankWallets.offset; renderRankResearch(); }
       if (activeView === 'protection' && state.resourceErrors.protection) renderProtection();
+      if(activeView==='dailyReview'&&state.resourceErrors.dailyReview){if(state.dailyReviewSelection)Object.assign(state.listPages.dailyReview,state.dailyReviewSelection,{offset:state.dailyReview.offset||0});renderDailyReview();}
       networkState();
     } finally {
       if (state.refreshController === controller) {
         state.refreshController = null; state.refreshing = false; $('refresh').classList.remove('spinning'); $('refresh').removeAttribute('aria-busy');
         if (state.authenticated && !document.hidden) {
           if (state.queued) { state.queued = false; void refresh(); }
-          else if (!isHistoryPage()) state.timer = setTimeout(refresh, state.view === 'home' ? 30000 : 15000);
+          else if (!isHistoryPage()) state.timer = setTimeout(refresh, state.view === 'dailyReview'?60000:state.view === 'home' ? 30000 : 15000);
         }
       }
     }
   }
   function isHistoryPage() {
+    if(state.view==='dailyReview')return state.listPages.dailyReview.pinned||state.listPages.dailyReview.offset>0||Boolean(state.listPages.dailyReview.date);
     return ['scans', 'candidates'].includes(state.view) ? state.offset > 0 : ['wallets', 'associations'].includes(state.view) ? state.walletOffset > 0 : state.view === 'rankResearch' ? state.listPages[state.rankResearchTab==='wallets'?'rankWallets':'rankResearch'].offset>0 : state.view === 'sources' ? state.listPages.ave.offset > 0 : state.view === 'followup' ? (state.followupTab === 'records' ? state.listPages.followup.offset > 0 : state.listPages.learning.offset > 0 || state.listPages.groups.offset > 0) : state.listPages[state.view]?.offset > 0;
   }
   function refreshQuery() { state.queryVersion++; cancelRefresh(); void refresh(); }
-  $('refresh').addEventListener('click', refresh);
+  $('refresh').addEventListener('click',()=>{if(state.view==='dailyReview'){state.listPages.dailyReview.pinned=false;state.listPages.dailyReview.offset=0;refreshQuery();}else void refresh();});
   $('system-details').addEventListener('click', () => setView('system'));
   $('system-protection-link').addEventListener('click', () => setView('protection'));
   $('chain-stream-summary').addEventListener('click', () => { setView('system'); $('chain-stream-panel').scrollIntoView({block: 'start'}); });
@@ -1178,15 +1186,16 @@
   $('wallet-search').addEventListener('input', () => { clearTimeout(state.walletSearchTimer); state.walletSearchTimer = setTimeout(() => { state.walletSearch = $('wallet-search').value.trim(); walletFiltersChanged(); }, 300); });
   $('wallet-previous-page').addEventListener('click', () => { state.walletOffset = Math.max(0, state.walletOffset - PAGE_SIZE); refreshQuery(); });
   $('wallet-next-page').addEventListener('click', () => { if (state.walletOffset + PAGE_SIZE < state.walletTotal) { state.walletOffset += PAGE_SIZE; refreshQuery(); } });
-  for (const key of ['risk','meme','ave','rankResearch','rankWallets','followup','protection','orders','groups','learning']) {
+  for (const key of ['risk','meme','ave','rankResearch','rankWallets','dailyReview','followup','protection','orders','groups','learning']) {
     const page = key === 'risk' ? debotRisk : state.listPages[key];
     for (const [suffix,delta] of [['previous',-PAGE_SIZE],['next',PAGE_SIZE]]) $(`${key}-${suffix}-page`).addEventListener('click', () => {
       page.offset = Math.max(0, page.offset + delta);
+      if(key==='dailyReview')page.pinned=Boolean(page.reportId);
       if (key === 'risk') { stopDebotRiskPolling(); debotRisk.signature = ''; void pollDebotRisk(); }
       else refreshQuery();
     });
-    for (const field of ['chain','decision','selected','state','sort']) {
-      const input = $(`${key}-${field}`); if (input) input.addEventListener('change', () => { page[field] = input.value; page.offset = 0; page.asOf = ''; if (key === 'risk') { stopDebotRiskPolling(); debotRisk.signature = ''; void pollDebotRisk(); } else refreshQuery(); });
+    for (const field of ['chain','decision','selected','state','sort','date']) {
+      const input = $(`${key}-${field}`); if (input) input.addEventListener('change', () => { page[field] = input.value; page.offset = 0; page.asOf = ''; if(key==='dailyReview'){page.pinned=field!=='date'&&Boolean(page.reportId);if(field==='date'){page.reportDate='';page.reportId='';}} if (key === 'risk') { stopDebotRiskPolling(); debotRisk.signature = ''; void pollDebotRisk(); } else refreshQuery(); });
     }
   }
   document.querySelectorAll('[data-rank-research-tab]').forEach(button=>button.addEventListener('click',()=>{state.rankResearchTab=button.dataset.rankResearchTab;closeDrawer();renderRankResearch();refreshQuery();}));
@@ -1212,7 +1221,7 @@
     }
     document.querySelectorAll('[data-view]').forEach(button => { const active = button.dataset.view === view; button.classList.toggle('active', active); if (active) button.setAttribute('aria-current', 'page'); else button.removeAttribute('aria-current'); });
     text('breadcrumb-current', views[view][0]); $('page-title').replaceChildren(document.createTextNode(views[view][0]), el('span', 'title-dot', '.')); text('page-description', views[view][1]);
-    for (const key of ['home','meme','rankResearch','orders','system','sources','protection','followup']) $(`${key}-panel`).hidden = view !== key;
+    for (const key of ['home','meme','rankResearch','dailyReview','orders','system','sources','protection','followup']) $(`${key}-panel`).hidden = view !== key;
     $('scans-panel').hidden = !['scans','candidates'].includes(view); $('debot-risk-panel').hidden = view !== 'risk';
     $('wallets-panel').hidden = !['wallets','associations'].includes(view); $('wallet-metrics').hidden = !['wallets','associations'].includes(view); $('scan-metrics').hidden = view !== 'home';
     $('scan-insights').hidden = view !== 'system'; $('workbench').classList.add('wallet-mode');
@@ -1225,6 +1234,7 @@
     if (view === 'meme') renderMeme();
     if (view === 'sources') { renderAveStatus(); renderAveSignals(); }
     if (view === 'rankResearch') renderRankResearch();
+    if(view==='dailyReview')renderDailyReview();
     if (load && view !== 'risk') void refresh();
   }
   function renderHome() {
@@ -1444,6 +1454,90 @@
     rebindNarrative(body);
     text('pagination-info', state.total ? `显示 ${state.items.length ? state.offset + 1 : 0}–${Math.min(state.offset + state.items.length, state.total)} 条，共 ${count(state.total)} 条` : '共 0 条记录');
     text('page-number', `${Math.floor(state.offset / PAGE_SIZE) + 1} / ${Math.max(1, Math.ceil(state.total / PAGE_SIZE))}`); $('previous-page').disabled = state.offset === 0; $('next-page').disabled = state.offset + PAGE_SIZE >= state.total;
+  }
+  const dailyFunnelNames={entered:['已有订单记录','neutral'],signal_filtered:['信号阶段未入选','neutral'],not_evaluated:['未完成判断','watch'],safety_blocked:['安全检查拦截','fail'],safety_incomplete:['安全证据不完整','watch'],execution_path:['发行阶段或交易路径未支持','watch'],analysis_incomplete:['分析超时 · 证据未返回完整','watch'],timeliness:['信号或证据时效不足','watch'],wallet_support:['钱包支持不足','watch'],market_risk:['市场风险阻断','watch'],strategy_watch:['策略继续观察','neutral'],execution_disabled:['开仓未启用','neutral'],execution_blocked:['执行检查阻断','watch'],eligible_no_entry_record:['通过研究 · 未发现开单记录','neutral'],decision_after_peak:['缺少采样峰值前判断','watch']};
+  function dailyTime(value) {const d=validDate(value);return d?new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}).format(d):'—';}
+  function dailySource(value) {return {gmgn:'GMGN',debot:'DeBot',ave:'Ave',dexscreener:'DexScreener',manual:'人工导入'}[value]||scalar(value,'来源未知');}
+  function dailyDecision(record) {return record?.decision?badge(...(decisions[record.decision]||[scalar(record.decision),'neutral'])):badge('当时判断未知','neutral');}
+  function dailyHasLaterDecision(item) {const first=item.firstDecision,last=item.latestDecision;return !!last&&(!first||['at','decision','policyVersion','buyEligible','scanId'].some(key=>last[key]!==first[key]));}
+  function dailyEligibility(item) {
+    const node=el('div','daily-review-eligibility'),value=item.eligibility;
+    if(value?.observedEligible===true){node.append(el('strong','','曾通过研究条件'),el('small','',`首次留存通过 ${dailyTime(value.firstEligibleAt)}`),el('small','',value.beforeObservedPeak===true?'采样峰值前已通过':value.beforeObservedPeak===false?'首次通过晚于采样峰值':'与采样峰值的先后未知'));}
+    else node.append(el('small','',value?.observedEligible===false?'未见已留存的通过判断':'研究通过历史未知'));return node;
+  }
+  function dailyDecisionEvidence(title,decision) {
+    const node=el('div','daily-review-decision-snapshot');node.append(el('h4','',title),dailyDecision(decision),kv('留存判断时间',dailyTime(decision?.at)),kv('策略版本',scalar(decision?.policyVersion,'未知')),kv('判断是否冻结',decision?.frozen===true?'已冻结 · 不按后续涨幅回写':decision?.frozen===false?'未冻结 · 不能完整还原当时依据':'未知'));
+    if(typeof decision?.buyEligible==='boolean')node.append(kv('当时研究准入',decision.buyEligible?'满足研究准入，不代表已执行开单':'未满足研究准入'));
+    if(decision?.scanId)node.append(kv('对应评估记录',decision.scanId));
+    if(decision?.reasons?.length)node.append(reasonList(decision.reasons));
+    for(const [key,check] of Object.entries(decision?.checks||{})){if(!check||typeof check!=='object')continue;const line=el('div','daily-review-check'),top=el('div','daily-review-check-heading');top.append(el('strong','',checkNames[key]||key),badge(check.status==='pass'?'通过':check.status==='fail'?'未通过':'证据不足',check.status==='pass'?'pass':check.status==='fail'?'fail':'watch'));line.append(top);if(check.reasons?.length)line.append(reasonList(check.reasons));node.append(line);}
+    if(!decision)node.append(el('p','','未取得当时判断，不能根据后来的涨幅反推当时应该买入。'));return node;
+  }
+  function dailyTextList(title,values,className='') {
+    const section=el('section',className);section.append(el('h3','',title));const list=el('ul');
+    for(const value of Array.isArray(values)?values:[])if(typeof value==='string')list.append(el('li','',value));
+    if(list.childElementCount)section.append(list);else section.append(el('p','','暂无已留存的说明。'));return section;
+  }
+  function dailyVendorPerformance(item,detail=false) {
+    const node=el('div','daily-review-vendors'),values=Array.isArray(item.vendorPerformance)?item.vendorPerformance:[];
+    if(!values.length){node.append(el('strong','missing','—'),el('small','','未取得平台涨幅'));return node;}
+    for(const value of values){const entry=el('div','daily-review-vendor'),gain=numeric(value.maxGainPct),ratio=value.maxGainUnit==='provider_display_ratio'?numeric(value.maxGainValue):undefined;entry.append(el('span','',dailySource(value.source)));
+      if(finite(gain))entry.append(gainNode(gain));else entry.append(el('strong','',scalar(value.display,finite(ratio)?`${ratio}x`:'—')));
+      if(finite(gain)&&value.display)entry.append(el('small','',`平台原显示 ${scalar(value.display)}`));
+      if(!finite(gain)&&finite(ratio))entry.append(el('small','',ratio>=2?'平台显示倍率 ≥2x · 列入重点，未换算百分比':'平台显示倍率 · 未换算百分比'));
+      else if(!finite(gain)&&value.display)entry.append(el('small','','口径未核实 · 原样保留，不参与重点统计'));
+      entry.append(el('small','',value.firstSignalAt?`平台首次通知 ${dailyTime(value.firstSignalAt)}`:'平台首次通知时间未知'));
+      if(detail)entry.append(el('small','',`平台报告时间 ${dailyTime(value.reportedAt)}`));node.append(entry);
+    }
+    node.append(el('small','daily-review-basis','平台原口径 · 未按本地基准复算'));return node;
+  }
+  function dailyReviewDetail(item,report) {
+    const detail=el('div','daily-review-detail'),performance=item.localPerformance,funnel=item.funnel||{};
+    const timing=el('section');timing.append(el('h3','','信号与涨幅基准'),kv('本地首次收到',dailyTime(item.firstReceivedAt)),kv('收到的通知数',count(item.signalCount)),kv('来源',Array.isArray(item.sources)?item.sources.map(dailySource).join(' / '):'—'),kv('本地价格基准',dailyTime(performance?.baselineAt)),kv('本地峰值采样',dailyTime(performance?.peakAt)),kv('最后采样',dailyTime(performance?.lastSampleAt)),kv('最后样本距报告截止',finite(performance?.trailingGapSec)?`${count(performance.trailingGapSec)} 秒`:'旧报告未保留此字段'),kv('采样数量',count(performance?.samples)),kv('最大采样间隔',finite(performance?.maxGapSec)?`${count(performance.maxGapSec)} 秒`:'未知'));
+    timing.append(el('p','',performance?.baselineDelayed===true?'首个价格基准存在延迟，不能代表刚收到信号时的可买价格。':performance?.baselineDelayed===false?'已记录首个价格基准；本地涨幅只覆盖此后的实际样本。':'基准延迟是否存在尚未确认。'),dailyVendorPerformance(item,true));detail.append(timing);
+    const initial=el('section');initial.append(el('h3','','已留存判断与核验证据'),dailyDecisionEvidence('初次留存判断',item.firstDecision));
+    if(dailyHasLaterDecision(item)){const later=el('details','daily-review-later-decision');later.append(el('summary','','展开截至报告的最新判断'),dailyDecisionEvidence('截至报告的最新判断',item.latestDecision));initial.append(later);}
+    initial.append(dailyEligibility(item),el('p','daily-review-basis','初次判断和后续变化分别保留；事后通过不回填为最初已通过。'));detail.append(initial);
+    const execution=el('section');execution.append(el('h3','','开单流程与执行记录'),badge(...(dailyFunnelNames[funnel.stage]||['流程阶段未知','neutral'])),el('p','',scalar(funnel.explanation,'缺少开单流程证据，原因仍为未知。')));
+    if(funnel.reasonCodes?.length)execution.append(reasonList(funnel.reasonCodes));
+    execution.append(kv('是否有订单记录',typeof funnel.hasOrder==='boolean'?funnel.hasOrder?'有记录 · 需结合执行结果确认':'未发现匹配订单记录':'未知'));
+    const audit=funnel.execution;if(audit){execution.append(kv('历史执行记录',audit.verified===true?'已匹配到执行审计':'尚未核实'),kv('记录的模式',audit.mode?entryModeLabel(audit.mode):'未知'),kv('记录的状态',{skipped:'未提交',blocked:'检查阻断',created:'已建立订单记录',existing:'已有订单记录'}[audit.status]||scalar(audit.status,'未知')),kv('记录时间',dailyTime(audit.at)));if(audit.scanId)execution.append(kv('对应评估记录',audit.scanId));if(audit.reason)execution.append(el('p','',audit.reason==='ENTRY_DISABLED'?'该次执行审计记录开仓关闭':reasonNames[audit.reason]||scalar(audit.reason)));execution.append(el('p','daily-review-basis','执行原因只对应所匹配的评估记录，不使用后来其他评估的跳过原因代替。'));}
+    execution.append(el('p','daily-review-basis',`报告生成时开仓模式：${entryModeLabel(report?.entryMode)}。这不是当时执行状态的证明；安全拦截与执行模式分别记录。`));detail.append(execution);
+    detail.append(dailyTextList('证据与覆盖线索',item.evidence,'daily-review-evidence'));return detail;
+  }
+  function renderDailyReview() {
+    const data=state.dailyReview,page=state.listPages.dailyReview,report=data?.report,items=Array.isArray(data?.items)?data.items.slice(0,PAGE_SIZE):[],schedule=data?.schedule,generationError=data?.status?.last_error||data?.status?.lastError,incomplete=report?.datasetComplete===false;
+    const status=$('dailyReview-status');status.className=`badge ${state.resourceErrors.dailyReview||generationError||incomplete?'watch':'neutral'}`;status.textContent=state.resourceErrors.dailyReview?'读取异常':generationError?'报告生成需关注':data?.enabled===false?'每日复盘未启用':incomplete?'报告覆盖不完整':report?'报告已生成':data?'等待首份报告':'正在读取';
+    const scheduleNode=$('dailyReview-schedule');scheduleNode.replaceChildren(el('strong','','每天北京时间 09:00'),el('span','',`下次生成 ${dailyTime(schedule?.nextRunAt)}（北京时间）`));
+    if(schedule?.timezone&&schedule.timezone!=='Asia/Shanghai')scheduleNode.append(el('span','',`服务端时区 ${scalar(schedule.timezone)} · 需核对计划`));
+    const dates=$('dailyReview-date');dates.replaceChildren(el('option','','最新报告'));dates.firstChild.value='';const seen=new Set();
+    for(const value of Array.isArray(data?.dates)?data.dates:[]){if(typeof value.date!=='string'||!/^\d{4}-\d{2}-\d{2}$/.test(value.date)||seen.has(value.date))continue;seen.add(value.date);const option=el('option','',value.date);option.value=value.date;dates.append(option);}
+    if(page.date&&!seen.has(page.date)){const option=el('option','',page.date);option.value=page.date;dates.append(option);}dates.value=page.date;$('dailyReview-chain').value=page.chain;
+    $('dailyReview-warning').hidden=!state.resourceErrors.dailyReview&&!generationError&&!incomplete;text('dailyReview-warning',state.resourceErrors.dailyReview?(state.dailyReviewLoaded?'本次读取失败，当前仍显示上次成功读取的报告与筛选；可点击刷新重试。':'每日复盘暂时无法读取，可点击刷新重试。'):generationError?'最近一次日报生成未完成；当前仅展示已成功保存的报告，请结合生成时间查看。':'本轮数据集读取不完整，报告仅供核查，未发布新的研究采样计划。');
+    const meta=$('dailyReview-report-meta');meta.replaceChildren();const counts=$('dailyReview-counts');counts.replaceChildren();
+    if(report){meta.append(el('strong','',`${scalar(report.date)} 复盘`),el('span','',`信号接收区间 ${dailyTime(report.windowStartAt)} 至 ${dailyTime(report.windowEndAt)} · 北京时间`),el('span','',`生成 ${dailyTime(report.generatedAt)} · 价格证据截至生成时刻 · 报告生成时${entryModeLabel(report.entryMode)}`),el('span','','概览与研究调整覆盖整份日报；网络筛选仅作用于下方名单。'));
+      for(const [key,label,hint] of [['signals','通知记录','含同币重复通知'],['tokens','不同代币','按链与完整 CA 区分'],['withPerformance','有本地价格样本','未覆盖不按零计算'],['highGainers','重点涨幅样本','本地 ≥100% / 平台 ≥100% 或 ≥2x'],['missedHighGainers','未进入的重点涨幅样本','不等于当时应放行'],['entered','已有订单记录','记录不等于真实成交']]){const card=el('div','daily-review-count');card.append(el('span','',label),el('strong','',count(report.counts?.[key])),el('small','',hint));counts.append(card);}
+    }else meta.append(el('p','',data?.enabled===false?'服务端尚未启用每日复盘。':'报告生成后会显示覆盖时段、全量名单和研究调整。'));
+    $('dailyReview-learning-panel').hidden=!report;const learning=$('dailyReview-learning');learning.replaceChildren();
+    if(report){const found=el('section');found.append(el('h3','','本次发现'));const findings=Array.isArray(report.findings)?report.findings:[];
+      for(const finding of findings){const line=el('p','daily-review-finding');line.append(el('span','',scalar(finding.text,'发现说明待补全')));if(finite(finding.count))line.append(el('strong','',`${count(finding.count)} 项`));found.append(line);}if(!findings.length)found.append(el('p','','本次没有已生成的发现说明。'));learning.append(found);
+      text('dailyReview-learning-status',incomplete?'覆盖不完整 · 未发布新计划':{research_plan_applied:'研究采样计划已调整',collecting:'继续积累样本',unavailable:'研究计划暂不可用'}[report.learning?.status]||'研究计划状态未知');
+      const notes=dailyTextList('研究调整',report.learning?.notes);notes.append(el('p','daily-review-basis','这里调整的是研究采样与证据补全，不表示策略盈利已验证，也不改变安全检查或开启实盘。'));if(report.learning?.planId&&!incomplete)notes.append(kv('研究计划',report.learning.planId));learning.append(notes);
+      const priorities=Array.isArray(report.learning?.priorities)?report.learning.priorities:[];if(priorities.length){const section=el('section','daily-review-priorities');section.append(el('h3','',incomplete?'覆盖缺口草案 · 本轮未发布':'后续研究覆盖优先级'));for(const item of priorities){const line=el('div');line.append(el('strong','',`${chainName(item.chain)} · ${dailySource(item.source)}`),el('span','',`已覆盖 ${count(item.covered)} / ${count(item.total)} · 缺失 ${count(item.missing)}`),badge(incomplete?'仅供核查':item.weight===2?'优先补充样本':'常规积累','neutral'));section.append(line);}learning.append(section);}
+      if(report.limitations?.length)learning.append(dailyTextList('报告覆盖限制',report.limitations,'daily-review-limitations'));
+    }
+    const tbody=$('dailyReview-rows'),open=new Set([...tbody.querySelectorAll('.daily-review-expand[aria-expanded="true"]')].map(button=>button.dataset.reviewKey));tbody.replaceChildren();
+    for(const [index,item] of items.entries()){const row=el('tr','daily-review-row'),key=`${report?.id||report?.date}:${item.chain}:${item.address}`,cell=(label,className='')=>{const td=el('td',className);td.dataset.label=label;return td;};
+      const token=cell('代币 / 所属链','daily-review-token');token.append(el('strong','',item.symbol||item.name||'未命名代币'));if(item.symbol&&item.name&&item.name!==item.symbol)token.append(el('span','daily-review-token-name',item.name));token.append(el('div','token-meta',`${chainName(item.chain)} · ${(Array.isArray(item.sources)?item.sources:[]).map(dailySource).join(' / ')||'来源未知'}`),addressNode(item.address),el('small','',`本地收到 ${dailyTime(item.firstReceivedAt)}`));
+      const actions=el('div','daily-review-actions'),toggle=el('button','text-button daily-review-expand',open.has(key)?'收起依据 ↑':'展开依据 ↓');toggle.type='button';toggle.dataset.reviewKey=key;toggle.setAttribute('aria-expanded',String(open.has(key)));toggle.setAttribute('aria-controls',`dailyReview-detail-${index}`);actions.append(gmgnTokenLink(item.chain,item.address),toggle);token.append(actions);row.append(token);
+      const local=cell('本地采样最高涨幅','daily-review-performance'),performance=item.localPerformance;local.append(gainNode(numeric(performance?.maxGainPct)),el('small','',`最近样本 ${percent(numeric(performance?.currentGainPct))}`),el('small','',`基准 ${dailyTime(performance?.baselineAt)}`),el('small','',`${count(performance?.samples)} 个样本`));if(item.highGain?.localObserved===true)local.append(badge('本地采样 ≥100%','neutral'));if(performance?.baselineDelayed)local.append(badge('基准存在延迟','watch'));if(!performance)local.append(el('small','','本地价格覆盖未知'));row.append(local);
+      const vendor=cell('平台报告最高涨幅');vendor.append(dailyVendorPerformance(item));if(item.highGain?.vendorReported===true)vendor.append(badge('平台重点 · ≥100% 或 ≥2x','neutral'));row.append(vendor);
+      const decision=cell('初次 / 后续判断');decision.append(el('small','','初次留存'),dailyDecision(item.firstDecision),el('small','',dailyTime(item.firstDecision?.at)),el('small','',item.firstDecision?.frozen===true?'当时判断已冻结':item.firstDecision?.frozen===false?'未冻结 · 不保证为首次判断':'当时依据冻结状态未知'));if(dailyHasLaterDecision(item))decision.append(el('small','daily-review-latest-label','截至报告的最新判断'),dailyDecision(item.latestDecision),el('small','',dailyTime(item.latestDecision.at)));decision.append(dailyEligibility(item));row.append(decision);
+      const funnel=item.funnel||{},progress=cell('开单进度 / 未进入原因');progress.append(badge(...(dailyFunnelNames[funnel.stage]||['流程阶段未知','neutral'])),el('p','',scalar(funnel.explanation,'原因尚未查明。')));row.append(progress);tbody.append(row);
+      const detailRow=el('tr','daily-review-detail-row'),detailCell=el('td');detailCell.colSpan=5;detailRow.id=`dailyReview-detail-${index}`;detailRow.hidden=!open.has(key);if(open.has(key))detailCell.append(dailyReviewDetail(item,report));detailRow.append(detailCell);tbody.append(detailRow);
+      toggle.addEventListener('click',()=>{detailRow.hidden=!detailRow.hidden;toggle.setAttribute('aria-expanded',String(!detailRow.hidden));toggle.textContent=detailRow.hidden?'展开依据 ↓':'收起依据 ↑';if(!detailRow.hidden&&!detailCell.childElementCount)detailCell.append(dailyReviewDetail(item,report));});
+    }
+    text('dailyReview-count',count(page.total));renderPager('dailyReview');const empty=$('dailyReview-empty');empty.hidden=items.length>0;empty.querySelector('h3').textContent=state.resourceErrors.dailyReview&&!state.dailyReviewLoaded?'暂时无法读取每日复盘':!data?'正在读取每日复盘':!report?'暂无这一天的复盘报告':'此筛选范围暂无信号';empty.querySelector('p').textContent=report?'可切换日期或网络查看全名单。未取得的价格不会记作零涨幅。':'每天北京时间 09:00 生成报告；尚无报告时不补造历史结果。';
   }
   const observedPriceSources={chain_pool_sample:'链上池行情',gmgn_token_info_sample:'GMGN 行情',dexscreener_token_pairs_sample:'DexScreener 行情',ave_price_stream_sample:'Ave 行情推送',debot_price_stream_sample:'DeBot 行情推送',debot_token_info_sample:'DeBot 现价'};
   const priceProviderNames={chain_pool:'链上池',dexscreener:'DexScreener',gmgn:'GMGN',ave:'Ave',debot:'DeBot'};

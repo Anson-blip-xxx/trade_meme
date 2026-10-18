@@ -1,5 +1,7 @@
+import {DailyReviewStore} from './daily-review-store.js';
+import {reviewDatabasePath,reviewSamplingPath} from './daily-review.js';
 import {isPersistentOrderPath,type Config} from './config.js';
-import type {Signal} from './types.js';
+import type {Signal,Report} from './types.js';
 import {Store} from './store.js';
 import {OrderStore} from './orders.js';
 import {EntryController} from './entry.js';
@@ -88,6 +90,8 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher}
     providers.walletScreening=(s,r,now)=>walletScreening.assess(s,r,now);
     providers.research=researchProvider(config,client,undefined,{walletTargets:signal=>walletScreening.researchTargets(signal)});
   }
+  const dailyReview=config.dashboard.enabled?new DailyReviewStore(reviewDatabasePath(config.dashboard.archivePath)):undefined;
+  let entryAuditError:string|undefined;
   const exitShadow=config.exitShadow.enabled?new ExitShadow(config.exitShadow.database,config.exitShadow):undefined;
   const walletObserver=walletHistory?new WalletObserver({history:walletHistory,client,config,chains:config.scannerChains,
     intervalMs:config.walletResearch.intervalSec*1000,maxRequestsPerCycle:config.walletResearch.maxRequestsPerCycle}):undefined;
@@ -97,7 +101,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher}
   const sourceEvidence=config.corroboration&&(config.meme?.enabled||config.ave?.enabled)
     ?new SourceCorroboration(config.corroboration.database,{maxBytes:config.corroboration.maxBytes}):undefined;
   let backgroundGmgnAbort:AbortController|undefined;
-  const memeObserver=config.meme?.enabled?new MemeObserver({...config.meme,marketBatch:fetchMemeMarkets,
+  const memeObserver=config.meme?.enabled?new MemeObserver({...config.meme,samplingPlanPath:reviewSamplingPath(config.dashboard.archivePath),marketBatch:fetchMemeMarkets,
     ...(config.gmgnApiKey?.trim()?{marketFallback:async(token:Signal['token'],abort:AbortSignal)=>{
       if(active||scanner.getStatus().inFlight)return;
       backgroundGmgnAbort=new AbortController();
@@ -198,7 +202,8 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher}
   const balances=config.dashboard.enabled?new DashboardBalances(config):undefined;
   const system=config.dashboard.enabled?new SystemMonitor(dirname(config.ordersDatabase)):undefined;
   orders.recover();
-  const entry=new EntryController(config,orders,client,walletScreening?{walletEvidence:(report,now)=>walletScreening.revalidate(report,now)}:{});
+  const entry=new EntryController(config,orders,client,{...(walletScreening?{walletEvidence:(report:Report,now:Date)=>walletScreening.revalidate(report,now)}:{}),
+    onDecision:(report,result,at)=>{try{dailyReview?.recordEntry(report,result,config.entryMode,at);entryAuditError=undefined;}catch{entryAuditError='ENTRY_AUDIT_WRITE_FAILED';}}});
   const reconciler=new OrderReconciler(orders,entry);
   let closed=false,active=0,archiveMaintenanceError:string|undefined;
   const onSignal=async(signal:Signal,firstReceivedAt?:string,context?:{detailsReady:Promise<void>;repeat?:boolean}):Promise<void>=>{
@@ -356,7 +361,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher}
       if(!priceTargetError){subscribedPriceKeys=new Set(targets.map(t=>`${t.chain}:${t.address}`));aveScanner?.setPriceTokens(targets);}
     }catch{priceTargetError='PRICE_STREAM_TARGET_REFRESH_FAILED';}
   };
-  return {client,providers,store,orders,entry,scanner,debotScanner,debotStream,debotAuth,archive,tracking,priceRouter,walletHistory,walletObserver,walletResearchStatus,walletProfiles,walletProfilesStatus,walletScreening,watchRechecker,exitShadow,chainMonitor,chainStreamStatus,memeObserver,sourceEvidence,aveScanner,aveSession,tokenRankResearch,
+  return {client,providers,store,orders,entry,dailyReview,scanner,debotScanner,debotStream,debotAuth,archive,tracking,priceRouter,walletHistory,walletObserver,walletResearchStatus,walletProfiles,walletProfilesStatus,walletScreening,watchRechecker,exitShadow,chainMonitor,chainStreamStatus,memeObserver,sourceEvidence,aveScanner,aveSession,tokenRankResearch,
     dashboardHome:()=>{
       const host=system?.get();
       return {now:new Date().toISOString(),entryMode:config.entryMode,stats:archive?.overviewStats(),
@@ -371,7 +376,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher}
       const page=exitShadow.page(options);
       return {...page,items:page.items.map(item=>({...item,priceRoute:priceRouter.latest(item)})),captureError:exitCaptureError,priceRouter:{...priceRouter.getStatus(),captureError:priceTargetError}};
     },
-    dashboardOverview:()=>({now:new Date().toISOString(),entryMode:config.entryMode,scanner:scanner.getStatus(),
+    dashboardOverview:()=>({entryAuditError,now:new Date().toISOString(),entryMode:config.entryMode,scanner:scanner.getStatus(),
       debotScanner:debotScanner?.getStatus()??{enabled:false,running:false},
       debotStream:debotStream?.getStatus(),
       meme:memeObserver?{...memeObserver.status(),captureError:memeCaptureError}:{enabled:false},
@@ -430,6 +435,6 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher}
       await walletScreening?.close();
       await walletProfiles?.stop();
       await debotScanner?.close();
-      store.close();orders.close();archive?.close();walletHistory?.close();exitShadow?.close();
+      store.close();orders.close();dailyReview?.close();archive?.close();walletHistory?.close();exitShadow?.close();
     }};
 }

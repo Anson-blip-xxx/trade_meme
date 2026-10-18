@@ -1,3 +1,5 @@
+import type {ReviewPageOptions} from './daily-review-store.js';
+import {reviewWindow} from './daily-review.js';
 import {createServer,type IncomingMessage,type ServerResponse} from 'node:http';
 import {randomBytes,createHash,timingSafeEqual} from 'node:crypto';
 import {readFileSync} from 'node:fs';
@@ -42,6 +44,7 @@ export interface DashboardServices {
   home?:()=>unknown;
   orders:(options?:DashboardPageOptions)=>unknown;
   protection?:(options?:DashboardPageOptions)=>unknown;
+  dailyReview?:(options:ReviewPageOptions)=>unknown;
   chainStream?:()=>unknown;
   debotAuth?:Pick<DebotAuthManager,'getStatus'|'sendCode'|'login'>;
   debotSignals?:(options?:DebotSignalListOptions)=>unknown;
@@ -170,6 +173,13 @@ export function buildDashboard(config:Config,services:DashboardServices,assetDir
       if(url.pathname==='/dashboard/api/session') {send(res,200,{authenticated:true,readOnly:true,authentication:proxyAuthenticated(req)?'proxy':'session'});return;}
       if(url.pathname==='/dashboard/api/overview') {send(res,200,services.overview());return;}
       if(url.pathname==='/dashboard/api/home') {send(res,200,services.home?.()??{enabled:false});return;}
+      if(url.pathname==='/dashboard/api/daily-review') {
+        const options={...pageOptions(url),date:url.searchParams.get('date')||undefined,runId:url.searchParams.get('runId')||undefined};
+        if(options.runId&&!/^[a-f0-9]{24}$/.test(options.runId)||url.searchParams.has('sort')&&url.searchParams.get('sort')!=='gain')throw new Error('INVALID_FILTER');
+        try{if(options.date)reviewWindow(options.date);send(res,200,services.dailyReview?.(options)??{enabled:false,dates:[],items:[],total:0,limit:options.limit,offset:options.offset,hasMore:false});}
+        catch(error){if(error instanceof Error&&error.message==='REVIEW_DATE_INVALID')throw new Error('INVALID_FILTER');throw error;}
+        return;
+      }
       if(url.pathname==='/dashboard/api/followup') {send(res,200,services.archive.followupDashboardSummary());return;}
       if(url.pathname==='/dashboard/api/followup/records') {send(res,200,services.archive.followupList(followupOptions(url)));return;}
       if(url.pathname==='/dashboard/api/followup/groups') {send(res,200,services.archive.followupGroups(followupOptions(url)));return;}

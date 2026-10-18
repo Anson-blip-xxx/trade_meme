@@ -1,0 +1,23 @@
+[Unit]
+Description=Daily meme signal missed-opportunity review and research sampling plan
+After=network-online.target meme-signal-gate.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/meme
+ExecStart=/usr/bin/flock -n -E 75 /home/ubuntu/meme/data/daily-review.lock /home/ubuntu/.local/node/bin/node --max-old-space-size=512 --env-file=.env dist/scripts/daily-review.js
+ExecStopPost=/home/ubuntu/.local/node/bin/node --env-file=.env dist/scripts/daily-review-status.js
+SuccessExitStatus=75
+Environment=NODE_ENV=production
+TimeoutStartSec=600
+Nice=10
+CPUQuota=50%
+MemoryMax=1G
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/home/ubuntu/meme/data

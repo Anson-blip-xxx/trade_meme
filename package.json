@@ -3,6 +3,7 @@
   "version": "0.2.0",
   "description": "GMGN meme signals, wallet attribution research and guarded opening orders",
   "scripts": {
+    "daily-review": "node --env-file-if-exists=.env --import tsx scripts/daily-review.ts",
     "strategy-audit": "node --env-file-if-exists=.env --import tsx scripts/strategy-audit.ts",
     "dev": "node --env-file-if-exists=.env --import tsx src/server.ts",
     "analyze": "node --env-file-if-exists=.env --import tsx src/cli.ts",

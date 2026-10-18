@@ -1,3 +1,4 @@
+import {normalizeDebotPerformance,type VendorSignalPerformance} from './vendor-performance.js';
 import {createHash,randomUUID} from 'node:crypto';
 import bs58 from 'bs58';
 import type {Fetcher} from '../http.js';
@@ -20,6 +21,7 @@ export interface DebotSignalObservation {
   /** Vendor-reported entries, not independently verified buyers or wallet ownership. */
   walletCount:number;addressCount:number;aliases:string[];
   alertPriceUsd?:number;averageWalletVolumeUsd?:number;
+  vendorPerformance?:VendorSignalPerformance;
   /** Vendor observations for later matching; absence of a transaction means no verified buy evidence. */
   vendorWallets?:DebotVendorWalletSnapshot[];
 }
@@ -138,12 +140,21 @@ export function normalizeDebotSignals(payload:unknown,chain:Chain,observedAt:Dat
     }
     const alertPriceUsd=object(row.token_trading_stat)?positive(row.token_trading_stat.price):undefined;
     const averageWalletVolumeUsd=positive(row.avg_wallet_volume);
+    // Supplier performance is a separate retrospective observation, not part of signal identity.
+    const stats=object(meta?.signals)?meta.signals:undefined;
+    const matching=[...keys].flatMap(key=>stats&&Object.hasOwn(stats,key)?[stats[key]]:[]);
+    const performances=matching.flatMap(value=>{
+      if(!object(value)||value.chain!==undefined&&value.chain!==chain||value.address!==undefined&&address(value.address,chain)!==token)return [];
+      const parsed=normalizeDebotPerformance(value,observedAt);return parsed?[parsed]:[];
+    });
+    const vendorPerformance=performances.length===matching.length&&performances.length&&
+      performances.every(value=>JSON.stringify(value)===JSON.stringify(performances[0]))?performances[0]:undefined;
     result.observations.push({id:row.id,signal,observedAt:observedAt.toISOString(),walletCount,
       ...(name?{name}:{}),...(symbol?{symbol}:{}),
       addressCount:addresses.size,aliases:[...aliases],
       ...(vendorWallets.length?{vendorWallets}:{}),
       ...(alertPriceUsd!==undefined?{alertPriceUsd}:{}),
-      ...(averageWalletVolumeUsd!==undefined?{averageWalletVolumeUsd}:{})});
+      ...(averageWalletVolumeUsd!==undefined?{averageWalletVolumeUsd}:{}),...(vendorPerformance?{vendorPerformance}:{})});
   }
   result.rejected+=Math.max(0,rows.length-PAGE_SIZE);
   if(result.rejected)result.reason='DEBOT_SIGNAL_RECORDS_REJECTED';

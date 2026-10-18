@@ -155,13 +155,15 @@ export class EntryController {
   private readonly fetcher: typeof fetch;
   private readonly now: () => Date;
   private readonly liveProtection?: LiveProtectionProvider;
+  private readonly onDecision?: (report:Report,result:EntryResult,at:string)=>void;
   private readonly walletEvidence?: (report:Report,now:Date)=>Check;
   constructor(private readonly config: Config, private readonly orders: OrderStore,
     private readonly client: GmgnClient, options: {fetcher?: typeof fetch; now?: () => Date;
-      liveProtection?: LiveProtectionProvider;walletEvidence?:(report:Report,now:Date)=>Check} = {}) {
+      liveProtection?: LiveProtectionProvider;walletEvidence?:(report:Report,now:Date)=>Check;onDecision?:(report:Report,result:EntryResult,at:string)=>void} = {}) {
     this.fetcher = options.fetcher ?? fetch;
     this.now = options.now ?? (() => new Date());
     this.liveProtection = options.liveProtection;
+    this.onDecision = options.onDecision;
     this.walletEvidence = options.walletEvidence;
   }
 
@@ -184,6 +186,13 @@ export class EntryController {
   }
 
   async consider(input: Report): Promise<EntryResult> {
+    const result=await this.considerInternal(input);
+    // The optional audit sink is independent of execution; it never sees signing material.
+    try {this.onDecision?.(input,result,this.now().toISOString());}catch {/* Runtime records audit health separately. */}
+    return result;
+  }
+
+  private async considerInternal(input: Report): Promise<EntryResult> {
     if (this.config.entryMode === 'off') return {status: 'skipped', reason: 'ENTRY_DISABLED'};
     let report: Report;
     try { report = structuredClone(input); report.signal = parseSignal(report.signal); }

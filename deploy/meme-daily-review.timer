@@ -1,0 +1,12 @@
+[Unit]
+Description=Review previous meme signal day at 09:00 Asia/Shanghai
+
+[Timer]
+OnCalendar=*-*-* 09:00:00 Asia/Shanghai
+Persistent=true
+AccuracySec=1s
+RandomizedDelaySec=0
+Unit=meme-daily-review.service
+
+[Install]
+WantedBy=timers.target

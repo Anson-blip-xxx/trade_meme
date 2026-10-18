@@ -130,6 +130,43 @@ test('共同资金来源排除公共服务/冲突，协同行为至少双方各�
   } finally {history.close();}
 });
 
+test('coordination funding checks use covering scalar indexes and dirty queue selection does not sort all wallets',()=>{
+  const {history}=fixture(),db=(history as unknown as {db:DatabaseSync}).db;
+  const original=db.prepare.bind(db),captured:string[]=[];
+  try {
+    history.captureAnalysis(token,analysis([wallet(1),wallet(2)]),{source:'gmgn_analysis',observedAt:iso(100)});
+    db.prepare=((sql:string)=>{if(sql.includes('FROM wh_funding a')||sql.includes('INDEXED BY wh_metrics_coord_queue'))captured.push(sql);return original(sql);}) as typeof db.prepare;
+    history.refreshCoordination(1);db.prepare=original;
+    const funding=captured.find(sql=>sql.includes('FROM wh_funding a'))!;
+    const plan=db.prepare('EXPLAIN QUERY PLAN '+funding).all('bsc',address(1)).map(row=>String(row.detail));
+    assert.equal(plan.filter(detail=>/^SEARCH [absx] /.test(detail)).length,5);
+    assert.ok(plan.filter(detail=>/^SEARCH [absx] /.test(detail)).every(detail=>detail.includes('USING COVERING INDEX wh_funding_coord_')));
+    const queue=captured.find(sql=>sql.includes('INDEXED BY wh_metrics_coord_queue'))!;
+    const queuePlan=db.prepare('EXPLAIN QUERY PLAN '+queue).all(1).map(row=>String(row.detail));
+    assert.ok(queuePlan.some(detail=>detail.includes('USING COVERING INDEX wh_metrics_coord_queue')));
+    assert.ok(queuePlan.every(detail=>!detail.includes('TEMP B-TREE')));
+    assert.equal(history.getWallet('bsc',address(1))!.wallet.coordination.sharedFundingPeers,1);
+  }finally{db.prepare=original;history.close();}
+});
+
+test('stream wallet targets preserve relationship priority and recent fallback through covering ordered indexes',()=>{
+  const {history}=fixture(),db=(history as unknown as {db:DatabaseSync}).db;
+  const original=db.prepare.bind(db),captured:string[]=[];
+  try {
+    history.captureAnalysis(token,analysis([wallet(1),wallet(2)]),{source:'gmgn_analysis',observedAt:iso(100)});
+    db.prepare=((sql:string)=>{if(sql.includes('INDEXED BY wh_stream_'))captured.push(sql);return original(sql);}) as typeof db.prepare;
+    assert.deepEqual(new Set(history.streamWalletTargets('bsc',2)),new Set([address(1),address(2)]));db.prepare=original;
+    assert.equal(captured.length,2);
+    for(const sql of captured){const plan=db.prepare('EXPLAIN QUERY PLAN '+sql).all('bsc',2).map(row=>String(row.detail));
+      assert.ok(plan.some(detail=>detail.includes('USING COVERING INDEX wh_stream_')));
+      assert.ok(plan.every(detail=>!detail.includes('TEMP B-TREE')));
+    }
+    db.prepare(`INSERT INTO wh_assoc_relations(chain,leader,candidate,first_at,updated_at,token_count,forward_count,funding_count,dirty,data,funding_data)
+      VALUES('bsc',?,?,?, ?,5,1,0,0,'{}','[]')`).run(address(3),address(4),iso(1),iso(2));
+    assert.deepEqual(history.streamWalletTargets('bsc',2),[address(4),address(3)]);
+  }finally{db.prepare=original;history.close();}
+});
+
 test('晚导入旧正常资金快照不能覆盖更晚时点的冲突证据',()=>{
   const {history}=fixture();
   try {

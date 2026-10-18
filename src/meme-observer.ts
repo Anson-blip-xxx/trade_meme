@@ -25,6 +25,8 @@ export interface MemeObserverOptions {
   cooldownUntil?:()=>number;
   corroboration?:(token:Token,now:Date)=>SourceCorroborationAssessment;
   samplingPlanPath?:string;
+  /** A validated newly committed sample, for passive research reuse only. */
+  onMarketSample?:(sample:MemeMarketSample)=>void;
 }
 const hash=(v:unknown)=>createHash('sha256').update(JSON.stringify(v)).digest('hex');
 const parse=<T>(v:unknown):T|undefined=>{try{return v?JSON.parse(String(v)) as T:undefined;}catch{return;}};
@@ -51,6 +53,7 @@ export class MemeObserver {
   private timer?:ReturnType<typeof setTimeout>;private socialTimer?:ReturnType<typeof setTimeout>;
   private marketAbort?:AbortController;private socialAbort?:AbortController;
   private lastCycleAt?:string;private error?:string;private catalystError?:string;private nextPrune=0;private dexCooldown=0;
+  private marketSampleCallbackError?:string;
   private storagePressure=false;private usedBytes=0;private storageCheckedAt?:string;private reclaimedSnapshots=0;
   constructor(private readonly options:MemeObserverOptions){
     this.now=options.now??(()=>new Date());this.maxActive=options.maxActive??180;this.windowMs=(options.activeWindowSec??7200)*1000;
@@ -201,8 +204,13 @@ export class MemeObserver {
         .run(token.chain,token.address,sample.observedAt,sample.source,fingerprint,JSON.stringify(sample),JSON.stringify(assessment),corroboration?JSON.stringify(corroboration):null);
       this.db.prepare('UPDATE meme_tokens SET market=?,assessment=?,last_sample_at=?,sample_count=sample_count+1,error=NULL WHERE chain=? AND address=?')
         .run(JSON.stringify(sample),JSON.stringify(assessment),sample.observedAt,token.chain,token.address);
-      this.db.exec('RELEASE meme_market');return true;
+      this.db.exec('RELEASE meme_market');
     }catch(error){this.db.exec('ROLLBACK TO meme_market; RELEASE meme_market');throw error;}
+    // The subscriber runs after commit and cannot roll back or poison the
+    // observer. Clone so subscriber mutation cannot alter the accepted sample.
+    try {this.options.onMarketSample?.(structuredClone(sample));this.marketSampleCallbackError=undefined;}
+    catch {this.marketSampleCallbackError='MEME_MARKET_SAMPLE_CALLBACK_FAILED';}
+    return true;
   }
   recordCatalyst(snapshot:MemeCatalystSnapshot):void {
     if(this.closed||this.storagePressure)return;
@@ -290,6 +298,7 @@ export class MemeObserver {
       catalystMinRetrySec:600,catalystQueueIntervalSec:15,
       maxActive:this.maxActive,activeWindowSec:this.windowMs/1000,intervalSec:5,targetSampleIntervalSec:30,
       lastCycleAt:this.lastCycleAt,error:this.catalystError??this.error,marketInFlight:!!this.marketWork,catalystInFlight:!!this.catalystWork,
+      marketSampleCallbackError:this.marketSampleCallbackError,
       storage:{maxBytes:this.maxBytes,usedBytes:this.usedBytes,checkedAt:this.storageCheckedAt,pressure:this.storagePressure,reclaimedSnapshots:this.reclaimedSnapshots},
       experimental:true,tradingEnabled:false,retentionDays:30,maxSnapshots:250000,learningScope:'frozen_features_and_subsequent_sampled_returns'};
   }

@@ -42,6 +42,8 @@ export interface Config extends z.infer<typeof schema> {
   entryWallets:Partial<Record<Chain,string>>; entryAmounts:Partial<Record<Chain,string>>;
   entryInputTokens:Partial<Record<Chain,string>>;
   entryFeeReserves:Record<Chain,string>;
+  /** Optional per-chain native available-balance fraction, in basis points. Overrides fixed caps. */
+  entryBalanceBps?:Partial<Record<Chain,number>>;
   exitPolicy?:ExitPolicy;
   dashboard:{enabled:boolean;host:string;port:number;token?:string;origin?:string;archivePath:string;retentionDays:number;trackingHours:number;sampleIntervalSec:number};
   walletResearch:{enabled:boolean;database:string;maxBytes:number;intervalSec:number;maxRequestsPerCycle:number};
@@ -65,6 +67,11 @@ export function readConfig(env:NodeJS.ProcessEnv=process.env): Config {
     const value=raw??fallback;
     if(!/^(0|[1-9]\d{0,77})$/.test(value)||BigInt(value)>max) throw new Error('ENTRY_FEE_RESERVE_INVALID');
     return value;
+  };
+  const balanceBps=(raw:string|undefined):number|undefined=>{
+    if(raw===undefined)return undefined;
+    if(!/^[1-9]\d{0,4}$/.test(raw)||Number(raw)>10000)throw new Error('ENTRY_BALANCE_BPS_INVALID');
+    return Number(raw);
   };
   let exitPolicy:ExitPolicy|undefined;
   if(env.EXIT_POLICY_PATH?.trim()) {
@@ -119,6 +126,7 @@ export function readConfig(env:NodeJS.ProcessEnv=process.env): Config {
     debotLoginEmail:env.DEBOT_LOGIN_EMAIL?.trim()?z.string().trim().email().max(254).parse(env.DEBOT_LOGIN_EMAIL):undefined,
     entryWallets:{bsc:env.ENTRY_WALLET_BSC,solana:env.ENTRY_WALLET_SOLANA,robinhood:env.ENTRY_WALLET_ROBINHOOD},
     entryAmounts:{bsc:env.ENTRY_AMOUNT_BSC,solana:env.ENTRY_AMOUNT_SOLANA,robinhood:env.ENTRY_AMOUNT_ROBINHOOD},
+    entryBalanceBps:{bsc:balanceBps(env.ENTRY_BALANCE_BPS_BSC),solana:balanceBps(env.ENTRY_BALANCE_BPS_SOLANA),robinhood:balanceBps(env.ENTRY_BALANCE_BPS_ROBINHOOD)},
     entryInputTokens:{bsc:env.ENTRY_INPUT_TOKEN_BSC,solana:env.ENTRY_INPUT_TOKEN_SOLANA,robinhood:env.ENTRY_INPUT_TOKEN_ROBINHOOD},
     entryFeeReserves:{bsc:reserve(env.ENTRY_FEE_RESERVE_BSC,'5000000000000000',(1n<<256n)-1n),
       solana:reserve(env.ENTRY_FEE_RESERVE_SOLANA,'20000000',(1n<<64n)-1n),

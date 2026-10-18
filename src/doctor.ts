@@ -81,11 +81,13 @@ export async function runDoctor(config:Config,options:{live?:boolean;fetcher?:Fe
   add('exits','warn',config.exitPolicy
     ?'已配置剩余持仓止盈止损：+500%卖20%、+1000%卖10%、-40%卖100%。实际买单需附挂GMGN条件单；网页预设无公开自动继承保证。子单活跃状态尚待真实响应核对，未验证保护时暂停新买入。'
     :'未配置退出策略；现有开单不会主动附挂止盈止损。');
-  const entryMissing=CHAINS.filter(chain=>!config.entryWallets[chain]?.trim()||!config.entryInputTokens[chain]?.trim()||!config.entryAmounts[chain]?.trim());
+  const entryMissing=CHAINS.filter(chain=>!config.entryWallets[chain]?.trim()||!config.entryInputTokens[chain]?.trim()||(config.entryBalanceBps?.[chain]===undefined&&!config.entryAmounts[chain]?.trim()));
   add('entry.configuration',entryMissing.length?'warn':'pass',entryMissing.length
     ?`以下链尚未配置完整的下单钱包、输入币和金额：${entryMissing.join('、')}；不会自动决定单笔金额。`
     :'各链已填写下单钱包、输入币和金额；仍需实际验证账户权限、报价和成交。');
-  add('entry.sizing','pass',config.entrySizing==='balance_cap'
+  add('entry.sizing','pass',CHAINS.some(chain=>config.entryBalanceBps?.[chain]!==undefined)
+    ?`按链余额比例：${CHAINS.filter(chain=>config.entryBalanceBps?.[chain]!==undefined).map(chain=>`${chain} ${(config.entryBalanceBps![chain]!/100).toFixed(2)}%`).join('、')}；先扣手续费缓冲和未结算订单占用，再向下取整；提交前重新核验比例上限。其他链保持原金额规则。`
+    :config.entrySizing==='balance_cap'
     ?'按原生币余额与单笔本金上限动态计算金额，并扣除费用缓冲及尚未覆盖的订单占用；余额未知时不买入。'
     :'当前使用固定输入金额；未启用余额上限动态计算。');
   add('gmgn',gmgnReady?'pass':'warn',gmgnReady

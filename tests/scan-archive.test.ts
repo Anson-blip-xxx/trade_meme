@@ -37,6 +37,34 @@ function fixture() {
   return {archive,price,setNow:(at:number)=>{elapsed=at;},now:()=>new Date(start+elapsed)};
 }
 
+test('passive follow-up entry reuses prices without changing eligible scan performance or candidate selection',()=>{
+  let elapsed=1000;const archive=new ScanArchive(':memory:',{followupEnabled:true,now:()=>new Date(start+elapsed)});
+  const tokenAddress=(n:number)=>'0x'+n.toString(16).padStart(40,'0');
+  const make=(n:number,id:string,candidate=false)=>{
+    const row=stored(id,{decision:candidate?'BUY_CANDIDATE':'WATCH',buyEligible:candidate,gmgn:undefined});
+    row.signal.token.address=tokenAddress(n);row.report!.signal=row.signal;return row;
+  };
+  try {
+    for(let n=1;n<=4;n++)archive.capture(make(n,'passive-'+n));
+    const target={chain:'bsc' as const,address:tokenAddress(4)};
+    assert.equal(archive.followupDetail(target)!.selected,false);
+    elapsed=1200;archive.capture(make(4,'later-candidate',true));
+    const before=archive.get('later-candidate')!.performance;
+    elapsed=2000;archive.recordFollowupPrice({...target,observedAt:iso(elapsed),priceUsd:10,
+      source:'dexscreener_token_pairs_sample',market:{poolAddress:tokenAddress(90)}});
+    elapsed=32000;archive.recordFollowupPrice({...target,observedAt:iso(elapsed),priceUsd:20,
+      source:'dexscreener_token_pairs_sample',market:{poolAddress:tokenAddress(90)}});
+    assert.equal(archive.followupDetail(target)!.performance.samples,2);
+    assert.equal(archive.followupDetail(target)!.selected,false);
+    assert.equal(archive.followupDetail(target)!.initial.decision,'WATCH');
+    assert.deepEqual(archive.get('later-candidate')!.performance,before);
+    assert.equal(archive.get('later-candidate')!.performance!.baselineAt,undefined);
+    archive.recordFollowupPrice({...target,address:tokenAddress(99),observedAt:iso(elapsed),priceUsd:20,
+      source:'dexscreener_token_pairs_sample',market:{poolAddress:tokenAddress(90)}});
+    assert.equal(archive.followupDetail({...target,address:tokenAddress(99)}),undefined);
+  }finally{archive.close();}
+});
+
 test('dashboard scan projection preserves visible metrics but loads narrative and evidence only on detail',()=>{
   const {archive,price}=fixture();try {
     const row=stored();row.report!.narrative.supplier!.text='A'.repeat(2000);archive.capture(row);

@@ -6,6 +6,7 @@ import {fetchDebotSignalPage} from '../src/providers/debot-signals.js';
 import {fetchAveSignalPage} from '../src/providers/ave-signals.js';
 import {DebotSessionClient} from '../src/providers/debot-session.js';
 import {AveSessionClient} from '../src/providers/ave-session.js';
+import {readExitQualityReview} from '../src/exit-quality.js';
 
 const args=process.argv.slice(2),dateIndex=args.indexOf('--date');
 for(let i=0;i<args.length;i++){if(args[i]==='--date'){if(i!==dateIndex||!args[i+1])throw new Error('DAILY_REVIEW_ARGUMENT_INVALID');reviewWindow(args[++i]);}
@@ -31,6 +32,16 @@ try {
     }
   }
   const now=new Date(),asOf=now.toISOString(),today=reviewWindow(shanghaiDate(now));
+  if(config.exitShadow.enabled&&!store.hasExitQuality(shanghaiDate(now))){
+    try{
+      const quality=readExitQualityReview(config.exitShadow.database,{asOf,sinceAt:new Date(now.getTime()-7*86400_000).toISOString()});
+      store.saveExitQuality(quality);
+      console.log(JSON.stringify({exitQuality:{asOf,reviewed:quality.reviewed,total:quality.total,summary:quality.summary}}));
+    }catch{
+      // This independent audit must not prevent signal review or coverage planning.
+      store.exitQualityFailure(asOf);console.error('EXIT_QUALITY_REVIEW_FAILED');process.exitCode=1;
+    }
+  }
   const dates=dateIndex>=0?[args[dateIndex+1]]:[1,2,3].map(days=>shanghaiDate(new Date(Date.parse(today.start)-days*86400_000)));
   for(const [index,date] of dates.entries()){
     const id=reviewRunId(date,asOf);

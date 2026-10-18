@@ -89,6 +89,95 @@ test('registers capacity skips permanently and reserves three WATCH and three RE
     followup.price(price(4,1000,10),date(1000));assert.equal(detail(4).performance.samples,0);
   }finally{db.close();}
 });
+test('passive same-pool prices cover skipped registrations without changing scheduling or frozen features',()=>{
+  const {db,followup,capture,detail}=setup();try {
+    for(let n=1;n<=4;n++)capture(n);
+    const original=structuredClone(detail(4)),pool={poolAddress:address(90),liquidityUsd:5000};
+    followup.passivePrice(price(1,1000,10,{market:pool}),date(1000));
+    assert.equal(detail(1).performance.samples,0,'passive callbacks do not alter a scheduled route');
+    followup.passivePrice(price(4,1000,10,{market:pool}),date(1000));
+    followup.price(price(4,3600000,20,{market:pool}),date(3600000));
+    const row=detail(4);assert.deepEqual(row.initial,original.initial);assert.equal(row.selected,false);
+    assert.equal(row.selection,'capacity_skipped');assert.equal(row.performance.collection,'passive_same_pool');
+    assert.equal(row.performance.passiveSamples,2);assert.equal(row.horizons['3600'].gainPct,100);
+    assert.equal(followup.pending(date(3600000),100).length,3);
+    assert.equal(followup.observationStart(price(4,0,1),date(3600000)),undefined);
+    assert.equal(followup.evidenceWindow(price(4,3630000,20,{market:pool}),iso(3630000)),undefined);
+    const summary=followup.summary(date(4200000));
+    assert.deepEqual([summary.total,summary.scheduled,summary.passivelySampled,summary.observed,summary.missing],[4,3,1,1,3]);
+    const h=summary.groups[0].horizons[0];assert.deepEqual([h.count,h.mature,h.covered,h.missing],[4,4,1,3]);
+    assert.equal(summary.groups[0].passivelySampled,1);
+    followup.refresh(date(4200000));const saved=JSON.parse(String(db.prepare("SELECT value FROM signal_followup_meta WHERE key='last_review'").get()!.value));
+    assert.equal(saved.passivelySampled,1);assert.equal(saved.missing,3);
+  }finally{db.close();}
+});
+test('passive reuse rejects wrong or missing pools, future/stale/history prices, replay, and late baselines',()=>{
+  const {db,followup,capture,detail}=setup();try {
+    for(let n=1;n<=5;n++)capture(n);
+    const pool={poolAddress:address(90)};
+    for(const p of [price(4,0,1,{market:pool}),price(4,1000,1),price(4,1000,1,{market:{poolAddress:'bad'}}),
+      price(4,2001,1,{market:pool}),price(4,1000,1,{market:pool,source:'ath_price'}),
+      price(4,1000,0,{market:pool}),price(4,1000,1,{market:pool,chain:'robinhood'})])followup.passivePrice(p,date(2000));
+    followup.passivePrice(price(4,1000,1,{market:pool}),date(122000));assert.equal(detail(4).performance.samples,0);
+    followup.passivePrice(price(4,1000,10,{market:pool}),date(1000));
+    followup.passivePrice(price(4,1000,99,{market:pool}),date(1000));
+    followup.passivePrice(price(4,30000,99,{market:pool}),date(30000));
+    followup.passivePrice(price(4,31000,99,{market:{poolAddress:address(91)}}),date(31000));
+    followup.passivePrice(price(4,32000,99),date(32000));assert.equal(detail(4).performance.samples,1);
+    followup.passivePrice(price(4,33000,20,{market:pool,source:'dexscreener_token_pairs_sample'}),date(33000));
+    assert.equal(detail(4).performance.currentGainPct,100);assert.equal(detail(4).performance.baselinePriceUsd,10);
+    followup.passivePrice(price(5,600001,10,{market:pool}),date(600001));
+    followup.passivePrice(price(5,3600000,20,{market:pool}),date(3600000));
+    assert.equal(detail(5).performance.baselineDelayed,true);assert.deepEqual(detail(5).horizons,{});
+    followup.passivePrice(price(4,87000001,900,{market:pool}),date(87000001));
+    assert.equal(detail(4,87000001).performance.status,'ended');assert.equal(detail(4).performance.samples,2);
+    followup.passivePrice(price(99,1000,10,{market:pool}),date(1000));assert.equal(detail(99),undefined);
+  }finally{db.close();}
+});
+test('a previously unknown passive pool cannot be retroactively asserted',()=>{
+  const {db,followup,capture,detail}=setup();try {
+    for(let n=1;n<=4;n++)capture(n);
+    const row=detail(4);row.performance={...row.performance,samples:1,baselineAt:iso(1000),baselinePriceUsd:10,
+      latestAt:iso(1000),latestPriceUsd:10,points:[{at:iso(1000),priceUsd:10}]};
+    db.prepare('UPDATE signal_followups SET record=? WHERE address=?').run(JSON.stringify(row),address(4));
+    followup.passivePrice(price(4,33000,100,{market:{poolAddress:address(90)}}),date(33000));
+    assert.equal(detail(4).performance.samples,1);assert.equal(detail(4).performance.baselineMarket,undefined);
+  }finally{db.close();}
+});
+test('passive outcomes participate in chronological learning while unobserved controls stay in the denominator',()=>{
+  const {db,followup,capture}=setup();try {
+    for(let n=1;n<=3;n++)capture(n);
+    const pool={poolAddress:address(90)};
+    for(let n=4;n<=163;n++){
+      const at=n*120000,f=fixture(n,{},at);f.record.wallets!.summary.qualifiedSmartFundingClusterCount=n%2?2:1;
+      followup.capture(f.report,f.record,date(at));
+      followup.passivePrice(price(n,at+1000,10,{market:pool}),date(at+1000));
+      followup.passivePrice(price(n,at+3600000,n%2?20:5,{market:pool}),date(at+3600000));
+    }
+    const summary=followup.summary(date(30000000)),learning=summary.learning.find(r=>r.feature==='two_wallet_groups'&&r.seconds===3600)!;
+    assert.equal(summary.scheduled,3);assert.equal(summary.passivelySampled,160);assert.equal(summary.missing,3);
+    assert.equal(summary.groups[0].horizons[0].mature,163);assert.equal(summary.groups[0].horizons[0].missing,3);
+    assert.equal(learning.status,'consistent_association');assert.ok(learning.train.present.covered>=20);
+    assert.ok(learning.validation.absent.covered>=20);assert.ok(learning.purgedTrainingCount>0);
+    assert.equal(learning.train.medianDifferencePct,150);assert.equal(learning.train.absent.missing,3);
+    const past=followup.summary(date(50000));assert.equal(past.total,3);assert.equal(past.observed,0);
+    assert.ok(past.learning.every(l=>l.train.covered===0&&l.validation.covered===0));
+  }finally{db.close();}
+});
+test('as-of aggregates cannot observe a later passive horizon or registration',()=>{
+  const {db,followup,capture}=setup();try {
+    for(let n=1;n<=4;n++)capture(n);
+    const pool={poolAddress:address(90)};
+    followup.passivePrice(price(4,1000,10,{market:pool}),date(1000));
+    followup.passivePrice(price(4,3600000,20,{market:pool}),date(3600000));
+    capture(5,{},5000000);
+    const past=followup.summary(date(2000));assert.equal(past.total,4);assert.equal(past.observed,1);
+    assert.equal(past.lastSampleAt,iso(1000));assert.equal(past.groups[0].horizons[0].covered,0);
+    assert.equal(past.groups[0].horizons[0].mature,0);
+    const later=followup.summary(date(4200000));assert.equal(later.total,4);
+    assert.equal(later.groups[0].horizons[0].covered,1);assert.equal(later.groups[0].horizons[0].missing,3);
+  }finally{db.close();}
+});
 test('only complete recent live reports with matching identity register; no old report backfill',()=>{
   const {db,followup}=setup();try {
     for(const patch of [{mode:'demo' as const},{evaluatedAt:iso(1000)},{evaluatedAt:'bad'}]) {

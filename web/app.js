@@ -183,6 +183,7 @@
     GMGN_FEED_SCHEMA_INVALID: 'GMGN 信号响应格式异常',
     GMGN_FEED_CHAIN_MISMATCH: '信号网络与请求的网络不匹配',
     ENTRY_INSUFFICIENT_BALANCE: '可用余额不足',
+    ENTRY_BALANCE_FRACTION_EXCEEDED: '余额变化后，原报价超过当前可用余额的比例上限',
     ENTRY_BALANCE_STALE: '余额查询结果已过期',
     EXIT_PROTECTION_UNVERIFIED: '退出保护尚未验证',
     ASSET_ALREADY_OPEN: '同一资产已有占用仓位',
@@ -1507,6 +1508,7 @@
   }
   function renderDailyReview() {
     const data=state.dailyReview,page=state.listPages.dailyReview,report=data?.report,items=Array.isArray(data?.items)?data.items.slice(0,PAGE_SIZE):[],schedule=data?.schedule,generationError=data?.status?.last_error||data?.status?.lastError,incomplete=report?.datasetComplete===false;
+    renderExitQualityReview(data?.exitQuality,data?.status?.exit_quality_error);
     const status=$('dailyReview-status');status.className=`badge ${state.resourceErrors.dailyReview||generationError||incomplete?'watch':'neutral'}`;status.textContent=state.resourceErrors.dailyReview?'读取异常':generationError?'报告生成需关注':data?.enabled===false?'每日复盘未启用':incomplete?'报告覆盖不完整':report?'报告已生成':data?'等待首份报告':'正在读取';
     const scheduleNode=$('dailyReview-schedule');scheduleNode.replaceChildren(el('strong','','每天北京时间 09:00'),el('span','',`下次生成 ${dailyTime(schedule?.nextRunAt)}（北京时间）`));
     if(schedule?.timezone&&schedule.timezone!=='Asia/Shanghai')scheduleNode.append(el('span','',`服务端时区 ${scalar(schedule.timezone)} · 需核对计划`));
@@ -1677,6 +1679,37 @@
     }
     return node;
   }
+  const exitQualityStates={open:'尚未清仓',return_unavailable:'退出记录不可核算',not_due:'尚未到观察时点',awaiting_sample:'等待窗口内报价',missing_price:'缺少窗口内报价',provenance_unknown:'历史池信息缺失',provenance_mismatch:'来源或池不一致',sample_limit:'样本容量截断',invalid_sample:'样本校验未通过'};
+  function protectionQualityDetail(quality) {
+    const node=el('section','protection-return-detail exit-quality-detail');node.append(el('h4','','退出质量 · 后续验证'));
+    if(!quality||quality.mode!=='shadow'||quality.execution!=='observation_only'){node.append(el('p','','尚未取得退出质量数据。'));return node;}
+    const peak=quality.equityPeak||{};
+    node.append(kv('策略版本',quality.policyVersion),kv('退出前采样权益峰值',peak.status==='valid'?percent(peak.gainPct):'未知 · 历史样本或同池依据不足'),kv('峰值至清仓收益回吐',peak.status==='valid'?`${count(peak.givebackPct)} 个百分点`:'—'));
+    node.append(el('p','detail-small','权益按已卖出的收益与剩余仓位加权；采样峰值不代表市场真实最高点。清仓后的对照只使用目标时点后 2 分钟内首个同源同池报价。'));
+    const grid=el('div','exit-quality-grid');
+    for(const row of Array.isArray(quality.afterExit)?quality.afterExit:[]){
+      const card=el('div','exit-quality-metric');card.append(el('strong','',`清仓后 ${row.minutes} 分钟`));
+      if(row.status==='valid')card.append(el('span','',`币价变化 ${percent(row.tokenMovePct)}`),el('span','',`若多持有最后一批：初始本金收益差 ${finite(row.impactOnInitialPrincipalPct)?`${row.impactOnInitialPrincipalPct>=0?'+':''}${count(row.impactOnInitialPrincipalPct)} 个百分点`:'—'}`),el('small','',`样本 ${date(row.sampleAt,true)}`));
+      else card.append(el('span','',exitQualityStates[row.status]||'未知'));grid.append(card);
+    }
+    node.append(grid,el('p','detail-small','后续收益差为正，表示这次退出后仍有上涨；为负，表示这次退出避开了后续下跌。仅模拟价格对照，未扣费用滑点，不据单笔结果修改规则。'));return node;
+  }
+  function exitQualitySummary(summary) {
+    const node=el('div','exit-quality-summary'),final=summary?.finalReturn||{},giveback=summary?.equityGiveback||{};
+    node.append(kv('可核算已清仓样本 / 其中盈利',`${count(final.denominator)} / ${count(final.profitable)}`),kv('等权平均模拟毛收益',percent(final.meanGainPct)),kv('平均权益回吐',finite(giveback.meanGivebackPct)?`${count(giveback.meanGivebackPct)} 个百分点`:'未知'),kv('权益回吐样本 · 有效 / 未知',`${count(giveback.denominator)} / ${count(giveback.unknown)}`));
+    for(const row of Array.isArray(summary?.afterExit)?summary.afterExit:[]){const line=el('div','exit-quality-comparison');line.append(el('strong','',`${row.minutes} 分钟对照 · ${count(row.denominator)} 个有效样本`),el('span','',`退出后上涨 ${count(row.continuedUp)} · 避开下跌 ${count(row.avoidedDrawdown)} · 持平 ${count(row.flat)}`));
+      const unknown=Object.entries(row.statuses||{}).filter(([key,value])=>key!=='valid'&&value>0).map(([key,value])=>`${exitQualityStates[key]||'未知'} ${count(value)}`);if(unknown.length)line.append(el('small','',unknown.join(' · ')));node.append(line);}
+    return node;
+  }
+  function renderExitQualityReview(review,error) {
+    const panel=$('dailyReview-exit-panel'),node=$('dailyReview-exit-quality');panel.hidden=!review&&!error;node.replaceChildren();
+    if(error)node.append(el('p','notice warning','最近一次退出质量复盘失败；保留已有快照，信号日报独立继续生成。'));if(!review)return;
+    node.append(el('p','',`最近 7 日清仓观察：${dailyTime(review.sinceAt)} 至 ${dailyTime(review.asOf)}。覆盖全部链，独立于上方信号日期和网络筛选；每天 09:00 留存一次。`));
+    if(review.historyComplete===false||review.truncated)node.append(el('p','notice warning',`历史留存不完整或达到读取上限；本次覆盖 ${count(review.reviewed)} / ${count(review.total)} 个留存清仓对象，不能代表全部持仓表现。`));
+    node.append(exitQualitySummary(review.summary),el('p','detail-small','按每个影子仓等权计算，未扣费用与滑点，不能视为账户总收益。按清仓时策略版本分组，包含迁移仓，不是完整版本回测；尚未用于自动修改交易参数。'));
+    for(const policy of Array.isArray(review.byPolicy)?review.byPolicy:[]){const fold=el('details','exit-quality-policy');fold.append(el('summary','',`策略 ${scalar(policy.policyVersion)} · ${count(policy.summary?.positions)} 个样本`),exitQualitySummary(policy.summary));node.append(fold);}
+    const cases=Array.isArray(review.cases)?review.cases.slice(0,10):[];if(cases.length){const fold=el('details','exit-quality-policy');fold.append(el('summary','',`查看退出对照案例（${cases.length} 个）`));for(const item of cases){const entry=el('details','exit-quality-case');entry.append(el('summary','',`${chainName(item.chain)} · ${scalar(item.symbol,'未命名代币')} · 最终 ${percent(item.quality?.finalGainPct)}`),addressNode(item.address),gmgnTokenLink(item.chain,item.address),protectionQualityDetail(item.quality));fold.append(entry);}node.append(fold);}
+  }
   function protectionEvent(event) {
     const row = el('li', 'protection-event'); const head = el('div', 'protection-event-heading');
     head.append(el('strong', '', protectionEventNames[event.kind] || scalar(event.kind, '观察事件')), el('time', '', date(event.at, true))); row.append(head);
@@ -1773,7 +1806,7 @@
   }
   function renderProtectionDetail(record) {
     const item = record.item || record, title = el('h2','',`${item.symbol || item.name || '代币'} · 影子保护`); title.id='detail-title';
-    const body=[title,protectionCard(item,new Set())];if(record.priceRouter)body.push(priceRouterSummary(record.priceRouter));$('detail-content').replaceChildren(...body);
+    const body=[title,protectionCard(item,new Set()),protectionQualityDetail(record.quality)];if(record.priceRouter)body.push(priceRouterSummary(record.priceRouter));$('detail-content').replaceChildren(...body);
   }
   function renderOrders() {
     const body = $('order-rows'); body.replaceChildren(); text('orders-count', count(state.listPages.orders.total)); $('orders-empty').hidden = state.orders.length > 0;
@@ -1957,12 +1990,13 @@
       }
     }
     if(data.priceRouter)runtime.append(priceRouterSummary(data.priceRouter));
+    if(data.meme?.marketSampleCallbackError)runtime.append(el('p','detail-message detail-error','行情已采集，但复盘复用写入失败；新样本覆盖可能缺失。'));
     const protection = data.exitProtection || {};
     policy.append(kv('动态止盈保护', protection.enabled ? '仅影子验证 · 不发送卖单' : '影子验证未启用'), kv('实盘保护就绪', '未就绪'), kv('保护策略版本', protection.policyVersion), kv('影子观察对象 / 触发建议', `${count(protection.status?.positions)} / ${count(protection.status?.triggered)}`));
     if(protection.policyVersion==='adaptive-shadow-v3')policy.append(kv('持有时限','无固定持有时限 / 按行情持续保护'));
     if (protection.captureError) policy.append(el('p', 'detail-message detail-error', `影子保护记录异常：${protectionReason(protection.captureError)}`));
     const caps = Array.isArray(settings.caps) ? settings.caps : [];
-    if (caps.length) for (const cap of caps) { policy.append(kv(`${chainName(cap.chain)} · 单笔上限`, `${scalar(cap.maxPerOrder)} ${scalar(cap.symbol, chainSymbols[cap.chain] || '')}`), kv(`${chainName(cap.chain)} · 费用预留`, `${scalar(cap.feeReserve)} ${scalar(cap.symbol, chainSymbols[cap.chain] || '')}`)); }
+    if (caps.length) for (const cap of caps) { const fraction=cap.sizing==='balance_fraction'&&finite(cap.balanceBps);policy.append(kv(`${chainName(cap.chain)} · 单笔上限`, fraction?`可用余额 × ${count(cap.balanceBps/100)}%`:`${scalar(cap.maxPerOrder)} ${scalar(cap.symbol, chainSymbols[cap.chain] || '')}`), kv(`${chainName(cap.chain)} · 费用预留`, `${scalar(cap.feeReserve)} ${scalar(cap.symbol, chainSymbols[cap.chain] || '')}`));if(fraction)policy.append(el('p','policy-caption','先扣手续费预留与未结算订单占用，再计算本笔金额；提交前复核，不设固定 1 SOL 上限。')); }
     else policy.append(el('p', 'panel-placeholder', '暂无可展示的开仓上限。'));
     const exit = settings.exitPolicy;
     if (exit?.enabled) {
@@ -1984,11 +2018,11 @@
   }
   function renderFollowup() {
     const data = {...(state.followupSummary || {}), learning: state.learningPage?.items || [], groups: state.groupsPage?.items || []}, error = Boolean(state.resourceErrors.followupSummary || state.resourceErrors.learning || state.resourceErrors.groups), loaded = Boolean(state.followupSummary);
-    text('followup-total', count(data.total)); text('followup-sampled', `${count(data.sampled)} / ${count(data.selected)}`); text('followup-active', count(data.active)); text('followup-skipped', count(data.capacitySkipped));
+    text('followup-total', count(data.total)); text('followup-sampled', `${count(data.observed??data.sampled)} / ${count(data.total)}`); text('followup-active', count(data.active)); text('followup-skipped', count(data.missing));
     const status = $('followup-status'); status.className = `badge ${error ? 'watch' : data.enabled ? 'pass' : 'neutral'}`; status.textContent = error ? '更新暂时中断' : !loaded ? '正在读取' : data.enabled ? '持续积累中' : '未启用';
     const started = validDate(data.startedAt) ? `登记起点 ${date(data.startedAt, true)}` : '等待新信号建立登记起点';
     text('followup-refresh-note', `每 15 秒读取 · 汇总每 ${finite(data.refreshIntervalSec) ? data.refreshIntervalSec : 60} 秒更新`);
-    text('followup-coverage', `${started} · 汇总计算于 ${date(data.computedAt, true)} · 最近报价 ${date(data.lastSampleAt, true)}。${finite(data.retentionDays) ? `保留 ${count(data.retentionDays)} 天，` : ''}按首次到达与容量选取样本；观察和排除信号均参与对照，历史涨幅不回填。`);
+    text('followup-coverage', `${started} · 汇总计算于 ${date(data.computedAt, true)} · 最近报价 ${date(data.lastSampleAt, true)}。主动队列 ${count(data.scheduled??data.selected)}，额外行情复用覆盖 ${count(data.passivelySampled)}，已观测 ${count(data.observed??data.sampled)} / 登记 ${count(data.total)}。${finite(data.retentionDays) ? `保留 ${count(data.retentionDays)} 天。` : ''}未入队对象可复用已取得的同池新行情；这是机会性采样，存在覆盖偏差，缺失不记零，历史涨幅不回填。`);
     $('followup-warning').hidden = !error; text('followup-warning', loaded ? '后续记录暂时无法更新，已保留最近成功读取的结果。页面会自动重试。' : '暂时无法读取持续复盘数据，连接恢复后会自动更新。');
     const learning = $('followup-learning'); learning.replaceChildren();
     learning.append(el('p', '', '分别检验钱包分组、净买入、名人链接、前置路径与公开钱包进场：同链、同首次判断、同策略版本、同观察窗口进行比较，按时间分为早期样本与后期验证样本。早期结果必须在后期样本登记前已经可知，跨越分界的结果剔除。'));
@@ -2011,9 +2045,9 @@
     const groups = $('followup-groups'); const groupScroll = groups.scrollLeft; groups.replaceChildren(); const allGroups = Array.isArray(data.groups) ? data.groups : [];
     if (allGroups.length) {
       const table = el('table', 'followup-group-table'), head = el('thead'), hr = el('tr');
-      for (const label of ['分组 / 策略版本', '登记 / 入选', '1 小时中位涨幅', '6 小时中位涨幅', '24 小时中位涨幅']) hr.append(el('th', '', label)); head.append(hr); table.append(head); const body = el('tbody');
+      for (const label of ['分组 / 策略版本', '登记 / 已观测', '1 小时中位涨幅', '6 小时中位涨幅', '24 小时中位涨幅']) hr.append(el('th', '', label)); head.append(hr); table.append(head); const body = el('tbody');
       for (const group of allGroups) {
-        const row = el('tr'), label = el('td'); label.append(followupChain(group.chain), badge(...(decisions[group.decision] || [scalar(group.decision), 'neutral'])), el('small', '', scalar(group.policyVersion))); row.append(label, el('td', '', `${count(group.count)} / ${count(group.selected)}`));
+        const row = el('tr'), label = el('td'); label.append(followupChain(group.chain), badge(...(decisions[group.decision] || [scalar(group.decision), 'neutral'])), el('small', '', scalar(group.policyVersion)));const coverage=el('td','',`${count(group.count)} / ${count(group.observed)}`);coverage.append(el('small','',`主动队列 ${count(group.scheduled??group.selected)} · 额外行情复用 ${count(group.passivelySampled)}`));row.append(label,coverage);
         for (const seconds of [3600, 21600, 86400]) { const horizon = (Array.isArray(group.horizons) ? group.horizons : []).find(h => h.seconds === seconds), cell = el('td'); cell.append(gainNode(horizon?.medianGainPct), el('small', '', `覆盖 ${count(horizon?.covered)} / 到期 ${count(horizon?.mature)}`), el('small', '', `缺失 ${count(horizon?.missing)}`)); const boundary = hypotheses.find(item => item.chain === group.chain && item.decision === group.decision && item.policyVersion === group.policyVersion && item.seconds === seconds); if (finite(boundary?.purgedTrainingCount)) cell.append(el('small', '', `训练跨界剔除 ${count(boundary.purgedTrainingCount)}`)); row.append(cell); }
         body.append(row);
       } table.append(body); groups.append(table); groups.scrollLeft = groupScroll;
@@ -2031,7 +2065,7 @@
       const p = item.performance || {}, initial = item.initial || {}, row = el('tr'), token = el('td'), name = scalar(item.name || item.symbol, '未命名代币');
       const title = el('button', 'token-name', name); title.type = 'button'; title.setAttribute('aria-label', `查看 ${scalar(item.chain)} ${scalar(item.address)} 的后续复盘`); title.addEventListener('click', () => openFollowup(item, title)); token.append(title, followupChain(item.chain));
       const address = scalar(item.address); const short = el('code', 'followup-address', address.length > 19 ? `${address.slice(0, 8)}…${address.slice(-7)}` : address); short.title = address; token.append(short); if (item.name && item.symbol && item.name !== item.symbol) token.append(el('div', 'cell-subtitle', scalar(item.symbol))); row.append(token);
-      const decision = el('td'); decision.append(badge(...(decisions[initial.decision] || ['待判断', 'neutral'])), el('div', 'cell-subtitle', followupStatus[p.status] || (item.selected ? '已入选' : '未入选')), el('div', 'cell-subtitle', `${count(p.samples)} 个报价`)); row.append(decision);
+      const decision = el('td'); decision.append(badge(...(decisions[initial.decision] || ['待判断', 'neutral'])), el('div', 'cell-subtitle', followupStatus[p.status] || (item.selected ? '已入选' : '未入选')), el('div', 'cell-subtitle', `${count(p.samples)} 个报价`));if(p.collection==='passive_same_pool')decision.append(el('div','cell-subtitle','已有同池行情复用'));row.append(decision);
       for (const field of ['maxGainPct', 'currentGainPct', 'maxDrawdownPct']) { const cell = el('td', 'numeric'); cell.append(field === 'maxDrawdownPct' ? el('span', `gain ${finite(p[field]) && p[field] > 0 ? 'negative' : 'missing'}`, finite(p[field]) ? `${p[field] > 0 ? '−' : ''}${percent(p[field]).replace(/^\+/, '')}` : '—') : gainNode(p[field])); row.append(cell); }
       const horizons = el('td'); for (const seconds of [3600, 21600, 86400]) horizons.append(followupHorizon(item.horizons?.[String(seconds)], seconds, item.registeredAt)); row.append(horizons);
       const actions = el('td'); actions.append(el('time', 'followup-time', date(p.latestAt, true)), gmgnTokenLink(item.chain, item.address)); const detail = el('button', 'text-button', '证据与时间线 ↗'); detail.type = 'button'; detail.setAttribute('aria-label', `查看 ${scalar(item.chain)} ${scalar(item.address)} 的后续时间线`); detail.addEventListener('click', () => openFollowup(item, detail)); actions.append(detail); row.append(actions); body.append(row);
@@ -2067,7 +2101,7 @@
     wrapper.append(initialSection);
     const result = section('后续表现 · 固定窗口对照'); const metrics = el('div', 'detail-metrics'); metrics.append(detailStat('采样最高涨幅', percent(p.maxGainPct), date(p.peakAt, true), p.maxGainPct < 0 ? 'negative' : 'positive'), detailStat('最新涨幅', percent(p.currentGainPct), date(p.latestAt, true), p.currentGainPct < 0 ? 'negative' : 'positive'), detailStat('峰后最大回撤', finite(p.maxDrawdownPct) ? `${p.maxDrawdownPct > 0 ? '−' : ''}${percent(p.maxDrawdownPct).replace(/^\+/, '')}` : '—', '从此前峰值计算', 'negative')); result.append(metrics);
     if (Array.isArray(p.points) && p.points.length) { const chart = priceChart(p); chart.querySelector('svg')?.setAttribute('aria-label', `首次登记后价格曲线，共 ${p.points.length} 个报价样本`); result.append(chart); }
-    else result.append(el('p', 'detail-message', record.selected ? '还没有取得有效的新报价，暂时无法比较涨跌。' : '本币已保留首次判断，未进入有界报价采样队列，因此没有后续涨跌数据。'));
+    else result.append(el('p', 'detail-message', record.selected ? '还没有取得有效的新报价，暂时无法比较涨跌。' : '本币已保留首次判断，未进入主动采样队列，等待复用其他模块取得的同池新行情。'));
     result.append(kv('首个报价 / 基准价', `${date(p.baselineAt, true)} / ${usd(p.baselinePriceUsd)}`), kv('有效报价 / 最大间隔', `${count(p.samples)} / ${finite(p.maxSampleGapSec) ? `${count(p.maxSampleGapSec)} 秒` : '—'}`));
     if (p.baselineDelayed) result.append(el('p', 'detail-small', '首个报价迟到超过 10 分钟，该币不参与固定窗口结果统计。'));
     if (p.baselineMarket || p.latestMarket) result.append(kv('流动性：基准 / 最近', `${usd(p.baselineMarket?.liquidityUsd)} / ${usd(p.latestMarket?.liquidityUsd)}`), kv('持币地址：基准 / 最近', `${count(p.baselineMarket?.holderCount)} / ${count(p.latestMarket?.holderCount)}`), kv('行情快照时间：基准 / 最近', `${date(p.baselineMarketAt, true)} / ${date(p.latestMarketAt, true)}`));

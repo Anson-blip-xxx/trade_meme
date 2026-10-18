@@ -3,7 +3,8 @@ import {mkdirSync,chmodSync} from 'node:fs';
 import {dirname} from 'node:path';
 import {randomUUID} from 'node:crypto';
 import {chainAddress} from './chain-stream-store.js';
-import {reviewSchedule,reviewWindow,type DailyReview,type ReviewExecution,type ReviewItem} from './daily-review.js';
+import {reviewSchedule,reviewWindow,shanghaiDate,type DailyReview,type ReviewExecution,type ReviewItem} from './daily-review.js';
+import type {ExitQualityReview} from './exit-quality.js';
 import type {Chain,Report} from './types.js';
 import type {EntryResult} from './entry.js';
 import {VendorPerformanceLedger} from './vendor-performance-ledger.js';
@@ -28,7 +29,8 @@ export class DailyReviewStore {
       CREATE TABLE IF NOT EXISTS review_entry_attempts(id TEXT PRIMARY KEY,scan_id TEXT NOT NULL,chain TEXT NOT NULL,address TEXT NOT NULL,at TEXT NOT NULL,data TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS review_entry_token ON review_entry_attempts(chain,address,at);
       CREATE INDEX IF NOT EXISTS review_entry_time ON review_entry_attempts(at);
-      CREATE TABLE IF NOT EXISTS review_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);`);
+      CREATE TABLE IF NOT EXISTS review_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS review_exit_quality(date TEXT PRIMARY KEY,as_of TEXT NOT NULL,data TEXT NOT NULL);`);
     this.vendor=new VendorPerformanceLedger(this.db);
   }
   recordVendor(observation:Parameters<VendorPerformanceLedger['record']>[0]):boolean {return this.vendor.record(observation);}
@@ -69,6 +71,26 @@ export class DailyReviewStore {
     }catch(error){this.db.exec('ROLLBACK');throw error;}
   }
   exists(id:string):boolean {return !!this.db.prepare('SELECT 1 FROM review_runs WHERE id=?').get(id);}
+  hasExitQuality(date:string):boolean {reviewWindow(date);return !!this.db.prepare('SELECT 1 FROM review_exit_quality WHERE date=?').get(date);}
+  /** Independent daily snapshot: never rewrites an earlier signal report or computes on an HTTP request. */
+  saveExitQuality(review:ExitQualityReview):boolean {
+    const asOf=new Date(review.asOf),since=Date.parse(review.sinceAt);
+    if(!Number.isFinite(asOf.getTime())||!Number.isFinite(since)||since>asOf.getTime()||review.version!=='exit-quality-review-v1'||
+      review.scope!=='closed_shadow_positions'||review.cases.length>10||review.reviewed>1000)throw new Error('EXIT_QUALITY_SNAPSHOT_INVALID');
+    this.db.exec('BEGIN IMMEDIATE');try{
+      const saved=!!this.db.prepare('INSERT OR IGNORE INTO review_exit_quality VALUES(?,?,?)').run(shanghaiDate(asOf),asOf.toISOString(),JSON.stringify(review)).changes;
+      this.db.prepare("DELETE FROM review_meta WHERE key='exit_quality_error'").run();
+      this.db.prepare("INSERT OR REPLACE INTO review_meta VALUES('exit_quality_attempt_at',?)").run(asOf.toISOString());
+      this.db.exec('COMMIT');return saved;
+    }catch(error){this.db.exec('ROLLBACK');throw error;}
+  }
+  exitQualityFailure(at:string):void {
+    this.db.exec('BEGIN IMMEDIATE');try{
+      this.db.prepare("INSERT OR REPLACE INTO review_meta VALUES('exit_quality_error','EXIT_QUALITY_REVIEW_FAILED')").run();
+      this.db.prepare("INSERT OR REPLACE INTO review_meta VALUES('exit_quality_attempt_at',?)").run(at);
+      this.db.exec('COMMIT');
+    }catch(error){this.db.exec('ROLLBACK');throw error;}
+  }
   failure(at:string):void {
     this.db.prepare("INSERT OR REPLACE INTO review_meta VALUES('last_error','DAILY_REVIEW_FAILED')").run();
     this.db.prepare("INSERT OR REPLACE INTO review_meta VALUES('last_attempt_at',?)").run(at);
@@ -86,6 +108,7 @@ export class DailyReviewStore {
       this.db.prepare('DELETE FROM review_items WHERE run_id IN (SELECT id FROM review_runs WHERE generated_at<?)').run(cutoff);
       this.db.prepare('DELETE FROM review_runs WHERE generated_at<?').run(cutoff);
       this.db.prepare('DELETE FROM review_entry_attempts WHERE at<?').run(cutoff);
+      this.db.prepare('DELETE FROM review_exit_quality WHERE as_of<?').run(cutoff);
       this.db.exec('COMMIT');
     }catch(error){this.db.exec('ROLLBACK');throw error;}
   }
@@ -99,7 +122,9 @@ export class DailyReviewStore {
       this.db.prepare('SELECT * FROM review_runs ORDER BY date DESC,generated_at DESC LIMIT 1').get();
     const dates=this.db.prepare('SELECT date,MAX(generated_at) generatedAt FROM review_runs GROUP BY date ORDER BY date DESC LIMIT 90').all();
     const status=Object.fromEntries(this.db.prepare('SELECT key,value FROM review_meta').all().map(r=>[r.key,r.value]));
-    const base={enabled:true,schedule:reviewSchedule(now),dates,status,limit,offset};
+    const quality=this.db.prepare('SELECT data FROM review_exit_quality ORDER BY date DESC LIMIT 1').get();
+    const exitQuality=quality?JSON.parse(String(quality.data)) as ExitQualityReview:undefined;
+    const base={enabled:true,schedule:reviewSchedule(now),dates,status,limit,offset,exitQuality};
     if(!run)return {...base,report:undefined,total:0,hasMore:false,items:[] as ReviewItem[]};
     if(date&&run.date!==date)throw new Error('REVIEW_DATE_INVALID');
     const filter=options.chain?' AND chain=?':'',params=options.chain?[String(run.id),options.chain]:[String(run.id)];

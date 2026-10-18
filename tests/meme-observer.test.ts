@@ -38,6 +38,27 @@ function fixture(overrides:Partial<MemeObserverOptions>={}){
   return {create,options,calls,rows,now:()=>current,advance:(sec:number)=>{current=sec;},close:async()=>{for(const observer of observers)await observer.close();rmSync(directory,{recursive:true,force:true});}};
 }
 
+test('market callback receives only committed sanitized new samples and cannot roll back collection',async()=>{
+  const seen:MemeMarketSample[]=[];let fail=true;
+  const f=fixture();f.options.onMarketSample=sample=>{
+    assert.equal(f.rows().length,seen.length+1,'callback sees a committed row through another connection');
+    seen.push(structuredClone(sample));sample.priceUsd=999;
+    if(fail)throw new Error('secret callback detail');
+  };
+  try {
+    const observer=f.create();observer.register(signal());
+    assert.equal(observer.recordMarket(market()),true);assert.equal(observer.list().items[0].sampleCount,1);
+    assert.equal(observer.status().marketSampleCallbackError,'MEME_MARKET_SAMPLE_CALLBACK_FAILED');
+    assert.equal(JSON.parse(String(f.rows()[0].market)).priceUsd,1);
+    assert.equal(observer.recordMarket(market()),false);assert.equal(seen.length,1);
+    f.advance(180);assert.equal(observer.recordMarket(market(token(),1)),false);assert.equal(seen.length,1);
+    fail=false;assert.equal(observer.recordMarket(market(token(),180,2)),true);assert.equal(seen.length,2);
+    assert.equal(observer.status().marketSampleCallbackError,undefined);assert.equal(seen[1].priceUsd,2);
+    const db=new DatabaseSync(f.options.database);db.exec("CREATE TRIGGER fail_sample BEFORE INSERT ON meme_snapshots BEGIN SELECT RAISE(ABORT,'test'); END");db.close();
+    f.advance(210);assert.throws(()=>observer.recordMarket(market(token(),210,3)));assert.equal(seen.length,2);
+  }finally{await f.close();}
+});
+
 test('signals enter independent observation before any eligible report; replay freezes first seen and does not renew TTL',async()=>{
   const f=fixture({activeWindowSec:60});try {
     const observer=f.create();assert.equal(observer.register(signal(),at(),{name:'First name'}),true);

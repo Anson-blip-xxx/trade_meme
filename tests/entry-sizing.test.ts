@@ -277,3 +277,67 @@ test('parallel live candidates cannot create a second unprotected position', asy
   assert.equal(results.filter(r=>r.reason==='EXIT_PROTECTION_UNVERIFIED').length,1);
   assert.equal(ctx.readCalls.length,1);assert.equal(ctx.signedCalls.length,1);assert.equal(ctx.orders.list().length,1);
 });
+
+test('Solana fraction removes 1 SOL cap, floors atomic units and needs no fixed amount even in global fixed mode',async t=>{
+  for(const entryAmounts of [{solana:'1000000000'},{},{solana:'retired-invalid-fixed-cap'}]) {
+    const ctx=setup(t,{chain:'solana',balances:[20_020_000_009n],config:{entrySizing:'fixed',entryAmounts,entryBalanceBps:{solana:1000}}});
+    const result=await ctx.controller.consider(ctx.candidate());
+    assert.equal(result.order?.status,'submitted');assert.equal(result.order?.inputAmount,'2000000000');
+    assert.equal(ctx.readCalls[0].url.searchParams.get('input_amount'),'2000000000');
+    assert.equal(JSON.parse(String(ctx.signedCalls[0].init?.body)).input_amount,'2000000000');
+    assert.equal(ctx.balanceReads(),2);
+  }
+});
+
+test('Solana fraction blocks a still-affordable quoted order when final balance falls below the 10 percent limit',async t=>{
+  const ctx=setup(t,{chain:'solana',balances:[20_020_000_000n,20_019_999_999n],config:{entryBalanceBps:{solana:1000}}});
+  const result=await ctx.controller.consider(ctx.candidate());
+  assert.equal(result.status,'blocked');assert.equal(result.reason,'ENTRY_BALANCE_FRACTION_EXCEEDED');
+  assert.equal(result.order?.status,'failed');assert.equal(result.order?.inputAmount,'2000000000');
+  assert.equal(ctx.readCalls.length,1);assert.equal(ctx.balanceReads(),2);assert.equal(ctx.signedCalls.length,0);
+});
+
+test('Solana fraction never increases an already quoted amount after a balance increase',async t=>{
+  const ctx=setup(t,{chain:'solana',balances:[20_020_000_000n,30_020_000_000n],config:{entryBalanceBps:{solana:1000}}});
+  const result=await ctx.controller.consider(ctx.candidate());
+  assert.equal(result.order?.status,'submitted');assert.equal(result.order?.inputAmount,'2000000000');
+  assert.equal(JSON.parse(String(ctx.signedCalls[0].init?.body)).input_amount,'2000000000');
+});
+
+test('parallel Solana paper quotes atomically take 10 percent of the remaining unreserved balance',async t=>{
+  const balance=20_020_000_009n,fee=20_000_000n;
+  const ctx=setup(t,{chain:'solana',balances:[balance],config:{entryMode:'paper',entryBalanceBps:{solana:1000}}});
+  const results=await Promise.all([ctx.controller.consider(ctx.candidate('fraction-paper-a')),
+    ctx.controller.consider(ctx.candidate('fraction-paper-b',token('solana',4)))]);
+  assert.ok(results.every(result=>result.order?.status==='paper_open'));
+  const amounts=results.map(r=>BigInt(r.order!.inputAmount)).sort((a,b)=>a<b?1:-1);
+  const first=(balance-fee)/10n,second=(balance-fee-first-fee)/10n;
+  assert.deepEqual(amounts,[first,second]);assert.equal(ctx.signedCalls.length,0);
+  assert.ok(first!==second);
+});
+
+test('Solana fraction override leaves BSC and Robinhood fixed ceilings unchanged',async t=>{
+  for(const chain of ['bsc','robinhood'] as const) {
+    const ctx=setup(t,{chain,config:{entryBalanceBps:{solana:1000}}});
+    const result=await ctx.controller.consider(ctx.candidate());
+    assert.equal(result.order?.status,'submitted');assert.equal(result.order?.inputAmount,caps[chain]);
+  }
+});
+
+test('fraction mode rejects unknown balance, non-native input, invalid config and disabled entry before quotation',async t=>{
+  for(const extra of [{unknownBalanceAt:1},{config:{entryInputTokens:{solana:token('solana',4)}}},
+    {config:{entryBalanceBps:{solana:10001}}},{config:{entryMode:'off' as const}}]) {
+    const ctx=setup(t,{chain:'solana',...extra,config:{entryBalanceBps:{solana:1000},...extra.config}});
+    const result=await ctx.controller.consider(ctx.candidate());
+    assert.ok(['ENTRY_BALANCE_UNAVAILABLE','ENTRY_NATIVE_INPUT_REQUIRED','ENTRY_CONFIG_INVALID','ENTRY_DISABLED'].includes(result.reason!));
+    assert.equal(ctx.readCalls.length,0);assert.equal(ctx.signedCalls.length,0);assert.equal(ctx.orders.list().length,0);
+  }
+});
+
+test('fraction config is explicit, chain-scoped and rejects malformed basis points without changing defaults',()=>{
+  const legacy=readConfig({});assert.equal(legacy.entryBalanceBps?.solana,undefined);assert.equal(legacy.entryMode,'off');
+  const cfg=readConfig({ENTRY_BALANCE_BPS_SOLANA:'1000'});
+  assert.equal(cfg.entryBalanceBps?.solana,1000);assert.equal(cfg.entryBalanceBps?.bsc,undefined);assert.equal(cfg.entryBalanceBps?.robinhood,undefined);
+  for(const value of ['','0','-1','10001','10.5','1e3','01000',' 1000','NaN'])
+    assert.throws(()=>readConfig({ENTRY_BALANCE_BPS_SOLANA:value}),/ENTRY_BALANCE_BPS_INVALID/);
+});

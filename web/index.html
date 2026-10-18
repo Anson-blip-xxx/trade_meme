@@ -114,6 +114,7 @@
                 <p class="daily-review-scope">重点口径：本地 ≥100% / 平台 ≥100% 或 ≥2x。平台报告与本地采样的起点、覆盖可能不同；重点与普通样本分别先排有百分比的样本，再排只有平台倍率的样本，各自降序。平台倍率保留原样，不换算百分比，也不是统一的收益排名。缺失数据保持未知；高涨幅不能倒推当时安全，也不代表能按最高价成交。</p>
               </article>
               <article id="dailyReview-learning-panel" class="panel" hidden><div class="panel-heading"><div class="section-title"><span class="section-marker"></span><h2>发现与研究调整</h2></div><span id="dailyReview-learning-status" class="badge neutral">研究计划</span></div><div id="dailyReview-learning" class="daily-review-learning"></div></article>
+              <article id="dailyReview-exit-panel" class="panel" hidden><div class="panel-heading"><div class="section-title"><span class="section-marker"></span><h2>最近 7 日退出质量</h2></div><span class="badge neutral">影子验证</span></div><div id="dailyReview-exit-quality" class="exit-quality-review"></div></article>
               <article class="panel daily-review-list"><div class="panel-heading"><div class="section-title"><span class="section-marker"></span><h2>信号全名单</h2><span id="dailyReview-count" class="count-pill">—</span></div><span class="daily-review-list-hint">展开查看当时依据</span></div>
                 <div class="table-scroll daily-review-scroll" tabindex="0" aria-label="每日复盘信号列表"><table class="daily-review-table"><thead><tr><th scope="col">代币 / 所属链</th><th scope="col">本地采样最高涨幅</th><th scope="col">平台报告最高涨幅</th><th scope="col">初次 / 后续判断</th><th scope="col">开单进度 / 未进入原因</th></tr></thead><tbody id="dailyReview-rows"></tbody></table></div>
                 <div id="dailyReview-empty" class="empty-state"><h3>正在读取每日复盘</h3><p>报告会保留信号、判断与后续表现；点击此栏目才加载。</p></div>
@@ -145,9 +146,9 @@
               <div class="followup-intro"><div><span class="eyebrow">SIGNAL → OUTCOME → EVIDENCE</span><h2 id="followup-title">从当时的判断，追到后来的结果</h2><p>冻结首次判断，再跟踪价格与钱包证据。通过、观察、排除的信号都登记，按容量选取后续报价样本，比较哪些线索值得继续验证。</p></div><span id="followup-status" class="badge neutral" role="status">正在读取</span></div>
               <div class="section-tabs" role="group" aria-label="复盘栏目"><button class="active" data-followup-tab="records" aria-pressed="true">逐币追踪</button><button data-followup-tab="learning" aria-pressed="false">规律验证</button></div><div id="followup-summary-metrics" class="metrics-grid followup-metrics" hidden aria-label="持续复盘覆盖范围">
                 <article class="metric-card"><div class="metric-label">登记代币</div><div id="followup-total" class="metric-value">—</div><div class="metric-note">同链同币合并，首次判断留档</div></article>
-                <article class="metric-card accent-card"><div class="metric-label">已采样 / 已入选</div><div id="followup-sampled" class="metric-value">—</div><div class="metric-note">首个新报价才建立涨幅基准</div></article>
+                <article class="metric-card accent-card"><div class="metric-label">已观测 / 已登记</div><div id="followup-sampled" class="metric-value">—</div><div class="metric-note">主动采样 + 已有行情复用</div></article>
                 <article class="metric-card"><div class="metric-label">运行中</div><div id="followup-active" class="metric-value">—</div><div class="metric-note">观察周期内继续接收报价</div></article>
-                <article class="metric-card"><div class="metric-label">容量未入选</div><div id="followup-skipped" class="metric-value">—</div><div class="metric-note">仍保留首次判断，无涨跌推断</div></article>
+                <article class="metric-card"><div class="metric-label">尚无报价覆盖</div><div id="followup-skipped" class="metric-value">—</div><div class="metric-note">保留首次判断，缺失不算零</div></article>
               </div>
               <p id="followup-coverage" class="followup-coverage">从此模块上线后开始积累独立样本，历史价格不会回填为提前知道的数据。</p>
               <div id="followup-warning" class="notice" role="status" hidden></div>

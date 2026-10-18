@@ -106,6 +106,14 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher}
     ?new SourceCorroboration(config.corroboration.database,{maxBytes:config.corroboration.maxBytes}):undefined;
   let backgroundGmgnAbort:AbortController|undefined;
   const memeObserver=config.meme?.enabled?new MemeObserver({...config.meme,samplingPlanPath:reviewSamplingPath(config.dashboard.archivePath),marketBatch:fetchMemeMarkets,
+    // Reuse a committed fresh market observation for research only. This path
+    // cannot initialize a position, advance exit protection or submit an order.
+    onMarketSample:sample=>{
+      if(sample.priceUsd===undefined)return;
+      const source=sample.source==='gmgn_token_info'?'gmgn_token_info_sample':sample.source==='dexscreener_pair'?'dexscreener_token_pairs_sample':undefined;
+      if(source)archive?.recordFollowupPrice({...sample.token,priceUsd:sample.priceUsd,observedAt:sample.observedAt,source,
+        market:{poolAddress:sample.poolAddress,liquidityUsd:sample.liquidityUsd,holderCount:sample.holderCount,top10HolderRate:sample.top10HolderRate}});
+    },
     ...(config.gmgnApiKey?.trim()?{marketFallback:async(token:Signal['token'],abort:AbortSignal)=>{
       if(active||scanner.getStatus().inFlight)return;
       backgroundGmgnAbort=new AbortController();

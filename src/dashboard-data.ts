@@ -14,7 +14,9 @@ export function dashboardSettings(config:Config) {
     watchRecheck:config.watch,
     sampleIntervalSec:config.dashboard.sampleIntervalSec,balanceIntervalSec:120,balanceRetryIntervalSec:30,
     caps:chains.map(chain=>({chain,symbol:nativeCurrency(chain).symbol,
-      maxPerOrder:config.entryAmounts[chain]?formatUnits(BigInt(config.entryAmounts[chain]!),nativeCurrency(chain).decimals):null,
+      sizing:config.entryBalanceBps?.[chain]===undefined?config.entrySizing:'balance_fraction',
+      balanceBps:config.entryBalanceBps?.[chain]??null,
+      maxPerOrder:config.entryBalanceBps?.[chain]===undefined&&config.entryAmounts[chain]?formatUnits(BigInt(config.entryAmounts[chain]!),nativeCurrency(chain).decimals):null,
       feeReserve:formatUnits(BigInt(config.entryFeeReserves[chain]),nativeCurrency(chain).decimals)})),
     exitPolicy:config.exitPolicy??null};
 }

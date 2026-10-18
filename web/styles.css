@@ -128,3 +128,14 @@
 .wallet-research-seed-status{padding:12px 16px;margin:12px 0;border:1px solid #31485b;border-radius:8px;background:#101f2b}.wallet-research-seed-status>summary{font-size:.875rem;color:#adc7db;line-height:1.8;cursor:pointer}.wallet-research-seed-status>p{font-size:.8125rem;color:#9cafc3;line-height:1.9;margin-top:8px;overflow-wrap:anywhere}
 
 .wallet-research-seed-status>.wallet-seed-attention{color:#e0bf87}
+
+/* Exit-quality reads are confined to the review view and on-demand detail. */
+.exit-quality-review { padding: 0 22px 22px; display: grid; gap: 16px; line-height: 1.65; }
+.exit-quality-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin: 14px 0; }
+.exit-quality-metric, .exit-quality-comparison { display: grid; gap: 6px; padding: 12px; border: 1px solid var(--line); border-radius: 10px; min-width: 0; overflow-wrap: anywhere; }
+.exit-quality-summary { display: grid; gap: 10px; }
+.exit-quality-policy, .exit-quality-case { border-top: 1px solid var(--line); padding-top: 12px; min-width: 0; }
+.exit-quality-policy > summary, .exit-quality-case > summary { cursor: pointer; padding: 4px 0 12px; font-weight: 600; overflow-wrap: anywhere; }
+.exit-quality-case { margin-top: 12px; }
+.exit-quality-detail { min-width: 0; overflow-wrap: anywhere; }
+@media(max-width: 720px) { .exit-quality-grid { grid-template-columns: 1fr; } .exit-quality-review { padding: 0 14px 16px; } }

@@ -34,12 +34,13 @@ export interface FundingSnapshot {
   blockNumber?:string;
   slot?:number;
 }
-export type FundingFailureReason='ENTRY_BALANCE_INVALID'|'ENTRY_BALANCE_STALE'|'ENTRY_INSUFFICIENT_BALANCE';
+export type FundingFailureReason='ENTRY_BALANCE_INVALID'|'ENTRY_BALANCE_STALE'|'ENTRY_INSUFFICIENT_BALANCE'|'ENTRY_BALANCE_FRACTION_EXCEEDED';
 export type FundingCheck={ok:true}|{ok:false;reason:FundingFailureReason};
 type NewOpening=Omit<OpeningOrder,'id'|'status'|'createdAt'|'updatedAt'>;
 const active="'prepared','submitting','submitted','confirmed','unknown','paper_open'";
 const occupies=`status IN (${active}) AND NOT (status='confirmed' AND COALESCE(json_extract(details,'$.exit.positionClosed'),0)=1)`;
 const object=(value:unknown):value is Record<string,unknown>=>value!==null&&typeof value==='object'&&!Array.isArray(value);
+const validBalanceBps=(value:unknown):value is number=>typeof value==='number'&&Number.isSafeInteger(value)&&value>=1&&value<=10000;
 const sameAddress=(a:string,b:string,chain:Chain)=>chain==='solana'?a===b:a.toLowerCase()===b.toLowerCase();
 function atomicAmount(value:unknown,chain:Chain):value is string {
   return typeof value==='string'&&/^(0|[1-9]\d{0,77})$/.test(value)&&
@@ -77,7 +78,7 @@ export class OrderStore {
       );`);
   }
   reserve(input:NewOpening,maxOpen:number,now=new Date(),funding?:FundingSnapshot,
-    options:{preventReentry?:boolean}={}):{created:boolean;order?:OpeningOrder;reason?:string} {
+    options:{preventReentry?:boolean;balanceBps?:number}={}):{created:boolean;order?:OpeningOrder;reason?:string} {
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const previous=this.byEvent(input.eventKey);
@@ -97,18 +98,26 @@ export class OrderStore {
       const count=Number(this.db.prepare(`SELECT count(*) AS n FROM opening_orders WHERE mode=? AND ${occupies}`).get(input.mode)!.n);
       if(count>=maxOpen) {this.db.exec('COMMIT');return {created:false,reason:'OPENING_LIMIT_REACHED'};}
       let inputAmount=input.inputAmount,details=input.details;
+      const balanceBps=options.balanceBps;
+      if(balanceBps!==undefined&&(!validBalanceBps(balanceBps)||funding===undefined)) {
+        this.db.exec('COMMIT');return {created:false,reason:'ENTRY_BALANCE_INVALID'};
+      }
       if(funding!==undefined) {
         const invalid=validateFunding(funding,input.chain,now);
-        if(invalid||!atomicAmount(input.inputAmount,input.chain)||input.inputAmount==='0') {
+        if(invalid||(balanceBps===undefined&&(!atomicAmount(input.inputAmount,input.chain)||input.inputAmount==='0'))) {
           this.db.exec('COMMIT');return {created:false,reason:invalid??'ENTRY_BALANCE_INVALID'};
         }
         const reservedBefore=this.reservedFunding(input,funding);
         if(reservedBefore===undefined) {this.db.exec('COMMIT');return {created:false,reason:'ENTRY_BALANCE_INVALID'};}
         const available=BigInt(funding.balance)-BigInt(funding.feeReserve)-reservedBefore;
         if(available<=0n) {this.db.exec('COMMIT');return {created:false,reason:'ENTRY_INSUFFICIENT_BALANCE'};}
-        const cap=BigInt(input.inputAmount);
-        inputAmount=(available<cap?available:cap).toString();
-        details={...input.details,funding:{cap:input.inputAmount,balance:funding.balance,feeReserve:funding.feeReserve,
+        // Compute after reservations under this write lock: concurrent candidates
+        // and paper orders must each use the remaining, not the same RPC balance.
+        if(balanceBps!==undefined)inputAmount=(available*BigInt(balanceBps)/10000n).toString();
+        else {const cap=BigInt(input.inputAmount);inputAmount=(available<cap?available:cap).toString();}
+        if(inputAmount==='0') {this.db.exec('COMMIT');return {created:false,reason:'ENTRY_INSUFFICIENT_BALANCE'};}
+        details={...input.details,funding:{...(balanceBps===undefined?{cap:input.inputAmount}:
+          {sizing:'balance_fraction',balanceBps,availableBefore:available.toString()}),balance:funding.balance,feeReserve:funding.feeReserve,
           reservedBefore:reservedBefore.toString(),inputAmount,checkedAt:funding.checkedAt,readStartedAt:funding.readStartedAt}};
       }
       const order:OpeningOrder={...input,inputAmount,details,id:randomUUID(),status:'prepared',createdAt:now.toISOString(),updatedAt:now.toISOString()};
@@ -174,7 +183,19 @@ export class OrderStore {
       }
       const previousFee=storedFee===undefined?0n:BigInt(storedFee as string);
       const currentFee=BigInt(funding!.feeReserve),effectiveFee=previousFee>currentFee?previousFee:currentFee;
-      const enough=BigInt(funding!.balance)-reservedBefore>=BigInt(order.inputAmount)+effectiveFee;
+      const available=BigInt(funding!.balance)-reservedBefore-effectiveFee;
+      const enough=available>=BigInt(order.inputAmount);
+      const balanceBps=storedFunding?.balanceBps;
+      if((storedFunding?.sizing!==undefined&&storedFunding.sizing!=='balance_fraction')||
+        (storedFunding?.sizing==='balance_fraction'&&!validBalanceBps(balanceBps))||
+        (balanceBps!==undefined&&storedFunding?.sizing!=='balance_fraction')) {
+        this.db.exec('COMMIT');return {ok:false,reason:'ENTRY_BALANCE_INVALID'};
+      }
+      // An affordable quote can still exceed the fraction after an external debit
+      // or another local reservation. Keep the quote fixed and fail before send.
+      if(enough&&validBalanceBps(balanceBps)&&BigInt(order.inputAmount)>available*BigInt(balanceBps)/10000n) {
+        this.db.exec('COMMIT');return {ok:false,reason:'ENTRY_BALANCE_FRACTION_EXCEEDED'};
+      }
       // Raising the fee buffer in this same transaction keeps subsequent
       // reservations from consuming funds this fixed order will still need.
       if(enough&&(storedFee===undefined||currentFee>previousFee)) {

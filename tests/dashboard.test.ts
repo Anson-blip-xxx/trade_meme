@@ -245,3 +245,12 @@ test('dashboard settings preserve approved caps and order projection omits priva
   assert.equal(dashboardOrders(partial).items[0].requestedAmount,'0.15');
   assert.equal(dashboardOrders(partial).items[0].amountBasis,'actual');
 });
+
+test('dashboard fraction sizing suppresses retired fixed SOL cap while exposing its precise percentage',()=>{
+  const cfg=config();cfg.entryAmounts={bsc:'150000000000000000',solana:'1000000000',robinhood:'50000000000000000'};
+  cfg.entryBalanceBps={solana:1000};
+  const caps=dashboardSettings(cfg).caps;
+  assert.deepEqual(caps.map(c=>c.maxPerOrder),['0.15',null,'0.05']);
+  assert.equal(caps[1].sizing,'balance_fraction');assert.equal(caps[1].balanceBps,1000);
+  assert.equal(caps[0].balanceBps,null);assert.equal(caps[2].balanceBps,null);
+});

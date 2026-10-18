@@ -8,6 +8,7 @@ import {ADAPTIVE_SHADOW_V1,ADAPTIVE_SHADOW_V2,ADAPTIVE_SHADOW_V3,adaptiveExitPol
 import type {Chain} from './types.js';
 import type {ScanPrice,ScanToken} from './scan-archive.js';
 import {shadowReturn} from './exit-shadow-return.js';
+import {readPositionExitQuality} from './exit-quality.js';
 
 export interface ExitObservationSeed {candidateId:string;eligibleAt:string;endsAt:string;symbol?:string;}
 export interface ExitShadowOptions {maxBytes?:number;staleAfterSec?:number;maxPositions?:number;now?:()=>Date;}
@@ -35,6 +36,12 @@ function identity(value:ScanToken):ScanToken|undefined {
   if(!value||!['bsc','solana','robinhood'].includes(value.chain)||typeof value.address!=='string')return;
   if(value.chain==='solana')try {const decoded=bs58.decode(value.address);return decoded.length===32&&decoded.some(x=>x!==0)?{...value}:undefined;}catch{return;}
   return /^0x[0-9a-fA-F]{40}$/.test(value.address)&&!/^0x0{40}$/i.test(value.address)?{chain:value.chain,address:value.address.toLowerCase()}:undefined;
+}
+function poolAddress(price:ScanPrice):string|undefined {
+  const pool=price.metadata?.pool??price.market?.poolAddress;
+  if(typeof pool!=='string')return;
+  if(price.chain==='solana')try {const bytes=bs58.decode(pool);return bytes.length===32&&bytes.some(byte=>byte!==0)?pool:undefined;}catch{return;}
+  return /^0x[0-9a-fA-F]{40}$/.test(pool)&&!/^0x0{40}$/i.test(pool)?pool.toLowerCase():undefined;
 }
 
 /** Forward-only research. This class cannot quote, sign, submit, or verify protection for a real holding. */
@@ -73,6 +80,8 @@ export class ExitShadow {
       CREATE TABLE IF NOT EXISTS exit_shadow_policy_history(position_id TEXT NOT NULL,effective_at TEXT NOT NULL,
         previous_policy TEXT NOT NULL,policy TEXT NOT NULL,previous_state TEXT NOT NULL,PRIMARY KEY(position_id,effective_at));
       CREATE INDEX IF NOT EXISTS exit_shadow_open ON exit_shadow_positions(phase,last_price_at,id);`);
+    this.db.exec(`CREATE INDEX IF NOT EXISTS exit_shadow_quality_closed_at
+      ON exit_shadow_positions(json_extract(state,'$.lastObservedAt') DESC,id) WHERE phase='triggered';`);
     // Derived display aggregates only: backfill from actual retained observations
     // once, without changing adaptive policy state or replaying exit decisions.
     this.db.exec(`INSERT OR IGNORE INTO exit_shadow_metrics(position_id,peak_price,max_gap_sec,last_source)
@@ -125,7 +134,7 @@ export class ExitShadow {
     // Closed simulations still collect comparison prices. Their arithmetic must
     // remain valid even though the model no longer advances its own state.
     if(!Number.isFinite((price.priceUsd/next.baselinePriceUsd-1)*100))this.fail('EXIT_SHADOW_PRICE_ARITHMETIC_INVALID');
-    const context={priceEvidence:evidence,policyVersion:next.policyVersion,protectionPriceUsd:next.protectionPriceUsd,
+    const context={priceEvidence:evidence,poolAddress:poolAddress(price),policyVersion:next.policyVersion,protectionPriceUsd:next.protectionPriceUsd,
       protectionActive:next.protectionActive,activationGainPct:next.activationGainPct,trailPct:next.drawdownPct,
       remainingPct:next.remainingPctOfInitial,shadowClosed:next.shadowClosed,volatilityPctPerMinute:next.volatilityPctPerMinute,
       gapSec:previous?(Date.parse(at)-Date.parse(previous.last_price_at))/1000:0,
@@ -293,7 +302,8 @@ export class ExitShadow {
     if(!row)return;
     const samples=this.db.prepare('SELECT at,price AS priceUsd,source,context FROM exit_shadow_samples WHERE position_id=? ORDER BY at LIMIT 2000').all(id);
     const count=Number(this.db.prepare('SELECT count(*) AS n FROM exit_shadow_samples WHERE position_id=?').get(id)!.n);
-    return {item:this.project(row,now),samples:samples.map(r=>({...r,context:JSON.parse(String(r.context))})),sampleCount:count,
+    const item=this.project(row,now);
+    return {item,quality:readPositionExitQuality(this.db,row,now.toISOString(),item.returns),samples:samples.map(r=>({...r,context:JSON.parse(String(r.context))})),sampleCount:count,
       responseTruncated:count>samples.length,storedSamplesThinned:false,mode:'shadow',liveReady:false};
   }
   close():void {this.db.close();}

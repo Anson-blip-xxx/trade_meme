@@ -11,6 +11,7 @@ import {readConfig} from '../src/config.js';
 import {OrderStore} from '../src/orders.js';
 import {GmgnClient} from '../src/providers/gmgn-client.js';
 import type {Report} from '../src/types.js';
+import {summarizeExitQuality,type ExitQualityReview} from '../src/exit-quality.js';
 
 const address='0x'+'a'.repeat(40),at='2026-10-16T01:00:00.000Z';
 const input:ReviewInput={date:'2026-10-15',asOf:at,entryMode:'off',notifications:[],decisions:[],prices:[],vendor:[],orders:[],executions:[],limitations:[]};
@@ -18,6 +19,41 @@ function fixture(t:{after:(fn:()=>void)=>void},options:{maxItems?:number}={}){
   const dir=mkdtempSync(join(tmpdir(),'meme-review-store-')),path=join(dir,'review.sqlite'),store=new DailyReviewStore(path,options);
   t.after(()=>{try{store.close();}catch{}rmSync(dir,{recursive:true,force:true});});return {store,path};
 }
+function qualitySnapshot(asOf=at):ExitQualityReview {
+  return JSON.parse(JSON.stringify({version:'exit-quality-review-v1',asOf,sinceAt:new Date(Date.parse(asOf)-7*86400_000).toISOString(),
+    scope:'closed_shadow_positions',total:0,reviewed:0,limit:1000,truncated:false,historyComplete:false,
+    summaryBasis:'equal_weight_per_position_gross_simulation',summary:summarizeExitQuality([]),byPolicy:[],cases:[]})) as ExitQualityReview;
+}
+test('exit-quality snapshots publish independently, once per Shanghai day, without rewriting signal reports',t=>{
+  const {store}=fixture(t),report=buildDailyReview(input),snapshot=qualitySnapshot();store.save(report);
+  assert.equal(store.hasExitQuality('2026-10-16'),false);assert.equal(store.saveExitQuality(snapshot),true);
+  assert.equal(store.hasExitQuality('2026-10-16'),true);
+  assert.equal(store.saveExitQuality({...snapshot,asOf:'2026-10-16T15:59:59.999Z',historyComplete:true}),false);
+  assert.deepEqual(store.page({date:report.date}).exitQuality,snapshot);
+  assert.equal(store.page().report?.generatedAt,report.generatedAt);
+  const next=qualitySnapshot('2026-10-16T16:00:00.000Z');assert.equal(store.saveExitQuality(next),true);
+  assert.deepEqual(store.page({runId:report.id}).exitQuality,next);
+  assert.deepEqual(store.page({date:'2026-10-13'}).exitQuality,next);
+  assert.equal(store.page({date:'2026-10-13'}).report,undefined);
+});
+test('exit-quality retention removes expired snapshots and invalid attempts preserve existing data',t=>{
+  const {store}=fixture(t),old=qualitySnapshot('2026-06-01T01:00:00.000Z'),latest=qualitySnapshot();
+  store.saveExitQuality(old);store.saveExitQuality(latest);
+  assert.throws(()=>store.saveExitQuality({...latest,asOf:'invalid'}),/EXIT_QUALITY_SNAPSHOT_INVALID/);
+  assert.throws(()=>store.saveExitQuality({...latest,sinceAt:'2026-10-17T01:00:00.000Z'}),/EXIT_QUALITY_SNAPSHOT_INVALID/);
+  store.prune(new Date('2026-10-18T01:00:00.000Z'));
+  assert.equal(store.hasExitQuality('2026-06-01'),false);assert.deepEqual(store.page().exitQuality,latest);
+  store.prune(new Date('2027-02-01T01:00:00.000Z'));assert.equal(store.page().exitQuality,undefined);
+});
+test('exit-quality failure is separate from signal report success and preserves last successful snapshot',t=>{
+  const {store}=fixture(t),snapshot=qualitySnapshot();store.saveExitQuality(snapshot);store.exitQualityFailure(at);
+  store.save(buildDailyReview(input));store.markRunSucceeded(at);
+  assert.equal(store.page().status.last_error,undefined);
+  assert.equal(store.page().status.exit_quality_error,'EXIT_QUALITY_REVIEW_FAILED');
+  assert.deepEqual(store.page().exitQuality,snapshot);
+  store.saveExitQuality(qualitySnapshot('2026-10-17T01:00:00.000Z'));
+  assert.equal(store.page().status.exit_quality_error,undefined);
+});
 test('daily report publication is immutable and pinned pagination survives another revision',t=>{
   const {store,path}=fixture(t),report=buildDailyReview({...input,notifications:Array.from({length:25},(_,i)=>({id:String(i),chain:'bsc',address:'0x'+(i+1).toString(16).padStart(40,'0'),source:'debot',receivedAt:'2026-10-15T01:00:00.000Z',occurredAt:'2026-10-15T00:59:59.000Z'}))});
   assert.equal(store.save(report),true);assert.equal(store.save({...report,counts:{...report.counts,tokens:999}}),false);

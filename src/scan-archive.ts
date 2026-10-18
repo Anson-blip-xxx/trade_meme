@@ -576,6 +576,14 @@ export class ScanArchive {
   }
   followupEvidenceWindow(price:ScanPrice) {return this.followup?.evidenceWindow(price,price.observedAt);}
 
+  /** Reuse a freshly collected market price for unscheduled follow-up only.
+   * This path never changes eligible scans, comparison cohorts or exit seeds. */
+  recordFollowupPrice(price:ScanPrice):void {
+    const identity=token(price),at=timestamp(price?.observedAt);
+    if(!identity||!at||price.source==='chain_pool_sample'&&!priceEvidence(price))return;
+    this.followup?.passivePrice({...price,...identity,observedAt:at},this.now());
+  }
+
   /** Public identity for forward-only exit observation; never supplies old prices or peaks. */
   exitObservationSeed(value:ScanToken,now=this.now()):{candidateId:string;eligibleAt:string;endsAt:string;symbol?:string}|undefined {
     const identity=token(value);if(!identity||!Number.isFinite(now.getTime()))return;

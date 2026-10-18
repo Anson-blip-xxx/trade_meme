@@ -213,3 +213,80 @@ test('资金覆盖查询不受列表50条分页限制，只返回同资金范围
     assert.equal(store.fundingOrders({...input(),inputToken:'0x'+'e'.repeat(40)}).length,0);
   } finally {store.close();}
 });
+
+test('fraction reserves floor lamports exactly across uint64 range and ignore retired fixed cap',()=>{
+  for(const balance of ['20020000009',((1n<<64n)-1n).toString()]) {
+    const store=new OrderStore(':memory:');
+    try {
+      const feeReserve='20000000',available=BigInt(balance)-BigInt(feeReserve);
+      const result=store.reserve({...input(),chain:'solana',inputAmount:'1000000000'},10,now,
+        snapshot({balance,feeReserve}),{balanceBps:1000});
+      assert.equal(result.order?.inputAmount,(available/10n).toString());
+      assert.ok(BigInt(result.order!.inputAmount)>1_000_000_000n);
+      assert.equal((result.order!.details.funding as Record<string,unknown>).balanceBps,1000);
+      assert.equal((result.order!.details.funding as Record<string,unknown>).cap,undefined);
+      assert.equal(BigInt(result.order!.inputAmount)*10n<=available,true);
+    } finally {store.close();}
+  }
+});
+
+test('fraction two-connection reservations use remaining amount, and failed reservations release capacity',()=>{
+  const dir=mkdtempSync(join(tmpdir(),'meme-fraction-')),path=join(dir,'orders.sqlite');
+  const a=new OrderStore(path),b=new OrderStore(path),funding=snapshot({balance:'1010'});
+  try {
+    const first=a.reserve({...input(),inputAmount:'0'},10,now,funding,{balanceBps:1000}).order!;
+    assert.equal(first.inputAmount,'100');
+    a.update(first.id,['prepared'],{status:'paper_open'},now);
+    const second=b.reserve({...input(2),inputAmount:'0'},10,now,funding,{balanceBps:1000}).order!;
+    assert.equal(second.inputAmount,'89');
+    assert.equal((second.details.funding as Record<string,unknown>).reservedBefore,'110');
+    assert.deepEqual(a.checkFunding(second.id,funding,now),{ok:true});
+    b.update(second.id,['prepared'],{status:'failed'},now);
+    assert.equal(a.reserve(input(3),10,now,funding,{balanceBps:1000}).order?.inputAmount,'89');
+  } finally {a.close();b.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('fraction preflight rejects still-affordable quote after balance, fee or other reservation reduces the limit',()=>{
+  for(const change of ['balance','fee','reservation'] as const) {
+    const store=new OrderStore(':memory:');
+    try {
+      const funding=snapshot({balance:'1010'});
+      const own=store.reserve(input(),10,now,funding,{balanceBps:1000}).order!;
+      assert.equal(own.inputAmount,'100');
+      if(change==='reservation')store.reserve({...input(2),inputAmount:'1'},10,now,funding);
+      const latest=change==='balance'?snapshot({balance:'1009'}):change==='fee'?snapshot({balance:'1010',feeReserve:'11'}):funding;
+      assert.deepEqual(store.checkFunding(own.id,latest,now),{ok:false,reason:'ENTRY_BALANCE_FRACTION_EXCEEDED'},change);
+      assert.equal(store.get(own.id)?.inputAmount,'100');
+    } finally {store.close();}
+  }
+});
+
+test('fraction preflight excludes itself, never raises quoted principal, and fails closed for invalid policy',()=>{
+  const store=new OrderStore(':memory:');
+  try {
+    const own=store.reserve(input(),10,now,snapshot({balance:'1010'}),{balanceBps:1000}).order!;
+    assert.deepEqual(store.checkFunding(own.id,snapshot({balance:'1010'}),now),{ok:true});
+    assert.deepEqual(store.checkFunding(own.id,snapshot({balance:'2010'}),now),{ok:true});
+    assert.equal(store.get(own.id)?.inputAmount,'100');
+    for(const patch of [{balanceBps:undefined},{balanceBps:0},{balanceBps:10001},{balanceBps:NaN},{balanceBps:'1000'},{sizing:'unknown'}]) {
+      const original=own.details.funding as Record<string,unknown>;
+      store.update(own.id,['prepared'],{details:{...own.details,funding:{...original,...patch}}},now);
+      assert.deepEqual(store.checkFunding(own.id,snapshot({balance:'2010'}),now),{ok:false,reason:'ENTRY_BALANCE_INVALID'});
+    }
+  } finally {store.close();}
+});
+
+test('fraction below one lamport, absent funding and invalid bps cannot create a reservation',()=>{
+  for(const balanceBps of [0,-1,1.5,10001,NaN]) {
+    const store=new OrderStore(':memory:');
+    try {assert.equal(store.reserve(input(),10,now,snapshot(),{balanceBps}).reason,'ENTRY_BALANCE_INVALID');
+      assert.equal(store.list().length,0);}finally {store.close();}
+  }
+  const store=new OrderStore(':memory:');
+  try {
+    assert.equal(store.reserve(input(),10,now,undefined,{balanceBps:1000}).reason,'ENTRY_BALANCE_INVALID');
+    assert.equal(store.reserve(input(),10,now,snapshot({balance:'19'}),{balanceBps:1000}).reason,'ENTRY_INSUFFICIENT_BALANCE');
+    assert.equal(store.list().length,0);
+    assert.equal(store.reserve(input(),10,now,snapshot({balance:'20'}),{balanceBps:1000}).order?.inputAmount,'1');
+  } finally {store.close();}
+});

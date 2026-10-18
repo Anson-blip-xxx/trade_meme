@@ -18,6 +18,8 @@ export interface FollowupInitial {
 }
 export interface FollowupPerformance {
   status:'waiting'|'tracking'|'unavailable'|'ended'|'not_selected';samples:number;
+  /** Fresh prices reused from another observer; never an extra polling slot. */
+  passiveSamples?:number;collection?:'scheduled'|'passive_same_pool';
   baselineAt?:string;baselinePriceUsd?:number;baselineDelayed?:boolean;
   latestAt?:string;latestPriceUsd?:number;peakAt?:string;peakPriceUsd?:number;
   currentGainPct?:number;maxGainPct?:number;maxDrawdownPct?:number;maxSampleGapSec?:number;
@@ -42,6 +44,7 @@ export interface FollowupHorizonStats {
 }
 export interface FollowupGroup {
   chain:ScanToken['chain'];decision:Report['decision'];policyVersion:string;count:number;selected:number;horizons:FollowupHorizonStats[];
+  scheduled:number;observed:number;passivelySampled:number;missing:number;
 }
 interface FeatureStats {count:number;covered:number;missing:number;medianGainPct:number|null;upRatePct:number|null;}
 interface LearningSplit {count:number;covered:number;present:FeatureStats;absent:FeatureStats;unknown:FeatureStats;medianDifferencePct:number|null;}
@@ -62,7 +65,7 @@ export type FollowupListRecord=Omit<FollowupRecord,'initial'|'performance'|'time
 interface OutcomeRecord {
   chain:ScanToken['chain'];registeredAt:string;endsAt:string;selected:boolean;
   initial:Pick<FollowupInitial,'decision'|'policyVersion'|'features'>;
-  performance:Pick<FollowupPerformance,'samples'|'latestAt'>;horizons:FollowupRecord['horizons'];
+  performance:Pick<FollowupPerformance,'samples'|'latestAt'|'baselineAt'|'baselineDelayed'|'passiveSamples'|'collection'>;horizons:FollowupRecord['horizons'];
 }
 
 const HORIZONS=[3600,21600,86400];
@@ -128,7 +131,8 @@ export class SignalFollowup {
   private metric(r:FollowupRecord):string {
     const value:OutcomeRecord={chain:r.chain,registeredAt:r.registeredAt,endsAt:r.endsAt,selected:r.selected,
       initial:{decision:r.initial.decision,policyVersion:r.initial.policyVersion,features:r.initial.features},
-      performance:{samples:r.performance.samples,latestAt:r.performance.latestAt},horizons:r.horizons};
+      performance:{samples:r.performance.samples,latestAt:r.performance.latestAt,baselineAt:r.performance.baselineAt,
+        baselineDelayed:r.performance.baselineDelayed,passiveSamples:r.performance.passiveSamples,collection:r.performance.collection},horizons:r.horizons};
     return JSON.stringify(value);
   }
   capture(report:Report,record:ScanRecord,now:Date):void {
@@ -207,23 +211,34 @@ export class SignalFollowup {
     return {fromAt:new Date(Math.max(registered,ms-600000)).toISOString(),untilAt:new Date(ms).toISOString()};
   }
   price(price:ScanPrice,now:Date,walletEvidence?:FollowupWalletEvidence):void {
+    this.observePrice(price,now,walletEvidence,false);
+  }
+  /** Only reuse a quote for an already registered, unscheduled observation.
+   * No registration, selection, initial features or subscription target changes. */
+  passivePrice(price:ScanPrice,now:Date):void {this.observePrice(price,now,undefined,true);}
+  private observePrice(price:ScanPrice,now:Date,walletEvidence:FollowupWalletEvidence|undefined,passiveOnly:boolean):void {
     const token=identity(price),ms=time(price.observedAt),nowMs=now.getTime();
-    if(!token||ms===undefined||ms>nowMs||nowMs-ms>120000||!Number.isFinite(price.priceUsd)||price.priceUsd<=0||
+    if(!token||ms===undefined||!Number.isFinite(nowMs)||ms>nowMs||nowMs-ms>120000||!Number.isFinite(price.priceUsd)||price.priceUsd<=0||
       !['gmgn_token_info_sample','chain_pool_sample','dexscreener_token_pairs_sample','ave_price_stream_sample','debot_token_info_sample'].includes(price.source))return;
-    const row=this.db.prepare('SELECT record,last_attempt_at FROM signal_followups WHERE chain=? AND address=? AND selected=1 AND ends_at>?')
-      .get(token.chain,token.address,now.toISOString());if(!row)return;
+    const row=this.db.prepare('SELECT record,last_attempt_at FROM signal_followups WHERE chain=? AND address=? AND ends_at>? AND (?=0 OR selected=0)')
+      .get(token.chain,token.address,now.toISOString(),passiveOnly?1:0);if(!row)return;
     const value=JSON.parse(String(row.record)) as FollowupRecord,p=value.performance,registered=Date.parse(value.registeredAt);
     if(ms<=registered||p.latestAt&&ms<=Date.parse(p.latestAt)||row.last_attempt_at&&ms<Date.parse(String(row.last_attempt_at)))return;
     if(p.latestAt&&ms-Date.parse(p.latestAt)<30000)return;
+    const passive=!value.selected,market=this.market(price.market,token);
+    // Passive sources are opportunistic, not a controlled quote route. Bind the
+    // baseline to one known pool; a changed/unknown pool cannot create a return.
+    if(passive&&(!market?.poolAddress||p.baselineAt&&p.baselineMarket?.poolAddress!==market.poolAddress))return;
     const at=new Date(ms).toISOString(),base=p.baselinePriceUsd??price.priceUsd;
     const peak=Math.max(p.peakPriceUsd??price.priceUsd,price.priceUsd),gain=(price.priceUsd/base-1)*100,maxGain=(peak/base-1)*100;
     if(!Number.isFinite(gain)||!Number.isFinite(maxGain))return;
     const drawdown=(1-price.priceUsd/peak)*100,peakAt=price.priceUsd>=(p.peakPriceUsd??price.priceUsd)?at:p.peakAt!;
-    const points=[...p.points,{at,priceUsd:price.priceUsd}],market=this.market(price.market,token);
+    const points=[...p.points,{at,priceUsd:price.priceUsd}];
     const baselineMarket=p.baselineMarket??(!p.baselineAt?market:undefined);
     const samePool=!!market?.poolAddress&&market.poolAddress===baselineMarket?.poolAddress;
     const liquidityComparable=samePool&&market?.liquidityUsd!==undefined&&!!baselineMarket?.liquidityUsd;
-    value.performance={...p,status:'tracking',samples:p.samples+1,baselineAt:p.baselineAt??at,baselinePriceUsd:base,
+    value.performance={...p,status:'tracking',samples:p.samples+1,collection:passive?'passive_same_pool':'scheduled',
+      ...(passive?{passiveSamples:(p.passiveSamples??0)+1}:{}),baselineAt:p.baselineAt??at,baselinePriceUsd:base,
       baselineDelayed:p.baselineDelayed??ms-registered>TOLERANCE,latestAt:at,latestPriceUsd:price.priceUsd,
       peakAt,peakPriceUsd:peak,currentGainPct:gain,maxGainPct:maxGain,maxDrawdownPct:Math.max(p.maxDrawdownPct??0,drawdown),
       maxSampleGapSec:Math.max(p.maxSampleGapSec??0,p.latestAt?(ms-Date.parse(p.latestAt))/1000:(ms-registered)/1000),
@@ -319,7 +334,7 @@ export class SignalFollowup {
     if(!row)return;return this.withStatus(JSON.parse(String(row.record)) as FollowupRecord,now);
   }
   private withStatus(row:FollowupRecord,now:Date):FollowupRecord {
-    return {...row,performance:{...row.performance,...(row.selected&&row.endsAt<=now.toISOString()?{status:'ended' as const}:{})}};
+    return {...row,performance:{...row.performance,...((row.selected||row.performance.samples>0)&&row.endsAt<=now.toISOString()?{status:'ended' as const}:{})}};
   }
   private aggregate(now:Date):ReturnType<SignalFollowup['buildSummary']> {
     if(this.cachedSummary&&now.getTime()>=this.cachedSummary.at&&now.getTime()-this.cachedSummary.at<60000)return this.cachedSummary.value;
@@ -365,7 +380,7 @@ export class SignalFollowup {
       'horizons',json_extract(record,'$.horizons')) AS item
       FROM signal_followups WHERE ${where} ORDER BY registered_at DESC,chain,address LIMIT ? OFFSET ?`).all(...values,limit,offset);
     const items=rows.map(row=>{const item=JSON.parse(String(row.item)) as FollowupListRecord;
-      if(item.selected&&item.endsAt<=now.toISOString())item.performance.status='ended';return item;});
+      if((item.selected||item.performance.samples>0)&&item.endsAt<=now.toISOString())item.performance.status='ended';return item;});
     return {now:now.toISOString(),asOf,total,limit,offset,hasMore:offset+items.length<total,items};
   }
   groups(options:FollowupListOptions={},now=new Date()) {
@@ -390,13 +405,27 @@ export class SignalFollowup {
     if(previous===summary.computedAt)return;
     const review={version:summary.version,computedAt:summary.computedAt,total:summary.total,selected:summary.selected,
       sampled:summary.sampled,capacitySkipped:summary.capacitySkipped,active:summary.active,
+      scheduled:summary.scheduled,passivelySampled:summary.passivelySampled,observed:summary.observed,missing:summary.missing,
+      coverageBasis:summary.coverageBasis,
       groups:summary.groups,learning:summary.learning,limitations:summary.limitations};
     this.db.prepare("INSERT INTO signal_followup_meta(key,value) VALUES ('last_review',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(JSON.stringify(review));
     this.db.prepare("INSERT INTO signal_followup_meta(key,value) VALUES ('last_review_at',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(summary.computedAt);
   }
   private buildSummary(now:Date) {
-    const rows=this.db.prepare('SELECT summary_record FROM signal_followups ORDER BY registered_at,chain,address').all()
-      .map(r=>JSON.parse(String(r.summary_record)) as OutcomeRecord);
+    const rows=this.db.prepare('SELECT summary_record FROM signal_followups WHERE registered_at<=? ORDER BY registered_at,chain,address').all(now.toISOString())
+      .map(r=>JSON.parse(String(r.summary_record)) as OutcomeRecord).map(r=>{
+        // An as-of summary never borrows a later horizon. Delayed baselines have
+        // no fixed-horizon outcome even if some later prices were observed.
+        const horizons=Object.fromEntries(Object.entries(r.horizons).filter(([seconds,h])=>
+          HORIZONS.includes(Number(seconds))&&Number.isFinite(h.gainPct)&&time(h.at)!==undefined&&
+          Date.parse(h.at)<=now.getTime()&&Date.parse(h.at)>=Date.parse(r.registeredAt)+Number(seconds)*1000&&
+          Date.parse(h.at)<=Date.parse(r.registeredAt)+Number(seconds)*1000+TOLERANCE&&!r.performance.baselineDelayed));
+        const first=r.performance.baselineAt??r.performance.latestAt;
+        const visible=!!first&&Date.parse(first)<=now.getTime();
+        const latest=r.performance.latestAt&&Date.parse(r.performance.latestAt)<=now.getTime()?r.performance.latestAt:
+          visible?r.performance.baselineAt:undefined;
+        return {...r,horizons,performance:{...r.performance,samples:visible?r.performance.samples:0,latestAt:latest}};
+      });
     const grouped=new Map<string,OutcomeRecord[]>();
     for(const row of rows) {
       const key=JSON.stringify([row.chain,row.initial.decision,row.initial.policyVersion]);
@@ -405,15 +434,16 @@ export class SignalFollowup {
     const groups:FollowupGroup[]=[],learning:FollowupLearning[]=[];
     for(const list of grouped.values()) {
       const head=list[0],identity={chain:head.chain,decision:head.initial.decision,policyVersion:head.initial.policyVersion};
-      const selected=list.filter(r=>r.selected);
-      groups.push({...identity,count:list.length,selected:selected.length,horizons:HORIZONS.map(seconds=>{
+      const selected=list.filter(r=>r.selected),observed=list.filter(r=>r.performance.samples>0);
+      groups.push({...identity,count:list.length,selected:selected.length,scheduled:selected.length,observed:observed.length,
+        passivelySampled:observed.filter(r=>!r.selected).length,missing:list.length-observed.length,horizons:HORIZONS.map(seconds=>{
         // Coverage is finalized only once the whole observation tolerance has elapsed.
-        const mature=selected.filter(r=>Date.parse(r.registeredAt)+seconds*1000+TOLERANCE<=now.getTime());
-        const metric=stats(mature,seconds);return {seconds,count:selected.length,mature:mature.length,
+        const mature=list.filter(r=>Date.parse(r.registeredAt)+seconds*1000+TOLERANCE<=now.getTime());
+        const metric=stats(mature,seconds);return {seconds,count:list.length,mature:mature.length,
           covered:metric.covered,missing:metric.missing,medianGainPct:metric.medianGainPct,upRatePct:metric.upRatePct};
       })});
       for(const seconds of HORIZONS) {
-        const mature=selected.filter(r=>Date.parse(r.registeredAt)+seconds*1000+TOLERANCE<=now.getTime());
+        const mature=list.filter(r=>Date.parse(r.registeredAt)+seconds*1000+TOLERANCE<=now.getTime());
         let split=Math.floor(mature.length*0.7);
         // Tied registration timestamps belong to the same temporal partition.
         while(split>0&&mature[split]&&mature[split-1].registeredAt===mature[split].registeredAt)split--;
@@ -435,15 +465,19 @@ export class SignalFollowup {
       }
     }
     const sampleTimes=rows.flatMap(r=>r.performance.latestAt?[r.performance.latestAt]:[]).sort();
-    return {enabled:true,version:'signal-followup-v1',now:now.toISOString(),computedAt:now.toISOString(),updatedAt:now.toISOString(),
-      refreshIntervalSec:60,scope:'observational_correlation',mode:'observation_only',selection:'first_arrivals_per_decision_with_capacity_limit',
+    const observed=rows.filter(r=>r.performance.samples>0);
+    return {enabled:true,version:'signal-followup-v2',now:now.toISOString(),computedAt:now.toISOString(),updatedAt:now.toISOString(),
+      refreshIntervalSec:60,scope:'observational_correlation',mode:'observation_only',selection:'scheduled_first_arrivals_and_opportunistic_same_pool_prices',
       startedAt:this.db.prepare("SELECT value FROM signal_followup_meta WHERE key='started_at'").get()?.value??null,
       retentionDays:90,maxRecords:20000,maxActiveComparisonsPerDecision:3,
       total:rows.length,selected:rows.filter(r=>r.selected).length,
+      scheduled:rows.filter(r=>r.selected).length,passivelySampled:observed.filter(r=>!r.selected).length,
+      observed:observed.length,missing:rows.length-observed.length,
+      coverageBasis:'all_registered_tokens; missing=no_observed_price; horizon_missing=mature_without_valid_horizon',
       active:rows.filter(r=>r.selected&&r.endsAt>now.toISOString()).length,
       sampled:rows.filter(r=>r.performance.samples>0).length,capacitySkipped:rows.filter(r=>!r.selected).length,
       lastSampleAt:sampleTimes.at(-1)??null,groups,learning,
-      limitations:['SAMPLED_QUOTES_NOT_REALIZED_RETURNS','CAPACITY_LIMITED_NON_RANDOM_COHORT','CORRELATION_NOT_CAUSATION',
+      limitations:['SAMPLED_QUOTES_NOT_REALIZED_RETURNS','CAPACITY_LIMITED_NON_RANDOM_COHORT','PASSIVE_OBSERVATION_COVERAGE_IS_OPPORTUNISTIC','CORRELATION_NOT_CAUSATION',
         'WALLET_IDENTITY_AND_SOCIAL_ENDORSEMENT_UNPROVEN','MISSING_HORIZONS_ARE_NOT_ZERO','NO_AUTOMATIC_POLICY_CHANGE']};
   }
 }

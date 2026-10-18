@@ -203,12 +203,14 @@ export class EntryController {
     if (ineligible) return {status: ineligible==='ENTRY_WALLET_EVIDENCE_UNAVAILABLE'?'blocked':'skipped', reason: ineligible};
     const chain = report.signal.token.chain, target = report.signal.token.address;
     const wallet = this.config.entryWallets[chain], amount = this.config.entryAmounts[chain], inputToken = this.config.entryInputTokens[chain];
+    const balanceBps=this.config.entryBalanceBps?.[chain];
     if (this.config.entryMode === 'live') {
       try {this.requireLiveProtection(chain, wallet ?? '', 'before_balance');}
       catch (error) {return {status: 'blocked', reason: reason(error)};}
     }
-    if (!this.config.gmgnApiKey || !wallet || !inputToken || !amount) return {status: 'blocked', reason: 'ENTRY_CONFIG_MISSING'};
-    if (!address(wallet, chain) || zeroEvm.test(wallet) || !address(inputToken, chain) || !atomic(amount, chain) ||
+    if (!this.config.gmgnApiKey || !wallet || !inputToken || (balanceBps===undefined&&!amount)) return {status: 'blocked', reason: 'ENTRY_CONFIG_MISSING'};
+    if (!address(wallet, chain) || zeroEvm.test(wallet) || !address(inputToken, chain) ||
+        (balanceBps===undefined?!atomic(amount!, chain):!Number.isSafeInteger(balanceBps)||balanceBps<1||balanceBps>10000) ||
         zeroEvm.test(target) || addressEqual(inputToken, target, chain) ||
         !Number.isInteger(this.config.entrySlippagePct) || this.config.entrySlippagePct < 0 || this.config.entrySlippagePct > 50 ||
         !Number.isInteger(this.config.entryMaxOpen) || this.config.entryMaxOpen < 1)
@@ -228,7 +230,7 @@ export class EntryController {
       if(policy) exit={policy,state:'awaiting_swap',reasons:[],checkedAt:this.now().toISOString(),positionClosed:false};
     } catch {return {status:'blocked',reason:'EXIT_POLICY_INVALID'};}
     let funding:FundingSnapshot|undefined;
-    if(this.config.entrySizing==='balance_cap') {
+    if(balanceBps!==undefined||this.config.entrySizing==='balance_cap') {
       if(!addressEqual(inputToken,NATIVE_INPUT_TOKENS[chain],chain)) return {status:'blocked',reason:'ENTRY_NATIVE_INPUT_REQUIRED'};
       try {funding=await this.fundingSnapshot(chain,wallet,inputToken,this.config.entryMode);}
       catch(error) {return {status:'blocked',reason:reason(error)};}
@@ -238,9 +240,11 @@ export class EntryController {
     }
     const reservation = this.orders.reserve({eventKey, chain, tokenAddress: target, mode: this.config.entryMode,
       wallet: chain === 'solana' ? wallet : wallet.toLowerCase(),
-      inputToken: chain === 'solana' ? inputToken : inputToken.toLowerCase(), inputAmount: amount,
+      inputToken: chain === 'solana' ? inputToken : inputToken.toLowerCase(),
+      // Fraction sizing is computed atomically in reserve; this placeholder is never quoted.
+      inputAmount: balanceBps===undefined?amount!:'0',
       slippagePct: this.config.entrySlippagePct, details,...(exit?{exit}:{})}, this.config.entryMaxOpen, this.now(),funding,
-      {preventReentry:report.signal.source==='debot'});
+      {preventReentry:report.signal.source==='debot',balanceBps});
     if (!reservation.created) return reservation.order ? {status: 'existing', order: reservation.order} :
       {status: 'blocked', reason: reservation.reason};
     let order = reservation.order!;

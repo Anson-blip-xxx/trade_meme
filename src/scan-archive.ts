@@ -48,7 +48,7 @@ export interface ScanWalletProfile {
   risks:string[];
 }
 export interface ScanRecord extends ScanToken {
-  id:string;source:'debot'|'gmgn'|'ave'|'manual';status:Stored['status'];mode?:Report['mode'];policyVersion?:string;
+  id:string;source:'debot'|'gmgn'|'ave'|'wallet'|'manual';status:Stored['status'];mode?:Report['mode'];policyVersion?:string;
   receivedAt:string;occurredAt:string;evaluatedAt?:string;decision?:Report['decision'];buyEligible?:boolean;validUntil?:string;
   name?:string;symbol?:string;reasons:string[];advisoryReasons?:string[];
   checks:{provenance:ScanCheck;safety:ScanCheck;narrative:ScanCheck;wallets:ScanCheck;flow:ScanCheck;market?:ScanCheck};
@@ -98,7 +98,7 @@ function token(value:ScanToken):ScanToken|undefined {
 /** Retain only public identifiers needed to repeat the original investigation. */
 function watchSignal(signal:Signal):Signal|undefined {
   const identity=token(signal.token),occurredAt=timestamp(signal.occurredAt);
-  if(!identity||!occurredAt||!['debot','gmgn','ave','manual'].includes(signal.source)||
+  if(!identity||!occurredAt||!['debot','gmgn','ave','wallet','manual'].includes(signal.source)||
     !/^[A-Za-z0-9:_-]{1,160}$/.test(signal.sourceEventId)) return;
   const evidenceUrls:string[]=[];
   for(const value of signal.evidenceUrls??[]) {
@@ -281,7 +281,7 @@ export class ScanArchive {
   private captureRecord(entry:Stored,insideTransaction=false):void {
     const identity=token(entry?.signal?.token),received=timestamp(entry?.receivedAt),occurred=timestamp(entry?.signal?.occurredAt);
     if(!identity||!received||!occurred||typeof entry.id!=='string'||!/^[A-Za-z0-9_-]{1,200}$/.test(entry.id)||
-      !['processing','completed','interrupted'].includes(entry.status)||!['debot','gmgn','ave','manual'].includes(entry.signal.source)) return;
+      !['processing','completed','interrupted'].includes(entry.status)||!['debot','gmgn','ave','wallet','manual'].includes(entry.signal.source)) return;
     const current=this.now(),nowMs=current.getTime();if(!Number.isFinite(nowMs)) return;
     if(!insideTransaction)this.db.exec('BEGIN IMMEDIATE');
     try {

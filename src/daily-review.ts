@@ -102,7 +102,7 @@ export function buildDailyReview(input:ReviewInput):DailyReview {
   const window=reviewWindow(input.date),asOf=Date.parse(input.asOf);
   if(!validTime(input.asOf)||Date.parse(window.end)>asOf)throw new Error('REVIEW_PERIOD_NOT_CLOSED');
   const all=new Map<string,ReviewNotification[]>(),seen=new Set<string>();
-  for(const n of input.notifications){const t=token(n);if(!t||!['debot','ave','gmgn','manual'].includes(n.source)||!validTime(n.receivedAt)||Date.parse(n.receivedAt)>asOf)continue;
+  for(const n of input.notifications){const t=token(n);if(!t||!['debot','ave','gmgn','wallet','manual'].includes(n.source)||!validTime(n.receivedAt)||Date.parse(n.receivedAt)>asOf)continue;
     const id=`${n.source}:${n.id}:${key(t)}`;if(seen.has(id))continue;seen.add(id);
     const rows=all.get(key(t))??[];rows.push({...n,...t,receivedAt:new Date(n.receivedAt).toISOString()});all.set(key(t),rows);
   }

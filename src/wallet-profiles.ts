@@ -400,5 +400,15 @@ export class WalletProfileReader {
   get(chain:Chain,address:string):WalletProfile|undefined {const db=this.open(),wallet=chainAddress(chain,address);if(!db||!wallet)return;const row=db.prepare('SELECT data FROM wp_profiles WHERE chain=? AND address=?').get(chain,wallet);if(!row)return;
     return {...this.profile(row.data),changes:db.prepare('SELECT data FROM wp_changes WHERE chain=? AND address=? ORDER BY id DESC LIMIT 20').all(chain,wallet).map(r=>parse(r.data))};}
   getMany(targets:{chain:Chain;address:string}[]):WalletProfile[]{const db=this.open();if(!db)return [];const statement=db.prepare('SELECT data FROM wp_profiles WHERE chain=? AND address=?');return targets.slice(0,200).flatMap(t=>{const wallet=chainAddress(t.chain,t.address);if(!wallet)return [];const row=statement.get(t.chain,wallet);return row?[this.profile(row.data)]:[];});}
+  /** Indexed, bounded snapshot for the live watcher; no full-profile COUNT or historical detail reads. */
+  streamTargets(chain:Chain,limit=10):WalletProfile[]{
+    const db=this.open();if(!db)return [];const cap=Math.max(1,Math.min(30,Math.trunc(limit))),quota=Math.max(1,Math.floor(cap/3)),result=new Map<string,WalletProfile>();
+    for(const group of ['forward_validated','repeated_early','public_kol']){
+      const rows=db.prepare(`SELECT p.data FROM wp_groups g INDEXED BY wp_groups_filter CROSS JOIN wp_profiles p ON p.chain=g.chain AND p.address=g.address
+        WHERE g.group_id=? AND g.chain=? AND p.fresh_until>? ORDER BY p.computed_at DESC,p.address LIMIT ?`).all(group,chain,this.now().toISOString(),quota);
+      for(const row of rows){const profile=this.profile(row.data);result.set(profile.address,profile);}
+    }
+    return [...result.values()].slice(0,cap);
+  }
   close():void {this.db?.close();this.db=undefined;}
 }

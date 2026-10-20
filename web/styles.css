@@ -139,3 +139,9 @@
 .exit-quality-case { margin-top: 12px; }
 .exit-quality-detail { min-width: 0; overflow-wrap: anywhere; }
 @media(max-width: 720px) { .exit-quality-grid { grid-template-columns: 1fr; } .exit-quality-review { padding: 0 14px 16px; } }
+.wallet-fast-status { margin: 16px 22px; padding: 18px; border: 1px solid var(--line); border-radius: 12px; display: grid; gap: 14px; min-width: 0; line-height: 1.65; overflow-wrap: anywhere; }
+.wallet-fast-status h3, .wallet-fast-status p { margin: 0; }
+.wallet-fast-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+.wallet-fast-event { display: grid; gap: 8px; padding: 12px 0; border-bottom: 1px solid var(--line); min-width: 0; }
+.wallet-fast-status summary { cursor: pointer; font-weight: 600; }
+@media(max-width:720px) { .wallet-fast-status { margin: 12px; padding: 12px; } .wallet-fast-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } }

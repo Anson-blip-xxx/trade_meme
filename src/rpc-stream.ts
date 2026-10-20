@@ -40,6 +40,8 @@ export class RpcStreamError extends Error {
 
 export interface RpcNotificationMeta {
   receivedAt: number;
+  /** Monotonic timestamp at the WebSocket message handler entrance, before JSON decoding. */
+  receivedMonoAt?:number;
   generation: number;
   subscriptionId: string | number;
 }
@@ -373,6 +375,7 @@ export class RpcStream {
   }
 
   private message(connection: Connection, data: unknown): void {
+    const receivedAt=this.clock.now(),receivedMonoAt=performance.now();
     if (typeof data !== 'string') {this.fail('RPC_MESSAGE_INVALID'); return;}
     if (Buffer.byteLength(data) > this.maxBytes) {this.fail('RPC_MESSAGE_TOO_LARGE'); return;}
     let decoded: unknown;
@@ -400,7 +403,7 @@ export class RpcStream {
         if (!active || active.generation !== connection.generation || active.desired.notificationMethod !== packet.method ||
             this.desired.get(active.desired.key)?.revision !== active.desired.revision) continue;
         this.lastMessageAt = this.clock.now(); this.reconnectAttempt = 0; this.lastError = undefined; this.notificationsReceived++;
-        try {this.onNotification(active.desired.key, packet.params.result, {receivedAt: this.lastMessageAt,
+        try {this.onNotification(active.desired.key, packet.params.result, {receivedAt,receivedMonoAt,
           generation: connection.generation, subscriptionId: active.id});}
         catch {this.lastError = 'RPC_CONSUMER_ERROR';}
         this.emitStatus();

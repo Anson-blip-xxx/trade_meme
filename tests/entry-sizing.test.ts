@@ -341,3 +341,9 @@ test('fraction config is explicit, chain-scoped and rejects malformed basis poin
   for(const value of ['','0','-1','10001','10.5','1e3','01000',' 1000','NaN'])
     assert.throws(()=>readConfig({ENTRY_BALANCE_BPS_SOLANA:value}),/ENTRY_BALANCE_BPS_INVALID/);
 });
+
+test('wallet-stream preview source cannot bypass independent execution readiness, even with a candidate report',async t=>{
+  const ctx=setup(t,{chain:'solana'}),report=ctx.candidate();report.signal.source='wallet';
+  const result=await ctx.controller.consider(report);
+  assert.equal(result.reason,'ENTRY_WALLET_STREAM_RESEARCH_ONLY');assert.equal(ctx.readCalls.length,0);assert.equal(ctx.signedCalls.length,0);
+});

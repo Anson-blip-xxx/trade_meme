@@ -3,7 +3,7 @@ import {closeSync,constants,fstatSync,fsyncSync,mkdirSync,openSync,readSync,rena
 import {dirname,join,basename} from 'node:path';
 import type {Chain} from './types.js';
 
-export type ReviewSamplingSource='debot'|'ave'|'gmgn'|'manual';
+export type ReviewSamplingSource='debot'|'ave'|'gmgn'|'wallet'|'manual';
 export interface ReviewSamplingCohort {chain:Chain;source:ReviewSamplingSource;total:number;covered:number;}
 export interface ReviewSamplingPlan {
   version:1;policyVersion:'review-coverage-v1';id:string;scope:'research_sampling_only';
@@ -20,11 +20,11 @@ const stamp=(v:unknown):v is string=>typeof v==='string'&&/^\d{4}-\d\d-\d\dT\d\d
 const exact=(v:Record<string,unknown>,keys:string[])=>Object.keys(v).length===keys.length&&keys.every(key=>Object.hasOwn(v,key));
 /** Uses the complete observed cohort counts only. Price, scores and outcomes are not inputs. */
 export function buildReviewSamplingPlan(input:{asOf:string;windowEndAt:string;cohorts:ReviewSamplingCohort[]}):ReviewSamplingPlan {
-  if(!stamp(input.asOf)||!stamp(input.windowEndAt)||input.windowEndAt>input.asOf||!Array.isArray(input.cohorts)||input.cohorts.length>12)
+  if(!stamp(input.asOf)||!stamp(input.windowEndAt)||input.windowEndAt>input.asOf||!Array.isArray(input.cohorts)||input.cohorts.length>15)
     throw new Error('REVIEW_SAMPLING_PLAN_INVALID');
   const seen=new Set<string>();
   const cohorts=input.cohorts.map(row=>{
-    if(!row||!['bsc','solana','robinhood'].includes(row.chain)||!['debot','ave','gmgn','manual'].includes(row.source)||
+    if(!row||!['bsc','solana','robinhood'].includes(row.chain)||!['debot','ave','gmgn','wallet','manual'].includes(row.source)||
       !Number.isSafeInteger(row.total)||row.total<0||row.total>1e9||!Number.isSafeInteger(row.covered)||row.covered<0||row.covered>row.total)
       throw new Error('REVIEW_SAMPLING_PLAN_INVALID');
     const key=`${row.chain}:${row.source}`;if(seen.has(key))throw new Error('REVIEW_SAMPLING_PLAN_INVALID');seen.add(key);

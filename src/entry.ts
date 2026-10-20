@@ -197,6 +197,7 @@ export class EntryController {
     let report: Report;
     try { report = structuredClone(input); report.signal = parseSignal(report.signal); }
     catch { return {status: 'blocked', reason: 'ENTRY_REPORT_INVALID'}; }
+    if(report.signal.source==='wallet')return {status:'blocked',reason:'ENTRY_WALLET_STREAM_RESEARCH_ONLY'};
     let ineligible: string | undefined;
     try { ineligible = this.checkEligibility(report); }
     catch { return {status: 'blocked', reason: 'ENTRY_REPORT_INVALID'}; }

@@ -41,8 +41,12 @@ import {AveSessionClient} from './providers/ave-session.js';
 import {TokenRankResearchRunner} from './token-rank-runner.js';
 import {MarketPriceRouter} from './market-price-router.js';
 import type {Fetcher} from './http.js';
+import {WalletFastRunner} from './wallet-fast-runner.js';
+import {WalletFastResearch} from './wallet-fast-research.js';
+import {WalletFastTargets,type FastWalletSnapshot,type FastWalletTarget,type FastTokenCheck} from './wallet-fast.js';
 
 export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher}={}) {
+  let walletFast:WalletFastRunner|undefined,walletFastResearch:WalletFastResearch|undefined;
   if(!isPersistentOrderPath(config.ordersDatabase)) throw new Error('PERSISTENT_ORDER_DATABASE_REQUIRED');
   if(config.gmgnApiKey?.trim()==='gmgn_solbscbaseethmonadtron') throw new Error('GMGN_DEMO_KEY_TEST_ONLY');
   const sameDatabase=(a:string,b:string)=>{
@@ -131,7 +135,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher}
     ...(memeObserver?{memeDatabase:config.meme!.database}:{}),
     ...(sourceEvidence?{sourceDatabase:config.corroboration!.database}:{})}):undefined;
   const captureSource=(signal:Signal,at?:string,display?:{name?:string})=>{
-    if(signal.source==='manual'||signal.source==='gmgn'&&!signal.sourceEventId.startsWith('gmgn:trade:'))return;
+    if(signal.source==='manual'||signal.source==='wallet'||signal.source==='gmgn'&&!signal.sourceEventId.startsWith('gmgn:trade:'))return;
     try {
       // This exact template is emitted by normalizeGmgnTrades only. The source
       // ledger validates reference formats again and never promotes ownership.
@@ -204,7 +208,8 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher}
         else recordPriceError(price,route.reason??'PRICE_SOURCE_CONFLICT');
       }
     }}):undefined;
-  const chainStreamStatus=()=>{try{return chainMonitor?.getStatus()??{enabled:false,running:false,mode:'observation_only',chains:[],recentEvents:[]};}
+  const chainStreamStatus=()=>{try{return {...(chainMonitor?.getStatus()??{enabled:false,running:false,mode:'observation_only',chains:[],recentEvents:[]}),
+    walletFast:walletFast?{...walletFast.status(),research:walletFastResearch?.status()}:{enabled:false}};}
     catch{return {enabled:config.chainStream.enabled,mode:'observation_only',captureError:'CHAIN_STATUS_READ_FAILED',chains:[],recentEvents:[]};}};
   const tracking=archive?new PriceTracker({archive:{
     pendingTokens:(limit,now)=>mergeTokens(exitShadow?.trackingTokens(180,now)??[],
@@ -239,6 +244,37 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher}
     } catch(error) {store.interrupt(item.id,item.claimId!);throw error;}
     finally {active--;}
   };
+  if(config.walletFast?.enabled&&config.chainStream.enabled&&walletHistory){
+    const fastTargets=new WalletFastTargets();
+    walletFastResearch=new WalletFastResearch({
+      ready:()=>!closed&&active<2&&!!config.gmgnApiKey?.trim()&&client.cooldownUntil<=Date.now()&&!scanner.getStatus().inFlight,
+      activity:event=>client.withSignal(AbortSignal.timeout(8000)).get('/v1/user/wallet_activity',
+        {chain:event.chain==='solana'?'sol':event.chain,wallet_address:event.wallet,limit:100},3),
+      onTrades:trades=>walletHistory.recordTrades(trades),onSignal});
+    walletFast=new WalletFastRunner({endpoints:config.chainStream.endpoints,maxWallets:config.chainStream.maxWallets,
+      onEvent:event=>walletFastResearch?.enqueue(event),snapshot:()=>{
+        const now=Date.now(),targets:FastWalletTarget[]=[],tokens:FastTokenCheck[]=[];
+        for(const chain of ['bsc','solana','robinhood'] as const){
+          if(!config.chainStream.endpoints[chain])continue;
+          const addresses=new Set<string>();
+          // Reserve room for multiple research cohorts rather than only the largest reported profits.
+          for(const p of walletProfiles?.reader.streamTargets(chain,config.chainStream.maxWallets)??[])addresses.add(p.address);
+          for(const address of walletHistory.streamWalletTargets(chain,config.chainStream.maxWallets))addresses.add(address);
+          const selected=fastTargets.select(chain,[...addresses],config.chainStream.maxWallets,now),
+            profiles=new Map((walletProfiles?.reader.getMany(selected.map(address=>({chain,address})))??[]).map(p=>[p.address,p]));
+          for(const wallet of selected){
+            const p=profiles.get(wallet);
+            targets.push({chain,wallet,groups:p?.groups.map(g=>g.id)??[],profileUntil:p?.freshUntil});
+          }
+        }
+        const cachedTokens=new Set<string>();
+        for(const item of store.list().slice(0,500).sort((a,b)=>(b.report?.evaluatedAt??'').localeCompare(a.report?.evaluatedAt??'')))if(item.report){const r=item.report;
+          const key=`${r.signal.token.chain}:${r.signal.token.address}`;if(cachedTokens.has(key))continue;cachedTokens.add(key);
+          tokens.push({...r.signal.token,state:r.safety.status==='fail'||r.provenance.status==='fail'?'fail':
+            r.safety.status==='pass'&&r.provenance.status==='pass'?'pass':'unknown',validUntil:r.validUntil});}
+        return {at:new Date(now).toISOString(),validUntil:new Date(now+120000).toISOString(),targets,tokens} satisfies FastWalletSnapshot;
+      }});
+  }
   const scanner=new GmgnScanner({client,chains:config.scannerChains,intervalMs:config.scannerIntervalSec*1000,
     maxAgeSec:config.maxSignalAgeSec,maxSignalsPerCycle:config.scannerMaxSignals,onSignal,
     onFeed:page=>{
@@ -408,6 +444,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher}
         for(const observation of debotScanner?.observationSeeds()??[])observeSignal(observation.signal,observation.observedAt,observation,false);
         memeObserver.start();
       }
+      walletFastResearch?.start();walletFast?.start();
       chainMonitor?.start();tracking?.start();balances?.start();system?.start();walletProfiles?.start();tokenRankResearch?.start();walletScreening?.start(async signal=>{
         if(closed||active>=4||!config.gmgnApiKey?.trim()||client.cooldownUntil>Date.now()||scanner.getStatus().inFlight)return false;
         await onSignal(signal);
@@ -434,6 +471,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher}
     async close(){
       if(closed) return;closed=true;scanner.stop();clearInterval(sweep);clearInterval(reconcileTimer);clearInterval(walletIndexTimer);clearInterval(debotSyncTimer);clearInterval(exitMaintenanceTimer);
       priceRouter.close();
+      await walletFast?.stop();await walletFastResearch?.stop();
       await debotStream?.stop();
       await aveScanner?.stop();
       await Promise.all([chainMonitor?.stop(),tracking?.stop(),balances?.stop(),walletObserver?.stop(),system?.stop(),watchRechecker?.stop(),debotScanner?.stop()]);

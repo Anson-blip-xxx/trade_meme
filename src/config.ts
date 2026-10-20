@@ -57,6 +57,7 @@ export interface Config extends z.infer<typeof schema> {
   exitShadow:{enabled:boolean;database:string;maxBytes:number;staleAfterSec:number;maxPositions:number};
   chainStream:{enabled:boolean;database:string;maxBytes:number;maxWallets:number;maxPools:number;
     endpoints:Partial<Record<Chain,{http:string;ws:string}>>};
+  walletFast?:{enabled:boolean};
 }
 export function isPersistentOrderPath(value:string):boolean {
   return typeof value==='string'&&value.trim().length>0&&value.trim()!==':memory:'&&
@@ -105,6 +106,7 @@ export function readConfig(env:NodeJS.ProcessEnv=process.env): Config {
       entryMode:env.ENTRY_MODE,entrySizing:env.ENTRY_SIZING,entrySlippagePct:env.ENTRY_SLIPPAGE_PCT,entryMaxOpen:env.ENTRY_MAX_OPEN,
       entryGasPriceBsc:env.ENTRY_GAS_PRICE_BSC_WEI,entryPriorityFeeSolana:env.ENTRY_PRIORITY_FEE_SOLANA,entryTipFeeSolana:env.ENTRY_TIP_FEE_SOLANA}),
     rpc:{bsc:env.BSC_RPC_URL,solana:env.SOLANA_RPC_URL,robinhood:env.ROBINHOOD_RPC_URL},
+    walletFast:{enabled:z.enum(['true','false']).default('false').parse(env.WALLET_FAST_ENABLED)==='true'},
     chainStream:{enabled:z.enum(['true','false']).default('false').parse(env.CHAIN_STREAM_ENABLED)==='true',
       database:z.string().trim().refine(isPersistentOrderPath).parse(env.CHAIN_STREAM_DATABASE_PATH??'data/chain-stream.sqlite'),
       maxBytes:z.coerce.number().int().min(16).max(4096).parse(env.CHAIN_STREAM_MAX_MB??256)*1024*1024,

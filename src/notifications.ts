@@ -21,7 +21,7 @@ const canonicalAddress=(address:string,chain:ChainName)=>chain==='solana'?addres
 // This is an operator-supplied notification, not a vendor-authenticated webhook.
 // Chain and original occurrence time are mandatory; neither can be inferred safely.
 const NotificationSchema=z.object({
-  source:z.enum(['debot','gmgn','ave','manual']),
+  source:z.enum(['debot','gmgn','ave','wallet','manual']),
   chain:Chain,
   occurredAt:z.iso.datetime({offset:true}),
   text:z.string().min(1).max(12000).refine(v=>v.trim().length>0,'请提供通知原文'),

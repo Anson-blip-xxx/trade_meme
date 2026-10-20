@@ -1375,7 +1375,28 @@
     body.append(el('p', 'chain-event-caveat', '转账或钱包交易活动本身不足以判断买卖方向、真实成交或实际控制人。'));
     card.append(body); return card;
   }
+  const fastVerdicts={priority_review:'优先核验',review_activity:'核验交易类型',watch_outflow:'关注资金流出',blocked_cached_risk:'已有风险阻断',refresh_profile:'画像待更新',retracted:'链上日志已撤回'};
+  function renderWalletFast(data) {
+    const node=$('wallet-fast-status'),openFolds=[...node.querySelectorAll('details')].map(item=>item.open);node.replaceChildren();
+    node.append(el('h3','','聪明钱包直听 · 快速预判'));
+    if(!data?.enabled){node.append(el('p','','独立钱包监听尚未启用。'));return;}
+    const metric=data.latency||{},ms=value=>finite(value)?`${value.toFixed(2)} ms`:'待采样';
+    node.append(badge(data.running&&!data.statusStale?'监听运行中':'监听状态待确认',data.running&&!data.statusStale?'pass':'watch'),
+      el('p','',`口径：节点消息进入监听程序 → 完成快速预判。目标 <100ms；不含节点传输、交易详情补查、完整风控及下单。`));
+    const grid=el('div','wallet-fast-metrics');
+    for(const [label,value] of [['P50',metric.p50Ms],['P95',metric.p95Ms],['P99',metric.p99Ms],['启动后最大耗时',metric.maxMs]])grid.append(protectionMetric(label,ms(value),'已观测处理耗时'));
+    node.append(grid,el('p','',`累计 ${count(metric.samples)} 次钱包通知 · 分位数取最近 ${count(metric.windowSamples)} 次 · ≥100ms ${count(metric.over100Ms)} 次。当前测量不代表未来每次都达标。`));
+    node.append(kv('名单数量 / 名单状态',`${count(data.targets)} / ${data.snapshotFresh?'有效':'已过期，暂停预判'}`),kv('送达研究线程 P99',ms(data.mainThreadHandoff?.p99Ms)),kv('监听事件循环延迟 P99',ms(data.eventLoopP99Ms)),kv('拥塞丢弃事件',count(data.droppedEvents)));
+    if(data.error||data.droppedEvents||!data.snapshotFresh||data.statusStale)node.append(el('p','notice warning',`监听存在异常或覆盖缺口：${scalar(data.error,'请查看名单时效、拥塞数量与连接状态')}。不保证完整捕获。`));
+    const chains=el('div','price-router-tags');for(const c of data.chains||[])chains.append(badge(`${chainName(c.chain)} · ${c.identityVerified&&c.activeSubscriptions===c.desiredSubscriptions?'已连接':'连接待恢复'} · ${count(c.watchedWallets)} 钱包 · 订阅 ${count(c.activeSubscriptions)}/${count(c.desiredSubscriptions)}`,c.identityVerified&&c.activeSubscriptions===c.desiredSubscriptions?'neutral':'watch'));node.append(chains);
+    const research=data.research||{};node.append(el('p','',`后续核验：排队 ${count(research.queued)} · 匹配买入 ${count(research.counts?.matchedBuys)} · 完成完整分析 ${count(research.counts?.dispatched)} · 过期 ${count(research.counts?.expired)} · 队列丢弃 ${count(research.counts?.dropped)}。明细补查最多每分钟 ${count(research.requestLimitPerMinute)} 次，共用 GMGN 限流。`));
+    node.append(el('p','detail-small','Solana 使用 processed 预警，BSC / Robinhood 使用已入块转账日志。钱包提及、转账和供应商分类均不等于独立验证成交；此通道只触发研究，暂不下单。'));
+    const fold=el('details');fold.append(el('summary','',`当前监听名单 · ${count(data.targets)} 个`));for(const t of data.watchedTargets||[]){const row=el('div','wallet-fast-event');row.append(el('strong','',`${chainName(t.chain)} · ${t.profileFresh?'画像有效':'画像过期或缺失'}`),addressNode(t.wallet),el('small','',(t.groups||[]).map(g=>profileGroupNames[g]||g).join(' / ')||'待积累画像'));fold.append(row);}node.append(fold);
+    const events=el('details');events.append(el('summary','','最近预判 · 最多 20 条'));for(const event of data.recentEvents||[]){const row=el('div','wallet-fast-event');row.append(el('strong','',`${chainName(event.chain)} · ${fastVerdicts[event.verdict]||'待核验'} · ${ms(event.processingMs)}`),addressNode(event.wallet),el('small','',date(event.receivedAt,true)),followupTradeLink(event.chain,event.txHash));if(event.tokenAddress)row.append(gmgnTokenLink(event.chain,event.tokenAddress));events.append(row);}node.append(events);
+    fold.open=!!openFolds[0];events.open=!!openFolds[1];
+  }
   function renderChainStream() {
+    renderWalletFast((state.chainStream||state.overview?.chainStream)?.walletFast);
     const data = state.chainStream || state.overview?.chainStream, chains = Array.isArray(data?.chains) ? data.chains.filter(chain => chain && typeof chain === 'object') : [], store = data?.store || {};
     const cards = $('chain-stream-cards'); cards.replaceChildren(); for (const chain of chains) cards.append(chainStreamCard(chain));
     const empty = $('chain-stream-empty'); empty.hidden = chains.length > 0;
@@ -1458,7 +1479,7 @@
   }
   const dailyFunnelNames={entered:['已有订单记录','neutral'],signal_filtered:['信号阶段未入选','neutral'],not_evaluated:['未完成判断','watch'],safety_blocked:['安全检查拦截','fail'],safety_incomplete:['安全证据不完整','watch'],execution_path:['发行阶段或交易路径未支持','watch'],analysis_incomplete:['分析超时 · 证据未返回完整','watch'],timeliness:['信号或证据时效不足','watch'],wallet_support:['钱包支持不足','watch'],market_risk:['市场风险阻断','watch'],strategy_watch:['策略继续观察','neutral'],execution_disabled:['开仓未启用','neutral'],execution_blocked:['执行检查阻断','watch'],eligible_no_entry_record:['通过研究 · 未发现开单记录','neutral'],decision_after_peak:['缺少采样峰值前判断','watch']};
   function dailyTime(value) {const d=validDate(value);return d?new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}).format(d):'—';}
-  function dailySource(value) {return {gmgn:'GMGN',debot:'DeBot',ave:'Ave',dexscreener:'DexScreener',manual:'人工导入'}[value]||scalar(value,'来源未知');}
+  function dailySource(value) {return {gmgn:'GMGN',debot:'DeBot',ave:'Ave',dexscreener:'DexScreener',wallet:'钱包直听',manual:'人工导入'}[value]||scalar(value,'来源未知');}
   function dailyDecision(record) {return record?.decision?badge(...(decisions[record.decision]||[scalar(record.decision),'neutral'])):badge('当时判断未知','neutral');}
   function dailyHasLaterDecision(item) {const first=item.firstDecision,last=item.latestDecision;return !!last&&(!first||['at','decision','policyVersion','buyEligible','scanId'].some(key=>last[key]!==first[key]));}
   function dailyEligibility(item) {
@@ -1842,7 +1863,7 @@
   function sourceDiagnostic(code) {
     return {AVE_SESSION_PUBLIC_ONLY:'当前为公开数据连接，账号尚未认证',AVE_SESSION_NOT_VERIFIED:'账号尚未完成验证',AVE_SESSION_VERIFICATION_EXPIRED:'账号验证已过期，等待重新验证',AVE_SESSION_AUTH_REQUIRED:'账号会话失效，等待重新登录',AVE_SESSION_EMAIL_MISMATCH:'登录账号与配置账号不匹配',AVE_SESSION_EMAIL_UNVERIFIED:'账号邮箱尚未核实',AVE_SESSION_FILE_MISSING:'尚未取得账号会话',AVE_SIGNAL_STALE:'原始通知超过本轮分析时限',AVE_SIGNAL_ANALYSIS_FAILED:'分析暂时失败，已保留收到的通知',AVE_SIGNAL_UNSUPPORTED_CHAIN:'当前来源尚未覆盖此链',GMGN_RATE_LIMITED:'GMGN 限流，等待研究队列恢复',RESEARCH_BUSY:'已有研究任务运行，等待队列',SCANNER_BUSY:'主扫描正在运行，等待分析',SOURCE_LEDGER_CAPACITY_REACHED:'来源账本达到容量上限，新证据暂未写入',SOURCE_EVENT_ID_CONFLICT:'来源事件标识出现合约身份冲突'}[code] || reasonNames[code] || scalar(code,'等待更新');
   }
-  function sourceLabel(value) { return {ave:'Ave',debot:'DeBot',gmgn:'GMGN',manual:'手动'}[value] || scalar(value,'来源未知'); }
+  function sourceLabel(value) { return {ave:'Ave',debot:'DeBot',gmgn:'GMGN',wallet:'钱包直听',manual:'手动'}[value] || scalar(value,'来源未知'); }
   function sourceExternalLink(value,label,provider) {
     try { const url=new URL(value),hosts=provider==='x'?['x.com','www.x.com','twitter.com','www.twitter.com']:['ave','debot','gmgn'].includes(provider)?[`${provider}.ai`,`www.${provider}.ai`]:[];
       if(url.protocol!=='https:'||url.username||url.password||url.port||!hosts.includes(url.hostname)||url.pathname.startsWith('/api/'))return null;

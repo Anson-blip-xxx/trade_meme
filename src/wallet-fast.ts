@@ -15,6 +15,12 @@ export interface FastWalletEvent {
 }
 const priority=new Set(['forward_validated','repeated_early','precursor_pattern','public_kol']);
 const validTime=(v:unknown)=>typeof v==='string'&&Number.isFinite(Date.parse(v));
+/** Pins add observation targets after automatic selection; they grant no profile or trading qualification. */
+export function mergePinnedWallets(chain:Chain,automatic:readonly string[],pinned:readonly string[]=[]):string[]{
+  const targets=new Set<string>();
+  for(const value of [...automatic,...pinned]){const wallet=chainAddress(chain,value);if(wallet)targets.add(wallet);}
+  return [...targets];
+}
 /** Keep subscriptions stable while profile evidence continues to refresh every 30 seconds. */
 export class WalletFastTargets {
   private selected=new Map<Chain,{wallets:string[];rotateAt:number}>();

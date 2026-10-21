@@ -45,7 +45,7 @@ import {WalletFastRunner} from './wallet-fast-runner.js';
 import {WalletFastResearch} from './wallet-fast-research.js';
 import {WalletActivityVerifier} from './wallet-activity.js';
 import {WalletActivityStore} from './wallet-activity-store.js';
-import {WalletFastTargets,type FastWalletSnapshot,type FastWalletTarget,type FastTokenCheck} from './wallet-fast.js';
+import {WalletFastTargets,mergePinnedWallets,type FastWalletSnapshot,type FastWalletTarget,type FastTokenCheck} from './wallet-fast.js';
 
 export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher}={}) {
   let walletFast:WalletFastRunner|undefined,walletFastResearch:WalletFastResearch|undefined;
@@ -203,8 +203,10 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher}
     try{groups.push(archive?.streamingTokens(new Date(),config.chainStream.maxPools)??[]);}catch{failed='ARCHIVE_PRICE_TARGETS_UNAVAILABLE';}
     priceTargetError=failed;return mergeTokens(...groups).slice(0,200);
   };
-  const chainMonitor=config.chainStream.enabled?new ChainMonitor({config:config.chainStream,
-    tokens:streamPriceTokens,wallets:(chain,limit)=>walletHistory?.streamWalletTargets(chain,limit)??[],onPrice:price=>{
+  // Reserve pin capacity without changing the automatic selection budget on any chain.
+  const streamWalletCapacity=config.chainStream.maxWallets+Math.max(0,...Object.values(config.chainStream.pinnedWallets??{}).map(wallets=>wallets.length));
+  const chainMonitor=config.chainStream.enabled?new ChainMonitor({config:{...config.chainStream,maxWallets:streamWalletCapacity},
+    tokens:streamPriceTokens,wallets:chain=>mergePinnedWallets(chain,walletHistory?.streamWalletTargets(chain,config.chainStream.maxWallets)??[],config.chainStream.pinnedWallets?.[chain]),onPrice:price=>{
       if(priceRouter.observeChainSample(price)){
         const route=priceRouter.latest(price);
         if(route.status==='available')recordPrice(price);
@@ -256,7 +258,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher}
       ready:()=>!closed&&active<2&&!!config.gmgnApiKey?.trim()&&client.cooldownUntil<=Date.now()&&!scanner.getStatus().inFlight,
       verify:event=>walletVerifier!.verify(event),onClassification:result=>walletActivity!.record(result),
       onTrades:trades=>walletHistory.recordTrades(trades),onSignal});
-    walletFast=new WalletFastRunner({endpoints:config.chainStream.endpoints,maxWallets:config.chainStream.maxWallets,
+    walletFast=new WalletFastRunner({endpoints:config.chainStream.endpoints,maxWallets:streamWalletCapacity,
       onEvent:event=>walletFastResearch?.enqueue(event),snapshot:()=>{
         const now=Date.now(),targets:FastWalletTarget[]=[],tokens:FastTokenCheck[]=[];
         for(const chain of ['bsc','solana','robinhood'] as const){
@@ -265,7 +267,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher}
           // Reserve room for multiple research cohorts rather than only the largest reported profits.
           for(const p of walletProfiles?.reader.streamTargets(chain,config.chainStream.maxWallets)??[])addresses.add(p.address);
           for(const address of walletHistory.streamWalletTargets(chain,config.chainStream.maxWallets))addresses.add(address);
-          const selected=fastTargets.select(chain,[...addresses],config.chainStream.maxWallets,now),
+          const selected=mergePinnedWallets(chain,fastTargets.select(chain,[...addresses],config.chainStream.maxWallets,now),config.chainStream.pinnedWallets?.[chain]),
             profiles=new Map((walletProfiles?.reader.getMany(selected.map(address=>({chain,address})))??[]).map(p=>[p.address,p]));
           for(const wallet of selected){
             const p=profiles.get(wallet);

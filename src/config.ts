@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import {readFileSync} from 'node:fs';
+import bs58 from 'bs58';
 import type { Chain } from './types.js';
 import {parseExitPolicy,type ExitPolicy} from './exit-policy.js';
 
@@ -56,7 +57,7 @@ export interface Config extends z.infer<typeof schema> {
   watch:{enabled:boolean;windowSec:number;intervalSec:number;maxPerCycle:number};
   exitShadow:{enabled:boolean;database:string;maxBytes:number;staleAfterSec:number;maxPositions:number};
   chainStream:{enabled:boolean;database:string;maxBytes:number;maxWallets:number;maxPools:number;
-    endpoints:Partial<Record<Chain,{http:string;ws:string}>>};
+    endpoints:Partial<Record<Chain,{http:string;ws:string}>>;pinnedWallets?:Partial<Record<Chain,string[]>>};
   walletFast?:{enabled:boolean;database?:string;maxBytes?:number};
 }
 export function isPersistentOrderPath(value:string):boolean {
@@ -94,6 +95,20 @@ export function readConfig(env:NodeJS.ProcessEnv=process.env): Config {
       streamEndpoints[chain]={ws:w.href,http:h.href};
     }catch {throw new Error('CHAIN_STREAM_ENDPOINT_INVALID');}
   }
+  const streamMaxWallets=z.coerce.number().int().min(1).max(30).parse(env.CHAIN_STREAM_MAX_WALLETS??10);
+  const watchlist=env.SOLANA_WALLET_WATCHLIST??'';
+  let solanaPins:string[]=[];
+  try {
+    if(watchlist.length>2048)throw new Error();
+    if(watchlist.trim())solanaPins=[...new Set(watchlist.split(',').map(value=>{
+      const wallet=value.trim();if(wallet.length<32||wallet.length>44)throw new Error();
+      const decoded=bs58.decode(wallet);
+      if(decoded.length!==32||!decoded.some(byte=>byte!==0)||bs58.encode(decoded)!==wallet)throw new Error();
+      return wallet;
+    }))];
+    if(solanaPins.length>5)throw new Error();
+  }catch {throw new Error('SOLANA_WALLET_WATCHLIST_INVALID');}
+  if(streamMaxWallets+solanaPins.length>30)throw new Error('SOLANA_WALLET_WATCHLIST_CAPACITY');
   return {
     ...schema.parse({maxSignalAgeSec:env.MAX_SIGNAL_AGE_SEC, maxEvidenceAgeSec:env.MAX_EVIDENCE_AGE_SEC,
       decisionTtlSec:env.DECISION_TTL_SEC,maxTaxRate:env.MAX_TAX_RATE,xDataProvider:env.X_DATA_PROVIDER,narrativeProvider:env.NARRATIVE_PROVIDER,
@@ -112,8 +127,9 @@ export function readConfig(env:NodeJS.ProcessEnv=process.env): Config {
     chainStream:{enabled:z.enum(['true','false']).default('false').parse(env.CHAIN_STREAM_ENABLED)==='true',
       database:z.string().trim().refine(isPersistentOrderPath).parse(env.CHAIN_STREAM_DATABASE_PATH??'data/chain-stream.sqlite'),
       maxBytes:z.coerce.number().int().min(16).max(4096).parse(env.CHAIN_STREAM_MAX_MB??256)*1024*1024,
-      maxWallets:z.coerce.number().int().min(1).max(30).parse(env.CHAIN_STREAM_MAX_WALLETS??10),
-      maxPools:z.coerce.number().int().min(1).max(30).parse(env.CHAIN_STREAM_MAX_POOLS??8),endpoints:streamEndpoints},
+      maxWallets:streamMaxWallets,
+      maxPools:z.coerce.number().int().min(1).max(30).parse(env.CHAIN_STREAM_MAX_POOLS??8),endpoints:streamEndpoints,
+      ...(solanaPins.length?{pinnedWallets:{solana:solanaPins}}:{})},
     goPlusToken:env.GOPLUS_ACCESS_TOKEN,etherscanKey:env.ETHERSCAN_API_KEY,xBearer:env.X_BEARER_TOKEN,
     twitterApiIoKey:env.TWITTERAPI_IO_KEY,
     openaiKey:env.OPENAI_API_KEY,openaiModel:env.OPENAI_MODEL,

@@ -101,6 +101,54 @@ test('as-of token and wallet pages stay fixed when later profit rows change orde
   }finally{f.close();}
 });
 
+test('new rank observations advance token history and checkpoints without duplicating unchanged wallet evidence',()=>{
+  const f=fixture();try{
+    f.rank();f.buy(1);f.buy(2);f.profit(1,'10');f.profit(2,'20');const worker=f.create();worker.runBatch();
+    const r=f.reader(),first=r.wallet('bsc',address(1)),db=new DatabaseSync(f.out,{readOnly:true});
+    try{
+      const counts=()=>['tr_token_versions','tr_wallet_token_versions','tr_wallet_versions'].map(table=>
+        Number(db.prepare(`SELECT count(*) AS n FROM ${table}`).get()!.n));
+      assert.deepEqual(counts(),[1,2,2]);
+      f.advance(130);f.rank(125,900,2);const status=worker.runBatch();
+      assert.equal(status.error,undefined);assert.equal(status.lastRunAt,at(130));assert.deepEqual(counts(),[2,2,2]);
+      assert.equal(r.detail('bsc',address(900)).token?.latestRank.observedAt,at(125));
+      assert.equal(r.wallet('bsc',address(1)).wallet?.computedAt,at(100),'an unchanged summary retains its first-known version time');
+      assert.deepEqual(r.wallet('bsc',address(1)).items,first.items);
+      assert.deepEqual({...r.wallet('bsc',address(1),{asOf:first.asOf}),now:first.now},first);
+      f.advance(431);assert.equal(worker.runBatch().lastRunAt,at(431));assert.deepEqual(counts(),[2,2,2]);
+    }finally{db.close();}
+  }finally{f.close();}
+});
+
+test('wallet deduplication preserves losses, evidence times and conflicts while omitting unchanged summaries',()=>{
+  const f=fixture();try{
+    f.rank();f.buy();f.profit();const worker=f.create();worker.runBatch();const r=f.reader(),initial=r.wallet('bsc',address(1)),
+      db=new DatabaseSync(f.out,{readOnly:true});
+    try{
+      const counts=()=>['tr_wallet_token_versions','tr_wallet_versions'].map(table=>
+        Number(db.prepare(`SELECT count(*) AS n FROM ${table}`).get()!.n));
+      assert.deepEqual(counts(),[1,1]);
+      f.advance(130);f.profit(1,'-5','0','-5',125);worker.runBatch();assert.deepEqual(counts(),[2,2]);
+      assert.equal(r.wallet('bsc',address(1)).wallet?.realizedProfitUsd,-5);
+      assert.equal(r.wallet('bsc',address(1),{asOf:initial.asOf}).wallet?.realizedProfitUsd,50);
+      f.advance(160);f.profit(1,'-5','0','-5',155);worker.runBatch();assert.deepEqual(counts(),[3,3]);
+      assert.equal(r.wallet('bsc',address(1)).items[0].pnl?.observedAt,at(155),'same amounts with newer evidence are not duplicates');
+      const sig:Signal={source:'debot',sourceEventId:'dedup-anchor',token:token(),occurredAt:at(50),text:'signal',evidenceUrls:[],claim:'unspecified'};
+      f.advance(190);f.sources.record(sig,at(190));f.rank(185);worker.runBatch();assert.deepEqual(counts(),[4,3]);
+      const anchored=r.wallet('bsc',address(1));assert.equal(anchored.items[0].comparisons.signal.anchor?.knownAt,at(190));
+      assert.equal(anchored.items[0].comparisons.signal.position,'before');assert.equal(anchored.wallet?.computedAt,at(160));
+      f.advance(220);f.sources.record({...sig,occurredAt:at(49)},at(220));f.rank(215);worker.runBatch();assert.deepEqual(counts(),[5,3]);
+      const conflict=r.wallet('bsc',address(1));assert.equal(conflict.items[0].comparisons.signal.anchor?.status,'conflict');
+      assert.equal(conflict.items[0].comparisons.signal.position,'unknown');
+      assert.equal(r.wallet('bsc',address(1),{asOf:anchored.asOf}).items[0].comparisons.signal.position,'before');
+      f.advance(250);f.buy(1,70,245,900,1);worker.runBatch();assert.deepEqual(counts(),[6,4]);
+      const revoked=r.wallet('bsc',address(1));assert.equal(revoked.items[0].entry,undefined);assert.equal(revoked.wallet?.earlyTokenCount,0);
+      assert.ok(revoked.items[0].limitations.includes('CONFLICTING_BUY_TIMESTAMPS_EXCLUDED'));
+      assert.deepEqual({...r.wallet('bsc',address(1),{asOf:anchored.asOf}),now:anchored.now},anchored);
+    }finally{db.close();}
+  }finally{f.close();}
+});
+
 test('batch results become visible at completion, not at their source-read cutoff',()=>{
   const f=fixture();try{
     f.rank();f.buy();let calls=0;const worker=f.create({now:()=>new Date(at(calls++===0?100:120))});worker.runBatch();

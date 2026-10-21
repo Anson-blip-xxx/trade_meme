@@ -2,6 +2,7 @@ import {DatabaseSync} from 'node:sqlite';
 import {chmodSync,existsSync,mkdirSync,realpathSync,statSync} from 'node:fs';
 import {dirname,resolve} from 'node:path';
 import {createHash} from 'node:crypto';
+import {isDeepStrictEqual} from 'node:util';
 import bs58 from 'bs58';
 import type {Chain} from './types.js';
 
@@ -216,18 +217,26 @@ export class TokenRankResearch {
         this.db.prepare('UPDATE tr_tokens SET input_hash=? WHERE chain=? AND address=?').run(fingerprint,row.chain,row.address);
         // The bounded source/display windows must never delete accumulated wallet facts.
         for(const w of value.updates){
+          const encodedWallet=JSON.stringify(w),current=this.db.prepare('SELECT data FROM tr_wallet_current WHERE chain=? AND address=? AND token_address=?')
+            .get(w.chain,w.address,w.tokenAddress);
+          // A new token rank alone does not change this wallet's evidence or its first-known version.
+          if(current?.data===encodedWallet)continue;
           this.db.prepare('INSERT OR IGNORE INTO tr_wallets VALUES(?,?,?)').run(w.chain,w.address,now);
           this.db.prepare('INSERT INTO tr_wallet_current VALUES(?,?,?,?) ON CONFLICT(chain,address,token_address) DO UPDATE SET data=excluded.data')
-            .run(w.chain,w.address,w.tokenAddress,JSON.stringify(w));
+            .run(w.chain,w.address,w.tokenAddress,encodedWallet);
           this.db.prepare('INSERT OR IGNORE INTO tr_wallet_tokens VALUES(?,?,?,?)').run(w.chain,w.address,w.tokenAddress,now);
           this.db.prepare('INSERT INTO tr_wallet_token_versions(chain,address,token_address,computed_at,present,data) VALUES(?,?,?,?,1,?)')
-            .run(w.chain,w.address,w.tokenAddress,now,JSON.stringify(w));
+            .run(w.chain,w.address,w.tokenAddress,now,encodedWallet);
           touched.add(`${w.chain}:${w.address}`);
         }
         changed++;
       }
       for(const key of touched){const split=key.indexOf(':'),chain=key.slice(0,split) as Chain,who=key.slice(split+1);
         const summary=this.summarize(chain,who,now),encoded=JSON.stringify(summary);
+        const previous=parse(this.db.prepare('SELECT data FROM tr_wallet_versions WHERE chain=? AND address=? ORDER BY computed_at DESC,id DESC LIMIT 1')
+          .get(chain,who)?.data);
+        // Evidence versions keep every field; only the summary's computation clock is incidental.
+        if(object(previous)&&isDeepStrictEqual({...previous,computedAt:undefined},{...summary,computedAt:undefined}))continue;
         if(bytes(this.db)+Buffer.byteLength(encoded)*4+65536>=this.maxBytes)throw new Error(CAPACITY);
         this.db.prepare('INSERT INTO tr_wallet_versions(chain,address,computed_at,early_count,realized,data) VALUES(?,?,?,?,?,?)')
           .run(chain,who,now,summary.earlyTokenCount,summary.realizedProfitUsd,encoded);

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import bs58 from 'bs58';
 import {WalletFastJudge,WalletFastTargets,LatencyWindow,type FastWalletEvent} from '../src/wallet-fast.js';
 import {WalletFastResearch} from '../src/wallet-fast-research.js';
+import {activityResult,type WalletActivity} from '../src/wallet-activity.js';
 import {TRANSFER_TOPIC} from '../src/chain-stream-store.js';
 import type {Signal} from '../src/types.js';
 
@@ -63,23 +64,37 @@ test('latency distribution counts all notices, bounds window and retains lifetim
   const s=latency.summary();assert.equal(s.samples,3001);assert.equal(s.windowSamples,2048);assert.equal(s.p99Ms,2);assert.equal(s.maxMs,110);assert.equal(s.over100Ms,1);
 });
 function preview():FastWalletEvent {return fixture().judge.judge('bsc','wallet:in',log(),meta())[0];}
-function activity(side='buy',tx=hash){return {activities:[{event_type:side,tx_hash:tx,timestamp:at/1000,token:{address:token},token_amount:'1',cost_usd:'2',price_usd:'2'}]};}
-test('slow research requires exact hash/CA match and dispatches a separately labelled wallet signal',async t=>{
-  const signals:Signal[]=[],trades:unknown[]=[];const worker=new WalletFastResearch({now:()=>at+1000,ready:()=>true,activity:async()=>activity(),
-    onTrades:rows=>trades.push(...rows),onSignal:async s=>{signals.push(s);}});t.after(()=>worker.stop());worker.start();worker.enqueue(preview());await worker.runOnce();
+function verified(e=preview(),kind:WalletActivity['classification']='buy'){return activityResult(e,at+1000,kind,['SUPPORTED_SWAP_AND_WALLET_FLOW_CONFIRMED'],{
+  eventAt:new Date(at).toISOString(),confirmation:'included',trades:kind==='buy'||kind==='sell'?[{side:kind,tokenAddress:token,amountAtomic:'10',protocol:'four_meme'}]:[]});}
+test('chain-verified buys persist before dispatch; quote-token notification does not hide the actual meme purchase',async t=>{
+  const signals:Signal[]=[],trades:unknown[]=[];const worker=new WalletFastResearch({now:()=>at+1000,ready:()=>true,verify:async e=>verified(e),onClassification:()=>true,
+    onTrades:rows=>trades.push(...rows),onSignal:async s=>{signals.push(s);}});t.after(()=>worker.stop());worker.start();worker.enqueue({...preview(),tokenAddress:other});await worker.runOnce();
   assert.equal(signals.length,1);assert.equal(signals[0].source,'wallet');assert.equal(signals[0].token.address,token);assert.equal(trades.length,1);
   worker.enqueue(preview());await worker.runOnce();assert.equal(signals.length,1);
 });
-test('unrelated buys and transfers never create a buy signal; retries use the same observed transaction',async t=>{
-  for(const raw of [activity('transferIn'),activity('buy','0x'+'9'.repeat(64))]){
-    let signals=0,now=at+1000,calls=0;const worker=new WalletFastResearch({now:()=>now,ready:()=>true,activity:async()=>{calls++;return raw;},onTrades:()=>{},onSignal:async()=>{signals++;}});
+test('transfers, failures and unknown unsupported actions do not enter trade metrics or repeat vendor queries',async t=>{
+  for(const kind of ['received_purchase','distribution','transfer','self_transfer','approval','liquidity','wrap','failed','no_change','unknown'] as const){
+    let signals=0,now=at+1000,calls=0,records=0;const worker=new WalletFastResearch({now:()=>now,ready:()=>true,verify:async e=>{calls++;return verified(e,kind);},onClassification:()=>true,onTrades:()=>{records++;},onSignal:async()=>{signals++;}});
     t.after(()=>worker.stop());worker.start();worker.enqueue(preview());await worker.runOnce();now+=16000;await worker.runOnce();
-    assert.equal(signals,0);assert.equal(calls,2);assert.equal(worker.status().queued,0);
+    assert.equal(signals,0);assert.equal(records,0);assert.equal(calls,1);assert.equal(worker.status().queued,0);
   }
 });
 test('retraction during asynchronous enrichment prevents dispatch; queue and request budgets remain bounded',async t=>{
-  let release!:(value:unknown)=>void,signals=0;const worker=new WalletFastResearch({now:()=>at+1000,ready:()=>true,activity:()=>new Promise(done=>{release=done;}),onTrades:()=>{},onSignal:async()=>{signals++;}});
-  t.after(()=>worker.stop());worker.start();const e=preview();worker.enqueue(e);const done=worker.runOnce();worker.enqueue({...e,removed:true,verdict:'retracted'});release(activity());await done;assert.equal(signals,0);
+  let release!:(value:WalletActivity)=>void,signals=0;const worker=new WalletFastResearch({now:()=>at+1000,ready:()=>true,verify:()=>new Promise(done=>{release=done;}),onClassification:()=>true,onTrades:()=>{},onSignal:async()=>{signals++;}});
+  t.after(()=>worker.stop());worker.start();const e=preview();worker.enqueue(e);const done=worker.runOnce();worker.enqueue({...e,removed:true,verdict:'retracted'});release(verified());await done;assert.equal(signals,0);
   for(let i=0;i<50;i++)worker.enqueue({...e,txHash:'0x'+(i+10).toString(16).padStart(64,'0')});
-  assert.equal(worker.status().queued,32);assert.equal(worker.status().counts.dropped,18);
+  assert.equal(worker.status().queued,4);assert.equal(worker.status().counts.perWalletDropped,46);
+});
+test('chain classification proceeds while screening is busy; sell evidence is recorded without buy dispatch',async t=>{
+  let ready=false,now=at+1000,calls=0,signals=0,records=0;
+  const worker=new WalletFastResearch({now:()=>now,ready:()=>ready,verify:async e=>{calls++;return verified(e,calls===1?'buy':'sell');},onClassification:()=>true,onTrades:()=>{records++;},onSignal:async()=>{signals++;}});
+  t.after(()=>worker.stop());worker.start();worker.enqueue(preview());await worker.runOnce();assert.equal(calls,1);assert.equal(signals,0);
+  now+=1100;worker.enqueue({...preview(),txHash:'0x'+'a'.repeat(64)});await worker.runOnce();assert.equal(calls,2);assert.equal(records,2);assert.equal(worker.status().counts.verifiedSells,1);
+  ready=true;await worker.runOnce();assert.equal(signals,1);
+});
+test('retry pending chain confirmation at most three times; unavailable persistence and mismatched identities cannot dispatch',async t=>{
+  let now=at+1000,calls=0,signals=0;const w=new WalletFastResearch({now:()=>now,ready:()=>true,verify:async e=>{calls++;return {...verified(e,'unknown'),retryable:true};},onClassification:()=>true,onTrades:()=>{},onSignal:async()=>{signals++;}});
+  t.after(()=>w.stop());w.start();w.enqueue(preview());for(let i=0;i<4;i++){await w.runOnce();now+=4000;}assert.equal(calls,3);assert.equal(signals,0);
+  for(const mode of ['persistence','identity']){const worker=new WalletFastResearch({now:()=>at+1000,ready:()=>true,verify:async e=>({...verified(e),...(mode==='identity'?{wallet:other}:{})}),onClassification:()=>false,onTrades:()=>{throw new Error('must not record');},onSignal:async()=>{signals++;}});
+    t.after(()=>worker.stop());worker.start();worker.enqueue(preview());await worker.runOnce();assert.equal(signals,0);}
 });

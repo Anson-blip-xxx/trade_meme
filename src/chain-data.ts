@@ -57,20 +57,20 @@ export class ChainHttp {
   constructor(private url:string,private fetcher:typeof fetch=fetch,private intervalMs=350,private timeoutMs=10000){
     if(!Number.isFinite(intervalMs)||intervalMs<0||intervalMs>60000||!Number.isFinite(timeoutMs)||timeoutMs<1||timeoutMs>60000)fail('CHAIN_HTTP_CONFIG_INVALID');
   }
-  request(method:string,params:readonly unknown[]=[]):Promise<any> {
+  request(method:string,params:readonly unknown[]=[],signal?:AbortSignal):Promise<any> {
     if(this.stopped||this.pending>=60)return Promise.reject(new Error(this.stopped?'CHAIN_STOPPED':'CHAIN_HTTP_QUEUE_FULL'));
     let paramsJson:string;
     try {if(!READ_METHODS.has(method)||!Array.isArray(params))fail('CHAIN_HTTP_REQUEST_INVALID');
       paramsJson=JSON.stringify(params);if(Buffer.byteLength(paramsJson)>1024*1024)fail('CHAIN_HTTP_REQUEST_INVALID');
     }catch{return Promise.reject(new Error('CHAIN_HTTP_REQUEST_INVALID'));}
-    this.pending++;
+    this.pending++;const requestSignal=signal?AbortSignal.any([this.controller.signal,signal]):this.controller.signal;
     const run=this.tail.catch(()=>{}).then(async()=>{
       let timeout:ReturnType<typeof deadline>|undefined;
       try {
         if(this.stopped)fail('CHAIN_STOPPED');
-        await wait(this.nextAt-Date.now(),this.controller.signal);
+        await wait(this.nextAt-Date.now(),requestSignal);
         if(this.stopped)fail('CHAIN_STOPPED');this.nextAt=Date.now()+this.intervalMs;
-        const id=++this.id;timeout=deadline(this.controller.signal,this.timeoutMs);
+        const id=++this.id;timeout=deadline(requestSignal,this.timeoutMs);
         const response=await abortable(this.fetcher(this.url,{method:'POST',redirect:'error',headers:{'content-type':'application/json'},
           body:`{"jsonrpc":"2.0","id":${id},"method":${JSON.stringify(method)},"params":${paramsJson}}`,signal:timeout.signal}),timeout.signal,cancel);
         const data=await readJson(response,timeout.signal);

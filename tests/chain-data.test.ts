@@ -73,6 +73,16 @@ test('stop resolves active and queued requests even if a provider ignores AbortS
   release(new Response(new ReadableStream({cancel(){cancelled=true;}})));await delay(0);assert.equal(cancelled,true);
 });
 
+test('caller deadline aborts rate-limit cooldown and stalled fetches without stopping the shared client',async()=>{
+  for(const cooling of [true,false]){
+    let calls=0;const rpc=new ChainHttp(privateUrl,async()=>{calls++;return cooling?new Response('',{status:429,headers:{'retry-after':'60'}}):new Promise(()=>{});},0,10000);
+    if(cooling)await assert.rejects(rpc.request('eth_chainId'),/^Error: CHAIN_HTTP_RATE_LIMITED$/);
+    const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),20);
+    try{await assert.rejects(rpc.request('eth_blockNumber',[],controller.signal),/^Error: CHAIN_HTTP_ABORTED$/);assert.equal(calls,1);}
+    finally{clearTimeout(timer);rpc.stop();}
+  }
+});
+
 test('request timeout covers ignored fetch aborts and stalled response bodies',async()=>{
   for(const stallBody of [false,true]) {
     let cancelled=false;

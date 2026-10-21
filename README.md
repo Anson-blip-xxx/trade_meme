@@ -500,8 +500,20 @@ Solana 使用 `logsSubscribe / processed`；BSC 与 Robinhood 使用已入块 ER
 
 100ms 的计时起点是 **WebSocket message 回调入口、JSON 解析之前**，终点是快速预判完成；这不测量节点到服务器传输、内核/事件循环调度前的等待，也不包括详情补查、完整风控、报价或成交。页面展示累计样本、最近 2048 个消息的 P50/P95/P99、启动后最大值与超时数，并独立展示事件循环延迟、送达主线程的耗时、丢弃数。未收到实际样本时保持未知；基准测试与线上数字不能相互代替。
 
-预判后异步进行详情核验：最多排队 32 笔，最多每分钟 6 次 GMGN 钱包明细请求，仍共享现有 Key 的限流。仅接受与监听到的链、钱包、交易哈希及已知 CA 匹配的买入记录；未匹配最多重试一次，超过 120 秒失效。匹配结果单独标记 `source=wallet`（钱包直听），进入完整筛选和长期钱包历史；GMGN 的 buy 分类仍是供应商证据。此来源在开仓入口额外保持研究模式，不能因已有候选结论自动交易。通过本地解析交易并独立核验成交后，才能进一步评估取消该限制。
+预判后异步进行链上交易分类，独立查询 RPC，不再用 GMGN 的 `buy` 标签代替核验。核验队列最多 64 笔、单钱包最多 4 笔、每分钟最多开始 60 笔；同笔多条代币日志合并核验完整回执，避免把报价币的一条转账当成整个交易。单次核验最多 20 次 RPC 请求、总等待预算 12 秒（包含节点退避等待），节点未返回确认回执最多尝试 3 次，120 秒后失效。完整研究另有最多 16 笔队列，每分钟最多 6 笔；GMGN 限流或研究繁忙不会暂停链上分类。超限、过期和丢弃数量均独立展示。
 
-监听通知最多保留 64 个待主线程接收的批次，超量显式计为丢弃；断线缺失由既有历史观察处理，快速通道不回放旧事件触发新单。近期预判仅保留本次服务的最新 100 条（页面最多 20 条），完整筛选结果和匹配到的钱包交易沿用原持久档案。撤回通知能取消尚未完成的补查，不能撤销已经写入的供应商历史；因此不把快速通道作为最终成交凭证。
+分类包括已核验买入/卖出、他人代付买入、批量派发线索、转账、自身账户转移/零变化、授权、加减流动性、原生币包裹/解包、失败、撤回和未知。只有支持的协议操作与观察钱包的资产流向一致时才记买卖。Solana 使用 confirmed 交易的实际指令、签名者、账户所有者、原子余额差和对应调用内部的代币转移；手续费与已识别代币账户租金不作为买入支出。当前支持 Pump、PumpSwap、Raydium LaunchLab 的指定买卖指令，包括可核验的内层调用。LaunchLab 程序身份不证明它就是 Bonk 的特定平台，发行平台仍由原来的来源检查负责。
+
+EVM 核对交易、成功回执与当前规范区块的身份；Four / Flap 使用官方发出地址、成交事件中的参与钱包和代币流向，Pancake V2/V3 另外向官方 factory 核对池成员关系，并将池成交数量与钱包的两条资金流对应。V2 买入可识别池输出中明确转给代币合约自身或销毁地址的扣款：池总出币须与成交数量一致，钱包按净到账计数；这不证明税率或合约安全。V3 使用 Pancake 实际包含协议费用的事件定义；普通 Uniswap 事件签名不能替代。仅有 Swap/Transfer 的事件签名、与名人钱包相关或供应商 buy 标签均不能通过。EVM 的流向来自回执日志，不是逐交易状态差分，恶意代币、未知协议、复杂路由、转账税导致的数量歧义、代付、内部原生币收款等证据不完整时不猜成交方向；安全筛选仍独立运行。批量派发是日志线索，不保证代币实际有价值。单纯收到别人支付对价买来的代币不能计为自己的主动进场；保留发起钱包以供关系研究，不推断同一控制人。
+
+分类证据存入 `WALLET_ACTIVITY_DATABASE_PATH`，默认 `data/wallet-activity.sqlite`，上限由 `WALLET_ACTIVITY_MAX_MB` 控制（默认 128 MiB）。只保留身份、分类理由、原子数量和必要转账方向，近期面板最多展示 20 条。达到容量上限明确报错，不能保存证据的买入不进入研究。此通道只有已核验买卖进入钱包交易历史；其它分类独立保留，不能增加买入或盈利计数。撤回会给分类档案写不可复活的标记并取消未执行的分析，不删除已留存的历史研究；最终一致性与归属结论需继续复核。此来源继续标记 `source=wallet` 并在开仓入口保持研究模式，未启用实盘。
+
+监听通知最多保留 64 个待主线程接收的批次，超量显式计为丢弃；断线缺失由既有历史观察处理，快速通道不回放旧事件触发新单。近期预判仅保留本次服务的最新 100 条（页面最多 20 条），完整筛选结果和核验到的钱包交易沿用原持久档案。
 
 运行 `node --import tsx scripts/wallet-fast-benchmark.ts` 可执行不联网、不交易的三链各 10000 条消息重放；独立 Worker 测试另检查主线程阻塞时的隔离效果。
+
+运行 `node --env-file=.env --import tsx scripts/wallet-activity-replay.ts --limit=20` 可对既有链上档案进行有上限的历史分类回放。只保存分类，不发送筛选信号、不写买入计数、不下单。回放结果不代表实时分类延迟。
+
+分类协议依据（2026-10-21 核对）：[Solana getTransaction](https://solana.com/docs/rpc/http/gettransaction)、[Pump/PumpSwap IDL](https://github.com/pump-fun/pump-public-docs/tree/639b87fb45c3adeffa6f7c4a1bf0cb85e392bf22/idl)、[Raydium LaunchLab IDL](https://github.com/raydium-io/raydium-idl/blob/e7e0c96fe77bcf6a020b84a44c47a722aac8e359/raydium_launchpad/raydium_launchpad.json)、[Four TokenManager2 ABI](https://github.com/four-meme-community/fourmeme-docs/blob/5f7f589b042e4e3b41c2c214d0fe3a81b36725a9/abi/TokenManager2.lite.json)、[Flap IPortal](https://github.com/flap-sh/FlapVaultExample/blob/5949cc7eb99bcb5ac5f679cc710ae456e627f12a/src/flap/IPortal.sol)。协议升级和未覆盖操作保留为未知，不自动学习新事件签名为可信。
+
+[Pancake V3 官方事件接口](https://github.com/pancakeswap/pancake-v3-contracts/blob/986847948755cba528324d41be19480731c36c2a/projects/v3-core/contracts/interfaces/pool/IPancakeV3PoolEvents.sol) 同样按以上日期核对。

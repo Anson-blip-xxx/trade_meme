@@ -31,11 +31,11 @@ interface AssessmentInput {
   /** Optional exact first-observation counts from the same bounded database query, not trust/quality weights. */
   notificationCounts?:Partial<Record<CorroborationSource,number>>;truncated?:boolean;
 }
-export interface SourceCorroborationOptions {now?:()=>Date;windowSec?:number;maxBytes?:number;}
+export interface SourceCorroborationOptions {now?:()=>Date;windowSec?:number;maxBytes?:number;maxEvents?:number;}
 export interface SourceCorroborationMetadata {name?:string;txRefs?:SourceTransactionReference[];sourceUrl?:string;}
 type Row=Record<string,any>;
 const SOURCES:readonly CorroborationSource[]=['ave','debot','gmgn'];
-const RETENTION_DAYS=30,MAX_EVENTS=100000,MAX_REFS=20,ASSESS_EVENTS_PER_SOURCE=64;
+const RETENTION_DAYS=30,DEFAULT_MAX_EVENTS=100000,MAX_REFS=20,ASSESS_EVENTS_PER_SOURCE=64;
 const RETENTION_MS=RETENTION_DAYS*86400000;
 const iso=(n:number)=>new Date(n).toISOString();
 function millis(value:unknown):number {
@@ -152,11 +152,13 @@ export function assessSourceCorroboration(input:AssessmentInput):SourceCorrobora
 
 /** Durable provider-notification ledger. No trading client, account credentials or order methods are accepted. */
 export class SourceCorroboration {
-  private readonly db:DatabaseSync;private readonly now:()=>Date;private readonly windowSec:number;private readonly maxBytes:number;
+  private readonly db:DatabaseSync;private readonly now:()=>Date;private readonly windowSec:number;private readonly maxBytes:number;private readonly maxEvents:number;
   private closed=false;private error?:string;private rejected=0;private nextPrune=0;
   constructor(private readonly database:string,options:SourceCorroborationOptions={}){
     this.now=options.now??(()=>new Date());this.windowSec=windowSeconds(options.windowSec);this.maxBytes=options.maxBytes??256*1024*1024;
-    if(!Number.isSafeInteger(this.maxBytes)||this.maxBytes<1024*1024)throw new Error('SOURCE_LEDGER_CONFIG_INVALID');
+    this.maxEvents=options.maxEvents===undefined?DEFAULT_MAX_EVENTS:options.maxEvents;
+    if(!Number.isSafeInteger(this.maxBytes)||this.maxBytes<1024*1024||!Number.isSafeInteger(this.maxEvents)||this.maxEvents<1||this.maxEvents>1000000)
+      throw new Error('SOURCE_LEDGER_CONFIG_INVALID');
     if(database!==':memory:')mkdirSync(dirname(database),{recursive:true,mode:0o700});
     this.db=new DatabaseSync(database);
     this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=1500; PRAGMA wal_autocheckpoint=128; PRAGMA journal_size_limit=4194304;
@@ -201,7 +203,7 @@ export class SourceCorroboration {
           if(this.error!=='SOURCE_LEDGER_CAPACITY_REACHED')this.error=undefined;
           return {accepted:true,duplicate:true};
         }
-        if(Number(this.db.prepare('SELECT count(*) AS n FROM source_notifications').get()!.n)>=MAX_EVENTS){
+        if(Number(this.db.prepare('SELECT count(*) AS n FROM source_notifications').get()!.n)>=this.maxEvents){
           this.db.exec('RELEASE source_notification_record');this.error='SOURCE_LEDGER_CAPACITY_REACHED';return reject(this.error);
         }
         const refs=references(metadata.txRefs,token);
@@ -260,7 +262,7 @@ export class SourceCorroboration {
         deliveryCount:current?value.deliveryCount:null,name:value.name,sourceUrl:value.sourceUrl,txRefs:value.txRefs,
         ...(value.conflictAt&&millis(value.conflictAt)<=at?{conflictAt:value.conflictAt}:{})};
     });
-    return {token,asOf,total,limit,offset,hasMore:offset+items.length<total,items,retentionDays:RETENTION_DAYS,maxEvents:MAX_EVENTS,
+    return {token,asOf,total,limit,offset,hasMore:offset+items.length<total,items,retentionDays:RETENTION_DAYS,maxEvents:this.maxEvents,
       retainedFrom:earliest,scope:'source_notifications_not_independent_wallets' as const,
       limitations:['RETAINED_NOTIFICATIONS_ONLY','FIRST_NOTIFICATION_METADATA_FROZEN',
         ...(items.some(item=>item.deliveryCount===null)?['HISTORICAL_DELIVERY_COUNT_UNKNOWN']:[])]};
@@ -270,7 +272,7 @@ export class SourceCorroboration {
     const counts=this.db.prepare('SELECT count(*) AS events,COALESCE(sum(delivery_count),0) AS deliveries,max(first_observed_at) AS latest FROM source_notifications').get()!;
     const pages=Number(this.db.prepare('PRAGMA page_count').get()!.page_count),pageSize=Number(this.db.prepare('PRAGMA page_size').get()!.page_size);
     return {enabled:true,researchOnly:true,scoreEffect:0,windowSec:this.windowSec,events:Number(counts.events),deliveries:Number(counts.deliveries),
-      latestObservedAt:counts.latest??undefined,retentionDays:RETENTION_DAYS,maxEvents:MAX_EVENTS,maxBytes:this.maxBytes,bytes:pages*pageSize,
+      latestObservedAt:counts.latest??undefined,retentionDays:RETENTION_DAYS,maxEvents:this.maxEvents,maxBytes:this.maxBytes,bytes:pages*pageSize,
       prunedEvents:Number(this.db.prepare("SELECT value FROM source_corroboration_meta WHERE key='pruned_events'").get()!.value),
       rejected:this.rejected,error:this.error,scope:'source_notifications_not_independent_wallets'};
   }

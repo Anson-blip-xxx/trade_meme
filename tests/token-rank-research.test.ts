@@ -205,6 +205,13 @@ test('capacity failure rolls back results and cursors while keeping existing ver
     const db=new DatabaseSync(f.out);db.exec('CREATE TABLE capacity_padding(data BLOB)');db.prepare('INSERT INTO capacity_padding VALUES(?)').run(Buffer.alloc(1024*1024));db.close();
     f.advance(130);f.rank(125,901);const result=worker.runBatch();assert.equal(result.error,'TOKEN_RANK_RESEARCH_CAPACITY_REACHED');
     assert.deepEqual(result.watermarks,before);assert.equal(f.reader().list().total,1);assert.equal(f.reader().detail('bsc',address(900)).items[0].pnl?.realizedProfitUsd,50);
+    worker.close();
+    const stillFull=f.create({maxBytes:1048576});assert.equal(stillFull.runBatch().error,'TOKEN_RANK_RESEARCH_CAPACITY_REACHED');stillFull.close();
+    const recovered=f.create({maxBytes:4*1048576});assert.equal(recovered.status().error,undefined);
+    f.advance(140);assert.equal(recovered.runBatch().error,undefined);
+    assert.equal(f.reader().list().total,2);
+    assert.equal(f.reader().detail('bsc',address(901)).token?.computedAt,at(140),'recovered computation must not be backdated');
+    assert.equal(f.reader().detail('bsc',address(900),{asOf:at(100)}).items[0].pnl?.realizedProfitUsd,50,'original frozen evidence survives recovery');
   }finally{f.close();}
 });
 

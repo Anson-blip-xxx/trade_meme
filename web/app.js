@@ -127,6 +127,12 @@
     GMGN_RATE_LIMITED: 'GMGN 请求受到限流',
     DEBOT_SIGNAL_STORE_FULL: 'DeBot 信号存储已达到容量上限',
     DEBOT_SIGNAL_PERSIST_FAILED: 'DeBot 信号保存失败',
+    TOKEN_RANK_RESEARCH_CAPACITY_REACHED: '涨幅榜研究存储已满，更新已停止',
+    TOKEN_RANK_REFRESH_FAILED: '涨幅榜研究更新失败',
+    TOKEN_RANK_WORKER_TIMEOUT: '涨幅榜研究更新超时',
+    TOKEN_RANK_WORKER_FAILED: '涨幅榜研究进程异常',
+    TOKEN_RANK_WORKER_EXITED: '涨幅榜研究进程已退出',
+    TOKEN_RANK_WORKER_START_FAILED: '涨幅榜研究进程启动失败',
     DEBOT_SIGNAL_DISPATCH_FAILED: 'DeBot 信号分析失败，本条尚未完成',
     DEBOT_SIGNAL_STALE: 'DeBot 信号已超过分析有效期',
     DEBOT_SIGNAL_INTERRUPTED: 'DeBot 信号分析因服务中断而未完成',
@@ -1956,7 +1962,23 @@
     if(data.limitations?.includes('SHARED_REFERENCE_COMPARISON_BOUNDED_SAMPLE'))node.append(el('p','detail-small','交易引用对比只覆盖有限的近期通知样本。'));
     return node;
   }
+  function renderPersistentStore(runtime, title, store, options = {}) {
+    const used = options.usedBytes ?? store?.bytes, limit = store?.maxBytes;
+    const errors = [...new Set((options.errors || []).filter(value => typeof value === 'string' && value))];
+    const full = (finite(used) && finite(limit) && limit > 0 && used >= limit) ||
+      (finite(options.records) && finite(options.maxRecords) && options.maxRecords > 0 && options.records >= options.maxRecords);
+    const status = store?.enabled === false ? '未启用' : store?.enabled !== true ? '状态待确认' : errors.length ? '记录受阻' : full ? '已达到容量上限' : store.ready === false ? '等待初始化' : store.running === false ? '未运行' : '已启用';
+    runtime.append(kv(`${title}存储状态`, status), kv(`${title}已用 / 容量上限`, `${bytes(used)} / ${bytes(limit)}`));
+    if (options.recordLabel) runtime.append(kv(`${title}${options.recordLabel}`, Object.hasOwn(options, 'maxRecords') ? `${count(options.records)} / ${count(options.maxRecords)}` : count(options.records)));
+    if (errors.length || full) {
+      const warning = el('p', 'notice warning', errors.length ? `${title}：${errors.map(sourceDiagnostic).join('；')}` : `${title}已达到存储上限，新增记录可能无法保存。`);
+      if (errors.length) warning.title = errors.join(' · ');
+      runtime.append(warning);
+    }
+  }
   function renderDebotScanner(runtime, scanner, stream) {
+    const persistError = scanner?.persistError || (['DEBOT_SIGNAL_STORE_FULL', 'DEBOT_SIGNAL_PERSIST_FAILED'].includes(scanner?.lastError) ? scanner.lastError : undefined);
+    renderPersistentStore(runtime, 'DeBot 信号', scanner, {usedBytes:scanner?.dbBytes,records:scanner?.stored,recordLabel:'已保存条数',errors:[persistError]});
     if (!scanner) return;
     const cycle = scanner.lastCycle || {};
     const cooling = scanner.cooldownUntil && Date.parse(scanner.cooldownUntil) > Date.now();
@@ -1993,6 +2015,10 @@
     runtime.append(kv('钱包历史采集', research.enabled ? '已启用 · 长期保留' : '未启用'), kv('钱包历史 / 容量上限', `${bytes(research.store?.bytes)} / ${bytes(research.store?.maxBytes)}`), kv('最近钱包观测', date(research.store?.lastObservedAt, true)), kv('最近钱包增强采集', date(research.observer?.lastCycle?.completedAt, true)));
     const researchError = research.store?.error || research.captureError || research.observer?.feedError;
     if (researchError) runtime.append(el('p', 'detail-message detail-error', reasonNames[researchError] || scalar(researchError)));
+    const evidence = data.corroboration, rank = data.tokenRankResearch;
+    renderPersistentStore(runtime, '来源账本', evidence, {records:evidence?.events,maxRecords:evidence?.maxEvents,recordLabel:'通知数 / 条数上限',errors:[evidence?.error,evidence?.captureError]});
+    renderPersistentStore(runtime, '涨幅榜研究', rank, {records:rank?.tokens,recordLabel:'已登记币数',errors:[rank?.error]});
+    runtime.append(kv('涨幅榜研究已登记钱包 / 待更新币数', `${count(rank?.wallets)} / ${count(rank?.pending)}`), kv('涨幅榜研究最近更新', date(rank?.lastRunAt, true)));
     for (const balance of Array.isArray(data.balances) ? data.balances : []) {
       runtime.append(kv(`${chainName(balance.chain)} · 余额查询`, balance.status === 'ok' ? `正常 · ${date(balance.checkedAt, true)}` : balance.status === 'stale' ? `刷新失败 · 上次成功 ${date(balance.checkedAt, true)}` : balance.status === 'loading' ? '查询中' : '暂不可用'));
       if (balance.status !== 'ok' && balance.reason) runtime.append(el('p', 'detail-message detail-error', reasonNames[balance.reason] || scalar(balance.reason)));

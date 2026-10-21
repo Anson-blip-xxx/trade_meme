@@ -154,7 +154,11 @@ export class DebotNotificationLedger {
   record(observation:DebotSignalObservation):DebotNotificationResult {
     this.db.exec('SAVEPOINT debot_notification_record');
     try {const result=this.write(observation);this.prune();this.db.exec('RELEASE debot_notification_record');return result;}
-    catch(error){this.db.exec('ROLLBACK TO debot_notification_record; RELEASE debot_notification_record');throw error;}
+    catch(error){
+      // SQLITE_FULL can roll back the outer inbox transaction as well as this savepoint.
+      try{this.db.exec('ROLLBACK TO debot_notification_record; RELEASE debot_notification_record');}catch{/* Already rolled back. */}
+      throw error;
+    }
   }
 
   current(chain:Chain,ca:string) {

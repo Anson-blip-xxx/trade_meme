@@ -5,6 +5,7 @@ import {mkdtempSync,rmSync,statSync} from 'node:fs';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {DebotScanner,type DebotScannerOptions} from '../src/debot-scanner.js';
+import {DebotNotificationLedger} from '../src/debot-notification-ledger.js';
 import {DebotSignalError,normalizeDebotSignals,type DebotSignalObservation,type NormalizedDebotSignals,type DebotWalletDetails} from '../src/providers/debot-signals.js';
 import type {Signal} from '../src/types.js';
 
@@ -384,4 +385,59 @@ test('full push inbox exposes a fixed capacity reason, preserves recent deduplic
     assert.doesNotThrow(()=>scanner.acceptPage(page(observation(1))));
     await scanner.dispatchOnce();assert.equal(f.signals.length,1);assert.equal(scanner.getStatus().dispatched,1);
   }finally{await f.close();}
+});
+
+test('DeBot storage defaults to 64 MiB and rejects invalid byte budgets',async()=>{
+  const f=fixture();
+  try {
+    const scanner=f.create();assert.equal(scanner.getStatus().maxBytes,64*1024*1024);
+    assert.ok(scanner.getStatus().dbBytes>0);
+    for(const maxBytes of [0,-1,1024*1024-1,1024*1024+0.5,NaN,Infinity,Number.MAX_SAFE_INTEGER+1])
+      assert.throws(()=>new DebotScanner({...f.options,database:':memory:',maxBytes}),/DEBOT_SCANNER_CONFIG_INVALID/);
+  }finally{await f.close();}
+});
+
+test('a larger DeBot byte budget resumes a full database with its original events and deduplication',async()=>{
+  const f=fixture({mode:'authenticated_stream',maxBytes:1024*1024+4095});
+  try {
+    // Existing databases may use a nondefault page size; bytes must remain the actual cap.
+    const seed=new DatabaseSync(f.database);
+    try{seed.exec('PRAGMA page_size=8192; VACUUM;');}finally{seed.close();}
+    const scanner=f.create();let failed:DebotSignalObservation|undefined;
+    for(let id=1;id<=1000;id++){
+      const item=observation(id);item.signal.text+='x'.repeat(8192);
+      try{scanner.acceptPage(page(item));}catch(error){
+        assert.match(String(error),/DEBOT_SIGNAL_STORE_FULL/);failed=item;break;
+      }
+    }
+    assert.ok(failed,'the small page budget must reject a new event before the event-count limit');
+    const full=scanner.getStatus(),before=f.rows();
+    assert.equal(full.lastError,'DEBOT_SIGNAL_STORE_FULL');assert.ok(full.stored>1&&full.stored<1000);
+    assert.ok(full.dbBytes<=1024*1024);assert.equal(full.dbBytes%8192,0);
+    assert.equal(scanner.notificationHistory('bsc',failed.signal.token.address).total,0);
+    await scanner.close();f.options.maxBytes=4*1024*1024;
+    const reopened=f.create();assert.equal(reopened.getStatus().maxBytes,4*1024*1024);
+    assert.equal(reopened.getStatus().lastError,undefined);assert.deepEqual(f.rows(),before);
+    const original=JSON.parse(String(before[0].payload)) as DebotSignalObservation;
+    reopened.acceptPage(page(original));assert.deepEqual(f.rows(),before);
+    assert.equal(reopened.notificationHistory('bsc',original.signal.token.address).aggregation?.notificationCount,1);
+    reopened.acceptPage(page(failed));assert.equal(reopened.getStatus().stored,before.length+1);
+    assert.equal(reopened.notificationHistory('bsc',failed.signal.token.address).total,1);
+    assert.ok(reopened.getStatus().dbBytes>full.dbBytes);
+    assert.ok(reopened.getStatus().dbBytes<=reopened.getStatus().maxBytes);
+  }finally{await f.close();}
+});
+
+test('a full nested notification ledger preserves SQLITE_FULL and rolls back the failed event',()=>{
+  const db=new DatabaseSync(':memory:');
+  try{
+    const ledger=new DebotNotificationLedger(db,()=>new Date(iso(1000)));
+    db.exec('PRAGMA max_page_count=32');let saved=0,error:unknown;
+    for(let id=1;id<=1000;id++){
+      try{ledger.record(observation(id));saved++;}catch(value){error=value;break;}
+    }
+    assert.ok(saved>0&&saved<1000);assert.equal((error as {errcode?:number})?.errcode,13);
+    assert.equal(Number(db.prepare('SELECT count(*) AS n FROM debot_notification_events').get()!.n),saved);
+    assert.equal(ledger.history('bsc',address(saved+1)).total,0);
+  }finally{db.close();}
 });

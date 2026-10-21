@@ -38,7 +38,7 @@ export interface Config extends z.infer<typeof schema> {
   issuerIds: string[]; trackedIds: string[];
   ingestToken?:string; database:string; host:string; port:number;
   gmgnApiKey?:string; gmgnPrivateKey?:string; walletIdentitiesPath?:string;
-  scannerChains:Chain[]; ordersDatabase:string;debotSignalsDatabase:string;debotSessionPath:string;debotLoginEmail?:string;
+  scannerChains:Chain[]; ordersDatabase:string;debotSignalsDatabase:string;debotSignalsMaxBytes?:number;debotSessionPath:string;debotLoginEmail?:string;
   entryWallets:Partial<Record<Chain,string>>; entryAmounts:Partial<Record<Chain,string>>;
   entryInputTokens:Partial<Record<Chain,string>>;
   entryFeeReserves:Record<Chain,string>;
@@ -51,7 +51,7 @@ export interface Config extends z.infer<typeof schema> {
   walletScreening:{enabled:boolean;database:string;maxBytes:number};
   meme?:{enabled:boolean;database:string;maxBytes:number;maxActive:number;activeWindowSec:number};
   ave?:{enabled:boolean;database:string;sessionPath:string;email?:string};
-  corroboration?:{database:string;maxBytes:number};
+  corroboration?:{database:string;maxBytes:number;maxEvents?:number};
   tokenRankResearch?:{enabled:boolean;database:string;maxBytes:number;intervalSec:number;batchSize:number};
   watch:{enabled:boolean;windowSec:number;intervalSec:number;maxPerCycle:number};
   exitShadow:{enabled:boolean;database:string;maxBytes:number;staleAfterSec:number;maxPositions:number};
@@ -126,6 +126,7 @@ export function readConfig(env:NodeJS.ProcessEnv=process.env): Config {
     ingestToken:env.INGEST_TOKEN,database:':memory:',
     ordersDatabase:z.string().trim().refine(isPersistentOrderPath,'Order storage requires a persistent file path').parse(env.ORDERS_DATABASE_PATH??'data/orders.sqlite'),
     debotSignalsDatabase:z.string().trim().refine(isPersistentOrderPath).parse(env.DEBOT_SIGNALS_DATABASE_PATH??'data/debot-signals.sqlite'),
+    debotSignalsMaxBytes:z.coerce.number().int().min(16).max(1024).parse(env.DEBOT_SIGNALS_MAX_MB??64)*1024*1024,
     debotSessionPath:z.string().trim().refine(isPersistentOrderPath).parse(env.DEBOT_SESSION_PATH??'data/debot/session.json'),
     debotLoginEmail:env.DEBOT_LOGIN_EMAIL?.trim()?z.string().trim().email().max(254).parse(env.DEBOT_LOGIN_EMAIL):undefined,
     entryWallets:{bsc:env.ENTRY_WALLET_BSC,solana:env.ENTRY_WALLET_SOLANA,robinhood:env.ENTRY_WALLET_ROBINHOOD},
@@ -149,7 +150,8 @@ export function readConfig(env:NodeJS.ProcessEnv=process.env): Config {
       sessionPath:z.string().trim().refine(isPersistentOrderPath).parse(env.AVE_SESSION_PATH??'data/ave/session.json'),
       email:env.AVE_LOGIN_EMAIL?.trim()?z.string().trim().email().max(254).parse(env.AVE_LOGIN_EMAIL):undefined},
     corroboration:{database:z.string().trim().refine(isPersistentOrderPath).parse(env.SOURCE_EVIDENCE_DATABASE_PATH??'data/source-corroboration.sqlite'),
-      maxBytes:z.coerce.number().int().min(16).max(1024).parse(env.SOURCE_EVIDENCE_MAX_MB??128)*1024*1024},
+      maxBytes:z.coerce.number().int().min(16).max(1024).parse(env.SOURCE_EVIDENCE_MAX_MB??128)*1024*1024,
+      maxEvents:z.coerce.number().int().min(1000).max(1000000).parse(env.SOURCE_EVIDENCE_MAX_EVENTS??100000)},
     meme:{enabled:z.enum(['true','false']).parse(env.MEME_OBSERVER_ENABLED??(env.DEBOT_SCANNER_ENABLED==='true'||env.AVE_SCANNER_ENABLED==='true'?'true':'false'))==='true',
       database:z.string().trim().refine(isPersistentOrderPath).parse(env.MEME_DATABASE_PATH??'data/meme-observations.sqlite'),
       maxBytes:z.coerce.number().int().min(16).max(4096).parse(env.MEME_MAX_MB??1024)*1024*1024,

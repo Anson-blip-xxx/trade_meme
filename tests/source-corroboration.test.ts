@@ -21,7 +21,7 @@ function evidence(source:CorroborationSource='ave',seconds=0,overrides:Partial<S
 function fixture(maxBytes?:number){
   const directory=mkdtempSync(join(tmpdir(),'source-corroboration-')),database=join(directory,'sources.sqlite');let sec=0;
   const instances:SourceCorroboration[]=[];
-  const create=()=>{const ledger=new SourceCorroboration(database,{now:()=>new Date(at(sec)),maxBytes});instances.push(ledger);return ledger;};
+  const create=(maxEvents?:number)=>{const ledger=new SourceCorroboration(database,{now:()=>new Date(at(sec)),maxBytes,maxEvents});instances.push(ledger);return ledger;};
   return {database,create,advance:(value:number)=>{sec=value;},close:()=>{instances.forEach(value=>value.close());rmSync(directory,{recursive:true,force:true});}};
 }
 
@@ -205,7 +205,46 @@ test('100000-event limit retains existing dedup identities instead of evicting t
     }finally{db.close();}
     assert.equal(ledger.record(signal('debot')).reason,'SOURCE_LEDGER_CAPACITY_REACHED');
     assert.equal(ledger.record(signal('ave',0,'seed')).duplicate,true);
-    assert.equal(ledger.status().events,100000);assert.equal(ledger.status().error,'SOURCE_LEDGER_CAPACITY_REACHED');
-    assert.equal(ledger.history(token,{limit:1}).total,100000);
+    assert.equal(ledger.status().events,100000);assert.equal(ledger.status().error,'SOURCE_LEDGER_CAPACITY_REACHED');assert.equal(ledger.status().maxEvents,100000);
+    assert.equal(ledger.history(token,{limit:1}).total,100000);assert.equal(ledger.history(token,{limit:1}).maxEvents,100000);
   }finally{f.close();}
+});
+
+test('reopening a capped ledger with a larger event budget admits a new notification without evicting or reclassifying duplicates',()=>{
+  const f=fixture();try {
+    let ledger=f.create(1);
+    const target={chain:'solana' as const,address:bs58.encode(new Uint8Array(32).fill(9))},
+      wallet=bs58.encode(new Uint8Array(32).fill(7)),txHash=bs58.encode(new Uint8Array(64).fill(8)),
+      initial=signal('ave',0,'ave:signal:'+ '1'.repeat(64),target);
+    assert.deepEqual(ledger.record(initial,at(),{name:'first'}),{accepted:true,duplicate:false});
+    f.advance(60);
+    const fresh={...signal('gmgn',60,'gmgn:trade:'+ '2'.repeat(64),target),
+      text:`GMGN 链上买入记录；交易 ${txHash}；钱包 ${wallet}；CA ${target.address}。`},
+      metadata={txRefs:[{txHash,wallet,side:'buy' as const}],sourceUrl:'https://gmgn.ai/'};
+    assert.equal(ledger.record(fresh,at(60),metadata).reason,'SOURCE_LEDGER_CAPACITY_REACHED');
+    assert.deepEqual(ledger.record(initial,at(60),{name:'changed'}),{accepted:true,duplicate:true});
+    assert.equal(ledger.status().events,1);assert.equal(ledger.status().error,'SOURCE_LEDGER_CAPACITY_REACHED');
+    ledger.close();ledger=f.create(2);
+    assert.deepEqual(ledger.record(fresh,at(60),metadata),{accepted:true,duplicate:false});
+    assert.deepEqual(ledger.record(fresh,at(60),metadata),{accepted:true,duplicate:true});
+    const history=ledger.history(target),first=history.items.find(item=>item.eventId===initial.sourceEventId)!,
+      added=history.items.find(item=>item.eventId===fresh.sourceEventId)!;
+    assert.equal(history.total,2);assert.equal(history.maxEvents,2);assert.equal(ledger.status().maxEvents,2);
+    assert.equal(ledger.status().events,2);assert.equal(ledger.status().error,undefined);assert.equal(ledger.status().prunedEvents,0);
+    assert.equal(first.firstObservedAt,at());assert.equal(first.name,'first');assert.equal(first.deliveryCount,2);
+    assert.equal(added.firstObservedAt,at(60));assert.equal(added.deliveryCount,2);assert.deepEqual(added.txRefs,metadata.txRefs);
+    assert.equal(ledger.record(signal('debot',60,'third',target)).reason,'SOURCE_LEDGER_CAPACITY_REACHED');
+    ledger.close();ledger=f.create(1);
+    assert.equal(ledger.status().events,2);assert.equal(ledger.record(initial,at(60)).duplicate,true);
+    assert.equal(ledger.record(signal('debot',60,'third',target)).reason,'SOURCE_LEDGER_CAPACITY_REACHED');
+  }finally{f.close();}
+});
+
+test('event budgets accept positive safe integers up to one million and reject invalid limits',()=>{
+  for(const maxEvents of [0,-1,1.5,NaN,Infinity,-Infinity,1000001,Number.MAX_SAFE_INTEGER,'10' as never,null as never,false as never])
+    assert.throws(()=>new SourceCorroboration(':memory:',{maxEvents}),/SOURCE_LEDGER_CONFIG_INVALID/);
+  for(const maxEvents of [1,1000000]){
+    const ledger=new SourceCorroboration(':memory:',{maxEvents});
+    try{assert.equal(ledger.status().maxEvents,maxEvents);}finally{ledger.close();}
+  }
 });

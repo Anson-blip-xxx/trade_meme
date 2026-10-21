@@ -110,7 +110,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher}
   let memeCaptureError:string|undefined;
   let sourceCaptureError:string|undefined,nominationCaptureError:string|undefined;
   const sourceEvidence=config.corroboration&&(config.meme?.enabled||config.ave?.enabled)
-    ?new SourceCorroboration(config.corroboration.database,{maxBytes:config.corroboration.maxBytes}):undefined;
+    ?new SourceCorroboration(config.corroboration.database,{maxBytes:config.corroboration.maxBytes,maxEvents:config.corroboration.maxEvents}):undefined;
   let backgroundGmgnAbort:AbortController|undefined;
   const memeObserver=config.meme?.enabled?new MemeObserver({...config.meme,samplingPlanPath:reviewSamplingPath(config.dashboard.archivePath),marketBatch:fetchMemeMarkets,
     // Reuse a committed fresh market observation for research only. This path
@@ -307,6 +307,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher}
   const debotSession=config.debotScannerEnabled&&config.debotTransport==='authenticated_stream'?new DebotSessionClient({
     path:config.debotSessionPath,onAuthRequired:()=>{debotAuth?.setAuthenticated(false);debotStream?.invalidateSession();}}):undefined;
   const debotScanner:DebotScanner|undefined=config.debotScannerEnabled?new DebotScanner({database:config.debotSignalsDatabase,mode:config.debotTransport,
+    maxBytes:config.debotSignalsMaxBytes,
     chains:config.scannerChains,intervalSec:config.debotScannerIntervalSec,
     maxConcurrent:debotSession?2:1,parallelDetails:!!debotSession,
     lookupDisplay:reportId=>archive?.tokenDisplay(reportId),

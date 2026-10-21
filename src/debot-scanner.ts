@@ -18,7 +18,7 @@ interface Cycle {
   reasons:string[];diagnostics:{chain:Chain;status:'ok'|'unavailable'|'rate_limited'|'auth_required'|'invalid_response';received:number;reason?:string}[];
 }
 export interface DebotScannerOptions {
-  database:string;chains:Chain[];intervalSec?:number;maxAgeSec:number;
+  database:string;chains:Chain[];intervalSec?:number;maxAgeSec:number;maxBytes?:number;
   mode?:'anonymous_poll'|'authenticated_stream';
   onSignal:(signal:Signal,observedAt:string,context?:{detailsReady:Promise<void>;repeat?:boolean})=>Promise<unknown>;shouldDefer?:()=>string|undefined;
   repeatCooldownSec?:number;
@@ -53,6 +53,8 @@ export class DebotScanner {
   private readonly now:()=>Date;
   private readonly intervalSec:number;
   private readonly chains:Chain[];
+  private readonly maxBytes:number;
+  private readonly pageSize:number;
   private running=false;
   private stopped=false;
   private generation=0;
@@ -74,8 +76,9 @@ export class DebotScanner {
 
   constructor(private readonly options:DebotScannerOptions) {
     this.now=options.now??(()=>new Date());this.intervalSec=options.intervalSec??30;
-    this.chains=[...new Set(options.chains)];
+    this.chains=[...new Set(options.chains)];this.maxBytes=options.maxBytes??64*1024*1024;
     if(!this.chains.length||this.chains.some(c=>!['bsc','solana','robinhood'].includes(c))||
+      !Number.isSafeInteger(this.maxBytes)||this.maxBytes<1024*1024||
       !Number.isInteger(this.intervalSec)||this.intervalSec<15||this.intervalSec>3600||
       !Number.isInteger(options.maxAgeSec)||options.maxAgeSec<10||options.maxAgeSec>86400||
       options.maxConcurrent!==undefined&&![1,2].includes(options.maxConcurrent)||
@@ -83,8 +86,9 @@ export class DebotScanner {
       throw new Error('DEBOT_SCANNER_CONFIG_INVALID');
     if(options.database!==':memory:')mkdirSync(dirname(options.database),{recursive:true,mode:0o700});
     this.db=new DatabaseSync(options.database);
-    this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=2500;
-      PRAGMA max_page_count=16384;
+    this.db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=2500;');
+    this.pageSize=Number(this.db.prepare('PRAGMA page_size').get()!.page_size);
+    this.db.exec(`PRAGMA max_page_count=${Math.floor(this.maxBytes/this.pageSize)};
       CREATE TABLE IF NOT EXISTS debot_signals (
         id TEXT PRIMARY KEY, chain TEXT NOT NULL, address TEXT NOT NULL, occurred_at TEXT NOT NULL,
         observed_at TEXT NOT NULL, state TEXT NOT NULL, payload TEXT NOT NULL, reason TEXT,
@@ -260,6 +264,7 @@ export class DebotScanner {
     const detailStats=this.db.prepare('SELECT count(details) AS received,count(details_error) AS failed FROM debot_signals').get() as {received:number;failed:number};
     const latestDispatch=this.db.prepare('SELECT observed_at,dispatched_at FROM debot_signals WHERE dispatched_at IS NOT NULL ORDER BY dispatched_at DESC LIMIT 1').get() as {observed_at:string;dispatched_at:string}|undefined;
     return {enabled:true,running:this.running,inFlight:!!this.collecting||!!this.dispatching,mode:this.options.mode??'anonymous_poll',
+      maxBytes:this.maxBytes,dbBytes:Number(this.db.prepare('PRAGMA page_count').get()!.page_count)*this.pageSize,
       intervalSec:this.intervalSec,stored:rows.reduce((n,r)=>n+Number(r.n),0),pending:(counts.pending??0)+(counts.dispatching??0),
       dispatched:counts.completed??0,ignored:counts.ignored??0,failed:counts.failed??0,interrupted:counts.interrupted??0,
       lastObservedAt:latest.at??undefined,lastCycle:this.lastCycle?structuredClone(this.lastCycle):undefined,
@@ -381,7 +386,7 @@ export class DebotScanner {
     const at=this.now().toISOString();
     const cycle:Cycle={startedAt:at,completedAt:at,requests:0,received:0,added:0,errors:0,reasons:[],diagnostics:[]};
     this.lastError=undefined;
-    // Thirty-day retention, 10k events, and SQLite's 64 MiB hard page ceiling.
+    // Thirty-day retention, 10k events, and the configured SQLite page ceiling.
     this.db.prepare("DELETE FROM debot_signals WHERE state NOT IN ('pending','dispatching') AND observed_at<?")
       .run(new Date(this.now().getTime()-30*86400_000).toISOString());
     this.expire();
@@ -420,7 +425,11 @@ export class DebotScanner {
     this.db.exec('SAVEPOINT debot_inbox_record');
     let result:number;
     try {result=this.recordAtomic(observation);this.db.exec('RELEASE debot_inbox_record');}
-    catch(error){this.db.exec('ROLLBACK TO debot_inbox_record; RELEASE debot_inbox_record');throw error;}
+    catch(error){
+      // SQLITE_FULL may already have rolled back the savepoint. Keep its capacity reason.
+      try{this.db.exec('ROLLBACK TO debot_inbox_record; RELEASE debot_inbox_record');}catch{/* Already rolled back. */}
+      throw error;
+    }
     // Observation is independent of dispatch/dedup decisions, and cannot roll back the inbox.
     const bound=this.db.prepare('SELECT chain,address FROM debot_signals WHERE id=?').get(observation.signal.sourceEventId);
     if(bound&&bound.chain===observation.signal.token.chain&&bound.address===observation.signal.token.address){

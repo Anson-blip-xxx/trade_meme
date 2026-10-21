@@ -38,11 +38,14 @@ function localProviders(runtime:ReturnType<typeof createRuntime>){
 }
 
 test('Ave runtime immediately feeds cross-source evidence and Meme observation, then archives safety research without orders',async()=>{
-  const {dir,config}=fixture(),original=globalThis.fetch;let network=0;
+  const {dir,config}=fixture({SOURCE_EVIDENCE_MAX_EVENTS:'300000',SOURCE_EVIDENCE_MAX_MB:'512',DEBOT_SIGNALS_MAX_MB:'256'}),original=globalThis.fetch;let network=0;
   globalThis.fetch=async()=>{network++;throw Error('unexpected external request');};
   let runtime=createRuntime(config);
   try{
     localProviders(runtime);const page=ave(),signal=page.observations[0].signal;
+    assert.equal(runtime.sourceEvidence!.status().maxEvents,300000);
+    assert.equal(runtime.sourceEvidence!.status().maxBytes,512*1024*1024);
+    assert.equal(runtime.debotScanner!.getStatus().maxBytes,256*1024*1024);
     runtime.aveScanner!.acceptPage(page);
     assert.equal(runtime.archive!.list().total,0);assert.equal(runtime.memeObserver!.list().total,1);
     assert.equal(runtime.memeObserver!.list().items[0].firstSeenAt,page.observations[0].observedAt);
@@ -65,6 +68,16 @@ test('Ave runtime immediately feeds cross-source evidence and Meme observation, 
     assert.equal(runtime.sourceEvidence!.assess(signal.token).freshSourceCount,2);assert.equal(runtime.dashboardOrders().total,0);
     assert.equal(network,0);
   }finally{await runtime.close();globalThis.fetch=original;rmSync(dir,{recursive:true,force:true});}
+});
+
+test('collector storage budgets keep bounded defaults and reject invalid configuration',()=>{
+  const defaults=readConfig({});
+  assert.equal(defaults.corroboration?.maxEvents,100000);
+  assert.equal(defaults.debotSignalsMaxBytes,64*1024*1024);
+  for(const key of ['DEBOT_SIGNALS_MAX_MB','SOURCE_EVIDENCE_MAX_MB','SOURCE_EVIDENCE_MAX_EVENTS'])
+    for(const value of ['0','-1','Infinity','NaN','1.5','1000001'])
+      assert.throws(()=>readConfig({[key]:value}));
+  assert.equal(readConfig({TOKEN_RANK_RESEARCH_MAX_MB:'4096'}).tokenRankResearch?.maxBytes,4*1024**3);
 });
 
 test('Ave wallet nominations survive safety rejection independently of research limits and never fabricate trades',async()=>{

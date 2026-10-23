@@ -26,6 +26,41 @@ async function fixture(overrides:Partial<DashboardServices>={}) {
 const login=(base:string,value=password,origin?:string)=>fetch(`${base}/dashboard/api/login`,{
   method:'POST',headers:{'content-type':'application/json',...(origin?{origin}:{})},body:JSON.stringify({password:value})});
 
+test('JEV parallel records require authentication and bounded read-only paging without invoking scoring',async()=>{
+  const calls:unknown[]=[],headers={'x-dashboard-access':password};
+  const f=await fixture({jev:{status:()=>({enabled:true,mode:'shadow',available:false,circuit:{reason:'JEV_QUOTA_EXHAUSTED'}}),
+    list:options=>{calls.push(options);return {...options,total:1,items:[{id:'sample-1',status:'unavailable',result:null}]};},
+    detail:id=>id==='sample-1'?{id,result:null}:undefined},orders:()=>{throw new Error('JEV_MUST_NOT_TRADE');}});
+  try{
+    for(const route of ['jev','jev/status','jev/sample-1']){
+      assert.equal((await fetch(`${f.base}/dashboard/api/${route}`)).status,401);
+      assert.equal((await fetch(`${f.base}/dashboard/api/${route}`,{method:'POST',headers})).status,405);
+    }
+    const response=await fetch(`${f.base}/dashboard/api/jev?limit=7&offset=14&chain=solana`,{headers});
+    assert.equal(response.status,200);assert.equal(response.headers.get('cache-control'),'no-store');
+    const page=await response.json();assert.equal(page.items[0].result,null);assert.deepEqual(calls,[{limit:7,offset:14,chain:'solana'}]);
+    const status=await(await fetch(`${f.base}/dashboard/api/jev/status`,{headers})).json();assert.equal(status.circuit.reason,'JEV_QUOTA_EXHAUSTED');
+    assert.equal((await fetch(`${f.base}/dashboard/api/jev/sample-1`,{headers})).status,200);
+    assert.equal((await fetch(`${f.base}/dashboard/api/jev/missing`,{headers})).status,404);
+    for(const suffix of ['?limit=0','?limit=101','?offset=-1','?chain=eth','/%22secret','/'+ 'a'.repeat(129)])
+      assert.equal((await fetch(`${f.base}/dashboard/api/jev${suffix}`,{headers})).status,400,suffix);
+    assert.equal(calls.length,1);
+  }finally{await f.close();}
+});
+
+test('disabled JEV supplies empty pages and the homepage never loads its records',async()=>{
+  const headers={'x-dashboard-access':password},f=await fixture();
+  try{
+    const status=await(await fetch(`${f.base}/dashboard/api/jev/status`,{headers})).json();assert.equal(status.enabled,false);
+    const page=await(await fetch(`${f.base}/dashboard/api/jev?limit=5&offset=10`,{headers})).json();
+    assert.deepEqual(page,{enabled:false,items:[],total:0,limit:5,offset:10,hasMore:false});
+    assert.equal((await fetch(`${f.base}/dashboard/api/jev/missing`,{headers})).status,404);
+  }finally{await f.close();}
+  const unexpected=()=>{throw new Error('JEV_MUST_BE_LAZY');};
+  const isolated=await fixture({home:()=>({compact:true}),jev:{status:unexpected,list:unexpected,detail:unexpected}});
+  try{assert.deepEqual(await(await fetch(`${isolated.base}/dashboard/api/home`,{headers})).json(),{compact:true});}finally{await isolated.close();}
+});
+
 test('ranking research is authenticated and read-only with chain scoped stable pagination for tokens and wallets',async()=>{
   const calls:unknown[]=[],headers={'x-dashboard-access':password},stamp='2026-10-15T08:00:00.000Z',address='0x'+'A'.repeat(40);
   const page=(kind:string)=>(options:unknown)=>{calls.push({kind,options});return {items:[],total:0};};

@@ -46,8 +46,10 @@ import {WalletFastResearch} from './wallet-fast-research.js';
 import {WalletActivityVerifier} from './wallet-activity.js';
 import {WalletActivityStore} from './wallet-activity-store.js';
 import {WalletFastTargets,mergePinnedWallets,type FastWalletSnapshot,type FastWalletTarget,type FastTokenCheck} from './wallet-fast.js';
+import {JevShadow,type JevShadowOptions} from './jev-shadow.js';
+import {buildJevInput} from './jev-input.js';
 
-export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher}={}) {
+export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;jevInvoke?:JevShadowOptions['invoke']}={}) {
   let walletFast:WalletFastRunner|undefined,walletFastResearch:WalletFastResearch|undefined;
   let walletActivity:WalletActivityStore|undefined,walletVerifier:WalletActivityVerifier|undefined;
   if(!isPersistentOrderPath(config.ordersDatabase)) throw new Error('PERSISTENT_ORDER_DATABASE_REQUIRED');
@@ -82,6 +84,20 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher}
     ...(config.meme?[config.meme.database]:[]),...(config.corroboration?[config.corroboration.database]:[]),
     ...(config.ave?[config.ave.database,config.ave.sessionPath]:[])].some(path=>sameDatabase(path,config.tokenRankResearch!.database)))
     throw new Error('TOKEN_RANK_DATABASE_MUST_BE_SEPARATE');
+  // Optional model storage must never touch an execution/session database. A
+  // conflict disables only this observer, leaving the established strategy up.
+  let jevStartupError:string|undefined;
+  if(config.jev?.enabled)try {
+    if([...protectedPaths,reviewDatabasePath(config.dashboard.archivePath),reviewSamplingPath(config.dashboard.archivePath),
+      ...(config.tokenRankResearch?[config.tokenRankResearch.database]:[]),
+      ...(config.walletFast?.database?[config.walletFast.database]:[]),
+      ...(config.meme?[config.meme.database]:[]),...(config.corroboration?[config.corroboration.database]:[]),
+      ...(config.ave?[config.ave.database,config.ave.sessionPath]:[])].some(path=>sameDatabase(path,config.jev!.database)))
+      jevStartupError='JEV_DATABASE_CONFLICT';
+  }catch {jevStartupError='JEV_STORAGE_UNAVAILABLE';}
+  const jevShadow=config.jev?.enabled?new JevShadow({...config.jev,startupError:jevStartupError,invoke:dependencies.jevInvoke}):undefined;
+  let jevCaptureError:string|undefined;
+  const jevPending=new Set<ReturnType<typeof setImmediate>>();
   const providers=liveProviders(config,client);
   const archive=config.dashboard.enabled||config.watch.enabled||config.exitShadow.enabled||config.chainStream.enabled?new ScanArchive(config.dashboard.archivePath,{
     retentionDays:config.dashboard.retentionDays,trackingHours:config.dashboard.trackingHours,followupEnabled:true}):undefined;
@@ -117,6 +133,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher}
     // cannot initialize a position, advance exit protection or submit an order.
     onMarketSample:sample=>{
       if(sample.priceUsd===undefined)return;
+      try{jevShadow?.observePrice(sample);}catch{jevCaptureError='JEV_PRICE_CAPTURE_FAILED';}
       const source=sample.source==='gmgn_token_info'?'gmgn_token_info_sample':sample.source==='dexscreener_pair'?'dexscreener_token_pairs_sample':undefined;
       if(source)archive?.recordFollowupPrice({...sample.token,priceUsd:sample.priceUsd,observedAt:sample.observedAt,source,
         market:{poolAddress:sample.poolAddress,liquidityUsd:sample.liquidityUsd,holderCount:sample.holderCount,top10HolderRate:sample.top10HolderRate}});
@@ -162,9 +179,27 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher}
     }catch {walletCaptureError='WALLET_HISTORY_WRITE_FAILED';}
     if(item.status==='completed'&&item.report)try{memeObserver?.captureReport(item.report);memeCaptureError=undefined;}
     catch{memeCaptureError='MEME_REPORT_CAPTURE_FAILED';}
+    if(jevShadow&&item.status==='completed'&&item.report?.mode==='live'){
+      if(jevPending.size>=32){jevCaptureError='JEV_CAPTURE_QUEUE_FULL';return;}
+      // Complete the existing decision first. The detached research task never
+      // waits in the order path and reads only evidence known at evaluatedAt.
+      const report=item.report;
+      const task=setImmediate(()=>{
+        jevPending.delete(task);if(closed)return;
+        try{
+          let context:Record<string,unknown>={};
+          try{context=memeObserver?.researchSnapshot(report.signal.token,report.evaluatedAt)??{};}catch{/* Missing optional evidence stays unknown. */}
+          try{context.walletEvidence=walletHistory?.followupEvidence(report.signal.token,
+            new Date(Date.parse(report.evaluatedAt)-120000).toISOString(),report.evaluatedAt);}catch{/* Independent evidence read. */}
+          jevShadow.enqueue(buildJevInput(report,context));jevCaptureError=undefined;
+        }catch{jevCaptureError='JEV_INPUT_CAPTURE_FAILED';}
+      });jevPending.add(task);
+    }
   }),orders=new OrderStore(config.ordersDatabase);
   let exitCaptureError:string|undefined;
   const recordPrice=(price:ScanPrice)=>{
+      try{jevShadow?.observePrice({token:{chain:price.chain,address:price.address},priceUsd:price.priceUsd,
+        observedAt:price.observedAt,source:price.source,poolAddress:price.market?.poolAddress});}catch{jevCaptureError='JEV_PRICE_CAPTURE_FAILED';}
       let archiveFailed=false;
       let walletEvidence;
       // Join only already-observed local transactions at this sample's cutoff.
@@ -417,7 +452,8 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher}
       if(!priceTargetError){subscribedPriceKeys=new Set(targets.map(t=>`${t.chain}:${t.address}`));aveScanner?.setPriceTokens(targets);}
     }catch{priceTargetError='PRICE_STREAM_TARGET_REFRESH_FAILED';}
   };
-  return {client,providers,store,orders,entry,dailyReview,scanner,debotScanner,debotStream,debotAuth,archive,tracking,priceRouter,walletHistory,walletObserver,walletResearchStatus,walletProfiles,walletProfilesStatus,walletScreening,watchRechecker,exitShadow,chainMonitor,chainStreamStatus,memeObserver,sourceEvidence,aveScanner,aveSession,tokenRankResearch,
+  return {client,providers,store,orders,entry,dailyReview,scanner,debotScanner,debotStream,debotAuth,archive,tracking,priceRouter,walletHistory,walletObserver,walletResearchStatus,walletProfiles,walletProfilesStatus,walletScreening,watchRechecker,exitShadow,chainMonitor,chainStreamStatus,memeObserver,sourceEvidence,aveScanner,aveSession,tokenRankResearch,jevShadow,
+    jevStatus:()=>({...jevShadow?.status(),captureError:jevCaptureError}),
     dashboardHome:()=>{
       const host=system?.get();
       return {now:new Date().toISOString(),entryMode:config.entryMode,stats:archive?.overviewStats(),
@@ -445,6 +481,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher}
     dashboardOrders:(options:DashboardPageOptions={limit:20,offset:0})=>dashboardOrders(orders,options),
     start(){
       if(closed) return;
+      jevShadow?.start();
       try{exitShadow?.migrateActiveToV3();}catch{exitCaptureError='EXIT_SHADOW_MIGRATION_FAILED';}
       maintainProtection();
       if(!exitMaintenanceTimer){exitMaintenanceTimer=setInterval(maintainProtection,15_000);exitMaintenanceTimer.unref();}
@@ -478,6 +515,8 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher}
     },
     async close(){
       if(closed) return;closed=true;scanner.stop();clearInterval(sweep);clearInterval(reconcileTimer);clearInterval(walletIndexTimer);clearInterval(debotSyncTimer);clearInterval(exitMaintenanceTimer);
+      for(const task of jevPending)clearImmediate(task);jevPending.clear();
+      await jevShadow?.stop();
       priceRouter.close();
       await walletFast?.stop();walletVerifier?.stop();await walletFastResearch?.stop();walletActivity?.close();
       await debotStream?.stop();

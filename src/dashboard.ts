@@ -46,6 +46,7 @@ export interface DashboardServices {
   protection?:(options?:DashboardPageOptions)=>unknown;
   dailyReview?:(options:ReviewPageOptions)=>unknown;
   chainStream?:()=>unknown;
+  jev?:{status:()=>unknown;list:(options:DashboardPageOptions)=>unknown;detail:(id:string)=>unknown};
   debotAuth?:Pick<DebotAuthManager,'getStatus'|'sendCode'|'login'>;
   debotSignals?:(options?:DebotSignalListOptions)=>unknown;
   debotHistory?:(chain:Chain,address:string,options:{limit:number;offset:number;asOf?:string})=>unknown;
@@ -178,6 +179,16 @@ export function buildDashboard(config:Config,services:DashboardServices,assetDir
       if(url.pathname==='/dashboard/api/session') {send(res,200,{authenticated:true,readOnly:true,authentication:proxyAuthenticated(req)?'proxy':'session'});return;}
       if(url.pathname==='/dashboard/api/overview') {send(res,200,services.overview());return;}
       if(url.pathname==='/dashboard/api/home') {send(res,200,services.home?.()??{enabled:false});return;}
+      if(url.pathname==='/dashboard/api/jev/status') {send(res,200,services.jev?.status()??{enabled:false,mode:'shadow',available:false});return;}
+      if(url.pathname==='/dashboard/api/jev') {
+        const options=pageOptions(url);
+        send(res,200,services.jev?.list(options)??{enabled:false,items:[],total:0,...options,hasMore:false});return;
+      }
+      const jevMatch=url.pathname.match(/^\/dashboard\/api\/jev\/([^/]+)$/);
+      if(jevMatch) {
+        if(!/^[A-Za-z0-9_-]{1,128}$/.test(jevMatch[1]))throw new Error('INVALID_FILTER');
+        const detail=services.jev?.detail(jevMatch[1]);send(res,detail?200:404,detail??{error:'NOT_FOUND'});return;
+      }
       if(url.pathname==='/dashboard/api/daily-review') {
         const options={...pageOptions(url),date:url.searchParams.get('date')||undefined,runId:url.searchParams.get('runId')||undefined};
         if(options.runId&&!/^[a-f0-9]{24}$/.test(options.runId)||url.searchParams.has('sort')&&url.searchParams.get('sort')!=='gain')throw new Error('INVALID_FILTER');

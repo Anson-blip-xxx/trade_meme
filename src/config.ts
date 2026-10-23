@@ -51,6 +51,8 @@ export interface Config extends z.infer<typeof schema> {
   walletProfiles:{enabled:boolean;database:string;maxBytes:number;intervalSec:number;batchSize:number};
   walletScreening:{enabled:boolean;database:string;maxBytes:number};
   meme?:{enabled:boolean;database:string;maxBytes:number;maxActive:number;activeWindowSec:number};
+  jev?:{enabled:boolean;database:string;maxBytes:number;timeoutMs:number;minIntervalMs:number;perTokenIntervalMs:number;
+    maxCallsPerDay:number;maxTokensPerDay:number;clientPath:string};
   ave?:{enabled:boolean;database:string;sessionPath:string;email?:string};
   corroboration?:{database:string;maxBytes:number;maxEvents?:number};
   tokenRankResearch?:{enabled:boolean;database:string;maxBytes:number;intervalSec:number;batchSize:number};
@@ -168,6 +170,15 @@ export function readConfig(env:NodeJS.ProcessEnv=process.env): Config {
     corroboration:{database:z.string().trim().refine(isPersistentOrderPath).parse(env.SOURCE_EVIDENCE_DATABASE_PATH??'data/source-corroboration.sqlite'),
       maxBytes:z.coerce.number().int().min(16).max(1024).parse(env.SOURCE_EVIDENCE_MAX_MB??128)*1024*1024,
       maxEvents:z.coerce.number().int().min(1000).max(1000000).parse(env.SOURCE_EVIDENCE_MAX_EVENTS??100000)},
+    jev:{enabled:z.enum(['true','false']).parse(env.JEV_SHADOW_ENABLED??'false')==='true',
+      database:z.string().trim().refine(isPersistentOrderPath).parse(env.JEV_DATABASE_PATH??'data/jev-shadow.sqlite'),
+      maxBytes:z.coerce.number().int().min(16).max(1024).parse(env.JEV_MAX_MB??128)*1024*1024,
+      timeoutMs:z.coerce.number().int().min(100).max(10000).parse(env.JEV_TIMEOUT_MS??2000),
+      minIntervalMs:z.coerce.number().int().min(1000).max(600000).parse(env.JEV_MIN_INTERVAL_MS??5000),
+      perTokenIntervalMs:z.coerce.number().int().min(30).max(3600).parse(env.JEV_PER_TOKEN_INTERVAL_SEC??60)*1000,
+      maxCallsPerDay:z.coerce.number().int().min(1).max(10000).parse(env.JEV_MAX_CALLS_PER_DAY??500),
+      maxTokensPerDay:z.coerce.number().int().min(1000).max(100000000).parse(env.JEV_MAX_TOKENS_PER_DAY??1000000),
+      clientPath:z.string().trim().min(1).max(512).parse(env.JEV_CLIENT_PATH??'/home/ubuntu/shared/jev/node/index.mjs')},
     meme:{enabled:z.enum(['true','false']).parse(env.MEME_OBSERVER_ENABLED??(env.DEBOT_SCANNER_ENABLED==='true'||env.AVE_SCANNER_ENABLED==='true'?'true':'false'))==='true',
       database:z.string().trim().refine(isPersistentOrderPath).parse(env.MEME_DATABASE_PATH??'data/meme-observations.sqlite'),
       maxBytes:z.coerce.number().int().min(16).max(4096).parse(env.MEME_MAX_MB??1024)*1024*1024,

@@ -109,6 +109,7 @@ if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href) {
   const dashboard=config.dashboard.enabled&&runtime.archive?buildDashboard(config,{
     archive:runtime.archive,home:runtime.dashboardHome,overview:runtime.dashboardOverview,orders:runtime.dashboardOrders,
     dailyReview:options=>runtime.dailyReview?.page(options),
+    jev:runtime.jevShadow?{status:runtime.jevStatus,list:options=>runtime.jevShadow!.list(options),detail:id=>runtime.jevShadow!.detail(id)}:undefined,
     debotAuth:runtime.debotAuth,
     debotSignals:options=>runtime.debotScanner?.list(options)??{now:new Date().toISOString(),items:[],total:0,
       limit:options?.limit??20,offset:options?.offset??0,hasMore:false},

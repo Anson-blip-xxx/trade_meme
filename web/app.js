@@ -16,6 +16,7 @@
     candidates: ['条件后追踪', '回看曾通过研究判断的信号，观察此后的价格表现。'],
     followup: ['持续复盘', '保留当时判断，持续比较后续表现，用时间顺序与对照样本验证上涨线索。'],
     rankResearch: ['榜单研究', '持续记录上榜代币，比较热度之前的入场线索与已实现盈利钱包，积累跨币证据。'],
+    jev: ['JEV 并行对照', '比较原策略与异步辅助评分，持续积累同一时点的判断和后续表现。'],
     dailyReview: ['每日复盘', '每天北京时间 09:00 回看信号、后续涨幅与未进入开单的原因，留下可验证的研究调整。'],
     wallets: ['钱包研究', '回查公开钱包之前的买入者，持续验证跨币时序与资金联系。'],
     protection: ['止盈保护', '前瞻验证动态保护线与触发建议，观察利润回撤时策略会如何响应。'],
@@ -347,6 +348,7 @@
     walletSort: 'profiles', associationStatus: null, walletProfileStatus: null, walletProfilesReady: false, walletGroup: '', walletChain: '', walletSearch: '', walletOffset: 0, walletTotal: 0, walletItems: [], walletStatus: null, walletsLoaded: false, walletSearchTimer: null, protection: null, protectionLoaded: false, chainStream: null, chainStreamLoaded: false, followup: null, followupLoaded: false};
 
   const debotAuth = {status: null, busy: '', message: '', error: false, generation: 0};
+  state.jev = null; state.jevStatus = null; state.jevLoaded = false; state.listPages.jev = {offset: 0,total: 0,chain: ''};
   state.ave = null; state.aveLoaded = false; state.listPages.ave = {offset: 0,total: 0,chain: '',asOf: ''};
   state.rankResearchTab='tokens'; state.rankWallets=null; state.rankWalletsLoaded=false; state.listPages.rankWallets={offset:0,total:0,chain:'',sort:'early',asOf:''};
   state.rankResearch = null; state.rankResearchLoaded = false; state.listPages.rankResearch = {offset: 0,total: 0,chain: '',asOf: ''};
@@ -1091,6 +1093,10 @@
     const version = state.queryVersion, activeView = state.view, jobs = [];
     const add = (key, path, apply) => jobs.push({key, run: () => api(path, {signal: controller.signal}), apply});
     if (activeView === 'home') add('home', '/home', data => { state.home = data; renderHome(); });
+    if (activeView === 'jev') {
+      add('jevStatus', '/jev/status', data => { state.jevStatus = data; renderJev(); });
+      add('jev', `/jev?${listQuery('jev')}`, data => { state.jev = data; state.jevLoaded = true; savePage('jev', data); renderJev(); });
+    }
     if(activeView==='dailyReview')add('dailyReview',`/daily-review?${listQuery('dailyReview')}`,data=>{state.dailyReview=data;state.dailyReviewLoaded=true;state.listPages.dailyReview.reportDate=data.report?.date||'';state.listPages.dailyReview.reportId=data.report?.id||'';state.dailyReviewSelection={date:state.listPages.dailyReview.date,chain:state.listPages.dailyReview.chain,sort:state.listPages.dailyReview.sort,pinned:state.listPages.dailyReview.pinned,reportDate:state.listPages.dailyReview.reportDate,reportId:state.listPages.dailyReview.reportId};savePage('dailyReview',data);renderDailyReview();});
     if (activeView === 'meme') add('meme', `/meme?${listQuery('meme')}`, data => { state.meme = data; state.memeLoaded = true; savePage('meme', data); renderMeme(); });
     if (activeView === 'rankResearch' && state.rankResearchTab==='tokens') add('rankResearch', `/token-rank-research?${listQuery('rankResearch')}`, data => { state.rankResearch = data; state.rankResearchLoaded = true; savePage('rankResearch', data); renderRankResearch(); });
@@ -1141,6 +1147,7 @@
       if (activeView === 'sources' && state.resourceErrors.ave) { if (finite(state.ave?.offset)) state.listPages.ave.offset = state.ave.offset; renderAveSignals(); }
       if (activeView === 'rankResearch' && state.resourceErrors.rankResearch) { if (finite(state.rankResearch?.offset)) state.listPages.rankResearch.offset = state.rankResearch.offset; renderRankResearch(); }
       if (activeView === 'rankResearch' && state.resourceErrors.rankWallets) { if (finite(state.rankWallets?.offset)) state.listPages.rankWallets.offset=state.rankWallets.offset; renderRankResearch(); }
+      if (activeView === 'jev' && (state.resourceErrors.jev || state.resourceErrors.jevStatus)) { if (finite(state.jev?.offset)) state.listPages.jev.offset = state.jev.offset; renderJev(); }
       if (activeView === 'protection' && state.resourceErrors.protection) renderProtection();
       if(activeView==='dailyReview'&&state.resourceErrors.dailyReview){if(state.dailyReviewSelection)Object.assign(state.listPages.dailyReview,state.dailyReviewSelection,{offset:state.dailyReview.offset||0});renderDailyReview();}
       networkState();
@@ -1193,7 +1200,7 @@
   $('wallet-search').addEventListener('input', () => { clearTimeout(state.walletSearchTimer); state.walletSearchTimer = setTimeout(() => { state.walletSearch = $('wallet-search').value.trim(); walletFiltersChanged(); }, 300); });
   $('wallet-previous-page').addEventListener('click', () => { state.walletOffset = Math.max(0, state.walletOffset - PAGE_SIZE); refreshQuery(); });
   $('wallet-next-page').addEventListener('click', () => { if (state.walletOffset + PAGE_SIZE < state.walletTotal) { state.walletOffset += PAGE_SIZE; refreshQuery(); } });
-  for (const key of ['risk','meme','ave','rankResearch','rankWallets','dailyReview','followup','protection','orders','groups','learning']) {
+  for (const key of ['risk','meme','ave','jev','rankResearch','rankWallets','dailyReview','followup','protection','orders','groups','learning']) {
     const page = key === 'risk' ? debotRisk : state.listPages[key];
     for (const [suffix,delta] of [['previous',-PAGE_SIZE],['next',PAGE_SIZE]]) $(`${key}-${suffix}-page`).addEventListener('click', () => {
       page.offset = Math.max(0, page.offset + delta);
@@ -1228,7 +1235,7 @@
     }
     document.querySelectorAll('[data-view]').forEach(button => { const active = button.dataset.view === view; button.classList.toggle('active', active); if (active) button.setAttribute('aria-current', 'page'); else button.removeAttribute('aria-current'); });
     text('breadcrumb-current', views[view][0]); $('page-title').replaceChildren(document.createTextNode(views[view][0]), el('span', 'title-dot', '.')); text('page-description', views[view][1]);
-    for (const key of ['home','meme','rankResearch','dailyReview','orders','system','sources','protection','followup']) $(`${key}-panel`).hidden = view !== key;
+    for (const key of ['home','meme','jev','rankResearch','dailyReview','orders','system','sources','protection','followup']) $(`${key}-panel`).hidden = view !== key;
     $('scans-panel').hidden = !['scans','candidates'].includes(view); $('debot-risk-panel').hidden = view !== 'risk';
     $('wallets-panel').hidden = !['wallets','associations'].includes(view); $('wallet-metrics').hidden = !['wallets','associations'].includes(view); $('scan-metrics').hidden = view !== 'home';
     $('scan-insights').hidden = view !== 'system'; $('workbench').classList.add('wallet-mode');
@@ -1239,6 +1246,7 @@
     if (view === 'followup') syncFollowupTab();
     if (view === 'home') renderHome();
     if (view === 'meme') renderMeme();
+    if (view === 'jev') renderJev();
     if (view === 'sources') { renderAveStatus(); renderAveSignals(); }
     if (view === 'rankResearch') renderRankResearch();
     if(view==='dailyReview')renderDailyReview();
@@ -2358,6 +2366,106 @@
   function rankWalletProfileButton(chain,address) {
     const button=el('button','text-button','钱包档案 ↗');button.type='button';button.addEventListener('click',()=>void openWallet({chain,address},state.detailId?state.returnFocus:button));return button;
   }
+  const jevReasons = {
+    FRESH_ACTIVITY_GROWING: '新近活动持续增长', BUY_PRESSURE_SUPPORT: '采样买压提供支持', SELL_PRESSURE_RISING: '采样卖压增加',
+    WALLET_RELAY_EVIDENCE: '出现钱包接力证据', SOCIAL_DIFFUSION_OBSERVED: '已观察到传播证据', CELEBRITY_CA_MENTION: '存在名人提及 CA 的证据',
+    NON_TRADE_ONLY: '仅有转账或流动性操作', MIXED_EVIDENCE: '证据相互分歧', EVIDENCE_INSUFFICIENT: '可用证据不足', STALE_OR_MISSING: '证据过期或缺失',
+    HEAT_UNAVAILABLE: '市场热度证据缺失', TRADING_EMOTION_UNAVAILABLE: '交易情绪证据缺失', WALLET_RELAY_UNAVAILABLE: '钱包接力证据缺失', CATALYST_UNAVAILABLE: '传播证据缺失', CELEBRITY_UNAVAILABLE: '名人提及证据缺失',
+    JEV_AUTH_UNAVAILABLE: '供应商认证失败', JEV_KEY_MISSING: '辅助服务密钥未配置', JEV_CLIENT_UNAVAILABLE: '辅助客户端不可用',
+    JEV_PROVIDER_ERROR: '供应商服务异常', JEV_NETWORK_UNAVAILABLE: '辅助服务连接失败', JEV_REQUEST_REJECTED: '供应商未接受本次请求',
+    JEV_STOPPED: '辅助评分服务已停止', JEV_DAILY_CALL_BUDGET: '达到本地每日调用上限', JEV_DAILY_TOKEN_BUDGET: '达到本地每日 token 预算',
+    JEV_SUPERSEDED: '已由更新证据接续评分', JEV_STORAGE_UNAVAILABLE: '辅助评分存储不可用', JEV_PROVIDER_STILL_PENDING: '上次请求仍在收尾，暂停新请求',
+    JEV_EVIDENCE_INSUFFICIENT: '可用证据不足，不计入候选收益对照',
+    JEV_INSUFFICIENT_EVIDENCE: '可用证据不足，不计入评分收益对照',
+    JEV_BASELINE_PRICE_MISSING: '模型返回后未及时取得采样基准价', JEV_PRICE_SERIES_CHANGED: '报价来源或池子变化，停止混合比较',
+    JEV_PRICE_CAPTURE_FAILED: '对照报价登记异常', JEV_CAPTURE_QUEUE_FULL: '辅助证据登记队列已满', JEV_INPUT_CAPTURE_FAILED: '辅助证据整理失败',
+    JEV_CAPTURE_FAILED: '辅助证据登记异常', JEV_INPUT_INVALID: '辅助输入未通过校验',
+    JEV_DISABLED: '辅助评分未启用', JEV_QUOTA_EXHAUSTED: '供应商额度不足，冷却后探测',
+    JEV_CREDITS_EXHAUSTED: '供应商额度不足，冷却后探测', JEV_RATE_LIMITED: '供应商限流，等待重试',
+    JEV_TIMEOUT: '辅助评分超时', JEV_AUTH_FAILED: '供应商认证失败', JEV_AUTH_ERROR: '供应商认证失败',
+    JEV_UNAVAILABLE: '辅助服务暂不可用', JEV_API_UNAVAILABLE: '辅助服务暂不可用',
+    JEV_MISSING_API_KEY: '辅助服务密钥未配置', JEV_CONFIG_ERROR: '辅助服务配置异常',
+    JEV_DAILY_CALL_LIMIT: '达到本地每日调用上限', JEV_DAILY_TOKEN_LIMIT: '达到本地每日 token 上限',
+    JEV_LOCAL_BUDGET_EXHAUSTED: '达到本地每日预算上限', JEV_BUDGET_EXHAUSTED: '达到本地预算上限',
+    JEV_CIRCUIT_OPEN: '辅助服务冷却中', JEV_QUEUE_FULL: '辅助评分队列已满', JEV_QUEUE_EXPIRED: '队列中的证据已过期',
+    JEV_INPUT_EXPIRED: '证据已过期', JEV_RESPONSE_INVALID: '模型响应未通过校验', JEV_INVALID_RESPONSE: '模型响应未通过校验',
+    JEV_STORAGE_FULL: '辅助评分存储达到容量上限', JEV_INTERRUPTED: '辅助评分被中断',
+    HARD_CHECKS_NOT_PASSED: '原策略必要检查未通过', BASELINE_NOT_ELIGIBLE: '未进入原策略候选对照',
+    JEV_NOT_AVAILABLE: '辅助评分不可用，不计入评分对照',
+  };
+  function jevReason(value) { return jevReasons[value] || reasonNames[value] || scalar(value, '原因尚未取得'); }
+  function jevMetric(label, value, note) {
+    const node = el('div', 'jev-metric'); node.append(el('span', '', label), el('strong', '', value));
+    if (note) node.append(el('small', '', note)); return node;
+  }
+  function renderJev() {
+    const status = state.jevStatus || {}, data = state.jev || {}, page = state.listPages.jev;
+    const items = Array.isArray(data.items) ? data.items : [], circuit = status.circuit || {}, budget = status.budget || {}, totals = status.counts || {};
+    const cooling = validDate(circuit.retryAt) && Date.parse(circuit.retryAt) > Date.now();
+    const statusNode = $('jev-status'); statusNode.className = `badge ${cooling || status.lastError || status.captureError ? 'watch' : status.available ? 'pass' : 'neutral'}`;
+    statusNode.textContent = !state.jevStatus ? '等待读取' : status.enabled === false ? '辅助评分未启用' : cooling ? '降级原策略 · 等待探测' : status.captureError ? '辅助证据登记异常' : status.available ? '并行评分运行中' : '原策略独立运行';
+    const runtime = $('jev-runtime'); runtime.replaceChildren();
+    runtime.append(jevMetric('已完成评分 / 已登记', `${count(totals.available)} / ${count(totals.total)}`, `不可用 ${count(totals.unavailable)} · 等待 ${count(totals.pending)}`),
+      jevMetric('本地今日调用', `${count(budget.calls)} / ${count(budget.maxCalls)}`, `${scalar(budget.day, '日期尚未取得')} · 本地用量记录`),
+      jevMetric('本地已知 token 用量', `${count(budget.knownTokens)} / ${count(budget.maxTokens)}`, `另预留 ${count(budget.reservedTokens)} token · 用量未知 ${count(budget.unknownUsageCalls)} 次`));
+    const details = el('div', 'jev-service');
+    details.append(el('span', '', `模型 ${scalar(status.model)} · 规则 ${scalar(status.rubricVersion)}`),
+      el('span', '', `待处理 ${count(status.queueDepth)} · ${status.inFlight ? '正在请求' : '当前无请求'}`),
+      el('span', '', `最近完成 ${date(status.lastCompletedAt, true)}`),
+      el('strong', '', '供应商账户剩余额度：未知。本地计数不代表账户余额。'));
+    if (status.captureError) details.append(el('span', 'jev-degraded', `辅助证据登记：${jevReason(status.captureError)}`));
+    if (circuit.reason || status.lastError) details.append(el('span', 'jev-degraded', `降级原因：${jevReason(circuit.reason || status.lastError)}`));
+    if (validDate(circuit.retryAt)) details.append(el('span', '', `下次允许探测 ${date(circuit.retryAt, true)} · 有新证据时尝试恢复`));
+    runtime.append(details);
+    const warning = $('jev-warning'); warning.hidden = !state.resourceErrors.jev && !state.resourceErrors.jevStatus;
+    warning.textContent = 'JEV 记录暂时无法更新，以下保留最近成功读取的结果；页面显示不影响原策略运行。';
+    const comparison = status.comparison || {}, compareNode = $('jev-comparison'); compareNode.replaceChildren();
+    compareNode.append(el('h3', '', '后续观察对照 · 全链汇总'), el('p', '', `原策略候选 ${count(comparison.eligible)} · JEV 入选 ${count(comparison.selected)} · 未入选 ${count(comparison.rejected)} · 排除 ${count(comparison.excluded)} · 已有报价 ${count(comparison.priced)}`));
+    const windows = el('div', 'jev-window-grid');
+    for (const minutes of [5, 15, 60]) {
+      const sample = (Array.isArray(comparison.horizons) ? comparison.horizons : []).find(row => row.minutes === minutes) || {};
+      const card = el('div', 'jev-window'); card.append(el('strong', '', `${minutes} 分钟 · ${count(sample.pairs)} 个完整样本`),
+        el('span', '', `原策略配对候选均值 ${percent(sample.baselineMeanGrossPct)}`),
+        el('span', '', `JEV 入选均值 ${percent(sample.jevSelectedMeanGrossPct)}`),
+        el('small', '', `入选 ${count(sample.selectedCount)} · 未入选 ${count(sample.rejectedCount)}`)); windows.append(card);
+    }
+    compareNode.append(windows, el('p', 'jev-note-inline', '汇总涵盖全部链，网络筛选只作用于下方列表。JEV 入选为候选样本的子集；缺失或迟到报价不按 0% 计入，不能用少量样本推断盈利能力。'));
+    text('jev-count', count(data.total)); renderPager('jev'); text('jev-updated', `${page.offset ? '历史页暂停刷新' : '首页每 15 秒更新'} · 每页 ${PAGE_SIZE} 条`);
+    const rows = $('jev-rows'); rows.replaceChildren(); const empty = $('jev-empty'); empty.hidden = items.length > 0;
+    empty.querySelector('h3').textContent = !state.jevLoaded ? state.resourceErrors.jev ? '暂时无法读取并行样本' : '正在读取并行样本' : status.enabled === false ? '辅助评分未启用' : '当前筛选下暂无并行样本';
+    for (const item of items) {
+      const token = item.token || {}, result = item.status === 'available' ? item.result : null, observed = item.comparison || {}, baseline = item.baseline || {};
+      const researchOnly = item.status === 'available' && observed.excludedReason === 'BASELINE_NOT_ELIGIBLE';
+      const row = el('tr'), identity = el('td', 'jev-identity'); identity.dataset.label = '代币 / 冻结时点';
+      identity.append(memeIdentity({...token, name: item.name}), gmgnTokenLink(token.chain, token.address), el('small', '', `证据截止 ${date(item.asOf, true)}`), el('small', '', `返回 ${date(item.completedAt, true)}`)); row.append(identity);
+      const original = el('td', 'jev-cell'); original.dataset.label = '原策略判断'; const decision = decisions[baseline.decision];
+      original.append(badge(decision?.[0] || '判断未知', decision?.[1] || 'neutral'), el('small', '', baseline.hardChecksPassed === true ? '必要检查已通过' : '必要检查未全部通过'));
+      const reasons = Array.isArray(baseline.reasons) ? baseline.reasons : [];
+      if (reasons.length) { const node = el('details', 'jev-reasons'); node.append(el('summary', '', `当时依据 · ${reasons.length} 项`)); for (const reason of reasons) node.append(el('p', '', jevReason(reason))); original.append(node); } row.append(original);
+      const advisory = el('td', 'jev-cell'); advisory.dataset.label = 'JEV 辅助判断';
+      if (result) {
+        const labels = {support: '支持进一步研究', watch: '继续观察', avoid: '研究倾向不利', insufficient: '证据不足'};
+        advisory.append(el('strong', 'jev-score', finite(result.score) ? `${count(result.score)} / 100` : '—'), badge(labels[result.stance] || '判断未知', result.stance === 'support' ? 'pass' : result.stance === 'avoid' ? 'watch' : 'neutral'));
+        advisory.append(el('small', '', finite(result.confidence) ? `模型置信度 ${count(result.confidence * 100)}%（非胜率）` : '置信度未取得'));
+        if (Array.isArray(result.reasonCodes) && result.reasonCodes.length) { const reasons = el('details', 'jev-reasons'); reasons.append(el('summary', '', '辅助依据')); for (const code of result.reasonCodes) reasons.append(el('p', '', jevReason(code))); advisory.append(reasons); }
+      } else advisory.append(el('strong', 'jev-score missing', '—'), badge(item.status === 'pending' ? '等待异步评分' : '辅助评分不可用', item.status === 'pending' ? 'neutral' : 'watch'), el('small', '', item.status === 'pending' ? '原策略继续运行' : `${jevReason(item.reason)}；按原策略运行`));
+      if (validDate(item.retryAt)) advisory.append(el('small', '', `下次允许探测 ${date(item.retryAt, true)}`));
+      advisory.append(el('small', '', `模型 ${scalar(result?.model || item.model, '未返回')}`), el('small', '', `规则 ${scalar(result?.rubricVersion || item.rubricVersion, '未返回')}`), el('small', '', finite(item.latencyMs) ? `请求耗时 ${count(item.latencyMs)} ms` : '请求耗时 —')); row.append(advisory);
+      const dimensions = el('td', 'jev-cell'); dimensions.dataset.label = '维度 / 样本阶段';
+      const dimensionNames = {trading_emotion: '交易情绪代理', wallet_relay: '钱包接力', heat: '市场热度',heat_momentum: '热度变化',sentiment: '交易情绪',wallet: '钱包行为',wallet_flow: '钱包资金流',narrative: '叙事证据',celebrity: '名人提及',catalyst: '传播证据',evidence: '证据质量',priority: '研究优先级'};
+      for (const [key, value] of Object.entries(result?.dimensions || {})) dimensions.append(el('span', 'jev-dimension', `${dimensionNames[key] || key} ${finite(value) ? count(value) : '—'}`));
+      if (!result || !Object.keys(result.dimensions || {}).length) dimensions.append(el('span', 'missing', '维度尚未取得'));
+      if (result?.phase) dimensions.append(el('small', '', `样本阶段：${{emerging:'萌芽',spreading:'传播中',crowded:'拥挤',fading:'回落',unknown:'未知',isolated_buy:'孤立买入',accumulation:'买入延续',accelerating:'活跃度加速',contested:'买卖分歧',distribution:'卖出 / 撤退',non_trade:'转账 / 流动性操作',mixed:'买卖混合',insufficient:'证据不足'}[result.phase] || result.phase}`)); row.append(dimensions);
+      const outcome = el('td', 'jev-cell'); outcome.dataset.label = '后续观察毛涨幅';
+      outcome.append(badge(researchOnly ? '研究观察 · 不进入候选对照' : !observed.excludedReason && observed.eligible ? observed.selected === true ? 'JEV 对照入选' : observed.selected === false ? 'JEV 对照未入选' : '等待辅助判断' : '未进入可比较样本', 'neutral'));
+      if (observed.excludedReason) outcome.append(el('small', '', jevReason(observed.excludedReason)));
+      outcome.append(el('small', '', `采样基准 ${date(observed.baselineAt, true)} · ${usd(observed.baselinePriceUsd)}`));
+      for (const minutes of ['5', '15', '60']) { const horizon = observed.horizons?.[minutes]; outcome.append(el('span', 'jev-horizon', `${minutes} 分钟 ${horizon?.status === 'complete' ? percent(horizon.grossReturnPct) : horizon?.status === 'missed' ? '缺少准时报价' : researchOnly ? '— 待研究采样' : observed.excludedReason || !observed.eligible ? '— 不纳入对照' : '— 待采样'}`)); }
+      if (finite(observed.seriesMismatchCount) && observed.seriesMismatchCount > 0) outcome.append(el('small', '', `已跳过 ${count(observed.seriesMismatchCount)} 条来源或池子不一致的报价，等待同口径采样`));
+      outcome.append(el('small', '', `采样最高 ${percent(observed.sampledMaxGainPct)} · 最大回撤 ${percent(observed.sampledMaxDrawdownPct)}`)); row.append(outcome); rows.append(row);
+    }
+  }
+
   function rankPnl(value, label) {
     const node=el('div','rank-pnl');node.append(el('span','',label),el('strong',finite(value)?value<0?'negative':'positive':'missing',finite(value)?usd(value):'未知'));return node;
   }

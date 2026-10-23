@@ -253,6 +253,19 @@ export class MemeObserver {
     const active=new Set(this.activeRows().map(row=>tokenKey({chain:row.chain,address:row.address})));
     return {now:this.now().toISOString(),asOf,total,limit,offset,hasMore:offset+rows.length<total,status:this.status(),items:rows.map(row=>this.project(row,active))};
   }
+  /** A bounded point-in-time feature view; no future outcomes or current-row overwrite. */
+  researchSnapshot(input:Token,asOf:string) {
+    const token=validToken(input);if(!token||!Number.isFinite(Date.parse(asOf)))throw new Error('INVALID_FILTER');
+    const rows=this.db.prepare(`SELECT observed_at,market,assessment FROM meme_snapshots
+      WHERE chain=? AND address=? AND observed_at<=? AND json_extract(assessment,'$.assessedAt')<=?
+      ORDER BY observed_at DESC,id DESC LIMIT 8`).all(token.chain,token.address,asOf,asOf);
+    const catalyst=this.db.prepare(`SELECT data FROM meme_catalysts WHERE chain=? AND address=? AND observed_at<=?
+      ORDER BY observed_at DESC LIMIT 1`).get(token.chain,token.address,asOf);
+    // Display labels are local metadata only and never part of the outbound model state.
+    const label=this.db.prepare('SELECT name,symbol FROM meme_tokens WHERE chain=? AND address=? AND first_seen_at<=?').get(token.chain,token.address,asOf);
+    return {token:{...token,name:label?.name??label?.symbol,market:parse(rows[0]?.market),assessment:parse(rows[0]?.assessment),catalyst:parse(catalyst?.data)},
+      items:rows.map(row=>({observedAt:row.observed_at,market:parse(row.market)}))};
+  }
   detail(input:Token,options:MemePage={}) {
     const token=validToken(input);if(!token)throw new Error('INVALID_FILTER');
     const {limit,offset,asOf}=this.pageArgs(options),row=this.row(token);

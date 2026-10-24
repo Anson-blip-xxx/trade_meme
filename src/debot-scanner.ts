@@ -113,6 +113,9 @@ export class DebotScanner {
     if(!columns.has('review_priority'))this.db.exec('ALTER TABLE debot_signals ADD COLUMN review_priority INTEGER NOT NULL DEFAULT 0');
     if(!columns.has('merged_truncated'))this.db.exec('ALTER TABLE debot_signals ADD COLUMN merged_truncated INTEGER NOT NULL DEFAULT 0');
     if(!columns.has('analyzed'))this.db.exec("ALTER TABLE debot_signals ADD COLUMN analyzed INTEGER NOT NULL DEFAULT 0; UPDATE debot_signals SET analyzed=1 WHERE state='completed' AND dispatched_at IS NOT NULL");
+    // First-delivery qualification is immutable. Old rows, revisions and future
+    // timestamps cannot become fresh notifications after a restart or clock catch-up.
+    if(!columns.has('fresh_notification'))this.db.exec('ALTER TABLE debot_signals ADD COLUMN fresh_notification INTEGER NOT NULL DEFAULT 0');
     this.db.exec('CREATE INDEX IF NOT EXISTS debot_signals_notification ON debot_signals(notification_key)');
     this.notifications=new DebotNotificationLedger(this.db,this.now);
     this.performance=new VendorPerformanceLedger(this.db,this.now);
@@ -471,10 +474,13 @@ export class DebotScanner {
     }
     const previous=this.db.prepare('SELECT 1 FROM debot_signals WHERE chain=? AND address=? AND analyzed=1 LIMIT 1').get(signal.token.chain,signal.token.address);
     const stale=Date.parse(signal.occurredAt)<this.now().getTime()-this.maxAgeSec()*1000&&!(previous&&update.kind==='wallet_hint');
+    const occurred=Date.parse(signal.occurredAt),observed=Date.parse(observation.observedAt),now=this.now().getTime(),windowMs=Math.min(120,this.maxAgeSec())*1000;
+    const freshNotification=update.newEvent&&!existing&&!signal.sourceEventId.startsWith('debot:revision:')&&
+      Number.isFinite(occurred)&&Number.isFinite(observed)&&occurred<=observed&&observed<=now&&now-occurred<windowMs&&now-observed<windowMs;
     const dedupKey=update.key;
-    this.db.prepare('INSERT INTO debot_signals(id,chain,address,occurred_at,observed_at,state,payload,reason,dedup_key,notification_key,hint_kind) VALUES(?,?,?,?,?,?,?,?,?,?,?)')
+    this.db.prepare('INSERT INTO debot_signals(id,chain,address,occurred_at,observed_at,state,payload,reason,dedup_key,notification_key,hint_kind,fresh_notification) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)')
       .run(signal.sourceEventId,signal.token.chain,signal.token.address,signal.occurredAt,observation.observedAt,
-        stale?'ignored':'pending',JSON.stringify(observation),stale?'DEBOT_SIGNAL_STALE':null,dedupKey,update.key,update.kind);
+        stale?'ignored':'pending',JSON.stringify(observation),stale?'DEBOT_SIGNAL_STALE':null,dedupKey,update.key,update.kind,freshNotification?1:0);
     this.storeDisplay(signal.sourceEventId,signal.token.chain,signal.token.address,observation);
     if(stale)this.notifications.mark(update.key,{classification:'stale',reasons:['DEBOT_SIGNAL_STALE']});
     else {
@@ -486,11 +492,18 @@ export class DebotScanner {
   }
 
   private coalescePending(token:Signal['token']):void {
-    const rows=this.db.prepare("SELECT * FROM debot_signals WHERE chain=? AND address=? AND state='pending' ORDER BY rowid")
+    const rows=this.db.prepare("SELECT *,rowid AS queue_seq FROM debot_signals WHERE chain=? AND address=? AND state='pending' ORDER BY rowid")
       .all(token.chain,token.address);
     if(rows.length<2)return;
     const started=this.db.prepare("SELECT 1 FROM debot_signals WHERE chain=? AND address=? AND (analyzed=1 OR state='dispatching') LIMIT 1").get(token.chain,token.address);
-    const protectedId=started?undefined:rows[0].id,latest=rows.at(-1)!;
+    // Late older notifications cannot replace a newer pending assessment.
+    // Keep a qualified original notification over its same-time revisions;
+    // wallet hints still merge below without transferring event eligibility.
+    const validTime=(row:Record<string,any>)=>{const event=Date.parse(row.occurred_at),seen=Date.parse(row.observed_at);
+      return Number.isFinite(event)&&Number.isFinite(seen)&&event<=seen&&seen<=this.now().getTime();};
+    const protectedId=started?undefined:rows.find(validTime)?.id,latest=[...rows].sort((a,b)=>
+      Number(validTime(a))-Number(validTime(b))||String(a.occurred_at).localeCompare(String(b.occurred_at))||
+      Number(a.fresh_notification)-Number(b.fresh_notification)||Number(a.queue_seq)-Number(b.queue_seq)).at(-1)!;
     const merging=rows.filter(row=>row.id!==protectedId&&row.id!==latest.id);
     if(!merging.length)return;
     const payloads:DebotSignalObservation[]=[];
@@ -534,6 +547,14 @@ export class DebotScanner {
       reasons:['DEBOT_REPEAT_LOCAL_EVIDENCE_UNAVAILABLE']};}
   }
 
+  private freshNotification(row:Record<string,any>,previous:Record<string,any>):boolean {
+    const now=this.now().getTime(),windowMs=Math.min(120,this.maxAgeSec())*1000;
+    const occurred=Date.parse(String(row.occurred_at)),observed=Date.parse(String(row.observed_at));
+    const baseline=Date.parse(String(previous.analysis_occurred_at??previous.occurred_at));
+    return row.fresh_notification===1&&row.id!==previous.id&&Number.isFinite(baseline)&&
+      occurred>baseline&&occurred<=observed&&observed<=now&&now-occurred<windowMs&&now-observed<windowMs;
+  }
+
   private async dispatch(generation:number):Promise<boolean> {
     if(this.interrupted(generation))return false;
     this.expire();this.deferredReason=undefined;
@@ -564,7 +585,8 @@ export class DebotScanner {
       this.db.prepare("UPDATE debot_signals SET state='ignored',reason=? WHERE id=?").run(reason,row.id);mark(classification,reasons,evidence);
     };
     let incremental=previous?this.repeatCheck(observation,previous):undefined;
-    if(previous&&!incremental?.material&&row.hint_kind==='display') {
+    let freshNotification=!!previous&&this.freshNotification(row,previous);
+    if(previous&&!incremental?.material&&!freshNotification&&row.hint_kind==='display') {
       ignore('DEBOT_DUPLICATE_TOKEN_ALERT','display_only',incremental?.evidence,['DEBOT_NO_MATERIAL_CHANGE']);return true;
     }
     if(previous&&incremental?.priority!=='risk') {
@@ -626,7 +648,8 @@ export class DebotScanner {
           if(!incremental.material)incremental.evidence.status='unavailable';
         }
         if(row.merged_truncated===1)incremental.evidence.limitations.push('MERGED_HINTS_LIMIT_6');
-        if(!incremental.material){
+        freshNotification=this.freshNotification(row,previous);
+        if(!incremental.material&&!freshNotification){
           if(incremental.evidence.status==='unavailable'){
             const after=new Date(this.now().getTime()+Math.max(5,this.options.repeatCooldownSec??30)*1000).toISOString();
             this.db.prepare("UPDATE debot_signals SET state='pending',reason='DEBOT_REPEAT_EVIDENCE_PENDING',review_after=? WHERE id=?").run(after,row.id);
@@ -652,7 +675,8 @@ export class DebotScanner {
         .run(this.now().toISOString(),evaluationSignal.occurredAt,row.id);
       if(incremental)this.db.prepare('UPDATE debot_signals SET review_wallets=? WHERE id=?')
         .run(JSON.stringify(incremental.evidence.vendorChanges.map(({address,observedAt})=>({address,observedAt}))),row.id);
-      mark(previous?'reassessment':'first_analysis',incremental?.reasons??['DEBOT_INITIAL_ANALYSIS'],incremental?.evidence);
+      mark(previous?'reassessment':'first_analysis',
+        [...(incremental?.reasons??['DEBOT_INITIAL_ANALYSIS']),...(freshNotification?['DEBOT_FRESH_NOTIFICATION_REASSESSMENT']:[])],incremental?.evidence);
       await this.options.onSignal(evaluationSignal,observation.observedAt,{detailsReady,repeat:!!previous});
       this.db.prepare("UPDATE debot_signals SET state='completed',analyzed=1,completed_at=? WHERE id=?")
         .run(this.now().toISOString(),row.id);

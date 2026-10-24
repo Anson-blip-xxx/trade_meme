@@ -8,6 +8,8 @@ import {tokenDisplayText} from './token-display.js';
 export type DebotNotificationKind='first'|'replay'|'display'|'wallet_hint';
 export interface DebotNotificationResult {
   key:string;kind:DebotNotificationKind;firstSeenAt:string;lastSeenAt:string;notificationCount:number;deliveryCount:number;
+  /** A distinct provider event, separate from changed wallet evidence or a card revision. */
+  newEvent:boolean;
 }
 interface Snapshot {
   occurredAt:string;name?:string;symbol?:string;claimedPlatform?:string;walletCount:number;addressCount:number;
@@ -209,7 +211,7 @@ export class DebotNotificationLedger {
       this.db.prepare('UPDATE debot_notification_versions SET delivery_count=delivery_count+1,last_observed_at=MAX(last_observed_at,?) WHERE key=?').run(observedAt,key);
       this.db.prepare('UPDATE debot_notification_groups SET delivery_count=?,last_seen_at=? WHERE chain=? AND address=?')
         .run(deliveryCount,lastSeenAt,token.chain,token.address);
-      return {key,kind:'replay',firstSeenAt,lastSeenAt,notificationCount:Number(group.notification_count),deliveryCount};
+      return {key,kind:'replay',firstSeenAt,lastSeenAt,notificationCount:Number(group.notification_count),deliveryCount,newEvent:false};
     }
     const event=this.db.prepare('SELECT occurred_at FROM debot_notification_events WHERE chain=? AND address=? AND event_id=?')
       .get(token.chain,token.address,eventId) as {occurred_at:string}|undefined;
@@ -228,7 +230,7 @@ export class DebotNotificationLedger {
         last_change_kind=excluded.last_change_kind,snapshot=excluded.snapshot,delta=excluded.delta,reasons=excluded.reasons`)
       .run(token.chain,token.address,firstSeenAt,lastSeenAt,notificationCount,deliveryCount,Number(group?.version_count??0)+1,
         key,observedAt,change.kind,JSON.stringify(next),JSON.stringify(change.delta),JSON.stringify(change.reasons));
-    return {key,kind:change.kind,firstSeenAt,lastSeenAt,notificationCount,deliveryCount};
+    return {key,kind:change.kind,firstSeenAt,lastSeenAt,notificationCount,deliveryCount,newEvent:!event};
   }
   private prune():void {
     const cutoff=new Date(this.now().getTime()-RETENTION_DAYS*86400_000).toISOString();

@@ -153,7 +153,7 @@ test('different vendor IDs describing the same CA event and unchanged payload di
     signal:{...first.signal,sourceEventId:'debot:fast:2',text:'different vendor notification ID'}};
   let calls=0;const f=fixture({onSignal:async()=>{calls++;}});
   try{
-    let scanner=f.create();scanner.acceptPage(page(first,second));await scanner.dispatchOnce();
+    f.advance(100);let scanner=f.create();scanner.acceptPage(page(first,second));await scanner.dispatchOnce();
     assert.equal(calls,1);assert.equal(scanner.getStatus().ignored,1);assert.equal(scanner.recent().items.length,1);
     assert.equal(f.rows()[1].reason,'DEBOT_DUPLICATE_TOKEN_ALERT');
     await scanner.close();scanner=f.create();scanner.acceptPage(page({...second,id:'3',signal:{...second.signal,sourceEventId:'debot:fast:3'}}));

@@ -30,6 +30,7 @@ test('pure comparison requires fresh same-chain full CA notifications from disti
   const result=assessSourceCorroboration({token,now:new Date(at(20)),observations:[first,second,foreign]});
   assert.equal(result.classification,'cross_source');assert.deepEqual(result.freshSources,['ave','debot']);assert.equal(result.freshSourceCount,2);
   assert.equal(result.independentEvidence,'unknown');assert.equal(result.scoreEffect,0);assert.equal(result.researchOnly,true);
+  assert.equal(result.activity,undefined); // A bounded caller sample cannot claim exact historical activity.
   const repeated=assessSourceCorroboration({token,now:new Date(at(20)),observations:[first,first,first]});
   assert.equal(repeated.classification,'single_source');assert.equal(repeated.sources[0].notificationCount,1);
 });
@@ -247,4 +248,86 @@ test('event budgets accept positive safe integers up to one million and reject i
     const ledger=new SourceCorroboration(':memory:',{maxEvents});
     try{assert.equal(ledger.status().maxEvents,maxEvents);}finally{ledger.close();}
   }
+});
+
+test('notification activity uses mutually exclusive event-time five-minute buckets and an exclusive one-minute start',()=>{
+  const f=fixture();try {
+    const ledger=f.create();
+    for(const seconds of [0,.001,299.999,300,300.001,540,540.001,600]){
+      f.advance(seconds);assert.equal(ledger.record(signal('ave',seconds,`boundary-${seconds}`)).accepted,true);
+    }
+    const result=ledger.assess(token),activity=result.activity!;
+    assert.equal(result.scoreEffect,0);assert.equal(result.researchOnly,true);
+    assert.deepEqual(activity.sources,[{source:'ave',last1m:2,last5m:4,previous5m:3,change5m:1},
+      {source:'debot',last1m:0,last5m:0,previous5m:0,change5m:0},{source:'gmgn',last1m:0,last5m:0,previous5m:0,change5m:0}]);
+    assert.deepEqual(activity.windows,{last1m:{startExclusive:at(540),endInclusive:at(600)},
+      last5m:{startExclusive:at(300),endInclusive:at(600)},previous5m:{startExclusive:at(),endInclusive:at(300)}});
+    assert.equal(activity.bucketBy,'occurredAt');assert.equal(activity.historyComplete,false);
+    assert.ok(activity.limitations.includes('ZERO_COUNT_DOES_NOT_PROVE_SOURCE_INACTIVE'));
+  }finally{f.close();}
+});
+
+test('valid arrivals keep original event-time buckets; a replay or recording delay does not refresh activity',()=>{
+  const f=fixture();try {
+    const ledger=f.create();f.advance(400);
+    assert.equal(ledger.record(signal('ave',300,'delayed'),at(400)).accepted,true); // Event exactly on previous-bucket end.
+    f.advance(550);assert.equal(ledger.record(signal('ave',300,'delayed'),at(550)).duplicate,true);
+    ledger.record(signal('debot',540,'recorded-later'),at(540));
+    f.advance(600);const activity=ledger.assess(token).activity!;
+    assert.deepEqual(activity.sources[0],{source:'ave',last1m:0,last5m:0,previous5m:1,change5m:-1});
+    assert.deepEqual(activity.sources[1],{source:'debot',last1m:0,last5m:1,previous5m:0,change5m:1});
+    assert.equal(ledger.history(token).items.find(row=>row.source==='ave')!.deliveryCount,2);
+  }finally{f.close();}
+});
+
+test('activity excludes arrivals delayed over 120 seconds and future-dated originals even after the clock catches up',()=>{
+  const f=fixture();try {
+    const ledger=f.create();f.advance(300);
+    ledger.record(signal('ave',180,'exact-delay'));ledger.record(signal('ave',179.999,'too-late'));
+    ledger.record(signal('debot',301,'future'));
+    f.advance(600);ledger.record(signal('debot',301,'future'));
+    const activity=ledger.assess(token).activity!;
+    assert.deepEqual(activity.sources[0],{source:'ave',last1m:0,last5m:0,previous5m:1,change5m:-1});
+    assert.deepEqual(activity.sources[1],{source:'debot',last1m:0,last5m:0,previous5m:0,change5m:0});
+    assert.equal(activity.maxArrivalDelaySec,120);
+  }finally{f.close();}
+});
+
+test('later recordings and conflicts cannot rewrite activity known at an earlier as-of time',()=>{
+  const f=fixture();try {
+    const ledger=f.create();ledger.record(signal());f.advance(30);ledger.record(signal('debot',10),at(10));
+    f.advance(40);ledger.record(signal(),at(40));f.advance(50);ledger.record(signal('ave',5),at(50));
+    const historical=ledger.assess(token,new Date(at(20))).activity!;
+    assert.deepEqual(historical.sources[0],{source:'ave',last1m:1,last5m:1,previous5m:0,change5m:1});
+    assert.deepEqual(historical.sources[1],{source:'debot',last1m:0,last5m:0,previous5m:0,change5m:0});
+    assert.equal(ledger.assess(token,new Date(at(49.999))).activity!.sources[0].last5m,1);
+    const current=ledger.assess(token).activity!;
+    assert.equal(current.sources[0].last5m,0);assert.equal(current.sources[1].last5m,1);
+  }finally{f.close();}
+});
+
+test('exact activity is not truncated with reference samples and isolates sources, chains and full contract addresses',()=>{
+  const f=fixture();try {
+    const ledger=f.create();
+    for(let i=0;i<80;i++){f.advance(i);ledger.record(signal('ave',i,`burst-${i}`));}
+    ledger.record(signal('debot',79,'debot-good'));
+    ledger.record(signal('ave',79,'other-token',other));
+    ledger.record(signal('ave',79,'other-chain',{...token,chain:'robinhood'}));
+    const result=ledger.assess(token),activity=result.activity!;
+    assert.equal(activity.referenceSampleTruncated,true);assert.equal(activity.sources[0].last5m,80);
+    assert.equal(activity.sources[0].last1m,60);assert.equal(activity.sources[1].last5m,1);
+    assert.equal(activity.sources[2].last5m,0);assert.equal(ledger.assess(other).activity!.sources[0].last5m,1);
+    assert.equal(ledger.assess({...token,chain:'robinhood'}).activity!.sources[0].last5m,1);
+    assert.ok(activity.limitations.includes('REFERENCE_SAMPLE_LIMIT_DOES_NOT_TRUNCATE_ACTIVITY_COUNTS'));
+  }finally{f.close();}
+});
+
+test('activity outside retained history reports unknown coverage rather than complete provider inactivity',()=>{
+  const f=fixture();try {
+    const ledger=f.create();ledger.record(signal());f.advance(30*86400+1);
+    const historical=ledger.assess(token,new Date(at(20))).activity!;
+    assert.equal(historical.sources[0].last5m,0);assert.equal(historical.historyComplete,false);
+    assert.equal(historical.retainedFrom,at(1));assert.ok(historical.limitations.includes('ACTIVITY_WINDOW_OUTSIDE_RETENTION'));
+    assert.equal(historical.counting,'exact_retained_events');assert.equal(historical.scope,'retained_valid_provider_events');
+  }finally{f.close();}
 });

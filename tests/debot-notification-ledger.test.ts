@@ -28,14 +28,14 @@ function fixture() {
 test('notification ledger merges tokens, distinguishes vendor events from versions and retains original timestamps',()=>{
   const f=fixture();try {
     const first=observation(),a=f.ledger.record(first);
-    assert.equal(a.kind,'first');assert.equal(a.notificationCount,1);assert.equal(a.deliveryCount,1);
+    assert.equal(a.kind,'first');assert.equal(a.notificationCount,1);assert.equal(a.deliveryCount,1);assert.equal(a.newEvent,true);
     f.advance(20);const repeat=f.ledger.record({...first,observedAt:iso(20)});
-    assert.equal(repeat.key,a.key);assert.equal(repeat.kind,'replay');assert.equal(repeat.notificationCount,1);assert.equal(repeat.deliveryCount,2);
+    assert.equal(repeat.key,a.key);assert.equal(repeat.kind,'replay');assert.equal(repeat.notificationCount,1);assert.equal(repeat.deliveryCount,2);assert.equal(repeat.newEvent,false);
     assert.equal(repeat.firstSeenAt,iso());assert.equal(repeat.lastSeenAt,iso(20));
     const changed={...first,observedAt:iso(20),vendorWallets:[...first.vendorWallets!,{address:other,amount:'30'}],walletCount:2,addressCount:2};
-    const version=f.ledger.record(changed);assert.equal(version.kind,'wallet_hint');assert.equal(version.notificationCount,1);
+    const version=f.ledger.record(changed);assert.equal(version.kind,'wallet_hint');assert.equal(version.notificationCount,1);assert.equal(version.newEvent,false);
     const distinct=f.ledger.record({...changed,id:'2',signal:{...changed.signal,sourceEventId:'debot:signal:2',occurredAt:iso(19)}});
-    assert.equal(distinct.kind,'display');assert.equal(distinct.notificationCount,2);assert.equal(distinct.deliveryCount,4);
+    assert.equal(distinct.kind,'display');assert.equal(distinct.notificationCount,2);assert.equal(distinct.deliveryCount,4);assert.equal(distinct.newEvent,true);
     const current=f.ledger.current('bsc',ca)!;assert.equal(current.retainedHistory,3);assert.equal(current.firstSeenAt,iso());
     assert.equal(current.deliveryCount,4);assert.equal(current.notificationCount,2);assert.equal(current.truncatedHistory,0);
     const history=f.ledger.history('bsc',ca);assert.equal(history.total,3);

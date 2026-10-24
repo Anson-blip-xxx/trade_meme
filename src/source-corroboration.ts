@@ -15,6 +15,12 @@ export interface SourceNotificationEvidence {
   name?:string;sourceUrl?:string;txRefs:SourceTransactionReference[];
 }
 export type CorroborationFreshness='fresh'|'stale'|'late'|'future'|'conflict';
+export interface SourceNotificationActivity {
+  asOf:string;scope:'retained_valid_provider_events';counting:'exact_retained_events';bucketBy:'occurredAt';maxArrivalDelaySec:120;
+  windows:Record<'last1m'|'last5m'|'previous5m',{startExclusive:string;endInclusive:string}>;
+  sources:{source:CorroborationSource;last1m:number;last5m:number;previous5m:number;change5m:number}[];
+  historyComplete:false;retainedFrom:string;referenceSampleTruncated:boolean;limitations:string[];
+}
 export interface SourceCorroborationAssessment {
   version:1;token:Token;assessedAt:string;windowStart:string;windowSec:number;
   classification:'cross_source'|'single_source'|'none';freshSourceCount:number;freshSources:CorroborationSource[];
@@ -25,6 +31,8 @@ export interface SourceCorroborationAssessment {
     verification:'vendor_reference';}[];
   independentEvidence:'unknown';researchOnly:true;scoreEffect:0;
   scope:'same_chain_contract_recent_notifications';limitations:string[];
+  /** Local event-ID activity only. A count is never an independent-wallet or trade count. */
+  activity?:SourceNotificationActivity;
 }
 interface AssessmentInput {
   token:Token;now:Date;windowSec?:number;observations:readonly SourceNotificationEvidence[];
@@ -245,7 +253,36 @@ export class SourceCorroboration {
         AND first_observed_at>=? AND first_observed_at<=? AND recorded_at<=? AND recorded_at>=?`)
         .get(token.chain,token.address,source,start,end,end,retention)!.n);
     }
-    return assessSourceCorroboration({token,now,windowSec:this.windowSec,observations,notificationCounts,truncated});
+    return {...assessSourceCorroboration({token,now,windowSec:this.windowSec,observations,notificationCounts,truncated}),
+      activity:this.activity(token,at,retention,truncated)};
+  }
+  private activity(token:Token,at:number,retainedFrom:string,referenceSampleTruncated:boolean):SourceNotificationActivity {
+    const end=iso(at),minute=iso(at-60000),five=iso(at-300000),ten=iso(at-600000);
+    const sources=SOURCES.map(source=>{
+      // The existing index bounds this query to one chain, full CA, source and ten minutes of first arrivals.
+      // Bucket by immutable event time: later delivery/recording cannot move an event into a newer bucket.
+      // Every eligible event has first_observed_at >= occurred_at, so this arrival range covers all buckets.
+      const row=this.db.prepare(`SELECT
+        COALESCE(sum(CASE WHEN occurred_at>? THEN 1 ELSE 0 END),0) AS last_1m,
+        COALESCE(sum(CASE WHEN occurred_at>? THEN 1 ELSE 0 END),0) AS last_5m,
+        COALESCE(sum(CASE WHEN occurred_at<=? THEN 1 ELSE 0 END),0) AS previous_5m
+        FROM source_notifications INDEXED BY source_notifications_token
+        WHERE chain=? AND address=? AND source=? AND first_observed_at>? AND first_observed_at<=?
+          AND occurred_at>? AND occurred_at<=first_observed_at
+          AND occurred_at>=strftime('%Y-%m-%dT%H:%M:%fZ',first_observed_at,'-120 seconds')
+          AND recorded_at<=? AND recorded_at>=? AND (conflict_at IS NULL OR conflict_at>?)`)
+        .get(minute,five,five,token.chain,token.address,source,ten,end,ten,end,retainedFrom,end)!;
+      const last1m=Number(row.last_1m),last5m=Number(row.last_5m),previous5m=Number(row.previous_5m);
+      return {source,last1m,last5m,previous5m,change5m:last5m-previous5m};
+    });
+    return {asOf:end,scope:'retained_valid_provider_events',counting:'exact_retained_events',bucketBy:'occurredAt',maxArrivalDelaySec:120,
+      windows:{last1m:{startExclusive:minute,endInclusive:end},last5m:{startExclusive:five,endInclusive:end},
+        previous5m:{startExclusive:ten,endInclusive:five}},sources,historyComplete:false,retainedFrom,referenceSampleTruncated,
+      limitations:['RETAINED_NOTIFICATIONS_ONLY','OBSERVED_STREAM_SAMPLE_NOT_FULL_PROVIDER_HISTORY',
+        'EVENT_IDS_NOT_INDEPENDENT_WALLETS_OR_TRADES','ZERO_COUNT_DOES_NOT_PROVE_SOURCE_INACTIVE',
+        'COLLECTION_GAPS_UNKNOWN','SOURCE_COUNT_DOES_NOT_CHANGE_SCORE',
+        ...(ten<retainedFrom?['ACTIVITY_WINDOW_OUTSIDE_RETENTION']:[]),
+        ...(referenceSampleTruncated?['REFERENCE_SAMPLE_LIMIT_DOES_NOT_TRUNCATE_ACTIVITY_COUNTS']:[])]};
   }
   history(value:Token,options:{limit?:number;offset?:number;asOf?:string}={}){
     if(this.closed)throw new Error('SOURCE_LEDGER_CLOSED');

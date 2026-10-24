@@ -70,24 +70,24 @@ test('a revised vendor event reassesses only after fresh details reveal a new ex
   }finally{await f.close();}
 });
 
-test('new alias labels without resolved addresses stay pending evidence and never call the full evaluator again',async()=>{
+test('same-event alias changes without resolved addresses stay pending evidence and never call the full evaluator again',async()=>{
   const f=fixture();let detailCalls=0;
   f.options.fetchDetails=async()=>{detailCalls++;return details(f.now(),[{alias:'unresolved-label',source:'debot',verification:'vendor_report'}]);};
   try {
     const scanner=f.create();scanner.acceptPage(page(observation()));await scanner.dispatchOnce();assert.equal(f.calls.length,1);
-    f.advance(1000);scanner.acceptPage(page(observation(2,1000,['hint-one','new-kol-name'])));await scanner.dispatchOnce();
+    f.advance(1000);scanner.acceptPage(page({...observation(1,1000,['hint-one','new-kol-name']),signal:observation().signal}));await scanner.dispatchOnce();
     assert.equal(f.calls.length,1);assert.equal(detailCalls,2);
-    const history=scanner.notificationHistory('bsc',address(100));assert.equal(history.aggregation?.notificationCount,2);
+    const history=scanner.notificationHistory('bsc',address(100));assert.equal(history.aggregation?.notificationCount,1);
     assert.equal(history.items[0].classification,'evidence_pending');assert.equal(history.items[0].evidence.status,'unavailable');
     assert.deepEqual(history.items[0].evidence.vendorChanges,[]);
     await scanner.dispatchOnce();assert.equal(detailCalls,2);assert.equal(f.calls.length,1);
   }finally{await f.close();}
 });
 
-test('changed aliases with the same resolved addresses do not reassess, and mark the no-change evidence explicitly',async()=>{
+test('same-event changed aliases with the same resolved addresses do not reassess, and mark the no-change evidence explicitly',async()=>{
   const f=fixture();try {
     const scanner=f.create();scanner.acceptPage(page(observation()));await scanner.dispatchOnce();
-    f.advance(1000);scanner.acceptPage(page(observation(2,1000,['a-new-display-name'])));await scanner.dispatchOnce();
+    f.advance(1000);scanner.acceptPage(page({...observation(1,1000,['a-new-display-name']),signal:observation().signal}));await scanner.dispatchOnce();
     assert.equal(f.calls.length,1);assert.equal(scanner.list().items[0].aggregation.analysisCount,1);
     const latest=scanner.notificationHistory('bsc',address(100)).items[0];assert.equal(latest.classification,'no_material_change');
     assert.equal(latest.evidence.status,'unchanged');assert.deepEqual(latest.evidence.vendorChanges,[]);
@@ -95,7 +95,7 @@ test('changed aliases with the same resolved addresses do not reassess, and mark
   }finally{await f.close();}
 });
 
-test('price-only updates, wallet ordering and same-content vendor reminders never rerun details or full analysis',async()=>{
+test('price-only updates, wallet ordering and reminders without a newer event time never rerun details or full analysis',async()=>{
   const f=fixture();let detailCalls=0;
   f.options.fetchDetails=async()=>{detailCalls++;return details(f.now(),[wallet(1),wallet(2)]);};
   try {
@@ -104,7 +104,7 @@ test('price-only updates, wallet ordering and same-content vendor reminders neve
     scanner.acceptPage(page(sorted));await scanner.dispatchOnce();
     f.advance(2000);const price=structuredClone(sorted);price.observedAt=at(2000);price.alertPriceUsd=0.01;
     price.vendorWallets!.forEach(row=>{row.priceUsd=0.01;});scanner.acceptPage(page(price));await scanner.dispatchOnce();
-    f.advance(3000);const reminder={...price,id:'2',observedAt:at(3000),signal:{...price.signal,sourceEventId:'debot:repeat:2',occurredAt:at(2900)}};
+    f.advance(3000);const reminder={...price,id:'2',observedAt:at(3000),signal:{...price.signal,sourceEventId:'debot:repeat:2'}};
     scanner.acceptPage(page(reminder));await scanner.dispatchOnce();
     assert.equal(detailCalls,1);assert.equal(f.calls.length,1);assert.equal(scanner.list().total,1);
     const history=scanner.notificationHistory('bsc',address(100));assert.equal(history.total,3);
@@ -295,7 +295,8 @@ test('partially failed merged detail requests stay evidence-pending until expiry
   };
   try {
     const scanner=f.create();scanner.acceptPage(page(observation()));const work=scanner.dispatchOnce();await turn();
-    for(let i=2;i<=7;i++){f.advance(i*1000);scanner.acceptPage(page(observation(i,i*1000,[`hint-${i}`])));}
+    for(let i=2;i<=7;i++){f.advance(i*1000);const next=observation(i,i*1000,[`hint-${i}`]);next.signal.occurredAt=observation().signal.occurredAt;
+      scanner.acceptPage(page(next));}
     release.resolve();await work;await scanner.dispatchOnce();
     assert.deepEqual(detailIds,['1','2','3','4','5','6','7']);assert.equal(f.calls.length,1);
     const pending=f.rows().find(row=>row.id==='debot:repeat:7');assert.equal(pending?.state,'pending');
@@ -343,5 +344,137 @@ test('a queued reassessment preserves the latest completed verdict and score whi
     assert.deepEqual(current.score,baseline.score);assert.deepEqual(current.checks,baseline.checks);assert.deepEqual(current.reasons,baseline.reasons);
     assert.equal(current.aggregation.reviewState,'pending');assert.equal(current.aggregation.reviewReason,'DEBOT_REPEAT_COOLDOWN');
     assert.equal(current.aggregation.analysisCount,1);assert.equal(current.aggregation.notificationCount,2);
+  }finally{await f.close();}
+});
+
+test('a genuinely newer notification reassesses unchanged wallets without labeling it as new wallet evidence',async()=>{
+  const f=fixture();let detailCalls=0;
+  f.options.fetchDetails=async()=>{detailCalls++;return details(f.now(),[wallet(1)]);};
+  try {
+    const scanner=f.create();scanner.acceptPage(page(observation()));await scanner.dispatchOnce();const baseline=f.rows()[0];
+    f.advance(1000);const next=observation(2,1000);scanner.acceptPage(page(next));await scanner.dispatchOnce();
+    assert.equal(f.calls.length,2);assert.equal(detailCalls,2);assert.equal(f.calls[1].repeat,true);
+    assert.equal(f.calls[1].signal.sourceEventId,next.signal.sourceEventId);assert.equal(f.calls[1].signal.occurredAt,next.signal.occurredAt);
+    assert.deepEqual(f.rows()[0],baseline);
+    const latest=scanner.notificationHistory('bsc',address(100)).items[0];assert.equal(latest.classification,'reassessment');
+    assert.ok(latest.reasons.includes('DEBOT_FRESH_NOTIFICATION_REASSESSMENT'));
+    assert.equal(latest.evidence.status,'unchanged');assert.deepEqual(latest.evidence.vendorChanges,[]);assert.deepEqual(latest.evidence.observedTrades,[]);
+    f.advance(2000);scanner.acceptPage(page({...next,observedAt:at(2000)}));await scanner.dispatchOnce();
+    assert.equal(f.calls.length,2);assert.equal(detailCalls,2);
+  }finally{await f.close();}
+});
+
+test('a fresh notification can request the full gate when optional wallet details are unavailable, without inventing wallet support',async()=>{
+  const f=fixture();f.options.fetchDetails=async()=>{throw new Error('DETAILS_UNAVAILABLE');};
+  try {
+    const scanner=f.create();scanner.acceptPage(page(observation()));await scanner.dispatchOnce();
+    f.advance(1000);scanner.acceptPage(page(observation(2,1000)));await scanner.dispatchOnce();assert.equal(f.calls.length,2);
+    const latest=scanner.notificationHistory('bsc',address(100)).items[0];assert.equal(latest.classification,'reassessment');
+    assert.ok(latest.reasons.includes('DEBOT_FRESH_NOTIFICATION_REASSESSMENT'));assert.equal(latest.evidence.status,'unavailable');
+    assert.deepEqual(latest.evidence.vendorChanges,[]);assert.deepEqual(latest.evidence.observedTrades,[]);
+  }finally{await f.close();}
+});
+
+test('high-frequency new notifications respect the per-token cooldown and coalesce to the newest original event time',async()=>{
+  const f=fixture({repeatCooldownSec:30});let detailCalls=0;
+  f.options.fetchDetails=async()=>{detailCalls++;return details(f.now(),[wallet(1)]);};
+  try {
+    const scanner=f.create();scanner.acceptPage(page(observation()));await scanner.dispatchOnce();
+    for(const milliseconds of [1000,10_000,29_000]){
+      f.advance(milliseconds);scanner.acceptPage(page(observation(milliseconds,milliseconds)));await scanner.dispatchOnce();
+      assert.equal(f.calls.length,1);assert.equal(f.rows().filter(row=>row.state==='pending').length,1);
+    }
+    // A late older card and a future-dated card cannot displace the current head.
+    f.advance(29_500);const older=observation(20_000,20_000);older.observedAt=at(29_500);
+    const future=observation(40_000,40_000);future.observedAt=at(29_500);
+    scanner.acceptPage(page(older,future));await scanner.dispatchOnce();
+    assert.equal(f.rows().filter(row=>row.state==='pending').length,1);
+    assert.equal(f.rows().find(row=>row.state==='pending')?.id,'debot:repeat:29000');
+    assert.equal(detailCalls,1);
+    f.advance(30_000);await scanner.dispatchOnce();assert.equal(f.calls.length,2);assert.equal(detailCalls,2);
+    assert.equal(f.calls[1].signal.sourceEventId,'debot:repeat:29000');assert.equal(f.calls[1].signal.occurredAt,at(28_900));
+    f.advance(31_000);scanner.acceptPage(page(observation(31_000,31_000)));await scanner.dispatchOnce();
+    assert.equal(f.calls.length,2);assert.equal(f.rows().find(row=>row.state==='pending')?.reason,'DEBOT_REPEAT_COOLDOWN');
+  }finally{await f.close();}
+});
+
+test('future, delayed and non-advancing event timestamps cannot acquire fresh-notification eligibility later',async()=>{
+  const f=fixture();let detailCalls=0;
+  f.options.fetchDetails=async()=>{detailCalls++;return details(f.now(),[wallet(1)]);};
+  try {
+    const scanner=f.create();scanner.acceptPage(page(observation()));await scanner.dispatchOnce();
+    f.advance(1000);
+    const future=observation(2,1000);future.signal.occurredAt=at(2000);
+    const futureReceipt=observation(3,2000);futureReceipt.signal.occurredAt=at(900);
+    const sameTime=observation(4,1000);sameTime.signal.occurredAt=observation().signal.occurredAt;
+    for(const value of [future,futureReceipt,sameTime]){scanner.acceptPage(page(value));await scanner.dispatchOnce();}
+    assert.equal(f.calls.length,1);assert.equal(detailCalls,1);
+    f.advance(5000);scanner.acceptPage(page({...future,observedAt:at(5000)},{...futureReceipt,observedAt:at(5000)}));await scanner.dispatchOnce();
+    assert.equal(f.calls.length,1);
+    f.advance(121_000);const delayed=observation(5,1000);delayed.observedAt=at(121_000);scanner.acceptPage(page(delayed));await scanner.dispatchOnce();
+    assert.equal(f.calls.length,1);assert.equal(f.rows().find(row=>row.id==='debot:repeat:5')?.reason,'DEBOT_SIGNAL_STALE');
+  }finally{await f.close();}
+});
+
+test('new notifications expire while waiting for details and never use their arrival time to refresh the event',async()=>{
+  const f=fixture();let detailCalls=0;
+  f.options.fetchDetails=async()=>{if(++detailCalls===2)f.advance(122_000);return details(f.now(),[wallet(1)]);};
+  try {
+    const scanner=f.create();scanner.acceptPage(page(observation()));await scanner.dispatchOnce();
+    f.advance(1000);scanner.acceptPage(page(observation(2,1000)));await scanner.dispatchOnce();assert.equal(f.calls.length,1);
+    assert.equal(f.rows().find(row=>row.id==='debot:repeat:2')?.state,'ignored');
+    assert.equal(scanner.notificationHistory('bsc',address(100)).items[0].reasons.includes('DEBOT_FRESH_NOTIFICATION_REASSESSMENT'),false);
+  }finally{await f.close();}
+});
+
+test('restart preserves a fresh notification waiting in cooldown without replaying completed notifications',async()=>{
+  const f=fixture({repeatCooldownSec:30});try {
+    const first=f.create();first.acceptPage(page(observation()));await first.dispatchOnce();
+    f.advance(1000);const next=observation(2,1000);first.acceptPage(page(next));await first.dispatchOnce();assert.equal(f.calls.length,1);
+    await first.close();const restarted=f.create();await restarted.dispatchOnce();assert.equal(f.calls.length,1);
+    f.advance(30_000);await restarted.dispatchOnce();assert.equal(f.calls.length,2);
+    f.advance(31_000);restarted.acceptPage(page({...next,observedAt:at(31_000)}));await restarted.dispatchOnce();assert.equal(f.calls.length,2);
+  }finally{await f.close();}
+});
+
+test('same-event price and name changes cannot displace a genuine new notification waiting in cooldown',async()=>{
+  const f=fixture({repeatCooldownSec:30});try {
+    const scanner=f.create();scanner.acceptPage(page(observation()));await scanner.dispatchOnce();
+    f.advance(1000);const next=observation(2,1000);scanner.acceptPage(page(next));await scanner.dispatchOnce();
+    f.advance(2000);const display={...next,observedAt:at(2000),name:'New display name',alertPriceUsd:2};
+    scanner.acceptPage(page(display));await scanner.dispatchOnce();
+    assert.equal(f.rows().length,2);assert.equal(f.rows().find(row=>row.state==='pending')?.id,next.signal.sourceEventId);
+    assert.equal(f.calls.length,1);
+    f.advance(30_000);await scanner.dispatchOnce();assert.equal(f.calls.length,2);
+    assert.equal(f.calls[1].signal.sourceEventId,next.signal.sourceEventId);assert.equal(f.calls[1].signal.occurredAt,next.signal.occurredAt);
+  }finally{await f.close();}
+});
+
+test('a wallet-hint revision preserves the pending original event eligibility without receiving eligibility itself',async()=>{
+  const f=fixture({repeatCooldownSec:30});let detailCalls=0;
+  f.options.fetchDetails=async()=>{detailCalls++;return details(f.now(),[wallet(1)]);};
+  try {
+    const scanner=f.create();scanner.acceptPage(page(observation()));await scanner.dispatchOnce();
+    f.advance(1000);const next=observation(2,1000);scanner.acceptPage(page(next));await scanner.dispatchOnce();
+    f.advance(2000);const revision={...observation(2,2000,['updated-wallet-label']),signal:next.signal};
+    scanner.acceptPage(page(revision));await scanner.dispatchOnce();
+    const pending=f.rows().filter(row=>row.state==='pending');assert.equal(pending.length,1);assert.equal(pending[0].id,next.signal.sourceEventId);
+    assert.equal(pending[0].fresh_notification,1);assert.equal(pending[0].occurred_at,next.signal.occurredAt);assert.equal(pending[0].observed_at,next.observedAt);
+    const revised=f.rows().find(row=>String(row.id).startsWith('debot:revision:'))!;
+    assert.equal(revised.fresh_notification,0);assert.equal(revised.reason,'DEBOT_UPDATE_COALESCED');assert.equal(f.calls.length,1);
+    f.advance(30_000);await scanner.dispatchOnce();assert.equal(f.calls.length,2);assert.equal(detailCalls,2);
+    assert.equal(f.calls[1].signal.sourceEventId,next.signal.sourceEventId);assert.equal(f.calls[1].signal.occurredAt,next.signal.occurredAt);
+    assert.ok(scanner.notificationHistory('bsc',address(100)).items.some(item=>item.eventId===next.signal.sourceEventId&&
+      item.classification==='reassessment'&&item.reasons.includes('DEBOT_FRESH_NOTIFICATION_REASSESSMENT')));
+  }finally{await f.close();}
+});
+
+test('a future first pending event is not protected ahead of a valid later arrival',async()=>{
+  const f=fixture();try {
+    const scanner=f.create(),future=observation();future.signal.occurredAt=at(1000);
+    scanner.acceptPage(page(future,observation(2)));await scanner.dispatchOnce();
+    assert.deepEqual(f.calls.map(call=>call.signal.sourceEventId),['debot:repeat:2']);
+    assert.equal(f.rows().find(row=>row.id===future.signal.sourceEventId)?.reason,'DEBOT_UPDATE_COALESCED');
+    f.advance(2000);scanner.acceptPage(page({...future,observedAt:at(2000)}));await scanner.dispatchOnce();assert.equal(f.calls.length,1);
   }finally{await f.close();}
 });

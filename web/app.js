@@ -591,7 +591,7 @@
   const debotChangeNames = {first: '首次通知', replay: '重复投递', display: '展示信息更新', wallet_hint: '钱包线索变化'};
   function debotChangeText(change) {
     const kind = typeof change === 'string' ? change : change?.kind;
-    if (kind === 'display' && Array.isArray(change?.reasons) && change.reasons.includes('DEBOT_REPEAT_NOTIFICATION')) return '再次提醒 · 无新变化';
+    if (kind === 'display' && Array.isArray(change?.reasons) && change.reasons.includes('DEBOT_REPEAT_NOTIFICATION')) return '再次提醒 · 钱包提示未变';
     return debotChangeNames[kind] || '变化待分类';
   }
   function debotChangeTitle(change) {
@@ -627,6 +627,7 @@
     DEBOT_REPEAT_EVIDENCE_PENDING: '供应商提示尚未形成新增可核验证据',
     DEBOT_REPEAT_COOLDOWN: '已保存通知变化，等待复核间隔',
     DEBOT_REPEAT_REASSESSMENT: '已取得新增证据，重新分析',
+    DEBOT_FRESH_NOTIFICATION_REASSESSMENT: '收到新一轮有效通知，重新检查市场与入场条件',
     DEBOT_INITIAL_ANALYSIS: '首次收到该币，开始实质分析',
     DEBOT_FIRST_NOTIFICATION: '首次收到该币通知',
     DEBOT_VENDOR_WALLET_HINT_CHANGED: '供应商钱包提示发生变化',
@@ -1959,8 +1960,21 @@
       data.classification==='single_source'?`窗口内仅 ${sources.map(sourceLabel).join(' / ') || '一个来源'}`:'窗口内无新提醒';
     node.append(badge(headline,data.classification==='cross_source'?'pass':'neutral'),el('p','source-corroboration-note','同链完整 CA · 平台数不加分 · 独立资金未知'));
     node.title=`${frozen?'当时判断':'当前判断'}：${date(data.assessedAt,true)}；${date(data.windowStart,true)} 至 ${date(data.assessedAt,true)}。多个平台可能引用同一交易或共享上游。`;
+    const activity = data.activity, activityRows = activity?.bucketBy === 'occurredAt' && Array.isArray(activity.sources) ? activity.sources.filter(value =>
+      ['ave','debot','gmgn'].includes(value.source) && [value.last1m,value.last5m,value.previous5m].every(n => Number.isSafeInteger(n) && n >= 0)) : [];
+    if (activityRows.length) {
+      const activeRows = activityRows.filter(value => value.last5m || value.previous5m);
+      const density = el('p','source-corroboration-note',activeRows.length ? activeRows.map(value => `${sourceLabel(value.source)} 近 5 分 ${count(value.last5m)} 次 · 前 5 分 ${count(value.previous5m)} 次`).join('；') : '近 10 分钟暂无有效通知记录');
+      density.title = '按原始事件时间统计不同通知，首次到达延迟不超过 120 秒。重送、未来时间和已知冲突不计入；数量不代表独立钱包或真实买入笔数。';node.append(density);
+    }
     if(compact)return node;
     node.append(kv(frozen?'当时交叉判断时间':'来源交叉判断时间',date(data.assessedAt,true)),kv('匹配窗口',`${date(data.windowStart,true)} 至 ${date(data.assessedAt,true)}`));
+    if (activityRows.length) {
+      const density = el('div','source-corroboration-entry'); density.append(el('strong','','新通知密度变化'));
+      for (const value of activityRows) { const change = value.last5m-value.previous5m;
+        density.append(kv(sourceLabel(value.source),`近 1 分 ${count(value.last1m)} · 近 5 分 ${count(value.last5m)} · 前 5 分 ${count(value.previous5m)} · 变化 ${change > 0 ? '+' : ''}${count(change)}`)); }
+      density.append(el('p','detail-small','仅统计本机留存且首次到达延迟不超过 120 秒的不同通知；以原始事件时间分窗。0 表示没有符合条件的本地记录，不表示平台在线或全平台没有信号。通知密度用于后续涨跌对照，尚不单独放行开仓。'));node.append(density);
+    }
     for(const entry of Array.isArray(data.sources)?data.sources:[]){const item=el('div','source-corroboration-entry');item.append(el('strong','',sourceLabel(entry.source)),badge(sourceFreshness[entry.status] || '状态未知',entry.status==='fresh'?'pass':'neutral'),
       kv('来源事件时间',date(entry.occurredAt,true)),kv('首次本地收到',date(entry.firstObservedAt,true)),kv('窗口内不同通知',count(entry.notificationCount)));
       if(entry.recordedAt)item.append(kv('本地入账时间',date(entry.recordedAt,true)));node.append(item);}
@@ -2597,6 +2611,7 @@
       const score = el('td', 'meme-score-cell'); score.append(memeScoreNode(assessment, memeIsStale(item)));
       const phase = el('td', 'meme-phase-cell'); phase.append(badge(memeStages[assessment?.stage] || '尚待采样', memeIsStale(item) ? 'neutral' : memeStageTone(assessment?.stage)));
       phase.append(memeReasons(assessment?.changeReasons?.length ? assessment.changeReasons : assessment?.reasons));
+      if (item.gate?.decision) { const gate = el('span','cell-subtitle',`最近筛选：${decisions[item.gate.decision]?.[0] || '待核实'}`);gate.title = `${date(item.gate.checkedAt,true)}\n${(item.gate.reasons || []).map(value => reasonNames[value] || scalar(value)).join('\n')}`;phase.append(gate); }
       const components = el('td', 'meme-components-cell');
       for (const id of ['market_heat','trading_emotion','wallet_relay']) { const component = assessment?.components?.find(value => value?.id === id), line = el('div', 'meme-component-line'); line.append(el('span', '', memeComponentLabels[id]), el('strong', '', finite(component?.score) ? `${count(component.score)} / ${count(component.maxScore)}` : '证据不足')); if (Array.isArray(component?.reasons)) line.title = component.reasons.map(memeReason).join('\n'); components.append(line); }
       const catalyst = el('td', 'meme-catalyst-cell'), summary = memeSummary(item.catalyst); catalyst.append(el('span', 'meme-social-label', memeSocialCaption(item.catalyst)));
@@ -2681,6 +2696,11 @@
     if (assessment?.limitations?.length) { const limits = el('details', 'meme-limitations'); limits.append(el('summary', '', '证据范围与缺口'), memeReasons(assessment.limitations)); current.append(limits); }
     const sourceSection = section('同币来源交叉'); sourceSection.append(corroborationNode(item.corroboration,history));
     wrapper.append(current,sourceSection, memeCatalystNode(item.catalyst));
+    const gate = item.gate, gateSection = section('最近一次入场筛选');
+    if (gate?.decision) { gateSection.append(badge(...(decisions[gate.decision] || ['待核实','neutral'])),kv('筛选时间',date(gate.checkedAt,true)),memeReasons(gate.reasons,'该次筛选没有记录阻塞原因；执行状态需单独核对。'));
+      if (!validDate(gate.validUntil) || Date.parse(gate.validUntil) <= Date.now()) gateSection.append(el('p','detail-small','这次筛选已过有效期，保留用于解释当时为何停在观察；开仓前必须重新核验。'));
+    } else gateSection.append(el('p','detail-small','尚未完成入场筛选，动态观察和通知密度不表示已经达到购买条件。'));
+    gateSection.append(el('p','detail-small','筛选通过也不等于已经下单，实际执行结果以订单记录为准。'));wrapper.append(gateSection);
     if (Array.isArray(data.catalystHistory) && data.catalystHistory.length) {
       const historyNode = el('details','meme-catalyst-history'); historyNode.append(el('summary','',`查看最近 ${count(data.catalystHistory.length)} 次催化证据快照`));
       for (const event of data.catalystHistory) { const entry = el('details','meme-catalyst-history-entry'); entry.append(el('summary','',date(event.observedAt,true))); entry.addEventListener('toggle', () => { if (entry.open && !entry.dataset.loaded) { entry.dataset.loaded = 'true'; entry.append(memeCatalystNode(event.snapshot)); } }); historyNode.append(entry); }

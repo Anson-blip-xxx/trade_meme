@@ -3,9 +3,10 @@ import assert from 'node:assert/strict';
 import {mkdtempSync,rmSync,statSync} from 'node:fs';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
-import {DatabaseSync} from 'node:sqlite';
+import {DatabaseSync,type SQLInputValue} from 'node:sqlite';
 import bs58 from 'bs58';
-import {WalletHistory,type WalletTradeObservation} from '../src/wallet-history.js';
+import {WalletHistory,WALLET_COORDINATION_INVALIDATION_SQL,type WalletTradeObservation} from '../src/wallet-history.js';
+import {WALLET_ASSOCIATION_INVALIDATION_SQL} from '../src/wallet-associations.js';
 import type {WalletAnalysis,WalletRecord} from '../src/research/wallet-types.js';
 import type {Report} from '../src/types.js';
 
@@ -171,6 +172,40 @@ test('200钱包报告在密集关联表上保持有界，不按钱包重复扫�
     const elapsed=performance.now()-started;
     assert.ok(elapsed<1_500,`batch capture took ${elapsed.toFixed(1)}ms`);
     assert.equal(Number(db.prepare('SELECT COUNT(*) AS n FROM wh_assoc_relations WHERE dirty=1').get()!.n),5_000);
+  } finally {history.close();}
+});
+
+test('批量关联失效由json_each驱动，并按完整链和地址键精确查索引',()=>{
+  const {history}=fixture(),db=(history as unknown as {db:DatabaseSync}).db;
+  const values=JSON.stringify([address(1),address(2)]),targetChain='bsc';
+  const explain=(sql:string,args:SQLInputValue[])=>db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...args).map(row=>String(row.detail));
+  const before=(plan:string[],first:RegExp,second:RegExp)=>{
+    const left=plan.findIndex(detail=>first.test(detail)),right=plan.findIndex(detail=>second.test(detail));
+    assert.ok(left>=0,`missing ${first} in\n${plan.join('\n')}`);
+    assert.ok(right>left,`${second} must follow ${first} in\n${plan.join('\n')}`);
+  };
+  try {
+    const fundingAnchors=explain(WALLET_ASSOCIATION_INVALIDATION_SQL.fundingAnchors,[values,targetChain,values,targetChain]);
+    before(fundingAnchors,/SCAN w VIRTUAL TABLE/,/SEARCH a .*\(chain=\? AND leader=\?\)/);
+    assert.ok(fundingAnchors.filter(detail=>/SCAN w VIRTUAL TABLE/.test(detail)).length===2);
+    assert.ok(fundingAnchors.some(detail=>/SEARCH e .*\(chain=\? AND candidate=\? AND active=\?\)/.test(detail)));
+    assert.ok(fundingAnchors.some(detail=>/SEARCH a .*\(chain=\? AND leader=\? AND token_address=\?\)/.test(detail)));
+
+    const fundingRelations=explain(WALLET_ASSOCIATION_INVALIDATION_SQL.fundingRelations,[values,targetChain,values,targetChain]);
+    before(fundingRelations,/SCAN w VIRTUAL TABLE/,/SEARCH r .*\(chain=\? AND leader=\?\)/);
+    assert.ok(fundingRelations.some(detail=>/SEARCH r .*\(chain=\? AND candidate=\?\)/.test(detail)));
+
+    for(const sql of [WALLET_ASSOCIATION_INVALIDATION_SQL.publicRelations,WALLET_ASSOCIATION_INVALIDATION_SQL.publicAnchors]) {
+      const publicPlan=explain(sql,[values,targetChain,targetChain,targetChain]);
+      assert.ok(publicPlan.some(detail=>detail==='MATERIALIZE recipients'));
+      before(publicPlan,/SCAN s VIRTUAL TABLE/,/SEARCH f .*\(chain=\? AND funding_address=\?\)/);
+      assert.ok(publicPlan.every(detail=>!/^SEARCH f .*\(chain=\?\)$/.test(detail)));
+    }
+
+    const coordination=explain(WALLET_COORDINATION_INVALIDATION_SQL,[values,targetChain]);
+    before(coordination,/SCAN a VIRTUAL TABLE/,/SEARCH f .*\(chain=\? AND funding_address=\?\)/);
+    before(coordination,/SEARCH f .*\(chain=\? AND funding_address=\?\)/,
+      /SEARCH m .*\(chain=\? AND address=\?\)/);
   } finally {history.close();}
 });
 

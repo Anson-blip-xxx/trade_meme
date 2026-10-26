@@ -166,7 +166,7 @@ test('runtime TG positions command and pagination callbacks use registered holdi
   }finally{await runtime.close();rmSync(dir,{recursive:true,force:true});}
 });
 
-test('runtime TG native test-buy menu binds an exact CA and cancel never creates an order',async t=>{
+test('runtime TG native test-buy menu and command are removed without affecting card buying',async t=>{
   const globalNetwork=t.mock.method(globalThis,'fetch',async()=>{throw Error('REAL_NETWORK_FORBIDDEN');});
   const solWallet=bs58.encode(Buffer.alloc(32,91)),mint=bs58.encode(Buffer.alloc(32,92));
   const sol='So11111111111111111111111111111111111111112';
@@ -179,18 +179,11 @@ test('runtime TG native test-buy menu binds an exact CA and cancel never creates
   const tg=telegramHarness(),runtime=createRuntime(config,{telegramFetcher:tg.fetcher,entryFetcher:async()=>{throw Error('TRADE_NETWORK_FORBIDDEN');}});
   try{
     assert.ok(runtime.manualNativeBuy);assert.equal(runtime.telegramControls!.status().manualBuyEnabled,true);
-    (runtime.manualNativeBuy as any).options.native.readiness=()=>({ready:true});
     await pollTelegram(runtime,config.telegram!.database,tg);
     const prompt=await pollTelegram(runtime,config.telegram!.database,tg,[privateMessage(1,'🧪 0.01 SOL 测试买入')]);
-    assert.ok(prompt.some(message=>message.text.includes('固定金额：0.01 SOL')));assert.equal(runtime.orders.list().length,0);
+    assert.equal(prompt.length,0);assert.equal(runtime.orders.list().length,0);
     const preview=await pollTelegram(runtime,config.telegram!.database,tg,[privateMessage(2,`/native_buy ${mint}`)]);
-    const message=preview.find(item=>item.text.includes(mint));assert.ok(message);assert.match(message.text,/点击即触发实盘/);
-    const buttons=message.reply_markup?.inline_keyboard?.flat()??[];
-    const confirm=buttons.find(button=>button.callback_data?.startsWith('nativebuy:confirm:'));
-    const cancel=buttons.find(button=>button.callback_data?.startsWith('nativebuy:cancel:'));
-    assert.ok(confirm?.callback_data);assert.ok(cancel?.callback_data);assert.equal(confirm.callback_data.split(':')[2],cancel.callback_data.split(':')[2]);
-    const canceled=await pollTelegram(runtime,config.telegram!.database,tg,[privateCallback(3,cancel.callback_data)]);
-    assert.ok(canceled.some(item=>item.text.includes('已取消，没有发送交易')));assert.equal(runtime.orders.list().length,0);
+    assert.equal(preview.length,0);assert.equal(runtime.orders.list().length,0);
     assert.equal(globalNetwork.mock.callCount(),0);
   }finally{await runtime.close();rmSync(dir,{recursive:true,force:true});}
 });
@@ -278,14 +271,21 @@ test('runtime TG contract card shows GMGN details and routes only an explicit bu
       submittedCustom=input.amountLamports;return {status:'accepted' as const,action:{ref:customRef,scope:input.scope,owner:input.owner,mint,
         amountLamports:input.amountLamports,state:'executing' as const,mode:'card_direct' as const,createdAt:at,updatedAt:at,expiresAt:at}};
     });
+    let canceledRef:string|undefined;
+    t.mock.method(runtime.manualNativeBuy!,'cancel',(input:{owner:string;scope:string;ref?:string})=>{
+      canceledRef=input.ref;return {status:'canceled' as const,action:{ref:customRef,scope:input.scope,owner:input.owner,mint,
+        state:'canceled' as const,mode:'card_direct' as const,createdAt:at,updatedAt:at,expiresAt:at}};
+    });
     const customPrompt=await pollTelegram(runtime,config.telegram!.database,tg,[privateCallback(7,`token:custom:${mint}`,86400)]);
     assert.ok(customPrompt.some(message=>message.text.includes('请在 5 分钟内直接发送 SOL 数量')));
     assert.ok(customPrompt.some(message=>message.reply_markup?.inline_keyboard?.flat()
-      .some(button=>button.callback_data===`nativebuy:cancel:${customRef}`)));
-    const customBuy=await pollTelegram(runtime,config.telegram!.database,tg,[privateMessage(8,'0.25')]);
+      .some(button=>button.callback_data===`token:cancel:${customRef}`)));
+    const canceled=await pollTelegram(runtime,config.telegram!.database,tg,[privateCallback(8,`token:cancel:${customRef}`,86400)]);
+    assert.equal(canceledRef,customRef);assert.ok(canceled.some(message=>message.text.includes('已取消')));
+    const customBuy=await pollTelegram(runtime,config.telegram!.database,tg,[privateMessage(9,'0.25')]);
     assert.equal(submittedCustom,'250000000');assert.ok(customBuy.some(message=>
       message.text.includes('买入已接收')&&message.text.includes('0.25 SOL')));
-    const refreshed=await pollTelegram(runtime,config.telegram!.database,tg,[privateCallback(9,`token:refresh:${mint}`,86400)]);
+    const refreshed=await pollTelegram(runtime,config.telegram!.database,tg,[privateCallback(10,`token:refresh:${mint}`,86400)]);
     const refreshedCard=refreshed.find(message=>message.text.includes('Contract Card'));assert.ok(refreshedCard);assert.equal(gmgnPaths.length,6);
     assert.deepEqual(refreshedCard.reply_markup?.inline_keyboard?.flat().flatMap(button=>button.callback_data??[]),expectedCardButtons);
     assert.deepEqual(refreshedCard.reply_markup?.inline_keyboard?.flat().flatMap(button=>button.url??[]),expectedLinks);
@@ -397,6 +397,12 @@ test('runtime owner selects any of four sell percentages in one click; holdings,
     // The integration test exercises startup routing without starting unrelated price/RPC observers.
     t.mock.method(runtime.heldMonitor,'start',()=>{});t.mock.method(runtime.heldTracking,'start',()=>{});
     runtime.start();runtime.telegram!.stop();await runtime.telegramControls!.stop();
+    const startupDb=new DatabaseSync(config.telegram!.database,{readOnly:true});
+    const startupKeys=startupDb.prepare("SELECT key FROM telegram_outbox WHERE key LIKE 'signal-counting-controls:%' OR key LIKE 'telegram-position-menu:%'")
+      .all().map(row=>String(row.key));startupDb.close();
+    assert.ok(startupKeys.some(key=>key.startsWith('signal-counting-controls:v2:')));
+    assert.ok(startupKeys.some(key=>key.startsWith('telegram-position-menu:v3:')));
+    assert.equal(startupKeys.some(key=>/signal-counting-controls:v1:|telegram-position-menu:v2:/.test(key)),false);
     await pollTelegram(runtime,config.telegram!.database,tg);
     assert.equal(networkRequests.length,0);assert.equal(runtime.directSell.status().requests.length,0);
     assert.equal(runtime.telegramControls!.status().manualCloseEnabled,true);

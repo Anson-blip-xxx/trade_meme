@@ -11,8 +11,7 @@ export type TelegramCountAction='start'|'stop'|'status';
 export type TelegramCloseAction='preview'|'confirm'|'cancel';
 /** Runtime-validated integer percentage in the inclusive 1..100 range. */
 export type TelegramSellPct=number;
-export type TelegramNativeBuyAction='prompt'|'prepare'|'confirm'|'cancel';
-export type TelegramTokenBuyAction='preset'|'custom_start'|'custom_value';
+export type TelegramTokenBuyAction='preset'|'custom_start'|'custom_value'|'cancel';
 export type TelegramTokenBuyCode=TelegramTokenBuyPresetCode|'legacy';
 export {TELEGRAM_TOKEN_BUY_PRESETS};
 export type {TelegramCallbackButtons,TelegramNotificationButtons,TelegramTokenBuyPresetCode} from './telegram-format.js';
@@ -48,8 +47,6 @@ export interface TelegramControlsOptions {
   onClose?:(action:TelegramCloseAction,ref:string)=>Promise<TelegramControlReply>|TelegramControlReply;
   /** The reference is an opaque server-side, single-use action; the handler accepts work quickly. */
   onSell?:(ref:string,pct:TelegramSellPct)=>Promise<TelegramControlReply>|TelegramControlReply;
-  /** Explicit owner-operated native buy flow. The final confirm callback is the transaction trigger. */
-  onNativeBuy?:(action:TelegramNativeBuyAction,value?:string)=>Promise<TelegramControlReply>|TelegramControlReply;
   /**
    * Exact owner-operated card buy flow. Presets carry an allowlisted compact code;
    * custom values are strict decimal text and are authorized against pending state by the handler.
@@ -74,8 +71,8 @@ type Command=({action:TelegramCountAction;help?:boolean}|{action:'positions';pag
   {action:'sell';pct:TelegramSellPct;ref:string;custom?:boolean;help?:never}|
   {action:'sell_custom';ref:string;help?:never}|
   {action:'token_card';address:string;refresh:boolean;help?:never}|
-  {action:'token_buy';buyAction:TelegramTokenBuyAction;address?:string;value?:string;help?:never}|
-  {action:'native_buy';buyAction:TelegramNativeBuyAction;value?:string;help?:never})&{callbackId?:string};
+  {action:'token_buy';buyAction:TelegramTokenBuyAction;address?:string;value?:string;help?:never})&{callbackId?:string};
+type AckOnly={action:'ack_only';callbackId:string;text:string};
 type TokenCardCommand=Extract<Command,{action:'token_card'}>;
 type TokenCardJob={updateId:number;command:TokenCardCommand};
 const TOKEN_CARD_QUEUE_CAPACITY=16;
@@ -84,10 +81,11 @@ const positiveId=(value:unknown):value is number=>typeof value==='number'&&Numbe
 const updateId=(value:unknown):value is number=>typeof value==='number'&&Number.isSafeInteger(value)&&value>=0&&value<Number.MAX_SAFE_INTEGER;
 const forward=(value:Row)=>['forward_origin','forward_from','forward_from_chat','forward_sender_name','forward_date',
   'is_automatic_forward','via_bot','sender_chat','business_connection_id','sender_business_bot','edit_date'].some(key=>value[key]!==undefined);
-const help=(mode:'simulation'|'live')=>`计数控制（${mode==='live'?'实盘策略':'仅模拟'}）：\n启动计数 /count_start${mode==='live'?'（后续达标自动买入）':''}\n停止计数 /count_stop${mode==='live'?'（持仓监控与保护继续）':''}\n计数状态 /count_status\n持仓查询 /positions（可加页码，如 /positions 2）\n代币查询：发送完整 CA，或 /token <CA>\n0.01 SOL 测试买入：/native_buy <完整 CA>\n/start 仅查询状态，不启动计数，不会触发买卖。`;
+const help=(mode:'simulation'|'live')=>`计数控制（${mode==='live'?'实盘策略':'仅模拟'}）：\n启动计数 /count_start${mode==='live'?'（后续达标自动买入）':''}\n停止计数 /count_stop${mode==='live'?'（持仓监控与保护继续）':''}\n计数状态 /count_status\n持仓查询 /positions（可加页码，如 /positions 2）\n代币查询：发送完整 CA，或 /token <CA>\n买入：先查询 CA，再使用代币卡片上的金额按钮\n/start 仅查询状态，不启动计数，不会触发买卖。`;
 const positionsPage=(value:string):number|undefined=>/^[1-9]\d{0,4}$/.test(value)&&Number(value)<=10000?Number(value):undefined;
 const closeConfirmedCallback=new RegExp(`^close:(confirm|cancel):(${TELEGRAM_CLOSE_UUID})$`);
-const nativeBuyCallback=/^nativebuy:(confirm|cancel):([0-9a-f]{32})$/;
+const tokenCancelCallback=/^(?:token:cancel|nativebuy:cancel):([0-9a-f]{32})$/;
+const removedNativeBuyCallback=/^nativebuy:confirm:[0-9a-f]{32}$/;
 const tokenBuyCallback=/^token:buy:([abcde]):([1-9A-HJ-NP-Za-km-z]{32,44})$/;
 const legacyTokenBuyCallback=/^token:buy:([1-9A-HJ-NP-Za-km-z]{32,44})$/;
 const tokenCustomCallback=/^token:custom:([1-9A-HJ-NP-Za-km-z]{32,44})$/;
@@ -146,7 +144,6 @@ export class TelegramControls {
       typeof options.onAction!=='function'||(options.onPositions!==undefined&&typeof options.onPositions!=='function')||
       (options.onClose!==undefined&&typeof options.onClose!=='function')||
       (options.onSell!==undefined&&typeof options.onSell!=='function')||
-      (options.onNativeBuy!==undefined&&typeof options.onNativeBuy!=='function')||
       (options.onTokenBuy!==undefined&&typeof options.onTokenBuy!=='function')||
       (options.onTokenCard!==undefined&&typeof options.onTokenCard!=='function')||
       (options.countingMode!==undefined&&!['simulation','live'].includes(options.countingMode))||
@@ -196,7 +193,7 @@ export class TelegramControls {
   status():TelegramControlStatus {
     const countingMode=this.options.countingMode??'simulation';
     const manualCloseEnabled=!!(this.options.onClose||this.options.onSell);
-    const manualBuyEnabled=!!(this.options.onNativeBuy||this.options.onTokenBuy);
+    const manualBuyEnabled=!!this.options.onTokenBuy;
     const mode=manualCloseEnabled?'counting_and_manual_positions':countingMode==='live'?'live_counting':'simulation_only';
     const capability:Pick<TelegramControlStatus,'mode'|'countingMode'|'manualCloseEnabled'|'manualBuyEnabled'>=
       {mode,countingMode,manualCloseEnabled,manualBuyEnabled};
@@ -269,13 +266,17 @@ export class TelegramControls {
       this.db.exec('BEGIN IMMEDIATE');let claimed=false;
       try {
         this.db.prepare('UPDATE telegram_control_state SET offset=MAX(offset,?) WHERE scope=?').run(id+1,this.scope);
-        if(command)claimed=!!this.db.prepare(`INSERT OR IGNORE INTO telegram_control_events(scope,update_id,action,state,created_at) VALUES(?,?,?,'claimed',?)`)
+        if(command&&command.action!=='ack_only')claimed=!!this.db.prepare(`INSERT OR IGNORE INTO telegram_control_events(scope,update_id,action,state,created_at) VALUES(?,?,?,'claimed',?)`)
           .run(this.scope,id,command.action,this.now()).changes;
         if(claimed&&command?.action==='sell'&&command.custom===true)
           this.db.prepare('DELETE FROM telegram_control_pending_token_sell WHERE scope=? AND ref=? AND expires_at>=?')
             .run(this.scope,command.ref,this.now());
         this.db.exec('COMMIT');
       }catch{this.db.exec('ROLLBACK');throw new Error('TELEGRAM_CONTROLS_STORAGE_ERROR');}
+      if(command?.action==='ack_only') {
+        if(!this.stopping)this.answerCallback(command.callbackId,command.text);
+        continue;
+      }
       if(!command||!claimed)continue;
       // Callback acknowledgement is best effort and independent. Telegram being
       // slow here must not leave an urgent sell/stop behind a read-only refresh.
@@ -333,8 +334,6 @@ export class TelegramControls {
             '【卡片买入】\n卡片买入暂不可用，没有发送交易。'):
         command.action==='token_card'?await (this.options.onTokenCard?.(command.address,command.refresh)??
           '【代币详情】\n代币详情查询暂不可用，请稍后重试。'):
-        command.action==='native_buy'?await (this.options.onNativeBuy?.(command.buyAction,command.value)??
-          '【测试买入】\n原生测试买入暂不可用，没有发送交易。'):
         await this.options.onAction(command.action);
       reply=typeof response==='string'?response:response?.text;
       if(typeof reply!=='string'||!reply.trim()||reply.length>4096)throw new ApiError('TELEGRAM_CONTROLS_REPLY_INVALID');
@@ -354,7 +353,6 @@ export class TelegramControls {
         command.action==='close'||command.action==='sell'||command.action==='sell_custom'?'【平仓操作】\n平仓操作或回复异常，结果待核对；不会自动重放。请查询持仓和订单状态。':
           command.action==='token_card'?'【代币详情】\n暂时无法读取代币详情，请稍后重新发送完整 CA。':
           command.action==='token_buy'?'【卡片买入】\n操作回复异常。系统不会自动重放买单，请查询持仓和订单状态。':
-          command.action==='native_buy'?'【测试买入】\n操作回复异常。系统不会自动重放买单，请查询持仓和订单状态。':
         '【计数控制】\n计数指令执行或回复异常；不会自动重放。请发送 /count_status 核对状态。';
       this.db.prepare('UPDATE telegram_control_state SET last_error=? WHERE scope=?').run(code,this.scope);
     }
@@ -368,18 +366,20 @@ export class TelegramControls {
   }
   private acknowledge(command:Command&{callbackId:string}):void {
     const text=command.action==='positions'?'持仓查询已收到，请查看回复。':command.action==='close'||command.action==='sell'?
-      '已收到平仓请求，请查看处理结果。':command.action==='native_buy'?
-      (command.buyAction==='confirm'?'买入请求已收到，请查看订单通知。':'测试买入操作已收到，请查看回复。'):
+      '已收到平仓请求，请查看处理结果。':
       command.action==='sell_custom'?'请在 5 分钟内发送 1%-100% 的整数卖出比例。':
       command.action==='token_buy'?(command.buyAction==='custom_start'?'请输入自定义 SOL 买入金额。':
-        '买入请求已收到，请查看订单通知。'):
+        command.buyAction==='cancel'?'已收到取消请求，请查看回复。':'买入请求已收到，请查看订单通知。'):
       command.action==='token_card'?'代币详情查询已收到，请查看回复。':'已收到指令，请查看回复。';
-    const task=this.api('answerCallbackQuery',{callback_query_id:command.callbackId,text,cache_time:0}).then(()=>{},error=>{
+    this.answerCallback(command.callbackId,text);
+  }
+  private answerCallback(callbackId:string,text:string):void {
+    const task=this.api('answerCallbackQuery',{callback_query_id:callbackId,text,cache_time:0}).then(()=>{},error=>{
       if(!this.stopping)this.memoryError=error instanceof ApiError?error.code:'TELEGRAM_CONTROLS_NETWORK_ERROR';
     });
     this.acknowledgements.add(task);void task.then(()=>this.acknowledgements.delete(task));
   }
-  private command(update:Row):Command|undefined {
+  private command(update:Row):Command|AckOnly|undefined {
     if(update.edited_message||update.channel_post||update.edited_channel_post||update.business_message||update.edited_business_message)return;
     if(object(update.message)&&!update.callback_query) {
       const message=update.message;
@@ -387,11 +387,6 @@ export class TelegramControls {
         message.date>Math.floor(this.now()/1000)||forward(message)||typeof message.text!=='string')return;
       const rawText=message.text,text=rawText.trim();
       if(text==='/start')return {action:'status',help:true};
-      if(['/native_buy','测试买入','🧪 0.01 SOL 测试买入'].includes(text))
-        return this.fresh(message.date)?{action:'native_buy',buyAction:'prompt'}:undefined;
-      const explicitBuy=text.match(/^\/native_buy ([1-9A-HJ-NP-Za-km-z]{32,44})$/)?.[1];
-      if(explicitBuy&&solanaAddress(explicitBuy))
-        return this.fresh(message.date)?{action:'native_buy',buyAction:'prepare',value:explicitBuy}:undefined;
       const explicitToken=text.match(/^\/(?:token|contract) ([1-9A-HJ-NP-Za-km-z]{32,44})$/)?.[1];
       if(explicitToken&&solanaAddress(explicitToken))return {action:'token_card',address:explicitToken,refresh:false};
       const sellPercentage=customSellPercentage(rawText);
@@ -407,8 +402,7 @@ export class TelegramControls {
       // handler owns the pending mint and rejects values when no custom prompt exists.
       if(this.options.onTokenBuy&&customSolAmount(rawText)&&this.fresh(message.date))
         return {action:'token_buy',buyAction:'custom_value',value:rawText};
-      if(solanaAddress(text))return this.options.onTokenCard?{action:'token_card',address:text,refresh:false}:
-        this.fresh(message.date)?{action:'native_buy',buyAction:'prepare',value:text}:undefined;
+      if(solanaAddress(text))return this.options.onTokenCard?{action:'token_card',address:text,refresh:false}:undefined;
       if(['持仓查询','持仓','💼 持仓查询','💼 持仓','📊 持仓查询','📊 持仓','/positions'].includes(text))return {action:'positions',page:1};
       const pageArgument=text.match(/^\/positions ([1-9]\d{0,4})$/)?.[1];
       const page=pageArgument===undefined?undefined:positionsPage(pageArgument);
@@ -443,10 +437,12 @@ export class TelegramControls {
       const tokenCustom=query.data.match(tokenCustomCallback)?.[1];
       if(tokenCustom&&solanaAddress(tokenCustom))return {action:'token_buy',buyAction:'custom_start',
         address:tokenCustom,callbackId:query.id};
-      const nativeBuy=query.data.match(nativeBuyCallback);
-      // The opaque server-side action owns its five-minute expiry. Telegram's
-      // message timestamp is not the click timestamp and cannot authorize a buy.
-      if(nativeBuy)return {action:'native_buy',buyAction:nativeBuy[1] as 'confirm'|'cancel',value:nativeBuy[2],callbackId:query.id};
+      const tokenCancel=query.data.match(tokenCancelCallback)?.[1];
+      // Keep cancellation compatible with already-delivered custom-card prompts,
+      // while removed native-buy confirmations can never reach a trade handler.
+      if(tokenCancel)return {action:'token_buy',buyAction:'cancel',value:tokenCancel,callbackId:query.id};
+      if(removedNativeBuyCallback.test(query.data))return {action:'ack_only',callbackId:query.id,
+        text:'该测试买入入口已移除，请使用 CA 代币卡片买入。'};
       const sell=query.data.match(sellCallback);
       // Message creation time is not click time. The server-side single-use action
       // validates this sell; never revive expired actions or infer a token from a CA.
@@ -455,7 +451,7 @@ export class TelegramControls {
       if(customSell)return {action:'sell_custom',ref:customSell,callbackId:query.id};
       const preview=query.data.match(/^close:preview:([0-9a-f]{32})$/);
       if(preview)return {action:'close',closeAction:'preview',ref:preview[1],callbackId:query.id};
-      if(!this.fresh(message.date))return;
+      if(!this.fresh(message.date))return {action:'ack_only',callbackId:query.id,text:'按钮已过期，请刷新后重试。'};
       const close=query.data.match(closeConfirmedCallback);
       if(close)return {action:'close',closeAction:close[1] as 'confirm'|'cancel',ref:close[2],callbackId:query.id};
       const action=({'count:start':'start','count:stop':'stop','count:status':'status'} as Record<string,TelegramCountAction>)[query.data];

@@ -65,39 +65,27 @@ test('only exact explicit commands and reply keyboard text are actions; /start o
   assert.equal(f.actions.length,10);
 });
 
-test('native test buy menu accepts a canonical CA and only the final owner callback triggers confirm',async t=>{
-  const calls:{action:string;value?:string}[]=[],f=fixture(t,{onNativeBuy:(action,value)=>{
-    calls.push({action,value});
-    if(action==='prepare')return {text:`【测试买入】\n金额：0.01 SOL\nCA：${value}`,
-      buttons:[[{text:'确认购买 0.01 SOL',callback_data:`nativebuy:confirm:${buyRef}`},
-        {text:'取消',callback_data:`nativebuy:cancel:${buyRef}`}]]};
-    return `【测试买入】\n${action}`;
-  }});
-  await f.poll();
-  await f.poll([message(1,'🧪 0.01 SOL 测试买入'),message(2,buyMint)]);
-  assert.deepEqual(calls,[{action:'prompt',value:undefined},{action:'prepare',value:buyMint}]);
-  assert.equal(f.notifications[1].buttons?.[0][0].callback_data,`nativebuy:confirm:${buyRef}`);
-  const confirm=callback(3,`nativebuy:confirm:${buyRef}`);confirm.callback_query.message.date=startTime/1000-86400;
-  await f.poll([confirm]);
-  assert.deepEqual(calls.at(-1),{action:'confirm',value:buyRef});
-  assert.equal(f.requests.filter(request=>request.url.endsWith('/answerCallbackQuery')).length,1);
+test('removed native test-buy commands are inert and an old confirmation is explicitly acknowledged as removed',async t=>{
+  const buys:string[]=[],f=fixture(t,{onTokenBuy:action=>{buys.push(action);return '不应调用';}});await f.poll();
+  await f.poll([message(1,'🧪 0.01 SOL 测试买入'),message(2,'/native_buy'),
+    message(3,`/native_buy ${buyMint}`),callback(4,`nativebuy:confirm:${buyRef}`)]);
+  assert.deepEqual(f.actions,[]);assert.deepEqual(buys,[]);assert.deepEqual(f.notifications,[]);
+  const acknowledgement=f.requests.find(request=>request.url.endsWith('/answerCallbackQuery'));assert.ok(acknowledgement);
+  assert.match(JSON.parse(String(acknowledgement.init.body)).text,/已移除/);
   assert.equal(f.controls.status().manualBuyEnabled,true);
 });
 
-test('configured token cards make bare and explicit lookup addresses read-only while explicit native buy stays stateful',async t=>{
-  const cards:Array<{address:string;refresh:boolean}>=[],buys:{action:string;value?:string}[]=[],f=fixture(t,{
+test('configured token cards make bare and explicit lookup addresses read-only while native-buy commands stay removed',async t=>{
+  const cards:Array<{address:string;refresh:boolean}>=[],f=fixture(t,{
     onTokenCard:(address,refresh)=>{cards.push({address,refresh});return `【代币详情】\nCA：${address}`;},
-    onNativeBuy:(action,value)=>{buys.push({action,value});return `【测试买入】\n${action}`;},
   });
   await f.poll();
   await f.poll([message(1,buyMint,startTime/1000-86400),message(2,`/token ${buyMint}`,startTime/1000-86400),
     message(3,`/contract ${buyMint}`,startTime/1000-86400),message(4,`/native_buy ${buyMint}`)]);
   await f.controls.waitForTokenCards();
   assert.deepEqual(cards,Array.from({length:3},()=>({address:buyMint,refresh:false})));
-  assert.deepEqual(buys,[{action:'prepare',value:buyMint}]);
-  assert.equal(f.notifications.length,4);assert.deepEqual(f.actions,[]);
+  assert.equal(f.notifications.length,3);assert.deepEqual(f.actions,[]);
   assert.equal(f.notifications.filter(item=>item.text.startsWith('【代币详情】')).length,3);
-  assert.match(f.notifications[0].text,/测试买入/);
 });
 
 test('token-card replies preserve a four-link official row together with callback controls',async t=>{
@@ -167,6 +155,16 @@ test('token-card preset and custom callbacks decode only allowlisted codes and c
   const acknowledgements=f.requests.filter(request=>request.url.endsWith('/answerCallbackQuery'));
   assert.equal(acknowledgements.length,6);
   assert.match(JSON.parse(String(acknowledgements.at(-1)!.init.body)).text,/自定义 SOL/);
+});
+
+test('card custom-buy cancel uses its own route while old delivered cancel buttons remain safe',async t=>{
+  const calls:Array<{action:string;address?:string;value?:string}>=[],f=fixture(t,{onTokenBuy:(action,address,value)=>{
+    calls.push({action,address,value});return '【自定义买入】\n已取消，没有发送交易。';
+  }});
+  await f.poll();await f.poll([callback(1,`token:cancel:${buyRef}`),callback(2,`nativebuy:cancel:${buyRef}`)]);
+  assert.deepEqual(calls,[{action:'cancel',address:undefined,value:buyRef},{action:'cancel',address:undefined,value:buyRef}]);
+  assert.equal(f.requests.filter(request=>request.url.endsWith('/answerCallbackQuery')).length,2);
+  assert.equal(f.notifications.length,2);
 });
 
 test('fresh exact decimal SOL messages route custom values without normalizing user input',async t=>{
@@ -266,11 +264,11 @@ test('preset, custom-start and custom-value are durably claimed before handlers 
   await second.pollOnce();assert.equal(seen.includes('replayed'),false);
 });
 
-test('missing token-card handler returns a read-only unavailable response without invoking native buy',async t=>{
-  const buys:string[]=[],f=fixture(t,{onNativeBuy:action=>{buys.push(action);return 'unused';}});
+test('missing token-card handler returns a read-only unavailable response',async t=>{
+  const f=fixture(t);
   await f.poll();await f.poll([message(1,`/token ${buyMint}`),message(2,`/contract ${buyMint}`)]);
   await f.controls.waitForTokenCards();
-  assert.deepEqual(buys,[]);assert.equal(f.notifications.length,2);
+  assert.equal(f.notifications.length,2);
   assert.ok(f.notifications.every(item=>/代币详情查询暂不可用/.test(item.text)));
 });
 
@@ -317,14 +315,16 @@ test('token-card low-priority queue is bounded and excess lookups fail closed wi
   assert.equal(calls,16);assert.equal(f.notifications.length,17);assert.equal(f.controls.status().pendingTokenCards,0);
 });
 
-test('native test buy rejects malformed CA, forged callbacks and stale initiating messages',async t=>{
-  const calls:string[]=[],f=fixture(t,{onNativeBuy:(action)=>{calls.push(action);return '【测试买入】\n收到';}});
+test('removed native test buy rejects forged and malformed callbacks while acknowledging an exact old confirmation',async t=>{
+  const f=fixture(t);
   await f.poll();
   const stale=message(1,buyMint,startTime/1000-121),wrong=callback(2,`nativebuy:confirm:${buyRef}`);
   wrong.callback_query.from.id=1;
   await f.poll([stale,message(3,buyMint+'x'),message(4,'11111111111111111111111111111111'),wrong,
     callback(5,`nativebuy:confirm:${'B'.repeat(32)}`),callback(6,`nativebuy:confirm:${'a'.repeat(31)}`)]);
-  assert.deepEqual(calls,[]);assert.equal(f.notifications.length,0);
+  assert.equal(f.notifications.length,0);
+  const acknowledgements=f.requests.filter(request=>request.url.endsWith('/answerCallbackQuery'));
+  assert.equal(acknowledgements.length,0);
 });
 
 test('strictly rejects other users/chats, groups, bots, edited, forwarded and stale/future messages',async t=>{
@@ -402,8 +402,9 @@ test('callback commands require the authorized actor, private chat, fresh own-bo
   const forwarded=callback(5);forwarded.callback_query.message.forward_origin={type:'user'};
   f.advance();f.replies.push(result([wrongUser,wrongBot,stale,inline,forwarded,callback(6,'count:buy'),callback(7,'count:stop')]),result(true));
   await f.controls.pollOnce();assert.deepEqual(f.actions,['stop']);assert.equal(f.notifications.length,1);
-  const ack=f.requests.find(request=>request.url.endsWith('/answerCallbackQuery'));assert.ok(ack);
-  assert.equal(JSON.parse(String(ack.init.body)).callback_query_id,'callback-7');
+  const acknowledgements=f.requests.filter(request=>request.url.endsWith('/answerCallbackQuery'));
+  assert.deepEqual(acknowledgements.map(item=>JSON.parse(String(item.init.body)).callback_query_id),['callback-3','callback-7']);
+  assert.match(JSON.parse(String(acknowledgements[0].init.body)).text,/过期/);
 });
 
 test('holdings commands use a separate read-only handler and bounded one-based pages',async t=>{
@@ -461,8 +462,9 @@ test('holdings pagination permits old own-bot messages but rejects other senders
   await f.poll([...updates,old,oldCount]);
   assert.deepEqual(pages,[2]);assert.deepEqual(f.actions,[]);assert.equal(f.notifications.length,1);
   const acknowledgements=f.requests.filter(request=>request.url.endsWith('/answerCallbackQuery'));
-  assert.equal(acknowledgements.length,1);
+  assert.equal(acknowledgements.length,2);
   assert.match(JSON.parse(String(acknowledgements[0].init.body)).text,/持仓查询/);
+  assert.match(JSON.parse(String(acknowledgements[1].init.body)).text,/过期/);
 });
 
 test('holdings query is durably claimed before reading and replay does not enqueue duplicates',async t=>{

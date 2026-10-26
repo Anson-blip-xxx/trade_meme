@@ -9,7 +9,7 @@ import {ThirdSignalEntryController} from './third-signal-entry.js';
 import {ProcessNativeTradingRuntime} from './native-solana/process-host.js';
 import type {ThirdSignalCandidate} from './third-signal-strategy.js';
 import {validThirdSignalFill} from './exit-tracking.js';
-import {buildExitConditions,parseExitPolicy} from './exit-policy.js';
+import {buildExitConditions} from './exit-policy.js';
 import {GmgnClient} from './providers/gmgn-client.js';
 import {GmgnEntryHolderReader} from './providers/gmgn-entry-holders.js';
 import {GmgnScanner,normalizeGmgnTrades} from './scanner.js';
@@ -524,11 +524,6 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
   },{pending:()=>orders.activePositions().filter(o=>o.status!=='confirmed').length});
   const manualBuyScope=config.telegram?.token&&config.telegram.chatId?
     createHash('sha256').update(config.telegram.token+'\0'+config.telegram.chatId).digest('hex'):undefined;
-  const manualBuyProtection=(()=>{try{
-    const policy=parseExitPolicy(config.exitPolicy);if(!policy)return '保护：未启用';
-    return '保护：'+policy.takeProfit.map(tier=>`上涨 ${tier.gainPct}% 卖出剩余仓位 ${tier.sellPct}%`).join('；')+
-      `；下跌 ${policy.stopLoss.dropPct}% 卖出剩余仓位 ${policy.stopLoss.sellPct}%`;
-  }catch{return '保护：配置不可用';}})();
   const solToLamports=(value:string):string|undefined=>{
     if(value.length>32||!/^(?:0|[1-9]\d*)(?:\.\d{1,9})?$/.test(value))return;
     const [whole,fraction='']=value.split('.');
@@ -541,18 +536,6 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
     const fraction=(amount%1_000_000_000n).toString().padStart(9,'0').replace(/0+$/,'');
     return `${whole}${fraction?`.${fraction}`:''} SOL`;
   };
-  const manualBuyReply=(result:ManualNativeBuyResult,action:'prompt'|'prepare'|'confirm'|'cancel')=>{
-    const mint=result.action?.mint,orderId=result.order?.id??result.action?.orderId;
-    if(result.status==='blocked')return {text:`【测试买入】\n未发送交易。\n原因：${result.reason}`};
-    if(action==='prompt'&&result.status==='created')return {text:'【测试买入】\n⚠️ 这是 Solana 实盘买入入口。\n固定金额：0.01 SOL\n请在 5 分钟内发送完整 CA。收到 CA 后，机器人会返回显示金额和 CA 的最终购买按钮。'};
-    if(action==='prepare'&&result.status==='ready'&&mint)return {text:`【测试买入】\n请核对后点击；点击即触发实盘，不再二次确认。\n金额：0.01 SOL\n链：Solana\nCA：${mint}\n执行：Pump / PumpSwap 原生交易 · Jito 防夹\n${manualBuyProtection}`,
-      buttons:[[{text:'确认实盘购买 0.01 SOL',callback_data:`nativebuy:confirm:${result.action.ref}`},
-        {text:'取消',callback_data:`nativebuy:cancel:${result.action.ref}`}]]};
-    if(action==='confirm'&&result.status==='accepted')return {text:`【买入已接收】\n0.01 SOL · Solana · Jito${mint?`\nCA：${mint}`:''}\n成交后发送最终结果和实际耗时。`};
-    if(action==='cancel'&&result.status==='canceled')return {text:`【${result.action.mode==='card_direct'?'自定义买入':'测试买入'}】\n已取消，没有发送交易。`};
-    if(result.status==='existing')return {text:`【测试买入】\n该操作已经处理，不会重复发送买单。${mint?`\nCA：${mint}`:''}${orderId?`\n开仓单：${orderId}`:''}`};
-    return {text:`【测试买入】\n操作状态：${result.status}${mint?`\nCA：${mint}`:''}${orderId?`\n开仓单：${orderId}`:''}`};
-  };
   const manualCardBuyReply=(result:ManualNativeBuyResult,request:{address?:string;amountLamports?:string},action:TelegramTokenBuyAction)=>{
     const address=result.action?.mint??request.address;
     const amountLamports=result.action?.amountLamports??request.amountLamports;
@@ -561,7 +544,8 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
     if(result.status==='blocked')return {text:`【卡片买入】\n未发送交易。${amountLamports?`\n金额：${amount}`:''}${address?`\nCA：${address}`:''}\n原因：${result.reason}`};
     if(action==='custom_start'&&(result.status==='created'||result.status==='existing')&&result.action.state==='awaiting_amount'&&address)
       return {text:`【自定义买入】\nCA：${address}\n请在 5 分钟内直接发送 SOL 数量，例如：0.25\n发送后立即实盘执行，不再二次确认，也不使用自动信号风控。`,
-        buttons:[[{text:'取消自定义买入',callback_data:`nativebuy:cancel:${result.action.ref}`}]]};
+        buttons:[[{text:'取消自定义买入',callback_data:`token:cancel:${result.action.ref}`}]]};
+    if(action==='cancel'&&result.status==='canceled')return {text:'【自定义买入】\n已取消，没有发送交易。'};
     if(result.status==='accepted')return {text:`【买入已接收】\n${amount} · Solana · Jito${address?`\nCA：${address}`:''}\n成交后发送最终结果和实际耗时。`};
     if(result.status==='existing')return {text:`【卡片买入】\n该操作已经处理，不会重复发送买单。\n金额：${amount}${address?`\nCA：${address}`:''}${orderId?`\n开仓单：${orderId}`:''}`};
     return {text:`【卡片买入】\n操作状态：${result.status}\n金额：${amount}${address?`\nCA：${address}`:''}${orderId?`\n开仓单：${orderId}`:''}`};
@@ -613,15 +597,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
           directSell?await directSell.submit(ref,pct):{text:'卖出按钮已失效，请刷新持仓。'};
         return {text:'【持仓卖出】\n'+reply.text,buttons:[[{text:'刷新持仓',callback_data:'positions:1'}]]};
       }}:{}),
-      ...(manualNativeBuy&&manualBuyScope?{onNativeBuy:(action:'prompt'|'prepare'|'confirm'|'cancel',value?:string)=>{
-        const actor={scope:manualBuyScope,owner:config.telegram!.chatId!};
-        const result=action==='prompt'?manualNativeBuy!.begin(actor):
-          action==='prepare'&&value?manualNativeBuy!.prepare({...actor,mint:value}):
-          action==='confirm'&&value?manualNativeBuy!.confirm({...actor,ref:value}):
-          action==='cancel'?manualNativeBuy!.cancel({...actor,...(value?{ref:value}:{})}):
-          {status:'blocked' as const,reason:'MANUAL_NATIVE_BUY_ACTION_INVALID'};
-        return manualBuyReply(result,action);
-      },onTokenBuy:(action:TelegramTokenBuyAction,address?:string,value?:string)=>{
+      ...(manualNativeBuy&&manualBuyScope?{onTokenBuy:(action:TelegramTokenBuyAction,address?:string,value?:string)=>{
         const actor={scope:manualBuyScope,owner:config.telegram!.chatId!};
         let result:ManualNativeBuyResult,amountLamports:string|undefined;
         if(action==='preset'&&address&&value){
@@ -636,6 +612,8 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
           amountLamports=solToLamports(value);
           result=amountLamports?manualNativeBuy!.submitCardCustom({...actor,amountLamports}):
             {status:'blocked',reason:'MANUAL_NATIVE_AMOUNT_INVALID'};
+        }else if(action==='cancel'&&value){
+          result=manualNativeBuy!.cancel({...actor,ref:value});
         }else result={status:'blocked',reason:'MANUAL_NATIVE_BUY_ACTION_INVALID'};
         return manualCardBuyReply(result,{address,amountLamports},action);
       }}:{}),
@@ -1083,12 +1061,12 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
         try {
           const destination=createHash('sha256').update(config.telegram.token!+'\0'+config.telegram.chatId!).digest('hex');
           telegram.enqueue({key:`connected:${destination}`,text:`Meme 交易通知已连接\n通知范围：开单状态、止盈止损状态、持仓价格观察及报价异常。\n研究开仓入口：${config.entryMode==='off'?'关闭':config.entryMode==='paper'?'模拟':'实盘'}\n第三次通知策略：${config.thirdSignalExecutionMode==='live'?'实盘':'模拟'} · ${signalCounting.status().running?'计数运行中':'等待启动计数'}\n此消息为连接测试，不代表已下单。`});
-          telegram.enqueue({key:`signal-counting-controls:v1:${destination}`,text:signalCounting.controlText()});
-          telegram.enqueue({key:`telegram-position-menu:v2:${destination}`,text:signalCounting.controlText()+
+          telegram.enqueue({key:`signal-counting-controls:v2:${destination}`,text:signalCounting.controlText()});
+          telegram.enqueue({key:`telegram-position-menu:v3:${destination}`,text:signalCounting.controlText()+
             '\n\n「持仓查询」每页 5 个，支持翻页和刷新；Solana 持仓可点击 25%、50%、75%、100% 直接卖出。'+
-            '\n「0.01 SOL 测试买入」是独立的本人触发实盘入口：先发送完整 CA，再点击显示 CA 和金额的最终购买按钮。'+
+            '\n发送完整 CA 可打开代币卡片，再选择卡片上的买入金额。'+
             '\n信号策略开仓金额仍为原生币总余额的 3%，另预留手续费及待结算占用。'});
-          if(config.thirdSignalExecutionMode==='live')telegram.enqueue({key:`third-signal-live-controls:v2:${config.solanaExecutionProvider}:${destination}`,
+          if(config.thirdSignalExecutionMode==='live')telegram.enqueue({key:`third-signal-live-controls:v3:${config.solanaExecutionProvider}:${destination}`,
             text:signalCounting.controlText()+`\n\n每单按 SOL 总余额的 3%；翻倍卖出 50%、跌 ${config.exitPolicy?.stopLoss.dropPct??60}% 卖出余仓。`+
               (config.solanaExecutionProvider==='pump_native'?'\n执行方式：Pump / PumpSwap 原生交易，Jito 防夹；保护由本机持仓服务执行。签名器或监控未就绪时禁止开仓。':'\n执行方式：GMGN 买单附带条件单。')+
               '\n点击「启动计数」开始接收新信号；点击「停止计数」停止新开仓，持仓监控继续。'});

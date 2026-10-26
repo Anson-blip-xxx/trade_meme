@@ -223,8 +223,8 @@ test('emoji near the limit is not split and invalid input is explicitly rejected
 test('count controls have persistent text buttons while preserving escaped facts and no inline keyboard',()=>{
   const result=formatTelegramMessage(`【计数控制】\n模拟计数 · 不执行实盘\n状态：<运行中> & 已登记\n链：Solana\nCA：${mint}\n${link}`);
   assert.deepEqual(result.reply_markup,{
-    keyboard:[[{text:'启动计数'},{text:'停止计数'}],[{text:'计数状态'},{text:'持仓查询'}],[{text:'🧪 0.01 SOL 测试买入'}]],
-    resize_keyboard:true,is_persistent:true,one_time_keyboard:false,input_field_placeholder:'计数 · 持仓 · 0.01 SOL 测试买入',
+    keyboard:[[{text:'启动计数'},{text:'停止计数'}],[{text:'计数状态'},{text:'持仓查询'}]],
+    resize_keyboard:true,is_persistent:true,one_time_keyboard:false,input_field_placeholder:'计数 · 持仓',
   });
   assert.match(result.text,/🎛 <b>计数控制<\/b>/);assert.ok(result.text.includes('&lt;运行中&gt; &amp; 已登记'));
   assert.ok(result.text.includes(link));assert.equal(result.reply_markup?.inline_keyboard,undefined);
@@ -241,7 +241,7 @@ test('live control messages never inherit a simulation-only keyboard placeholder
   for(const state of ['实盘计数：已停止 · 启动后达标自动实盘买入','实盘计数：运行中 · 达标自动实盘买入']){
     const result=formatTelegramMessage(`【计数控制】\n${state}\n处理链：SOL`);
     assert.ok(result.reply_markup&&'input_field_placeholder' in result.reply_markup);
-    assert.equal(result.reply_markup.input_field_placeholder,'计数 · 持仓 · 0.01 SOL 测试买入');
+    assert.equal(result.reply_markup.input_field_placeholder,'计数 · 持仓');
     assert.doesNotMatch(JSON.stringify(result.reply_markup),/模拟|不执行实盘/);
     assert.ok(decode(result.text).includes(state));
   }

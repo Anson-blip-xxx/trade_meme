@@ -64,7 +64,7 @@ function solAmount(lamports:string):string {
 }
 const eventKey=(ref:string)=>createHash('sha256').update(JSON.stringify(['manual_native_test_v1',ref])).digest('hex');
 
-/** Durable manual routes: /native_buy stays fixed at 0.01 SOL; card actions persist their exact requested amount. */
+/** Durable card actions plus legacy journal recovery; new Telegram buys use card-selected exact amounts. */
 export class ManualNativeTestController {
   private readonly db:DatabaseSync;
   private readonly now:()=>Date;

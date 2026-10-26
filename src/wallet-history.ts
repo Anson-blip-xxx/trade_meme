@@ -126,6 +126,14 @@ interface AssociationChanges {
   publicServices:Map<Chain,Set<string>>;
 }
 
+export const WALLET_COORDINATION_INVALIDATION_SQL=`UPDATE wh_metrics SET coordination_dirty=1 WHERE rowid IN (
+  SELECT m.rowid
+  FROM json_each(?) a
+  CROSS JOIN wh_funding f INDEXED BY wh_funding_address
+  CROSS JOIN wh_metrics m INDEXED BY sqlite_autoindex_wh_metrics_1
+  WHERE f.chain=? AND f.funding_address=a.value
+    AND m.chain=f.chain AND m.address=f.wallet)`;
+
 /** Long-lived research evidence. Never uses this data as a trading permission or deletes history to make space. */
 export class WalletHistory {
   private readonly db:DatabaseSync;
@@ -735,9 +743,7 @@ export class WalletHistory {
   private flushAssociationChanges(changes:AssociationChanges):void {
     for(const [chain,addresses] of changes.fundingAddresses) {
       const values=JSON.stringify([...addresses]);
-      this.db.prepare(`UPDATE wh_metrics SET coordination_dirty=1 WHERE chain=? AND address IN
-        (SELECT wallet FROM wh_funding INDEXED BY wh_funding_address JOIN json_each(?) a ON a.value=funding_address WHERE chain=?)`)
-        .run(chain,values,chain);
+      this.db.prepare(WALLET_COORDINATION_INVALIDATION_SQL).run(values,chain);
     }
     this.associations.fundingChangedMany([...changes.fundingWallets].flatMap(([chain,wallets])=>[...wallets].map(wallet=>({chain,wallet}))));
     this.associations.publicServiceChangedMany([...changes.publicServices].flatMap(([chain,funders])=>[...funders].map(funder=>({chain,funder}))));

@@ -17,7 +17,7 @@ export type TelegramTokenBuyPresetCode=keyof typeof TELEGRAM_TOKEN_BUY_PRESETS;
 const closeCallback=new RegExp(`^close:(?:preview:[0-9a-f]{32}|(?:confirm|cancel):${TELEGRAM_CLOSE_UUID})$`);
 const sellCallback=new RegExp(`^sell:(25|30|50|75|100):(${TELEGRAM_SELL_REF})$`);
 const customSellCallback=new RegExp(`^sell:custom:(${TELEGRAM_SELL_REF})$`);
-const nativeBuyCallback=/^nativebuy:(?:confirm|cancel):[0-9a-f]{32}$/;
+const tokenCancelCallback=/^(?:token:cancel|nativebuy:cancel):[0-9a-f]{32}$/;
 const tokenRefreshCallback=/^token:refresh:([1-9A-HJ-NP-Za-km-z]{32,44})$/;
 const legacyTokenBuyCallback=/^token:buy:([1-9A-HJ-NP-Za-km-z]{32,44})$/;
 const tokenBuyCallback=/^token:buy:([abcde]):([1-9A-HJ-NP-Za-km-z]{32,44})$/;
@@ -65,7 +65,7 @@ function validateButtons(value:unknown,allowUrls:boolean):TelegramNotificationBu
         button.callback_data.match(legacyTokenBuyCallback)?.[1];
       const customToken=button.callback_data.match(tokenCustomCallback)?.[1];
       if(!(page&&Number(page)<=10000)&&!closeCallback.test(button.callback_data)&&!sellCallback.test(button.callback_data)&&
-        !nativeBuyCallback.test(button.callback_data)&&!(token&&validAddress('sol',token))&&
+        !tokenCancelCallback.test(button.callback_data)&&!(token&&validAddress('sol',token))&&
         !(buyToken&&validAddress('sol',buyToken))&&!(customToken&&validAddress('sol',customToken))&&
         !customSellCallback.test(button.callback_data))
         throw new Error('TELEGRAM_BUTTONS_INVALID');
@@ -208,8 +208,8 @@ export function formatTelegramMessage(text:string):TelegramFormattedMessage {
   const lines=text.split('\n'),positions=lines[0]==='【持仓查询】';
   const button=controls||positions?undefined:gmgnButton(lines),rendered:Line[]=[];
   const reply_markup:TelegramReplyMarkup|undefined=controls?{
-    keyboard:[[{text:'启动计数'},{text:'停止计数'}],[{text:'计数状态'},{text:'持仓查询'}],[{text:'🧪 0.01 SOL 测试买入'}]],
-    resize_keyboard:true,is_persistent:true,one_time_keyboard:false,input_field_placeholder:'计数 · 持仓 · 0.01 SOL 测试买入',
+    keyboard:[[{text:'启动计数'},{text:'停止计数'}],[{text:'计数状态'},{text:'持仓查询'}]],
+    resize_keyboard:true,is_persistent:true,one_time_keyboard:false,input_field_placeholder:'计数 · 持仓',
   }:positions?positionsNavigation(lines):button?{inline_keyboard:[[{text:'查看 GMGN',url:button.url}]]}:undefined;
   for(const [index,line] of lines.entries()) {
     if(button?.indexes.has(index))continue;

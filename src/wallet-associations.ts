@@ -40,6 +40,64 @@ type Row=Record<string,any>;
 type Write=(evidence:unknown,fn:()=>unknown)=>void;
 const hash=(value:unknown)=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const LEAD_SECONDS=86400;
+export const WALLET_ASSOCIATION_INVALIDATION_SQL={
+  fundingAnchors:`UPDATE wh_assoc_anchors SET dirty=1 WHERE rowid IN (
+    SELECT a.rowid
+    FROM json_each(?) w
+    CROSS JOIN wh_assoc_anchors a INDEXED BY sqlite_autoindex_wh_assoc_anchors_1
+    WHERE a.chain=? AND a.leader=w.value
+    UNION
+    SELECT a.rowid
+    FROM json_each(?) w
+    CROSS JOIN wh_assoc_episodes e INDEXED BY wh_assoc_episode_candidate
+    CROSS JOIN wh_assoc_anchors a INDEXED BY sqlite_autoindex_wh_assoc_anchors_1
+    WHERE e.chain=? AND e.candidate=w.value AND e.active=1
+      AND a.chain=e.chain AND a.leader=e.leader AND a.token_address=e.token_address)`,
+  fundingRelations:`UPDATE wh_assoc_relations SET dirty=1 WHERE rowid IN (
+    SELECT r.rowid
+    FROM json_each(?) w
+    CROSS JOIN wh_assoc_relations r INDEXED BY sqlite_autoindex_wh_assoc_relations_1
+    WHERE r.chain=? AND r.leader=w.value
+    UNION
+    SELECT r.rowid
+    FROM json_each(?) w
+    CROSS JOIN wh_assoc_relations r INDEXED BY wh_assoc_relation_candidate
+    WHERE r.chain=? AND r.candidate=w.value)`,
+  publicRelations:`WITH recipients(wallet) AS MATERIALIZED (
+    SELECT DISTINCT f.wallet
+    FROM json_each(?) s
+    CROSS JOIN wh_funding f INDEXED BY wh_funding_address
+    WHERE f.chain=? AND f.funding_address=s.value
+  )
+  UPDATE wh_assoc_relations SET dirty=1 WHERE rowid IN (
+    SELECT r.rowid
+    FROM recipients w
+    CROSS JOIN wh_assoc_relations r INDEXED BY sqlite_autoindex_wh_assoc_relations_1
+    WHERE r.chain=? AND r.leader=w.wallet
+    UNION
+    SELECT r.rowid
+    FROM recipients w
+    CROSS JOIN wh_assoc_relations r INDEXED BY wh_assoc_relation_candidate
+    WHERE r.chain=? AND r.candidate=w.wallet)`,
+  publicAnchors:`WITH recipients(wallet) AS MATERIALIZED (
+    SELECT DISTINCT f.wallet
+    FROM json_each(?) s
+    CROSS JOIN wh_funding f INDEXED BY wh_funding_address
+    WHERE f.chain=? AND f.funding_address=s.value
+  )
+  UPDATE wh_assoc_anchors SET dirty=1 WHERE rowid IN (
+    SELECT a.rowid
+    FROM recipients w
+    CROSS JOIN wh_assoc_anchors a INDEXED BY sqlite_autoindex_wh_assoc_anchors_1
+    WHERE a.chain=? AND a.leader=w.wallet
+    UNION
+    SELECT a.rowid
+    FROM recipients w
+    CROSS JOIN wh_assoc_episodes e INDEXED BY wh_assoc_episode_candidate
+    CROSS JOIN wh_assoc_anchors a INDEXED BY sqlite_autoindex_wh_assoc_anchors_1
+    WHERE e.chain=? AND e.candidate=w.wallet AND e.active=1
+      AND a.chain=e.chain AND a.leader=e.leader AND a.token_address=e.token_address)`
+} as const;
 const event=(row:Row):AssociationEvent=>{const data=JSON.parse(String(row.data)) as WalletTradeObservation;return {
   eventId:String(row.id),wallet:String(row.wallet),txHash:String(row.tx_hash),eventAt:String(row.event_at),observedAt:String(row.observed_at),source:data.source};};
 const coverage:WalletAssociationDetail['coverage']={sampleOnly:true,firstObservedBuy:true,leadWindowSeconds:86400,
@@ -99,15 +157,8 @@ export class WalletAssociations {
   fundingChangedMany(changes:Iterable<{chain:Chain;wallet:string}>):void {
     for(const [chain,wallets] of this.group(changes,'wallet')) {
       const values=JSON.stringify(wallets);
-      this.db.prepare(`UPDATE wh_assoc_anchors SET dirty=1 WHERE rowid IN (
-        SELECT a.rowid FROM json_each(?) w JOIN wh_assoc_anchors a ON a.chain=? AND a.leader=w.value
-        UNION SELECT a.rowid FROM json_each(?) w JOIN wh_assoc_episodes e INDEXED BY wh_assoc_episode_candidate
-          ON e.chain=? AND e.candidate=w.value AND e.active=1
-          JOIN wh_assoc_anchors a ON a.chain=e.chain AND a.leader=e.leader AND a.token_address=e.token_address)`).run(values,chain,values,chain);
-      this.db.prepare(`UPDATE wh_assoc_relations SET dirty=1 WHERE rowid IN (
-        SELECT r.rowid FROM json_each(?) w JOIN wh_assoc_relations r ON r.chain=? AND r.leader=w.value
-        UNION SELECT r.rowid FROM json_each(?) w JOIN wh_assoc_relations r INDEXED BY wh_assoc_relation_candidate
-          ON r.chain=? AND r.candidate=w.value)`).run(values,chain,values,chain);
+      this.db.prepare(WALLET_ASSOCIATION_INVALIDATION_SQL.fundingAnchors).run(values,chain,values,chain);
+      this.db.prepare(WALLET_ASSOCIATION_INVALIDATION_SQL.fundingRelations).run(values,chain,values,chain);
     }
   }
 
@@ -118,17 +169,8 @@ export class WalletAssociations {
   publicServiceChangedMany(changes:Iterable<{chain:Chain;funder:string}>):void {
     for(const [chain,funders] of this.group(changes,'funder')) {
       const values=JSON.stringify(funders);
-      const recipients=`SELECT f.wallet FROM wh_funding f INDEXED BY wh_funding_address
-        JOIN json_each(?) s ON s.value=f.funding_address WHERE f.chain=?`;
-      this.db.prepare(`WITH recipients(wallet) AS (${recipients}) UPDATE wh_assoc_relations SET dirty=1 WHERE rowid IN (
-        SELECT r.rowid FROM recipients w JOIN wh_assoc_relations r ON r.chain=? AND r.leader=w.wallet
-        UNION SELECT r.rowid FROM recipients w JOIN wh_assoc_relations r INDEXED BY wh_assoc_relation_candidate
-          ON r.chain=? AND r.candidate=w.wallet)`).run(values,chain,chain,chain);
-      this.db.prepare(`WITH recipients(wallet) AS (${recipients}) UPDATE wh_assoc_anchors SET dirty=1 WHERE rowid IN (
-        SELECT a.rowid FROM recipients w JOIN wh_assoc_anchors a ON a.chain=? AND a.leader=w.wallet
-        UNION SELECT a.rowid FROM recipients w JOIN wh_assoc_episodes e INDEXED BY wh_assoc_episode_candidate
-          ON e.chain=? AND e.candidate=w.wallet AND e.active=1
-          JOIN wh_assoc_anchors a ON a.chain=e.chain AND a.leader=e.leader AND a.token_address=e.token_address)`).run(values,chain,chain,chain);
+      this.db.prepare(WALLET_ASSOCIATION_INVALIDATION_SQL.publicRelations).run(values,chain,chain,chain);
+      this.db.prepare(WALLET_ASSOCIATION_INVALIDATION_SQL.publicAnchors).run(values,chain,chain,chain);
     }
   }
 

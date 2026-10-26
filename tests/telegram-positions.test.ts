@@ -101,12 +101,12 @@ test('sell button validator permits only the four exact percentages and opaque 3
  assert.throws(()=>validateTelegramCallbackButtons([[...valid,valid[0]]]),/BUTTONS_INVALID/);
 });
 
-test('native test buy buttons permit only confirm or cancel with a lowercase opaque reference',()=>{
- const ref='a'.repeat(32),buttons=[[{text:'确认购买 0.01 SOL',callback_data:`nativebuy:confirm:${ref}`},
-  {text:'取消',callback_data:`nativebuy:cancel:${ref}`}]];
+test('card custom-buy cancellation permits only the token cancel route and legacy cancel compatibility',()=>{
+ const ref='a'.repeat(32),buttons=[[{text:'取消',callback_data:`token:cancel:${ref}`},
+  {text:'取消旧卡片',callback_data:`nativebuy:cancel:${ref}`}]];
  assert.deepEqual(validateTelegramCallbackButtons(buttons),buttons);
- for(const data of [`nativebuy:buy:${ref}`,`nativebuy:confirm:${'A'.repeat(32)}`,
-  `nativebuy:confirm:${'a'.repeat(31)}`,`nativebuy:confirm:${ref}:extra`])
+ for(const data of [`nativebuy:confirm:${ref}`,`token:cancel:${'A'.repeat(32)}`,
+  `token:cancel:${'a'.repeat(31)}`,`token:cancel:${ref}:extra`])
   assert.throws(()=>validateTelegramCallbackButtons([[{text:'bad',callback_data:data}]]),/BUTTONS_INVALID/);
 });
 

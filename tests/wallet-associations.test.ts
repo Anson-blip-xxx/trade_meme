@@ -5,6 +5,7 @@ import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {DatabaseSync} from 'node:sqlite';
 import {WalletHistory,type WalletTradeObservation} from '../src/wallet-history.js';
+import {WALLET_ASSOCIATION_INVALIDATION_SQL} from '../src/wallet-associations.js';
 
 const base=Date.parse('2026-10-09T00:00:00Z'),iso=(n:number)=>new Date(base+n*1000).toISOString();
 const address=(n:number)=>'0x'+n.toString(16).padStart(40,'0'),hash=(n:number)=>'0x'+n.toString(16).padStart(64,'0');
@@ -163,6 +164,42 @@ test('incremental legacy indexing survives restart; refresh bounded and list pag
     assert.equal(history.listAssociations({offset:1}).items.length,0);assert.equal(history.listAssociations({search:leader.slice(-4)}).total,1);
     history.close();
   } finally {rmSync(dir,{recursive:true,force:true});}
+});
+
+test('an orphan derived anchor is marked checked and cannot starve later valid anchors',()=>{
+  const {history}=fixture(),db=(history as unknown as {db:DatabaseSync}).db;
+  const orphanLeader=address(90),orphanToken=address(190);
+  try {
+    pair(history);
+    db.prepare(`INSERT INTO wh_assoc_anchors(chain,leader,token_address,public_observed_at,dirty)
+      VALUES (?,?,?,?,1)`).run(chain,orphanLeader,orphanToken,iso(1));
+    assert.equal(history.associationStats().pending,2);
+    history.refreshAssociations(1);
+    assert.equal(Number(db.prepare(`SELECT dirty FROM wh_assoc_anchors WHERE chain=? AND leader=? AND token_address=?`)
+      .get(chain,orphanLeader,orphanToken)!.dirty),0);
+    assert.equal(history.associationStats().pending,1);
+    history.refreshAssociations(1);
+    assert.equal(history.associationStats().pending,0);
+    assert.equal(history.listAssociations().total,1);
+
+    history.recordTrade(trade({wallet:orphanLeader,tokenAddress:orphanToken,txHash:hash(9090),side:'buy',
+      eventAt:iso(40),observedAt:iso(50),source:'gmgn_kol_feed'}));
+    assert.equal(Number(db.prepare(`SELECT dirty FROM wh_assoc_anchors WHERE chain=? AND leader=? AND token_address=?`)
+      .get(chain,orphanLeader,orphanToken)!.dirty),1,'later raw evidence reopens the derived anchor');
+  } finally {history.close();}
+});
+
+test('repeating the same association invalidation does not rewrite rows already dirty',()=>{
+  const {history}=fixture(),db=(history as unknown as {db:DatabaseSync}).db,values=JSON.stringify([candidate]);
+  try {
+    pair(history);history.refreshAssociations();
+    const anchors=db.prepare(WALLET_ASSOCIATION_INVALIDATION_SQL.fundingAnchors);
+    const relations=db.prepare(WALLET_ASSOCIATION_INVALIDATION_SQL.fundingRelations);
+    assert.equal(Number(anchors.run(values,chain,values,chain).changes),1);
+    assert.equal(Number(anchors.run(values,chain,values,chain).changes),0);
+    assert.equal(Number(relations.run(values,chain,values,chain).changes),1);
+    assert.equal(Number(relations.run(values,chain,values,chain).changes),0);
+  } finally {history.close();}
 });
 
 test('candidate funds leader is direct vendor evidence and public funder reclassification invalidates old cached support',()=>{

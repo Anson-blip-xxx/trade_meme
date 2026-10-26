@@ -249,6 +249,7 @@ test('关联失效队列跨重启保留，派生更新失败时原子回滚并�
     history.close();history=new WalletHistory(path,{now:()=>new Date(base+100_000)});
     assert.equal(history.associationInvalidationStatus().pending,2);
     const db=(history as unknown as {db:DatabaseSync}).db;
+    db.prepare('UPDATE wh_metrics SET coordination_dirty=0 WHERE chain=? AND address=?').run('bsc',address(1));
     db.exec(`CREATE TRIGGER reject_wallet_invalidation BEFORE UPDATE OF coordination_dirty ON wh_metrics
       BEGIN SELECT RAISE(ABORT,'test failure'); END`);
     assert.throws(()=>history.flushAssociationInvalidations(64));

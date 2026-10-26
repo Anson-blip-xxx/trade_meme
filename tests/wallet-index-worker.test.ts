@@ -5,6 +5,7 @@ import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {WalletHistory,type WalletTradeObservation} from '../src/wallet-history.js';
 import {WalletIndexRunner} from '../src/wallet-index-runner.js';
+import {walletIndexNextDelay} from '../src/wallet-index-policy.js';
 
 const address=(n:number)=>'0x'+n.toString(16).padStart(40,'0');
 const hash=(n:number)=>'0x'+n.toString(16).padStart(64,'0');
@@ -13,6 +14,14 @@ const waitFor=async(check:()=>boolean,timeoutMs=8_000)=>{
   while(!check()&&Date.now()<deadline)await new Promise(resolve=>setTimeout(resolve,20));
   assert.equal(check(),true,'timed out waiting for wallet-index worker');
 };
+
+test('wallet-index backlog uses the configured cadence and only an idle cycle backs off',()=>{
+  assert.equal(walletIndexNextDelay(30_000,{invalidationPending:50_000,processed:1024}),30_000);
+  assert.equal(walletIndexNextDelay(30_000,{invalidationPending:1,processed:0}),30_000);
+  assert.equal(walletIndexNextDelay(30_000,{invalidationPending:0,processed:13}),30_000);
+  assert.equal(walletIndexNextDelay(30_000,{invalidationPending:0,processed:0}),60_000);
+  assert.equal(walletIndexNextDelay(1_000,{invalidationPending:0,processed:0}),6_000);
+});
 
 test('wallet-index worker completes the coordination and association quotas on a small database',async()=>{
   const directory=mkdtempSync(join(tmpdir(),'wallet-index-worker-')),database=join(directory,'history.sqlite');
@@ -33,6 +42,7 @@ test('wallet-index worker completes the coordination and association quotas on a
     const status=runner.snapshot();
     assert.equal(status.coordinationError,undefined);assert.equal(status.associationError,undefined);
     assert.ok(status.coordinationMs>=0);assert.ok(status.associationMs>=0);
+    assert.ok(status.coordinationProcessed>=1);assert.ok(status.associationProcessed>=1);
     assert.equal(status.associationStats?.pending,0);assert.equal(status.associationStats?.relations,1);
     const firstCompleted=status.completedAt,firstStatsAt=status.associationStatsRefreshedAt;
     assert.ok(firstStatsAt);await waitFor(()=>runner.snapshot().completedAt!==firstCompleted);

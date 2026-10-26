@@ -128,7 +128,7 @@ interface AssociationChanges {
 }
 type AssociationInvalidationKind='funding_wallet'|'funding_address'|'public_service';
 
-export const WALLET_COORDINATION_INVALIDATION_SQL=`UPDATE wh_metrics SET coordination_dirty=1 WHERE rowid IN (
+export const WALLET_COORDINATION_INVALIDATION_SQL=`UPDATE wh_metrics SET coordination_dirty=1 WHERE coordination_dirty<>1 AND rowid IN (
   SELECT m.rowid
   FROM json_each(?) a
   CROSS JOIN wh_funding f INDEXED BY wh_funding_address
@@ -429,8 +429,9 @@ export class WalletHistory {
       this.putToken(target,observed);this.putFunding(value,changes);this.flushAssociationChanges(changes);});
   }
 
-  refreshAssociations(limit=3,flushInvalidations=true):void {
-    if(flushInvalidations&&!this.prepareAssociationRefresh())return;this.associations.refresh(limit);
+  refreshAssociations(limit=3,flushInvalidations=true):number {
+    if(flushInvalidations&&!this.prepareAssociationRefresh())return 0;
+    const result=this.associations.refresh(limit);return result.indexed+result.refreshed;
   }
   listAssociations(options:WalletAssociationListOptions={}) {return this.associations.list(options);}
   /** Bounded raw observations preserve contrary vendor copies for the screening model. */
@@ -546,11 +547,11 @@ export class WalletHistory {
         progress=this.db.prepare('UPDATE wh_association_invalidations SET stage=?,cursor=? WHERE kind=? AND chain=? AND address=?'),
         recipientPage=this.db.prepare(`SELECT DISTINCT wallet FROM wh_funding INDEXED BY wh_funding_recipients
           WHERE chain=? AND funding_address=? AND wallet>? ORDER BY wallet LIMIT ?`),
-        dirtyMetric=this.db.prepare('UPDATE wh_metrics SET coordination_dirty=1 WHERE chain=? AND address=?'),
+        dirtyMetric=this.db.prepare('UPDATE wh_metrics SET coordination_dirty=1 WHERE chain=? AND address=? AND coordination_dirty<>1'),
         enqueueWallet=this.db.prepare(`INSERT OR IGNORE INTO wh_association_invalidations(kind,chain,address,enqueued_at)
           VALUES ('funding_wallet',?,?,?)`),
-        dirtyAnchor=this.db.prepare('UPDATE wh_assoc_anchors SET dirty=1 WHERE chain=? AND leader=? AND token_address=?'),
-        dirtyRelation=this.db.prepare('UPDATE wh_assoc_relations SET dirty=1 WHERE chain=? AND leader=? AND candidate=?');
+        dirtyAnchor=this.db.prepare('UPDATE wh_assoc_anchors SET dirty=1 WHERE chain=? AND leader=? AND token_address=? AND dirty<>1'),
+        dirtyRelation=this.db.prepare('UPDATE wh_assoc_relations SET dirty=1 WHERE chain=? AND leader=? AND candidate=? AND dirty<>1');
       for(const row of rows) {
         if(budget<=0)break;
         if(row.kind==='funding_address'||row.kind==='public_service') {
@@ -775,17 +776,18 @@ export class WalletHistory {
   close():void {this.db.close();}
 
   /** Bounded background refresh; listing wallets never performs graph self-joins. */
-  refreshCoordination(limit=10,flushInvalidations=true):void {
-    if(flushInvalidations&&!this.prepareAssociationRefresh())return;
+  refreshCoordination(limit=10,flushInvalidations=true):number {
+    if(flushInvalidations&&!this.prepareAssociationRefresh())return 0;
     const n=Number.isSafeInteger(limit)?Math.max(1,Math.min(20,limit)):10;
     const dirty=this.db.prepare("SELECT chain,address FROM wh_metrics INDEXED BY wh_metrics_coord_queue WHERE coordination_dirty=1 ORDER BY COALESCE(coordination_checked_at,''),chain,address LIMIT ?").all(n);
     const updates=dirty.map(row=>({chain:row.chain as Chain,wallet:String(row.address),data:this.coordination(row.chain as Chain,String(row.address))}));
-    if(!updates.length) return;
+    if(!updates.length) return 0;
     this.append(updates,()=>{for(const update of updates) {
       const shared=new Set(update.data.sharedFunding.map(item=>item.wallet)).size,synced=new Set(update.data.synchronized.map(item=>item.wallet)).size;
       this.db.prepare('UPDATE wh_metrics SET coordination_score=?,coordination_data=?,coordination_checked_at=?,coordination_dirty=0 WHERE chain=? AND address=?')
         .run(Math.min(100,shared*10+synced*20),JSON.stringify(update.data),this.now().toISOString(),update.chain,update.wallet);
     }});
+    return updates.length;
   }
 
   private observed(value:string):string|undefined {const stamp=at(value);return stamp&&Date.parse(stamp)<=this.now().getTime()?stamp:undefined;}
@@ -812,7 +814,7 @@ export class WalletHistory {
     if(Number(inserted.changes)) {
       this.db.prepare('UPDATE wh_metrics SET event_count=event_count+1,buy_count=buy_count+?,sell_count=sell_count+?,coordination_dirty=1 WHERE chain=? AND address=?')
         .run(value.side==='buy'?1:0,value.side==='sell'?1:0,value.chain,value.wallet);
-      this.db.prepare('UPDATE wh_metrics SET coordination_dirty=1 WHERE chain=? AND address IN (SELECT wallet FROM wh_events WHERE chain=? AND token_address=? AND side=? AND event_at BETWEEN ? AND ?)')
+      this.db.prepare('UPDATE wh_metrics SET coordination_dirty=1 WHERE chain=? AND coordination_dirty<>1 AND address IN (SELECT wallet FROM wh_events WHERE chain=? AND token_address=? AND side=? AND event_at BETWEEN ? AND ?)')
         .run(value.chain,value.chain,value.tokenAddress,value.side,new Date(Date.parse(value.eventAt)-120_000).toISOString(),new Date(Date.parse(value.eventAt)+120_000).toISOString());
     }
     // Repeated polling from one source is one observation; a second source or

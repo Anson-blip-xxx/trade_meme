@@ -65,9 +65,18 @@ test('parent holding the shared orders write lock for 2 seconds cannot stall chi
 
 test('stale child blocks entries without killing it; actual crash restarts under the same exclusive lock',async t=>{
   const f=fixture(t,{snapshotStaleMs:100});f.host.start();await until(()=>f.host.readiness().ready);
+  const initiallyReady=f.host.status().process;
+  assert.ok(initiallyReady.lastRecoveredAt);assert.ok(initiallyReady.readinessTransitions>=2);
   const child=f.children[0];child.kill('SIGSTOP');await pause(200);
   assert.equal(f.host.readiness().reason,'NATIVE_WORKER_SNAPSHOT_STALE');assert.equal(f.children.length,1);
-  child.kill('SIGCONT');await until(()=>f.host.readiness().ready);child.kill('SIGKILL');
+  const stale=f.host.status().process;
+  assert.equal(stale.lastFalseReason,'NATIVE_WORKER_SNAPSHOT_STALE');assert.ok(stale.lastFalseAt);
+  assert.ok(stale.maxSnapshotAgeMs>=100);assert.equal(stale.lastRecoveredAt,initiallyReady.lastRecoveredAt);
+  child.kill('SIGCONT');await until(()=>f.host.readiness().ready);
+  const recovered=f.host.status().process;
+  assert.ok(recovered.lastRecoveredAt!>stale.lastFalseAt!);assert.ok(recovered.lastFalseDurationMs!>=0);
+  assert.equal(recovered.lastFalseReason,'NATIVE_WORKER_SNAPSHOT_STALE');assert.ok(recovered.readinessTransitions>stale.readinessTransitions);
+  child.kill('SIGKILL');
   await until(()=>f.children.length>=2);await until(()=>f.host.readiness().ready);assert.notEqual(f.host.status().process.pid,child.pid);
 });
 

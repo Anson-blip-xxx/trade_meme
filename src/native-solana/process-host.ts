@@ -10,6 +10,7 @@ import {NativeProcessStore} from './process-store.js';
 import {isProtocolMessage,safeProcessError,type NativeParentMessage,type NativeWorkerMessage,type NativeWorkerSnapshot} from './process-protocol.js';
 
 interface Pending {resolve:(value:any)=>void;reject:(error:Error)=>void;timer:ReturnType<typeof setTimeout>;guard?:()=>Promise<void>;guardStarted?:boolean;}
+interface ReadinessObservation {ready:boolean;reason?:string;changedAt:number;}
 export interface NativeProcessOptions {
   /** Main-process observers read the authoritative shared order ledger after this callback. */
   onOrderUpdate?:(order:OpeningOrder)=>void|Promise<void>;
@@ -23,6 +24,9 @@ export class ProcessNativeTradingRuntime {
   private store:NativeProcessStore;private child?:ChildProcess;private running=false;private stopping?:Promise<void>;
   private snapshot?:NativeWorkerSnapshot;private snapshots=new Map<string,NativePositionState>();
   private pending=new Map<string,Pending>();private error?:string;private retry?:ReturnType<typeof setTimeout>;
+  private readinessObservation?:ReadinessObservation;private readinessTransitions=0;
+  private lastFalseReason?:string;private lastFalseAt?:number;private lastRecoveredAt?:number;private lastFalseDurationMs?:number;
+  private maxSnapshotAgeMs=0;
   private readonly storePath:string;private readonly staleMs:number;private readonly guardMs:number;private readonly requestMs:number;
   private readonly pendingLimit:number;
   constructor(private config:Config,private orders:OrderStore,private enqueue:(event:TradeNotificationEvent)=>boolean,
@@ -35,7 +39,7 @@ export class ProcessNativeTradingRuntime {
       options.restartDelayMs!==undefined&&(!Number.isSafeInteger(options.restartDelayMs)||options.restartDelayMs<10||options.restartDelayMs>60000))throw Error('NATIVE_PROCESS_OPTIONS_INVALID');
     this.storePath=config.nativeSolana.positionsPath+'.process.sqlite';this.store=new NativeProcessStore(this.storePath);
   }
-  start(){if(this.running||this.stopping)return;this.running=true;this.launch();}
+  start(){if(this.running||this.stopping)return;this.running=true;this.launch();this.readiness();}
   private scheduleRestart(){
     if(!this.running||this.child)return;clearTimeout(this.retry);
     this.retry=setTimeout(()=>this.launch(),this.options.restartDelayMs??1000);this.retry.unref();
@@ -50,22 +54,22 @@ export class ProcessNativeTradingRuntime {
         ['--nonblock','--no-fork',this.storePath+'.lock',process.execPath,...execArgs],
         {cwd:process.cwd(),env:process.env,stdio:['ignore','ignore','ignore','ipc'],serialization:'advanced'});
       this.child=child;this.snapshot=undefined;this.error=undefined;
-      child.on('message',message=>{if(this.child===child)void this.receive(message).catch(()=>{this.error='NATIVE_WORKER_IPC_FAILED';});});
+      child.on('message',message=>{if(this.child===child)void this.receive(message).catch(()=>{this.error='NATIVE_WORKER_IPC_FAILED';this.readiness();});});
       const exited=(reason:string)=>{
         if(this.child!==child)return;this.child=undefined;this.snapshot=undefined;this.error=reason;
         for(const pending of this.pending.values()){clearTimeout(pending.timer);pending.reject(Error(reason));}this.pending.clear();
-        this.scheduleRestart();
+        this.readiness();this.scheduleRestart();
       };
-      child.once('error',()=>{this.error='NATIVE_WORKER_START_FAILED';if(!child.pid)exited('NATIVE_WORKER_START_FAILED');});
+      child.once('error',()=>{this.error='NATIVE_WORKER_START_FAILED';this.readiness();if(!child.pid)exited('NATIVE_WORKER_START_FAILED');});
       child.once('exit',()=>exited('NATIVE_WORKER_EXITED'));
       this.send({kind:'init',storePath:this.storePath,guardTimeoutMs:this.guardMs,config:{
         nativeSolana:this.config.nativeSolana,entryWallets:this.config.entryWallets,entrySlippagePct:this.config.entrySlippagePct,
         ordersDatabase:this.config.ordersDatabase,summaryIntervalMs:this.config.telegram?.summaryIntervalMs}});
-    }catch{this.error='NATIVE_WORKER_START_FAILED';this.scheduleRestart();}
+    }catch{this.error='NATIVE_WORKER_START_FAILED';this.readiness();this.scheduleRestart();}
   }
   private send(message:NativeParentMessage):boolean{
     if(!this.child?.connected)return false;
-    try{this.child.send(message,error=>{if(error)this.error='NATIVE_WORKER_IPC_FAILED';});return true;}catch{return false;}
+    try{this.child.send(message,error=>{if(error){this.error='NATIVE_WORKER_IPC_FAILED';this.readiness();}});return true;}catch{return false;}
   }
   private async receive(raw:unknown){
     if(!isProtocolMessage(raw))return;const message=raw as NativeWorkerMessage;
@@ -77,6 +81,7 @@ export class ProcessNativeTradingRuntime {
         if(this.snapshots.size>1000)for(const [id,p] of this.snapshots){if(p.state==='closed')this.snapshots.delete(id);if(this.snapshots.size<=1000)break;}
         this.error=undefined;
       }
+      this.readiness();
       this.send({kind:'snapshot_ack',sequence:value.sequence});return;
     }
     if(message.kind==='result'){
@@ -99,18 +104,39 @@ export class ProcessNativeTradingRuntime {
       try{const order=this.orders.get(message.orderId);if(order)await this.options.onOrderUpdate?.(order);
         this.send({kind:'order_ack',orderId:message.orderId,version:message.version});}catch{}return;
     }
-    if(message.kind==='fatal')this.error=safeProcessError(new Error(message.error));
+    if(message.kind==='fatal'){this.error=safeProcessError(new Error(message.error));this.readiness();}
   }
   readiness():{ready:boolean;reason?:string}{
-    if(!this.running)return {ready:false,reason:'NATIVE_PROTECTION_STOPPED'};
-    if(this.error)return {ready:false,reason:this.error};
-    if(!this.child?.connected||!this.snapshot)return {ready:false,reason:'NATIVE_WORKER_STARTING'};
-    if(Date.now()-this.snapshot.at>this.staleMs||this.snapshot.at>Date.now()+1000)return {ready:false,reason:'NATIVE_WORKER_SNAPSHOT_STALE'};
-    return this.snapshot.status.readiness;
+    const now=Date.now(),age=this.snapshot?Math.max(0,now-this.snapshot.at):undefined;
+    if(age!==undefined)this.maxSnapshotAgeMs=Math.max(this.maxSnapshotAgeMs,age);
+    const result=!this.running?{ready:false as const,reason:'NATIVE_PROTECTION_STOPPED'}:
+      this.error?{ready:false as const,reason:this.error}:
+      !this.child?.connected||!this.snapshot?{ready:false as const,reason:'NATIVE_WORKER_STARTING'}:
+      now-this.snapshot.at>this.staleMs||this.snapshot.at>now+1000?{ready:false as const,reason:'NATIVE_WORKER_SNAPSHOT_STALE'}:
+      this.snapshot.status.readiness;
+    this.observeReadiness(result,now);return result;
   }
-  status(){return {...(this.snapshot?.status??{provider:'pump_native',running:false}),readiness:this.readiness(),
+  private observeReadiness(value:{ready:boolean;reason?:string},now:number):void{
+    const previous=this.readinessObservation;
+    if(previous&&previous.ready===value.ready&&previous.reason===value.reason)return;
+    this.readinessTransitions++;
+    if(value.ready){
+      if(previous&&!previous.ready){this.lastRecoveredAt=now;this.lastFalseDurationMs=Math.max(0,now-(this.lastFalseAt??previous.changedAt));}
+    }else{
+      if(!previous||previous.ready)this.lastFalseAt=now;
+      this.lastFalseReason=value.reason??'NATIVE_WORKER_UNAVAILABLE';
+    }
+    this.readinessObservation={...value,changedAt:now};
+  }
+  status(){const readiness=this.readiness(),snapshotAgeMs=this.snapshot?Math.max(0,Date.now()-this.snapshot.at):undefined;
+    if(snapshotAgeMs!==undefined)this.maxSnapshotAgeMs=Math.max(this.maxSnapshotAgeMs,snapshotAgeMs);
+    return {...(this.snapshot?.status??{provider:'pump_native',running:false}),readiness,
     process:{isolated:true,pid:this.snapshot?.pid,connected:!!this.child?.connected,snapshotAt:this.snapshot?new Date(this.snapshot.at).toISOString():undefined,
-      snapshotAgeMs:this.snapshot?Math.max(0,Date.now()-this.snapshot.at):undefined,error:this.error}};}
+      snapshotAgeMs,maxSnapshotAgeMs:this.maxSnapshotAgeMs,readinessTransitions:this.readinessTransitions,
+      lastReadinessTransitionAt:this.readinessObservation?new Date(this.readinessObservation.changedAt).toISOString():undefined,
+      lastFalseReason:this.lastFalseReason,lastFalseAt:this.lastFalseAt?new Date(this.lastFalseAt).toISOString():undefined,
+      lastRecoveredAt:this.lastRecoveredAt?new Date(this.lastRecoveredAt).toISOString():undefined,
+      lastFalseDurationMs:this.lastFalseDurationMs,error:this.error}};}
   get(orderId:string){const p=this.snapshots.get(orderId);return p?structuredClone(p):undefined;}
   isClosed(orderId:string){return this.snapshots.get(orderId)?.state==='closed'||!!this.orders.get(orderId)?.exit?.positionClosed;}
   ownsAction(ref:string){return !!this.store.action(ref);}
@@ -145,7 +171,7 @@ export class ProcessNativeTradingRuntime {
     }
   }
   async stop(){
-    if(this.stopping)return this.stopping;this.running=false;clearTimeout(this.retry);
+    if(this.stopping)return this.stopping;this.running=false;this.readiness();clearTimeout(this.retry);
     this.stopping=(async()=>{
       const child=this.child;
       if(child&&child.exitCode===null){this.send({kind:'stop'});await new Promise<void>(resolve=>{

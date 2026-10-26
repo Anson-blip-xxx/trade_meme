@@ -41,7 +41,7 @@ type Write=(evidence:unknown,fn:()=>unknown)=>void;
 const hash=(value:unknown)=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const LEAD_SECONDS=86400;
 export const WALLET_ASSOCIATION_INVALIDATION_SQL={
-  fundingAnchors:`UPDATE wh_assoc_anchors SET dirty=1 WHERE rowid IN (
+  fundingAnchors:`UPDATE wh_assoc_anchors SET dirty=1 WHERE dirty<>1 AND rowid IN (
     SELECT a.rowid
     FROM json_each(?) w
     CROSS JOIN wh_assoc_anchors a INDEXED BY sqlite_autoindex_wh_assoc_anchors_1
@@ -53,7 +53,7 @@ export const WALLET_ASSOCIATION_INVALIDATION_SQL={
     CROSS JOIN wh_assoc_anchors a INDEXED BY sqlite_autoindex_wh_assoc_anchors_1
     WHERE e.chain=? AND e.candidate=w.value AND e.active=1
       AND a.chain=e.chain AND a.leader=e.leader AND a.token_address=e.token_address)`,
-  fundingRelations:`UPDATE wh_assoc_relations SET dirty=1 WHERE rowid IN (
+  fundingRelations:`UPDATE wh_assoc_relations SET dirty=1 WHERE dirty<>1 AND rowid IN (
     SELECT r.rowid
     FROM json_each(?) w
     CROSS JOIN wh_assoc_relations r INDEXED BY sqlite_autoindex_wh_assoc_relations_1
@@ -69,7 +69,7 @@ export const WALLET_ASSOCIATION_INVALIDATION_SQL={
     CROSS JOIN wh_funding f INDEXED BY wh_funding_address
     WHERE f.chain=? AND f.funding_address=s.value
   )
-  UPDATE wh_assoc_relations SET dirty=1 WHERE rowid IN (
+  UPDATE wh_assoc_relations SET dirty=1 WHERE dirty<>1 AND rowid IN (
     SELECT r.rowid
     FROM recipients w
     CROSS JOIN wh_assoc_relations r INDEXED BY sqlite_autoindex_wh_assoc_relations_1
@@ -85,7 +85,7 @@ export const WALLET_ASSOCIATION_INVALIDATION_SQL={
     CROSS JOIN wh_funding f INDEXED BY wh_funding_address
     WHERE f.chain=? AND f.funding_address=s.value
   )
-  UPDATE wh_assoc_anchors SET dirty=1 WHERE rowid IN (
+  UPDATE wh_assoc_anchors SET dirty=1 WHERE dirty<>1 AND rowid IN (
     SELECT a.rowid
     FROM recipients w
     CROSS JOIN wh_assoc_anchors a INDEXED BY sqlite_autoindex_wh_assoc_anchors_1
@@ -146,13 +146,13 @@ export class WalletAssociations {
         VALUES (?,?,?,?) ON CONFLICT(chain,leader,token_address) DO UPDATE SET public_observed_at=MIN(public_observed_at,excluded.public_observed_at),dirty=1`)
         .run(value.chain,value.wallet,value.tokenAddress,value.observedAt);
       if(!alreadyPublic) {
-        this.db.prepare(`UPDATE wh_assoc_anchors SET dirty=1 WHERE chain=? AND (leader,token_address) IN
+        this.db.prepare(`UPDATE wh_assoc_anchors SET dirty=1 WHERE chain=? AND dirty<>1 AND (leader,token_address) IN
           (SELECT leader,token_address FROM wh_assoc_episodes WHERE chain=? AND candidate=? AND active=1)`).run(value.chain,value.chain,value.wallet);
-        this.db.prepare('UPDATE wh_assoc_relations SET dirty=1 WHERE chain=? AND candidate=?').run(value.chain,value.wallet);
+        this.db.prepare('UPDATE wh_assoc_relations SET dirty=1 WHERE chain=? AND candidate=? AND dirty<>1').run(value.chain,value.wallet);
       }
     }
-    this.db.prepare('UPDATE wh_assoc_anchors SET dirty=1 WHERE chain=? AND token_address=?').run(value.chain,value.tokenAddress);
-    this.db.prepare(`UPDATE wh_assoc_relations SET dirty=1 WHERE chain=? AND (leader,candidate) IN
+    this.db.prepare('UPDATE wh_assoc_anchors SET dirty=1 WHERE chain=? AND token_address=? AND dirty<>1').run(value.chain,value.tokenAddress);
+    this.db.prepare(`UPDATE wh_assoc_relations SET dirty=1 WHERE chain=? AND dirty<>1 AND (leader,candidate) IN
       (SELECT leader,candidate FROM wh_assoc_episodes WHERE chain=? AND token_address=? AND active=1)`).run(value.chain,value.chain,value.tokenAddress);
   }
   fundingChanged(chain:Chain,wallet:string):void {
@@ -178,7 +178,7 @@ export class WalletAssociations {
     }
   }
 
-  refresh(limit=3):void {
+  refresh(limit=3):{indexed:number;refreshed:number} {
     const n=Number.isSafeInteger(limit)?Math.max(1,Math.min(5,limit)):3;
     const cursor=Number(this.db.prepare("SELECT value FROM wh_meta WHERE key='association_cursor'").get()?.value??0);
     // Only the indexed KOL source is scanned; existing raw history is never rewritten.
@@ -189,7 +189,8 @@ export class WalletAssociations {
       this.db.prepare("UPDATE wh_meta SET value=CAST(value AS INTEGER)+? WHERE key='association_indexed_count'").run(indexed.length);
     });
     const anchors=this.db.prepare(`SELECT * FROM wh_assoc_anchors WHERE dirty=1 ORDER BY COALESCE(checked_at,''),public_observed_at,chain,leader,token_address LIMIT ?`).all(n);
-    for(const anchor of anchors) this.refreshAnchor(anchor);
+    let refreshed=0;for(const anchor of anchors)if(this.refreshAnchor(anchor))refreshed++;
+    return {indexed:indexed.length,refreshed};
   }
 
   list(options:WalletAssociationListOptions={}):{items:WalletAssociationSummary[];total:number} {
@@ -257,10 +258,17 @@ export class WalletAssociations {
     });
   }
 
-  private refreshAnchor(anchor:Row):void {
+  private refreshAnchor(anchor:Row):boolean {
     const chain=anchor.chain as Chain,leader=String(anchor.leader),token=String(anchor.token_address),now=this.now().toISOString();
     const leaderRow=this.db.prepare("SELECT * FROM wh_events WHERE chain=? AND wallet=? AND token_address=? AND side='buy' ORDER BY event_at,id LIMIT 1").get(chain,leader,token);
-    if(!leaderRow) return;
+    if(!leaderRow) {
+      // This is a derived orphan, not raw evidence. Mark it checked so one bad
+      // legacy row cannot starve every later anchor; a future retained KOL buy
+      // runs recordTrade() and makes the same anchor dirty again.
+      this.write(anchor,()=>this.db.prepare(`UPDATE wh_assoc_anchors SET dirty=0,checked_at=?
+        WHERE chain=? AND leader=? AND token_address=? AND dirty=1`).run(now,chain,leader,token));
+      return true;
+    }
     const leaderBuy=event(leaderRow),leaderUsable=leaderBuy.eventAt<=now&&leaderBuy.observedAt<=now&&!this.timestampConflict(leaderBuy.eventId,leaderBuy.eventAt);
     const start=new Date(Date.parse(leaderBuy.eventAt)-LEAD_SECONDS*1000).toISOString();
     const candidates=leaderUsable?this.db.prepare(`SELECT e.* FROM wh_events e WHERE e.chain=? AND e.token_address=? AND e.side='buy' AND e.event_at>=? AND e.event_at<?
@@ -294,6 +302,7 @@ export class WalletAssociations {
       for(const candidate of new Set([...priorCandidates,...byWallet.keys()])) this.refreshRelation(chain,leader,candidate,now);
       this.db.prepare("UPDATE wh_meta SET value=? WHERE key='association_refreshed_at'").run(now);
     });
+    return true;
   }
   private refreshRelation(chain:Chain,leader:string,candidate:string,now:string):void {
     const old=this.db.prepare('SELECT first_at,token_count,active_since FROM wh_assoc_relations WHERE chain=? AND leader=? AND candidate=?').get(chain,leader,candidate);

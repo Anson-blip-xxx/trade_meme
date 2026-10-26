@@ -1,6 +1,7 @@
 import {parentPort,workerData} from 'node:worker_threads';
 import {performance} from 'node:perf_hooks';
 import {WalletHistory} from './wallet-history.js';
+import {walletIndexNextDelay} from './wallet-index-policy.js';
 
 interface Options {
   database:string;
@@ -28,7 +29,7 @@ const run=async()=>{
   parentPort!.postMessage({type:'working',at:attemptedAt});
 
   let invalidationError:string|undefined,coordinationError:string|undefined,associationError:string|undefined;
-  let invalidationMs=0,invalidationProcessed=0,coordinationMs=0,associationMs=0;
+  let invalidationMs=0,invalidationProcessed=0,coordinationMs=0,coordinationProcessed=0,associationMs=0,associationProcessed=0;
   // Short transactions release SQLite's single writer lock between batches,
   // giving live evidence capture a chance to commit without a long busy wait.
   for(let index=0;index<16&&!stopping;index++){
@@ -46,26 +47,23 @@ const run=async()=>{
   // whole coalesced queue has drained.
   if(invalidationPending>0) {
     parentPort!.postMessage({type:'status',status:{invalidationMs,invalidationProcessed,invalidationPending,invalidationError,
-      coordinationMs,associationMs,coordinationError,associationError,completedAt:new Date().toISOString()}});
-    // A persistent SQLite failure must not become a 10 Hz retry storm.
-    schedule(invalidationError?options.intervalMs:Math.min(options.intervalMs,100));return;
+      coordinationMs,coordinationProcessed,associationMs,associationProcessed,coordinationError,associationError,completedAt:new Date().toISOString()}});
+    schedule(walletIndexNextDelay(options.intervalMs,{invalidationPending,processed:invalidationProcessed}));return;
   }
-  for(let index=0;index<options.coordinationQuota;index++){
-    const started=performance.now();
-    try {history.refreshCoordination(1,false);}
-    catch {coordinationError='WALLET_COORDINATION_REFRESH_FAILED';}
-    coordinationMs=elapsed(started);
-  }
+  // Commit the complete quota together. The former one-row loop repeatedly
+  // checkpointed the same large wallet indexes during every worker cycle.
+  let started=performance.now();
+  try {coordinationProcessed=history.refreshCoordination(options.coordinationQuota,false);}
+  catch {coordinationError='WALLET_COORDINATION_REFRESH_FAILED';}
+  coordinationMs=elapsed(started);
 
   // Give stop messages a boundary between the two independent maintenance jobs.
   await new Promise<void>(resolve=>setImmediate(resolve));
   if(stopping)return;
-  for(let index=0;index<options.associationQuota;index++){
-    const started=performance.now();
-    try {history.refreshAssociations(1,false);}
-    catch {associationError='WALLET_ASSOCIATION_REFRESH_FAILED';}
-    associationMs=elapsed(started);
-  }
+  started=performance.now();
+  try {associationProcessed=history.refreshAssociations(options.associationQuota,false);}
+  catch {associationError='WALLET_ASSOCIATION_REFRESH_FAILED';}
+  associationMs=elapsed(started);
 
   // Exact relationship totals scan large derived indexes. Compute them here,
   // never in the dashboard request loop, and retain the previous parent-side
@@ -77,10 +75,11 @@ const run=async()=>{
   }
 
   parentPort!.postMessage({type:'status',status:{invalidationMs,invalidationProcessed,invalidationPending,invalidationError,
-    coordinationMs,associationMs,associationStats,associationStatsMs,
+    coordinationMs,coordinationProcessed,associationMs,associationProcessed,associationStats,associationStatsMs,
     ...(associationStatsAt?{associationStatsRefreshedAt:new Date(associationStatsAt).toISOString()}:{}),coordinationError,associationError,
     completedAt:new Date().toISOString()}});
-  schedule(options.intervalMs);
+  const processed=invalidationProcessed+coordinationProcessed+associationProcessed;
+  schedule(walletIndexNextDelay(options.intervalMs,{invalidationPending,processed}));
 };
 
 parentPort!.on('message',message=>{

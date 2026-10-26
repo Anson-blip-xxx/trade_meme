@@ -19,7 +19,9 @@ export interface WalletIndexSnapshot {
   invalidationPending:number;
   invalidationError?:string;
   coordinationMs:number;
+  coordinationProcessed:number;
   associationMs:number;
+  associationProcessed:number;
   associationStats?:WalletAssociationStats;
   associationStatsMs:number;
   associationStatsRefreshedAt?:string;
@@ -48,7 +50,9 @@ export class WalletIndexRunner {
   private invalidationPending=0;
   private invalidationError?:string;
   private coordinationMs=0;
+  private coordinationProcessed=0;
   private associationMs=0;
+  private associationProcessed=0;
   private coordinationError?:string;
   private associationError?:string;
   private associationStats?:WalletAssociationStats;
@@ -59,7 +63,7 @@ export class WalletIndexRunner {
   private completedAt?:string;
 
   constructor(private readonly options:WalletIndexRunnerOptions) {
-    this.intervalMs=options.intervalMs??10_000;
+    this.intervalMs=options.intervalMs??30_000;
     this.coordinationQuota=options.coordinationQuota??10;
     this.associationQuota=options.associationQuota??3;
     if(!Number.isSafeInteger(options.maxBytes)||options.maxBytes<16_384||
@@ -74,7 +78,8 @@ export class WalletIndexRunner {
       invalidationMs:this.invalidationMs,invalidationProcessed:this.invalidationProcessed,
       invalidationPending:this.invalidationPending,
       ...(this.invalidationError?{invalidationError:this.invalidationError}:{}),
-      coordinationMs:this.coordinationMs,associationMs:this.associationMs,associationStats:this.associationStats,
+      coordinationMs:this.coordinationMs,coordinationProcessed:this.coordinationProcessed,
+      associationMs:this.associationMs,associationProcessed:this.associationProcessed,associationStats:this.associationStats,
       associationStatsMs:this.associationStatsMs,associationStatsRefreshedAt:this.associationStatsRefreshedAt,
       ...(this.coordinationError?{coordinationError:this.coordinationError}:{}),
       ...(this.associationError?{associationError:this.associationError}:{}),
@@ -113,7 +118,9 @@ export class WalletIndexRunner {
           this.invalidationPending=Number.isSafeInteger(status.invalidationPending)&&status.invalidationPending!>=0?status.invalidationPending!:0;
           this.invalidationError=status.invalidationError==='WALLET_ASSOCIATION_INVALIDATION_FAILED'?status.invalidationError:undefined;
           this.coordinationMs=Number.isSafeInteger(status.coordinationMs)&&status.coordinationMs!>=0?status.coordinationMs!:0;
+          this.coordinationProcessed=Number.isSafeInteger(status.coordinationProcessed)&&status.coordinationProcessed!>=0?status.coordinationProcessed!:0;
           this.associationMs=Number.isSafeInteger(status.associationMs)&&status.associationMs!>=0?status.associationMs!:0;
+          this.associationProcessed=Number.isSafeInteger(status.associationProcessed)&&status.associationProcessed!>=0?status.associationProcessed!:0;
           if(status.associationStats)this.associationStats=status.associationStats;
           this.associationStatsMs=Number.isSafeInteger(status.associationStatsMs)&&status.associationStatsMs!>=0?status.associationStatsMs!:0;
           if(typeof status.associationStatsRefreshedAt==='string')this.associationStatsRefreshedAt=status.associationStatsRefreshedAt;

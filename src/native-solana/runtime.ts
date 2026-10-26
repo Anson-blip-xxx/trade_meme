@@ -1,5 +1,4 @@
 import {Connection,PublicKey} from '@solana/web3.js';
-import {TOKEN_PROGRAM_ID,TOKEN_2022_PROGRAM_ID} from '@solana/spl-token';
 import {DatabaseSync} from 'node:sqlite';
 import {mkdirSync,chmodSync} from 'node:fs';
 import {dirname} from 'node:path';
@@ -219,11 +218,16 @@ export class NativeTradingRuntime {
       if(!this.ownerVerified){if(await this.ownerConnection.getGenesisHash()!=='5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d')throw Error('NATIVE_INVENTORY_WRONG_CHAIN');this.ownerVerified=true;}
       const wallet=new PublicKey(this.config.entryWallets.solana!);
       const floor=Math.max(0,...[...this.mintOrders.values()].map(id=>this.positions.get(id)?.buy.buySlot??0));
-      for(const programId of [TOKEN_PROGRAM_ID,TOKEN_2022_PROGRAM_ID]){
-        const snapshot=await this.ownerConnection.getTokenAccountsByOwner(wallet,{programId},{commitment:'confirmed',minContextSlot:floor});
-        if(!this.running||generation!==this.cacheGeneration)return;
-        this.inventory.install(programId.toBase58(),snapshot.context.slot,snapshot.value,Date.now());
+      const programs=this.inventory.programsNeedingRefresh().map(program=>new PublicKey(program));
+      const snapshots=await Promise.allSettled(programs.map(programId=>
+        this.ownerConnection.getTokenAccountsByOwner(wallet,{programId},{commitment:'confirmed',minContextSlot:floor})));
+      if(!this.running||generation!==this.cacheGeneration)return;
+      let failed=false;
+      for(let i=0;i<snapshots.length;i++){
+        const snapshot=snapshots[i];if(snapshot.status==='rejected'){failed=true;continue;}
+        this.inventory.install(programs[i].toBase58(),snapshot.value.context.slot,snapshot.value.value,Date.now());
       }
+      if(failed||this.inventory.programsNeedingRefresh().length)throw Error('NATIVE_INVENTORY_RPC_UNAVAILABLE');
       this.inventoryError=undefined;
       for(const id of this.mintOrders.values())this.positions.markDirty(id);
     })().catch(()=>{this.inventoryError='NATIVE_INVENTORY_RPC_UNAVAILABLE';})

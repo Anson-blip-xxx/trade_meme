@@ -59,6 +59,12 @@ function validHash(value:unknown,chain:Chain):boolean {
   if(chain!=='solana') return /^0x[0-9a-fA-F]{64}$/.test(value);
   try {return bs58.decode(value).length===64;} catch {return false;}
 }
+function hasNativeDebitCoverage(order:OpeningOrder,funding:Pick<FundingSnapshot,'slot'|'blockNumber'>):boolean {
+  if(order.chain!=='solana'||!validHash(order.transactionHash,order.chain)||!Number.isSafeInteger(funding.slot)||Number(funding.slot)<0)return false;
+  const cache=order.details.nativeDebitCoverage;
+  return object(cache)&&cache.transactionHash===order.transactionHash&&Number.isSafeInteger(cache.slot)&&
+    Number(cache.slot)>=0&&Number(cache.slot)<=Number(funding.slot);
+}
 function validDirectClosure(order:OpeningOrder,evidence:unknown,now:Date):evidence is DirectSellClosureEvidence {
   if(order.mode!=='live'||order.status!=='confirmed'||order.chain!=='solana'||!validHash(order.transactionHash,'solana')||
     !object(evidence)||evidence.positionId!==order.id||typeof evidence.requestId!=='string'||
@@ -372,7 +378,8 @@ export class OrderStore {
       if(order.id===excludeId||!sameAddress(order.wallet,scope.wallet,scope.chain)||!sameAddress(order.inputToken,scope.inputToken,scope.chain)) continue;
       // An exit can close after a snapshot taken before this buy. Until the
       // controller proves inclusion, even closed confirmed buys retain their debit.
-      if(order.status==='confirmed'&&covered.has(order.id)&&validHash(order.transactionHash,order.chain)) continue;
+      if(order.status==='confirmed'&&validHash(order.transactionHash,order.chain)&&
+        (covered.has(order.id)||hasNativeDebitCoverage(order,funding))) continue;
       if(!atomicAmount(order.inputAmount,scope.chain)||order.inputAmount==='0') return;
       const stored=object(order.details.funding)?order.details.funding.feeReserve:undefined;
       if(stored!==undefined&&!atomicAmount(stored,scope.chain)) return;
@@ -415,10 +422,16 @@ export class OrderStore {
       .all(...args,limit,offset).map(row=>JSON.parse(String(row.details)) as OpeningOrder);
     return {items,total,limit,offset,hasMore:offset+items.length<total};
   }
-  /** All confirmed debits in a funding scope; UI pagination must never limit coverage checks. */
-  fundingOrders(scope:Pick<OpeningOrder,'chain'|'mode'|'wallet'|'inputToken'>):OpeningOrder[] {
-    return this.db.prepare("SELECT details FROM opening_orders WHERE mode=? AND chain=? AND status='confirmed' ORDER BY rowid ASC")
-      .all(scope.mode,scope.chain).map(row=>JSON.parse(String(row.details)) as OpeningOrder)
+  /** Confirmed debits not already proven inside this chain snapshot. Closed history remains relevant until covered. */
+  fundingOrders(scope:Pick<OpeningOrder,'chain'|'mode'|'wallet'|'inputToken'>,
+    funding?:Pick<FundingSnapshot,'slot'|'blockNumber'>):OpeningOrder[] {
+    const cached=funding&&scope.chain==='solana'&&Number.isSafeInteger(funding.slot)&&Number(funding.slot)>=0;
+    const sql=`SELECT details FROM opening_orders WHERE mode=? AND chain=? AND status='confirmed'${cached?`
+      AND NOT COALESCE(json_extract(details,'$.details.nativeDebitCoverage.transactionHash')=json_extract(details,'$.transactionHash')
+        AND json_type(details,'$.details.nativeDebitCoverage.slot')='integer'
+        AND json_extract(details,'$.details.nativeDebitCoverage.slot') BETWEEN 0 AND ?,0)`:''} ORDER BY rowid ASC`;
+    return this.db.prepare(sql)
+      .all(scope.mode,scope.chain,...(cached?[Number(funding!.slot)]:[])).map(row=>JSON.parse(String(row.details)) as OpeningOrder)
       .filter(order=>sameAddress(order.wallet,scope.wallet,scope.chain)&&sameAddress(order.inputToken,scope.inputToken,scope.chain));
   }
   pending():OpeningOrder[] {

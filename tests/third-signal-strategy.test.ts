@@ -244,6 +244,31 @@ test('entry holder-risk evidence survives restart and later status updates witho
   }finally{f.close();}
 });
 
+test('identical execution snapshots are no-op commits while status changes still persist',()=>{
+  const f=fixture(),mint='So11111111111111111111111111111111111111112';try {
+    const s=f.open();s.start('tg','live');for(let i=0;i<3;i++)s.observe(f.event({chain:'solana',address:mint}));
+    const candidate=s.candidates().items[0];assert.equal(s.claimDispatch(candidate),true);
+    const risk=assessEntryHolderRiskValues({provider:'gmgn',chain:'solana',address:mint,checkedAt:new Date(epoch).toISOString(),values:{
+      top10:{value:'0.1',sourceField:'security.top_10_holder_rate'},
+      bundler:{value:'0.2',sourceField:'holders.bundler.holding_ratio',coverage:'complete'},
+      ratTrader:{value:'0.15',sourceField:'holders.rat_trader.holding_ratio',coverage:'complete'},
+    }},new Date(epoch));
+    s.recordExecution(candidate,{status:'submitted',orderId:'order-1',holderRisk:risk});
+    const observer=new DatabaseSync(f.path,{readOnly:true});try {
+      const row=()=>observer.prepare('SELECT updated_at,execution_status,execution_holder_risk FROM third_signal_dispatch WHERE candidate_id=?')
+        .get(candidate.id)!;
+      const before=row(),version=Number(observer.prepare('PRAGMA data_version').get()!.data_version);f.advance(1000);
+      s.recordExecution(candidate,{status:'submitted',orderId:'order-1',holderRisk:{metrics:risk.metrics,reasons:risk.reasons,
+        status:risk.status,checkedAt:risk.checkedAt,address:risk.address,chain:risk.chain,provider:risk.provider}});
+      assert.deepEqual(row(),before);assert.equal(Number(observer.prepare('PRAGMA data_version').get()!.data_version),version);
+      f.advance(1000);s.recordExecution(candidate,{status:'confirmed',orderId:'order-1',holderRisk:risk});
+      const changed=row();assert.equal(changed.execution_status,'confirmed');assert.equal(changed.updated_at,f.now());
+      assert.notEqual(changed.updated_at,before.updated_at);
+      assert.ok(Number(observer.prepare('PRAGMA data_version').get()!.data_version)>version);
+    }finally{observer.close();}
+  }finally{f.close();}
+});
+
 test('legacy runs are migrated as simulation without upgrading or treating their claims as real buys',()=>{
   const f=fixture();try {
     let s=f.open();s.start();for(let i=0;i<3;i++)s.observe(f.event());s.close();

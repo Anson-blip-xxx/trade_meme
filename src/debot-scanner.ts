@@ -22,7 +22,11 @@ export interface DebotScannerOptions {
   mode?:'anonymous_poll'|'authenticated_stream';
   onSignal:(signal:Signal,observedAt:string,context?:{detailsReady:Promise<void>;repeat?:boolean})=>Promise<unknown>;shouldDefer?:()=>string|undefined;
   repeatCooldownSec?:number;
-  onObservation?:(observation:DebotSignalObservation)=>void;
+  /** Page-priority callback. When configured, the durable inbox forwards the
+   * whole page here before any notification/research persistence begins. */
+  onPriorityObservation?:(observation:DebotSignalObservation)=>void;
+  onPriorityObservations?:(observations:readonly DebotSignalObservation[])=>void;
+  onObservation?:(observation:DebotSignalObservation)=>unknown|Promise<unknown>;
   repeatEvidence?:(input:DebotRepeatEvidenceInput,signal:Signal)=>DebotRepeatEvidence;
   maxConcurrent?:number;parallelDetails?:boolean;
   lookupDisplay?:(reportId:string)=>{chain:Chain;address:string;name?:string;symbol?:string}|undefined;
@@ -37,9 +41,13 @@ export interface DebotSignalListOptions {
 }
 const SIGNAL_STATES=['pending','dispatching','completed','failed','interrupted','ignored'] as const;
 const STATUS_DB_FACTS_TTL_MS=5_000;
+const MAX_FAST_INBOX=200;
 interface StatusDbFacts {
   stored:number;pending:number;dispatched:number;ignored:number;failed:number;interrupted:number;
   lastObservedAt?:string;detailsReceived:number;detailsFailed:number;lastAnalysisQueueDelayMs?:number;
+}
+interface FastInboxRow {
+  id:string;chain:Chain;address:string;observed_at:string;payload:string;forwarded:number;research_forwarded:number;
 }
 const TOKEN_SUMMARY_COLUMNS=`chain,address,latest_observed_at,latest_observed_count,latest_seq,analysis_count,
   display_id,display_state,display_priority,display_observed_at,display_seq,
@@ -154,6 +162,9 @@ export class DebotScanner {
   private cursor=0;
   private timer?:ReturnType<typeof setTimeout>;
   private dispatchTimer?:ReturnType<typeof setTimeout>;
+  private inboxRecoveryTimer?:ReturnType<typeof setTimeout>;
+  private inboxRecoveryImmediate?:ReturnType<typeof setImmediate>;
+  private recoveringInbox=false;private inboxRecoveryWork?:Promise<void>;
   private collecting?:Promise<void>;
   private dispatching?:Promise<void>;
   private readonly workers=new Set<Promise<void>>();
@@ -193,15 +204,23 @@ export class DebotScanner {
       CREATE INDEX IF NOT EXISTS debot_signals_queue ON debot_signals(state,occurred_at);
       CREATE INDEX IF NOT EXISTS debot_signals_observed ON debot_signals(observed_at);
       CREATE TABLE IF NOT EXISTS review_retention_watermarks(source TEXT PRIMARY KEY,pruned_through TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS debot_observation_inbox (
+        id TEXT PRIMARY KEY,chain TEXT NOT NULL,address TEXT NOT NULL,observed_at TEXT NOT NULL,
+        payload TEXT NOT NULL,forwarded INTEGER NOT NULL DEFAULT 0 CHECK(forwarded IN (0,1)),
+        research_forwarded INTEGER NOT NULL DEFAULT 0 CHECK(research_forwarded IN (0,1))
+      );
       CREATE TRIGGER IF NOT EXISTS debot_review_retention AFTER DELETE ON debot_signals BEGIN
         INSERT INTO review_retention_watermarks(source,pruned_through) VALUES('debot',OLD.observed_at)
           ON CONFLICT(source) DO UPDATE SET pruned_through=MAX(pruned_through,excluded.pruned_through);
       END;
       UPDATE debot_signals SET state='interrupted',reason='DEBOT_SIGNAL_INTERRUPTED' WHERE state='dispatching';`);
     const columns=new Set(this.db.prepare('PRAGMA table_info(debot_signals)').all().map(row=>String(row.name)));
+    const inboxColumns=new Set(this.db.prepare('PRAGMA table_info(debot_observation_inbox)').all().map(row=>String(row.name)));
+    if(!inboxColumns.has('research_forwarded'))this.db.exec('ALTER TABLE debot_observation_inbox ADD COLUMN research_forwarded INTEGER NOT NULL DEFAULT 0 CHECK(research_forwarded IN (0,1))');
     if(!columns.has('details'))this.db.exec('ALTER TABLE debot_signals ADD COLUMN details TEXT');
     if(!columns.has('details_error'))this.db.exec('ALTER TABLE debot_signals ADD COLUMN details_error TEXT');
     for(const column of ['report_id','progress','verdict','dedup_key','token_name','token_symbol'])if(!columns.has(column))this.db.exec(`ALTER TABLE debot_signals ADD COLUMN ${column} TEXT`);
+    if(!columns.has('observation_payload_hash'))this.db.exec('ALTER TABLE debot_signals ADD COLUMN observation_payload_hash TEXT');
     this.db.exec('CREATE INDEX IF NOT EXISTS debot_signals_dedup ON debot_signals(dedup_key)');
     this.db.exec('CREATE INDEX IF NOT EXISTS debot_signals_token ON debot_signals(chain,address)');
     for(const column of ['notification_key','hint_kind','review_after','probed_at','evidence_cutoff_at','merged_payloads','risk_checked_at','analysis_occurred_at','review_wallets'])
@@ -218,11 +237,16 @@ export class DebotScanner {
       CREATE INDEX IF NOT EXISTS debot_signals_dispatching_token ON debot_signals(chain,address) WHERE state='dispatching';
       CREATE INDEX IF NOT EXISTS debot_signals_analyzed_token ON debot_signals(chain,address,dispatched_at DESC) WHERE analyzed=1;
       CREATE INDEX IF NOT EXISTS debot_signals_token_observed ON debot_signals(chain,address,observed_at DESC);
-      CREATE INDEX IF NOT EXISTS debot_signals_dispatched_latest ON debot_signals(dispatched_at DESC) WHERE dispatched_at IS NOT NULL;`);
+      CREATE INDEX IF NOT EXISTS debot_signals_dispatched_latest ON debot_signals(dispatched_at DESC) WHERE dispatched_at IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS debot_signals_details_present ON debot_signals(id) WHERE details IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS debot_signals_details_error_present ON debot_signals(id) WHERE details_error IS NOT NULL;`);
     this.initializeTokenSummary();
     const chainSlots=this.chains.map(()=>'?').join(',');
-    this.pendingProbe=this.db.prepare(`SELECT 1 FROM debot_signals INDEXED BY debot_signals_pending_chain WHERE state='pending' AND chain IN (${chainSlots}) LIMIT 1`);
+    this.pendingProbe=this.db.prepare(`SELECT 1 FROM debot_signals AS p INDEXED BY debot_signals_pending_chain
+      WHERE state='pending' AND chain IN (${chainSlots})
+      AND NOT EXISTS (SELECT 1 FROM debot_observation_inbox i WHERE i.id=p.id) LIMIT 1`);
     this.pendingSelector=this.db.prepare(`SELECT * FROM debot_signals AS p INDEXED BY debot_signals_pending_dispatch WHERE state='pending' AND p.chain IN (${chainSlots}) AND (review_after IS NULL OR review_after<=?)
+      AND NOT EXISTS (SELECT 1 FROM debot_observation_inbox i WHERE i.id=p.id)
       AND NOT EXISTS (SELECT 1 FROM debot_signals a WHERE a.state='dispatching' AND a.chain=p.chain AND a.address=p.address)
       ORDER BY review_priority DESC,CASE WHEN NOT EXISTS (SELECT 1 FROM debot_signals b WHERE b.chain=p.chain AND b.address=p.address AND b.analyzed=1) THEN 0 ELSE 1 END,
         CASE WHEN hint_kind='first' THEN 0 ELSE 1 END,occurred_at DESC,id LIMIT 1`);
@@ -474,16 +498,24 @@ export class DebotScanner {
   private statusDbFacts(nowMs:number):StatusDbFacts {
     const cached=this.cachedStatusDbFacts;
     if(cached&&nowMs>=cached.at&&nowMs-cached.at<STATUS_DB_FACTS_TTL_MS)return cached.value;
-    const row=this.db.prepare(`SELECT count(*) AS stored,
-      SUM(state='pending') AS pending,SUM(state='dispatching') AS dispatching,SUM(state='completed') AS completed,
-      SUM(state='ignored') AS ignored,SUM(state='failed') AS failed,SUM(state='interrupted') AS interrupted,
-      MAX(observed_at) AS latest,count(details) AS details_received,count(details_error) AS details_failed
-      FROM debot_signals`).get()!;
+    // Keep dashboard/status reads on compact covering indexes. The former
+    // all-column aggregate scanned every retained payload row (including large
+    // details JSON) whenever a live mutation invalidated the five-second cache.
+    const states=new Map(this.db.prepare(`SELECT state,count(*) AS n FROM debot_signals
+      INDEXED BY debot_signals_queue GROUP BY state`).all().map(row=>[String(row.state),Number(row.n)]));
+    const stored=Number(this.db.prepare(`SELECT count(*) AS n FROM debot_signals
+      INDEXED BY debot_signals_observed`).get()!.n);
+    const latest=this.db.prepare(`SELECT observed_at FROM debot_signals
+      INDEXED BY debot_signals_observed ORDER BY observed_at DESC LIMIT 1`).get()?.observed_at;
+    const detailsReceived=Number(this.db.prepare(`SELECT count(*) AS n FROM debot_signals
+      INDEXED BY debot_signals_details_present WHERE details IS NOT NULL`).get()!.n);
+    const detailsFailed=Number(this.db.prepare(`SELECT count(*) AS n FROM debot_signals
+      INDEXED BY debot_signals_details_error_present WHERE details_error IS NOT NULL`).get()!.n);
     const latestDispatch=this.db.prepare(`SELECT observed_at,dispatched_at FROM debot_signals
       WHERE dispatched_at IS NOT NULL ORDER BY dispatched_at DESC LIMIT 1`).get() as {observed_at:string;dispatched_at:string}|undefined;
-    const value:StatusDbFacts={stored:Number(row.stored),pending:Number(row.pending??0)+Number(row.dispatching??0),
-      dispatched:Number(row.completed??0),ignored:Number(row.ignored??0),failed:Number(row.failed??0),interrupted:Number(row.interrupted??0),
-      lastObservedAt:typeof row.latest==='string'?row.latest:undefined,detailsReceived:Number(row.details_received),detailsFailed:Number(row.details_failed),
+    const value:StatusDbFacts={stored,pending:(states.get('pending')??0)+(states.get('dispatching')??0),
+      dispatched:states.get('completed')??0,ignored:states.get('ignored')??0,failed:states.get('failed')??0,
+      interrupted:states.get('interrupted')??0,lastObservedAt:typeof latest==='string'?latest:undefined,detailsReceived,detailsFailed,
       lastAnalysisQueueDelayMs:latestDispatch?Math.max(0,Date.parse(latestDispatch.dispatched_at)-Date.parse(latestDispatch.observed_at)):undefined};
     this.cachedStatusDbFacts={at:nowMs,value};return value;
   }
@@ -500,6 +532,7 @@ export class DebotScanner {
   start():void {
     if(this.running||this.closed)return;
     this.running=true;this.stopped=false;
+    if(this.inboxSize())this.scheduleInboxRecovery();
     if(this.options.mode!=='authenticated_stream')this.collectTick();
     this.dispatchTick();
   }
@@ -508,7 +541,7 @@ export class DebotScanner {
   acceptPage(page:Page):void {
     if(this.stopped||this.closed)return;
     if(page.reason&&page.reason!=='DEBOT_SIGNAL_RECORDS_REJECTED')throw new Error('DEBOT_SIGNAL_RESPONSE_INVALID');
-    try {for(const observation of [...page.observations].sort((a,b)=>a.signal.occurredAt.localeCompare(b.signal.occurredAt)||a.id.localeCompare(b.id)))this.record(observation);}
+    try {this.recordObservations(page.observations);}
     catch(error){this.lastError=persistReason(error);throw new Error(this.lastError);}
     finally {if(this.running)void this.dispatchOnce();}
   }
@@ -576,8 +609,9 @@ export class DebotScanner {
 
   async stop():Promise<void> {
     this.running=false;this.stopped=true;this.generation++;
-    clearTimeout(this.timer);clearTimeout(this.dispatchTimer);
-    await Promise.all([this.collecting,...this.workers]);
+    clearTimeout(this.timer);clearTimeout(this.dispatchTimer);clearTimeout(this.inboxRecoveryTimer);
+    clearImmediate(this.inboxRecoveryImmediate);this.inboxRecoveryTimer=undefined;this.inboxRecoveryImmediate=undefined;
+    await Promise.all([this.collecting,this.inboxRecoveryWork,...this.workers]);
   }
 
   async close():Promise<void> {
@@ -628,7 +662,7 @@ export class DebotScanner {
           cycle.diagnostics.push({chain,status:'invalid_response',received:page.received,reason:page.reason});
           if(page.reason!=='DEBOT_SIGNAL_RECORDS_REJECTED')continue;
         }
-        for(const observation of [...page.observations].sort((a,b)=>a.signal.occurredAt.localeCompare(b.signal.occurredAt)||a.id.localeCompare(b.id)))cycle.added+=this.record(observation);
+        cycle.added+=this.recordObservations(page.observations);
         if(!page.reason)cycle.diagnostics.push({chain,status:'ok',received:page.received});
       } catch(error) {
         const reason=error instanceof DebotSignalError?error.reason:
@@ -645,11 +679,226 @@ export class DebotScanner {
     cycle.reasons=[...new Set(cycle.reasons)];cycle.completedAt=this.now().toISOString();this.lastCycle=cycle;
   }
 
-  private record(observation:DebotSignalObservation):number {
+  /**
+   * Commit the normalized source payload for the whole vendor page once, then
+   * forward every new event before notification-history and research-index
+   * writes begin.  A row remains here only across a failed/aborted slow write;
+   * start() and the next page finish it without forwarding it twice.
+   */
+  private recordObservations(observations:DebotSignalObservation[]):number {
+    const sorted=[...observations].sort((a,b)=>a.signal.occurredAt.localeCompare(b.signal.occurredAt)||a.id.localeCompare(b.id));
+    if(!this.options.onPriorityObservation&&!this.options.onPriorityObservations){
+      const claimed=this.captureObservationPage(sorted);let added=0;
+      try {
+        for(const observation of sorted)if(claimed.has(observation)){
+          added+=this.record(observation,true);this.completeInboxObservationSync(observation);
+        }
+        return added;
+      }finally{if(this.inboxSize())this.scheduleInboxRecovery();}
+    }
+    try {
+      const claimed=this.captureObservationPage(sorted);
+      this.forwardObservationPage(claimed);
+      // In two-stage mode the page is already durable and every new event has
+      // reached the counting callback. Yield before notification/research writes
+      // so the next websocket message can enter its priority path immediately.
+      return 0;
+    } finally {
+      if(this.inboxSize())this.scheduleInboxRecovery();
+    }
+  }
+
+  private claimableObservation(observation:DebotSignalObservation):boolean {
+    const signal=observation?.signal,chain=signal?.token?.chain,address=signal?.token?.address;
+    if(signal?.source!=='debot'||!this.chains.includes(chain)||typeof signal.sourceEventId!=='string'||
+      !/^[a-zA-Z0-9:_-]{1,200}$/.test(signal.sourceEventId)||typeof observation.id!=='string'||
+      !/^[a-zA-Z0-9_-]{1,128}$/.test(observation.id)||typeof address!=='string'||
+      !Number.isFinite(Date.parse(observation.observedAt))||!Number.isFinite(Date.parse(signal.occurredAt)))return false;
+    if(chain==='solana')try{return address.length>=32&&address.length<=44&&bs58.decode(address).length===32;}catch{return false;}
+    return /^0x[0-9a-fA-F]{40}$/.test(address);
+  }
+
+  private captureObservationPage(observations:DebotSignalObservation[]):Map<DebotSignalObservation,boolean> {
+    const claimed=new Map<DebotSignalObservation,boolean>();
+    if(!observations.length)return claimed;
+    const insert=this.db.prepare(`INSERT OR IGNORE INTO debot_observation_inbox(id,chain,address,observed_at,payload,forwarded)
+      SELECT ?,?,?,?,?,0 WHERE NOT EXISTS (SELECT 1 FROM debot_signals WHERE id=?)`),
+      insertUpdate=this.db.prepare(`INSERT OR IGNORE INTO debot_observation_inbox
+        (id,chain,address,observed_at,payload,forwarded,research_forwarded) VALUES(?,?,?,?,?,1,0)`),
+      replacePending=this.db.prepare(`UPDATE debot_observation_inbox SET observed_at=?,payload=?,research_forwarded=0
+        WHERE id=? AND chain=? AND address=?`),
+      pending=this.db.prepare('SELECT chain,address,payload,forwarded FROM debot_observation_inbox WHERE id=?'),
+      forwarded=this.db.prepare('SELECT chain,address,observation_payload_hash FROM debot_signals WHERE id=?');
+    let remaining=Math.max(0,MAX_FAST_INBOX-Number(this.db.prepare('SELECT count(*) AS n FROM debot_observation_inbox').get()!.n));
+    this.db.exec('SAVEPOINT debot_observation_page');
+    try {
+      for(const observation of observations){
+        if(!this.claimableObservation(observation))continue;
+        const signal=observation.signal,payload=JSON.stringify(observation),prior=pending.get(signal.sourceEventId);
+        if(prior){
+          if(prior.chain!==signal.token.chain||prior.address!==signal.token.address)continue;
+          if(String(prior.payload)!==payload)replacePending.run(observation.observedAt,payload,signal.sourceEventId,
+            signal.token.chain,signal.token.address);
+          claimed.set(observation,Number(prior.forwarded)===1);continue;
+        }
+        const priorForward=forwarded.get(signal.sourceEventId),payloadHash=createHash('sha256').update(payload).digest('hex');
+        if(priorForward&&(priorForward.chain!==signal.token.chain||priorForward.address!==signal.token.address))continue;
+        if(priorForward?.chain===signal.token.chain&&priorForward.address===signal.token.address&&
+          priorForward.observation_payload_hash===payloadHash){
+          claimed.set(observation,true);continue;
+        }
+        // Never let an unclaimed event fall through to the slow store: with a
+        // priority callback configured that would persist it without counting
+        // it.  Keep the inbox bounded and make the stream retry the full page.
+        if(remaining<=0)throw new Error('DEBOT_SIGNAL_STORE_FULL');
+        const existing=priorForward?.chain===signal.token.chain&&priorForward.address===signal.token.address;
+        const result=existing?insertUpdate.run(signal.sourceEventId,signal.token.chain,signal.token.address,
+          observation.observedAt,payload):insert.run(signal.sourceEventId,signal.token.chain,signal.token.address,
+          observation.observedAt,payload,signal.sourceEventId);
+        if(Number(result.changes)>0){claimed.set(observation,existing);remaining--;}
+      }
+      this.db.exec('RELEASE debot_observation_page');return claimed;
+    }catch(error){
+      try{this.db.exec('ROLLBACK TO debot_observation_page; RELEASE debot_observation_page');}catch{/* SQLITE_FULL may end the savepoint. */}
+      throw error;
+    }
+  }
+
+  private notifyPriorityObservation(observation:DebotSignalObservation):boolean {
+    try {
+      if(this.options.onPriorityObservation)this.options.onPriorityObservation(observation);
+      else if(this.options.onPriorityObservations)this.options.onPriorityObservations([observation]);
+      else this.options.onObservation?.(observation);
+      return true;
+    }
+    catch{return false;}
+  }
+
+  private async notifyResearchObservation(observation:DebotSignalObservation):Promise<boolean> {
+    if(!this.options.onPriorityObservation&&!this.options.onPriorityObservations)return true;
+    try {await this.options.onObservation?.(structuredClone(observation));return true;}catch{return false;}
+  }
+
+  private completeInboxObservationSync(observation:DebotSignalObservation):void {
+    const id=observation.signal.sourceEventId;
+    const row=this.db.prepare('SELECT forwarded FROM debot_observation_inbox WHERE id=?').get(id);
+    if(!row)return;
+    if(Number(row.forwarded)!==1){
+      if(!this.notifyPriorityObservation(observation))return;
+      this.db.prepare('UPDATE debot_observation_inbox SET forwarded=1 WHERE id=?').run(id);
+    }
+    this.db.prepare('DELETE FROM debot_observation_inbox WHERE id=?').run(id);
+  }
+
+  /** Complete the two callbacks only after the source row is durable. The
+   * separate bits let restart recovery avoid replaying the priority callback. */
+  private async completeInboxObservation(observation:DebotSignalObservation):Promise<void> {
+    const id=observation.signal.sourceEventId;
+    let row=this.db.prepare('SELECT forwarded,research_forwarded FROM debot_observation_inbox WHERE id=?').get(id);
+    if(!row)return;
+    if(Number(row.forwarded)!==1){
+      if(!this.notifyPriorityObservation(observation))return;
+      this.db.prepare('UPDATE debot_observation_inbox SET forwarded=1 WHERE id=?').run(id);
+      row={...row,forwarded:1};
+    }
+    if((this.options.onPriorityObservation||this.options.onPriorityObservations)&&Number(row.research_forwarded)!==1){
+      if(!await this.notifyResearchObservation(observation))throw new Error('DEBOT_SIGNAL_RESEARCH_CALLBACK_FAILED');
+      this.db.prepare('UPDATE debot_observation_inbox SET research_forwarded=1 WHERE id=?').run(id);
+      row={...row,research_forwarded:1};
+    }
+    if(Number(row.forwarded)===1&&(!this.options.onPriorityObservation&&!this.options.onPriorityObservations||Number(row.research_forwarded)===1))
+      this.db.prepare('DELETE FROM debot_observation_inbox WHERE id=?').run(id);
+  }
+
+  private forwardObservationPage(claimed:Map<DebotSignalObservation,boolean>):void {
+    if(!claimed.size)return;
+    const pending=[...claimed].filter(([,forwarded])=>!forwarded).map(([observation])=>observation);
+    if(!pending.length)return;
+    let delivered=pending;
+    if(this.options.onPriorityObservations)try {this.options.onPriorityObservations(pending.map(observation=>structuredClone(observation)));}
+    catch{delivered=[];}
+    else delivered=pending.filter(observation=>this.notifyPriorityObservation(observation));
+    const ids=[...new Set(delivered.map(observation=>observation.signal.sourceEventId))];
+    if(!ids.length)return;
+    const placeholders=ids.map(()=>'?').join(',');
+    this.db.exec('SAVEPOINT debot_observation_forward');
+    try {
+      this.db.prepare(`UPDATE debot_observation_inbox SET forwarded=1 WHERE id IN (${placeholders})`).run(...ids);
+      this.db.exec('RELEASE debot_observation_forward');
+    }catch(error){
+      try{this.db.exec('ROLLBACK TO debot_observation_forward; RELEASE debot_observation_forward');}catch{/* Preserve the raw rows for retry. */}
+      throw error;
+    }
+  }
+
+  private inboxSize():number {
+    return Number(this.db.prepare('SELECT count(*) AS n FROM debot_observation_inbox').get()!.n);
+  }
+
+  /** A transient slow-store failure must not leave a full fast inbox wedged until
+   * process restart. Recover one row per turn; persistent failures back off. */
+  private scheduleInboxRecovery(delayMs=0):void {
+    if(this.closed||this.stopped||this.inboxRecoveryTimer||this.inboxRecoveryImmediate||this.recoveringInbox)return;
+    const run=()=>{
+      this.inboxRecoveryTimer=undefined;this.inboxRecoveryImmediate=undefined;
+      if(this.closed||this.stopped)return;
+      const before=this.inboxSize();if(!before)return;
+      this.recoveringInbox=true;
+      const work=this.recoverObservationInbox(1).catch(error=>{this.lastError=persistReason(error);}).finally(()=>{
+        this.recoveringInbox=false;if(this.inboxRecoveryWork===work)this.inboxRecoveryWork=undefined;
+        if(this.closed||this.stopped)return;
+        const after=this.inboxSize();
+        // Let an earlier empty dispatch release its single-flight promise
+        // before waking analysis for the newly ACKed source row.
+        if(after<before&&this.running)setImmediate(()=>{
+          if(this.running&&!this.closed&&!this.stopped)void this.dispatchOnce();
+        }).unref?.();
+        if(after)this.scheduleInboxRecovery(after<before?0:1000);
+      });
+      this.inboxRecoveryWork=work;
+    };
+    if(delayMs){this.inboxRecoveryTimer=setTimeout(run,delayMs);this.inboxRecoveryTimer.unref();}
+    else {this.inboxRecoveryImmediate=setImmediate(run);this.inboxRecoveryImmediate.unref();}
+  }
+
+  private async recoverObservationInbox(limit=20):Promise<void> {
+    const rows=this.db.prepare(`SELECT id,chain,address,observed_at,payload,forwarded,research_forwarded
+      FROM debot_observation_inbox ORDER BY rowid LIMIT ${MAX_FAST_INBOX+1}`)
+      .all() as unknown as FastInboxRow[];
+    if(rows.length>MAX_FAST_INBOX)throw new Error('DEBOT_SIGNAL_PERSIST_FAILED');
+    for(const row of rows.slice(0,limit)){
+      let observation:DebotSignalObservation;
+      try{observation=JSON.parse(row.payload) as DebotSignalObservation;}catch{throw new Error('DEBOT_SIGNAL_PERSIST_FAILED');}
+      if(!this.claimableObservation(observation)||observation.signal.sourceEventId!==row.id||
+        observation.signal.token.chain!==row.chain||observation.signal.token.address!==row.address||observation.observedAt!==row.observed_at)
+        throw new Error('DEBOT_SIGNAL_PERSIST_FAILED');
+      const existing=this.db.prepare('SELECT chain,address,observation_payload_hash FROM debot_signals WHERE id=?').get(row.id);
+      if(existing){
+        if(existing.chain!==row.chain||existing.address!==row.address)throw new Error('DEBOT_SIGNAL_PERSIST_FAILED');
+        const payloadHash=createHash('sha256').update(row.payload).digest('hex');
+        if(existing.observation_payload_hash===payloadHash)await this.completeInboxObservation(observation);
+        else {this.record(observation,true);await this.completeInboxObservation(observation);}
+        continue;
+      }
+      if(row.forwarded!==1){
+        if(!this.notifyPriorityObservation(observation))continue;
+        this.db.prepare('UPDATE debot_observation_inbox SET forwarded=1 WHERE id=?').run(row.id);
+      }
+      this.record(observation,true);await this.completeInboxObservation(observation);
+    }
+  }
+
+  private record(observation:DebotSignalObservation,alreadyForwarded=false):number {
     if(!this.chains.includes(observation.signal.token.chain))return 0;
     this.db.exec('SAVEPOINT debot_inbox_record');
     let result:number;
-    try {result=this.recordAtomic(observation);this.db.exec('RELEASE debot_inbox_record');this.invalidateStatusDbFacts();}
+    try {
+      result=this.recordAtomic(observation);
+      if(alreadyForwarded)this.db.prepare('UPDATE debot_signals SET observation_payload_hash=? WHERE id=? AND chain=? AND address=?')
+        .run(createHash('sha256').update(JSON.stringify(observation)).digest('hex'),observation.signal.sourceEventId,
+          observation.signal.token.chain,observation.signal.token.address);
+      this.db.exec('RELEASE debot_inbox_record');this.invalidateStatusDbFacts();
+    }
     catch(error){
       // SQLITE_FULL may already have rolled back the savepoint. Keep its capacity reason.
       try{this.db.exec('ROLLBACK TO debot_inbox_record; RELEASE debot_inbox_record');}catch{/* Already rolled back. */}
@@ -660,7 +909,14 @@ export class DebotScanner {
     if(bound&&bound.chain===observation.signal.token.chain&&bound.address===observation.signal.token.address){
       if(observation.vendorPerformance)try{this.performance.record(observation);this.vendorPerformanceError=undefined;}
       catch{this.vendorPerformanceError='VENDOR_PERFORMANCE_PERSIST_FAILED';}
-      try{this.options.onObservation?.(observation);}catch{/* Optional observer failure is isolated. */}
+      if(!alreadyForwarded){
+        // Defensive fallback for observations which cannot use the inbox. A
+        // configured priority consumer must never be silently skipped.
+        if(this.options.onPriorityObservation||this.options.onPriorityObservations){
+          this.notifyPriorityObservation(observation);
+          this.notifyResearchObservation(observation);
+        }else this.notifyPriorityObservation(observation);
+      }
     }
     return result;
   }

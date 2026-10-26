@@ -40,7 +40,7 @@ interface AssessmentInput {
   notificationCounts?:Partial<Record<CorroborationSource,number>>;truncated?:boolean;
 }
 export interface SourceCorroborationOptions {now?:()=>Date;windowSec?:number;maxBytes?:number;maxEvents?:number;}
-export interface SourceCorroborationMetadata {name?:string;txRefs?:SourceTransactionReference[];sourceUrl?:string;}
+export interface SourceCorroborationMetadata {name?:string;txRefs?:SourceTransactionReference[];sourceUrl?:string;deliveryKey?:string;}
 type Row=Record<string,any>;
 const SOURCES:readonly CorroborationSource[]=['ave','debot','gmgn'];
 const RETENTION_DAYS=30,DEFAULT_MAX_EVENTS=100000,MAX_REFS=20,ASSESS_EVENTS_PER_SOURCE=64;
@@ -101,6 +101,62 @@ function cleanEvidence(raw:SourceNotificationEvidence,token:Token,now:number):So
   return {...raw,token,occurredAt:iso(occurred),firstObservedAt:iso(received),recordedAt:iso(recorded),
     lastDeliveryAt:iso(last),lastRecordedAt:iso(lastRecorded),...(Number.isFinite(conflict)?{conflictAt:iso(conflict)}:{}),
     name:tokenDisplayText(raw.name,100),sourceUrl:publicUrl(raw.sourceUrl,raw.source),txRefs:references(raw.txRefs,token)};
+}
+
+/** Read-only source assessment for dashboard workers. */
+export class SourceCorroborationReader {
+  private readonly db:DatabaseSync;
+  private readonly windowSec:number;
+  constructor(database:string,windowSec=300){
+    this.windowSec=windowSeconds(windowSec);this.db=new DatabaseSync(database,{readOnly:true});
+    this.db.exec('PRAGMA query_only=ON; PRAGMA busy_timeout=5000');
+  }
+  close():void {this.db.close();}
+  private decode(row:Row):SourceNotificationEvidence {
+    return {source:row.source,eventId:row.event_id,token:{chain:row.chain,address:row.address},occurredAt:row.occurred_at,
+      firstObservedAt:row.first_observed_at,recordedAt:row.recorded_at,lastDeliveryAt:row.last_delivery_at,lastRecordedAt:row.last_recorded_at,
+      deliveryCount:Number(row.delivery_count),conflictAt:row.conflict_at??undefined,name:row.name??undefined,
+      sourceUrl:row.source_url??undefined,txRefs:JSON.parse(row.tx_refs)};
+  }
+  assess(value:Token,now:Date):SourceCorroborationAssessment {
+    const token=normalizedToken(value),at=now.getTime();if(!token||!Number.isFinite(at))throw new Error('SOURCE_ASSESSMENT_INVALID');
+    const end=iso(at),start=iso(at-this.windowSec*1000),retention=iso(at-RETENTION_MS),observations:SourceNotificationEvidence[]=[],
+      notificationCounts:Partial<Record<CorroborationSource,number>>={};let truncated=false;
+    for(const source of SOURCES){
+      const rows=this.db.prepare(`SELECT * FROM source_notifications WHERE chain=? AND address=? AND source=? AND recorded_at<=? AND recorded_at>=?
+        ORDER BY CASE WHEN occurred_at>=? AND occurred_at<=? AND first_observed_at>=? AND occurred_at<=first_observed_at
+          AND (conflict_at IS NULL OR conflict_at>?) THEN 0 ELSE 1 END,first_observed_at DESC,event_id DESC LIMIT ?`)
+        .all(token.chain,token.address,source,end,retention,start,end,start,end,ASSESS_EVENTS_PER_SOURCE+1);
+      truncated=truncated||rows.length>ASSESS_EVENTS_PER_SOURCE;observations.push(...rows.slice(0,ASSESS_EVENTS_PER_SOURCE).map(row=>this.decode(row)));
+      notificationCounts[source]=Number(this.db.prepare(`SELECT count(*) AS n FROM source_notifications WHERE chain=? AND address=? AND source=?
+        AND first_observed_at>=? AND first_observed_at<=? AND recorded_at<=? AND recorded_at>=?`)
+        .get(token.chain,token.address,source,start,end,end,retention)!.n);
+    }
+    return {...assessSourceCorroboration({token,now,windowSec:this.windowSec,observations,notificationCounts,truncated}),
+      activity:this.activity(token,at,retention,truncated)};
+  }
+  private activity(token:Token,at:number,retainedFrom:string,referenceSampleTruncated:boolean):SourceNotificationActivity {
+    const end=iso(at),minute=iso(at-60000),five=iso(at-300000),ten=iso(at-600000),sources=SOURCES.map(source=>{
+      const row=this.db.prepare(`SELECT
+        COALESCE(sum(CASE WHEN occurred_at>? THEN 1 ELSE 0 END),0) AS last_1m,
+        COALESCE(sum(CASE WHEN occurred_at>? THEN 1 ELSE 0 END),0) AS last_5m,
+        COALESCE(sum(CASE WHEN occurred_at<=? THEN 1 ELSE 0 END),0) AS previous_5m
+        FROM source_notifications INDEXED BY source_notifications_token
+        WHERE chain=? AND address=? AND source=? AND first_observed_at>? AND first_observed_at<=?
+          AND occurred_at>? AND occurred_at<=first_observed_at
+          AND occurred_at>=strftime('%Y-%m-%dT%H:%M:%fZ',first_observed_at,'-120 seconds')
+          AND recorded_at<=? AND recorded_at>=? AND (conflict_at IS NULL OR conflict_at>?)`)
+        .get(minute,five,five,token.chain,token.address,source,ten,end,ten,end,retainedFrom,end)!;
+      const last1m=Number(row.last_1m),last5m=Number(row.last_5m),previous5m=Number(row.previous_5m);
+      return {source,last1m,last5m,previous5m,change5m:last5m-previous5m};
+    });
+    return {asOf:end,scope:'retained_valid_provider_events',counting:'exact_retained_events',bucketBy:'occurredAt',maxArrivalDelaySec:120,
+      windows:{last1m:{startExclusive:minute,endInclusive:end},last5m:{startExclusive:five,endInclusive:end},previous5m:{startExclusive:ten,endInclusive:five}},
+      sources,historyComplete:false,retainedFrom,referenceSampleTruncated,limitations:['RETAINED_NOTIFICATIONS_ONLY',
+        'OBSERVED_STREAM_SAMPLE_NOT_FULL_PROVIDER_HISTORY','EVENT_IDS_NOT_INDEPENDENT_WALLETS_OR_TRADES','ZERO_COUNT_DOES_NOT_PROVE_SOURCE_INACTIVE',
+        'COLLECTION_GAPS_UNKNOWN','SOURCE_COUNT_DOES_NOT_CHANGE_SCORE',...(ten<retainedFrom?['ACTIVITY_WINDOW_OUTSIDE_RETENTION']:[]),
+        ...(referenceSampleTruncated?['REFERENCE_SAMPLE_LIMIT_DOES_NOT_TRUNCATE_ACTIVITY_COUNTS']:[])]};
+  }
 }
 function freshness(value:SourceNotificationEvidence,now:number,windowMs:number):CorroborationFreshness {
   if(value.conflictAt&&millis(value.conflictAt)<=now)return 'conflict';
@@ -177,7 +233,7 @@ export class SourceCorroboration {
         source TEXT NOT NULL,event_id TEXT NOT NULL,chain TEXT NOT NULL,address TEXT NOT NULL,
         occurred_at TEXT NOT NULL,first_observed_at TEXT NOT NULL,recorded_at TEXT NOT NULL,
         last_delivery_at TEXT NOT NULL,last_recorded_at TEXT NOT NULL,delivery_count INTEGER NOT NULL,
-        conflict_at TEXT,name TEXT,source_url TEXT,tx_refs TEXT NOT NULL,
+        conflict_at TEXT,name TEXT,source_url TEXT,tx_refs TEXT NOT NULL,delivery_key TEXT,
         PRIMARY KEY(source,event_id));
       CREATE INDEX IF NOT EXISTS source_notifications_token ON source_notifications(chain,address,source,first_observed_at DESC,event_id DESC);
       CREATE INDEX IF NOT EXISTS source_notifications_recorded ON source_notifications(recorded_at);
@@ -185,6 +241,8 @@ export class SourceCorroboration {
       CREATE INDEX IF NOT EXISTS source_notifications_first_observed ON source_notifications(first_observed_at DESC);
       CREATE TABLE IF NOT EXISTS source_corroboration_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
       INSERT OR IGNORE INTO source_corroboration_meta VALUES('pruned_events','0');`);
+    if(!this.db.prepare('PRAGMA table_info(source_notifications)').all().some(row=>row.name==='delivery_key'))
+      this.db.exec('ALTER TABLE source_notifications ADD COLUMN delivery_key TEXT');
     this.initializeStatusMetadata();
     this.pageSize=Number(this.db.prepare('PRAGMA page_size').get()!.page_size);
     this.db.exec(`PRAGMA max_page_count=${Math.floor(this.maxBytes/this.pageSize)}`);
@@ -195,7 +253,9 @@ export class SourceCorroboration {
     const reject=(reason:string)=>{this.rejected++;return {accepted:false,reason};};
     if(this.closed)return reject('SOURCE_LEDGER_CLOSED');
     const token=normalizedToken(signal?.token),source=signal?.source as CorroborationSource,now=this.now().getTime(),received=millis(receivedAt),occurred=millis(signal?.occurredAt);
-    if(!token||!SOURCES.includes(source)||!eventId(signal?.sourceEventId)||!Number.isFinite(now)||!Number.isFinite(received)||
+    const deliveryKey=metadata.deliveryKey;
+    if(!token||!SOURCES.includes(source)||!eventId(signal?.sourceEventId)||
+      deliveryKey!==undefined&&!/^[a-f0-9]{64}$/.test(deliveryKey)||!Number.isFinite(now)||!Number.isFinite(received)||
       !Number.isFinite(occurred)||received>now)return reject('SOURCE_NOTIFICATION_INVALID');
     if(received<now-RETENTION_MS)return reject('SOURCE_NOTIFICATION_OUTSIDE_RETENTION');
     try {
@@ -205,12 +265,13 @@ export class SourceCorroboration {
         const prior=this.db.prepare('SELECT * FROM source_notifications WHERE source=? AND event_id=?').get(source,signal.sourceEventId);
         if(prior){
           if(prior.chain!==token.chain||prior.address!==token.address){this.db.exec('RELEASE source_notification_record');return reject('SOURCE_EVENT_ID_CONFLICT');}
+          if(deliveryKey&&prior.delivery_key===deliveryKey){this.db.exec('RELEASE source_notification_record');return {accepted:true,duplicate:true};}
           if(received<millis(prior.first_observed_at)||now<millis(prior.last_recorded_at)){
             this.db.exec('RELEASE source_notification_record');return reject('SOURCE_DELIVERY_TIME_REGRESSION');
           }
-          this.db.prepare(`UPDATE source_notifications SET delivery_count=MIN(delivery_count+1,9007199254740991),
+          this.db.prepare(`UPDATE source_notifications SET delivery_count=MIN(delivery_count+1,9007199254740991),delivery_key=?,
             last_delivery_at=MAX(last_delivery_at,?),last_recorded_at=?,conflict_at=CASE WHEN occurred_at!=? THEN COALESCE(conflict_at,?) ELSE conflict_at END
-            WHERE source=? AND event_id=?`).run(iso(received),iso(now),iso(occurred),iso(now),source,signal.sourceEventId);
+            WHERE source=? AND event_id=?`).run(deliveryKey??null,iso(received),iso(now),iso(occurred),iso(now),source,signal.sourceEventId);
           this.db.exec('RELEASE source_notification_record');
           // Updating an existing row does not prove there is capacity for a new event.
           if(this.error!=='SOURCE_LEDGER_CAPACITY_REACHED')this.error=undefined;
@@ -220,9 +281,11 @@ export class SourceCorroboration {
           this.db.exec('RELEASE source_notification_record');this.error='SOURCE_LEDGER_CAPACITY_REACHED';return reject(this.error);
         }
         const refs=references(metadata.txRefs,token);
-        this.db.prepare('INSERT INTO source_notifications VALUES(?,?,?,?,?,?,?,?,?,?,NULL,?,?,?)').run(source,signal.sourceEventId,token.chain,token.address,
+        this.db.prepare(`INSERT INTO source_notifications(source,event_id,chain,address,occurred_at,first_observed_at,recorded_at,
+          last_delivery_at,last_recorded_at,delivery_count,conflict_at,name,source_url,tx_refs,delivery_key)
+          VALUES(?,?,?,?,?,?,?,?,?,?,NULL,?,?,?,?)`).run(source,signal.sourceEventId,token.chain,token.address,
           iso(occurred),iso(received),iso(now),iso(received),iso(now),1,tokenDisplayText(metadata.name,100)??null,
-          publicUrl(metadata.sourceUrl,source)??null,JSON.stringify(refs));
+          publicUrl(metadata.sourceUrl,source)??null,JSON.stringify(refs),deliveryKey??null);
         this.db.exec('RELEASE source_notification_record');this.error=undefined;return {accepted:true,duplicate:false};
       }catch(error){
         // SQLITE_FULL may already have rolled the transaction back; preserve the original failure code.

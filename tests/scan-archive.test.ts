@@ -89,15 +89,17 @@ test('home counters are cached scalars and expire tracking by time without pruni
   }finally{archive.close();}
 });
 
-test('detailed stats cache is isolated from callers and invalidated by archive writes',()=>{
-  const {archive,price}=fixture();try {
+test('detailed stats cache is isolated and bounds ordinary write staleness to its TTL',()=>{
+  const {archive,price,setNow}=fixture();try {
     archive.capture(stored());
     const first=archive.stats();assert.equal(first.total,1);first.total=99;first.byStatus.completed=99;
     const cached=archive.stats();assert.equal(cached.total,1);assert.equal(cached.byStatus.completed,1);
     archive.capture(stored('second'));
-    assert.equal(archive.stats().total,2,'capture invalidates the hot stats snapshot immediately');
-    price(2_000,10);price(3_000,20);
-    assert.equal(archive.stats().maxGainPct,100,'price writes invalidate max-gain statistics');
+    assert.equal(archive.stats().total,1,'ordinary writes preserve the bounded hot snapshot');
+    setNow(16_001);assert.equal(archive.stats().total,2,'the next read after the TTL refreshes the aggregate');
+    price(20_000,10);price(30_000,20);
+    assert.equal(archive.stats().maxGainPct,undefined,'live price writes do not force a request-thread rescan');
+    setNow(31_002);assert.equal(archive.stats().maxGainPct,100,'price aggregates refresh after the bounded TTL');
   }finally{archive.close();}
 });
 
@@ -164,7 +166,7 @@ test('detailed stats rebuild from persisted scalar columns after restart',()=>{
 });
 
 test('基线来自首次符合条件之后实际采样，涨跌和最高涨幅只由已采样报价计算',()=>{
-  const {archive,price}=fixture();
+  const {archive,price,setNow}=fixture();
   try {
     archive.capture(stored());
     assert.equal(archive.get('scan-1')?.performance?.baselinePriceUsd,undefined);
@@ -177,7 +179,7 @@ test('基线来自首次符合条件之后实际采样，涨跌和最高涨幅�
     assert.equal(performance.maxGainPct,200);assert.equal(performance.currentGainPct,50);
     assert.equal(performance.peakAt,iso(4_000));assert.equal(performance.peakPriceUsd,30);
     assert.equal(performance.samples,4);assert.equal(performance.points.length,4);
-    assert.equal(archive.stats().maxGainPct,200);
+    setNow(16_001);assert.equal(archive.stats().maxGainPct,200);
   } finally {archive.close();}
 });
 

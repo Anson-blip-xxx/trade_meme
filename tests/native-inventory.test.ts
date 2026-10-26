@@ -42,9 +42,12 @@ test('stream updates and reads use the per-mint aggregate without enumerating th
 
 test('disconnect invalidates snapshot completeness until both token-program snapshots return',()=>{
   const cache=fixture();ready(cache,[row(key(4),100n)]);cache.invalidate();
-  assert.equal(cache.status().ready,false);assert.throws(()=>cache.read(mint.toBase58(),100,now),/NATIVE_INVENTORY_NOT_READY/);
+  assert.equal(cache.status().ready,false);assert.deepEqual(cache.programsNeedingRefresh().sort(),[standard,token2022].sort());
+  assert.throws(()=>cache.read(mint.toBase58(),100,now),/NATIVE_INVENTORY_NOT_READY/);
   cache.install(standard,101,[row(key(4),110n)],now+1);assert.equal(cache.status().ready,false);
+  assert.deepEqual(cache.programsNeedingRefresh(),[token2022]);
   cache.install(token2022,101,[],now+1);assert.equal(cache.status().ready,true);assert.equal(cache.read(mint.toBase58(),101,now+1).amount,'110');
+  assert.deepEqual(cache.programsNeedingRefresh(),[]);
 });
 
 test('older or equal-slot HTTP account values never overwrite newer WS values',()=>{
@@ -121,9 +124,12 @@ test('snapshot rejects duplicate addresses, mismatched programs and foreign owne
 test('an unrelated token-program snapshot cannot clear a corrupted tracked-account error',()=>{
   const cache=fixture();ready(cache,[row(key(4),100n)]);
   cache.ingest(key(4).toBase58(),{...token(0n),owner:SystemProgram.programId},101,now+1);
+  assert.deepEqual(cache.programsNeedingRefresh(),[standard]);
   cache.install(token2022,102,[],now+2);
+  assert.deepEqual(cache.programsNeedingRefresh(),[standard]);
   assert.throws(()=>cache.read(mint.toBase58(),100,now+2),/NATIVE_INVENTORY_ACCOUNT_INVALID/);
   cache.install(standard,102,[row(key(4),200n)],now+3);
+  assert.deepEqual(cache.programsNeedingRefresh(),[]);
   assert.equal(cache.read(mint.toBase58(),102,now+3).amount,'200');
 });
 

@@ -347,7 +347,7 @@ export class ManualNativeTestController {
     if(balance.status!=='verified'||balance.amount===undefined)throw new ManualBuyFailure('ENTRY_BALANCE_UNAVAILABLE');
     const balanceAmount=balance.amount;
     const coveredOrderIds:string[]=[];
-    for(const previous of this.orders.fundingOrders({chain:'solana',mode:'live',wallet,inputToken:SOL})){
+    for(const previous of this.orders.fundingOrders({chain:'solana',mode:'live',wallet,inputToken:SOL},balance)){
       if(!previous.transactionHash)continue;
       const cache=previous.details.nativeDebitCoverage;
       const cached=cache!==null&&typeof cache==='object'&&!Array.isArray(cache)&&

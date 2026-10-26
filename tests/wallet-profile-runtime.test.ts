@@ -36,6 +36,26 @@ test('profile worker continuously processes new evidence without web requests an
   } finally {await runner.stop();history.close();rmSync(directory,{recursive:true,force:true});}
 });
 
+test('profile live priority pauses research writes and resumes the accumulated backlog',async()=>{
+  const directory=mkdtempSync(join(tmpdir(),'wallet-profile-live-priority-'));
+  const history=new WalletHistory(join(directory,'history.sqlite'));
+  const runner=new WalletProfileRunner({database:join(directory,'profiles.sqlite'),historyDatabase:join(directory,'history.sqlite'),
+    maxBytes:16*1024*1024,intervalSec:1,batchSize:10});
+  const trade=(n:number)=>history.recordTrade({chain:'bsc',wallet:address(n),tokenAddress:address(99),
+    txHash:'0x'+n.toString(16).padStart(64,'0'),side:'buy',eventAt:new Date(Date.now()-2000).toISOString(),
+    observedAt:new Date(Date.now()-1000).toISOString(),source:'gmgn_kol_feed'});
+  try {
+    trade(1);runner.setLivePriority(true);runner.start();
+    await until(()=>runner.status().workerLivePriority===true);
+    await new Promise(resolve=>setTimeout(resolve,1100));assert.equal(runner.status().profiles,0);
+    runner.setLivePriority(false);await until(()=>runner.status().workerLivePriority===false);
+    await until(()=>Number(runner.status().profiles)>=1);
+    runner.setLivePriority(true);await until(()=>runner.status().workerLivePriority===true);trade(2);
+    await new Promise(resolve=>setTimeout(resolve,1100));assert.equal(runner.status().profiles,1);
+    runner.setLivePriority(false);await until(()=>Number(runner.status().profiles)>=2);
+  } finally {await runner.stop();history.close();rmSync(directory,{recursive:true,force:true});}
+});
+
 test('profile worker publishes and persists compact profit cohorts for the live reader',async()=>{
   const directory=mkdtempSync(join(tmpdir(),'wallet-profile-cohort-worker-'));
   const history=new WalletHistory(join(directory,'history.sqlite')),now=Date.now(),observedAt=new Date(now-1000).toISOString();

@@ -7,6 +7,7 @@ const INFO = '/v1/token/info';
 const HOLDERS = '/v1/market/token_top_holders';
 const TOP10_FIELD = 'info.stat.top_10_holder_rate';
 const ENTRAPMENT_FIELD = 'info.stat.top_entrapment_trader_percentage';
+const LIVE_ENTRY_SCHEDULING = {priority: 'live_entry' as const, queueTimeoutMs: 20_000};
 type RiskTag = 'bundler' | 'rat_trader';
 type Coverage = 'complete' | 'lower_bound' | 'unknown';
 type Decimal = {atoms: bigint; scale: number};
@@ -158,7 +159,7 @@ export class GmgnEntryHolderReader {
       return complete();
     }
     let info: unknown;
-    try {info = await this.client.get(INFO, {chain: 'sol', address: tokenAddress}, 1);}
+    try {info = await this.client.get(INFO, {chain: 'sol', address: tokenAddress}, 1, LIVE_ENTRY_SCHEDULING);}
     catch (error) {
       evidence.identity = {status: 'unavailable', reasons: ['ENTRY_HOLDER_RISK_INFO_REQUEST_FAILED', requestReason(error)]};
       return complete();
@@ -181,9 +182,9 @@ export class GmgnEntryHolderReader {
     // No undocumented pagination or guessed entrapment tag is requested.
     const query = {chain: 'sol', address: tokenAddress, limit: LIMIT, order_by: 'amount_percentage', direction: 'desc'};
     const collected = await Promise.allSettled([
-      this.client.get(HOLDERS, {...query, tag: 'bundler'}, 5),
-      this.client.get(HOLDERS, {...query, tag: 'rat_trader'}, 5),
-      this.client.get(HOLDERS, query, 5),
+      this.client.get(HOLDERS, {...query, tag: 'bundler'}, 5, LIVE_ENTRY_SCHEDULING),
+      this.client.get(HOLDERS, {...query, tag: 'rat_trader'}, 5, LIVE_ENTRY_SCHEDULING),
+      this.client.get(HOLDERS, query, 5, LIVE_ENTRY_SCHEDULING),
     ]);
     for (const [index, tag, key] of [[0, 'bundler', 'bundler'], [1, 'rat_trader', 'ratTrader']] as const) {
       const response = collected[index];

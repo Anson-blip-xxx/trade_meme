@@ -22,6 +22,27 @@ test('registered holdings paginate five at a time, clamp stale pages and preserv
  for(const page of [0,-1,1.5,10001,NaN])assert.throws(()=>queries.page(page),/PAGE_INVALID/);
 });
 
+test('sell capabilities are created only for the visible holdings page',()=>{
+ const rows=Array.from({length:12},(_,i)=>({...row(i),canClose:true,sellActionRef:undefined,sellProvider:'native' as const}));
+ const created:string[]=[];
+ const queries=new TelegramPositions(()=>rows,{now:()=>now,action:p=>{created.push(p.id);return 'np'+positionReference(p).slice(0,30);}});
+ const page=result(queries.page(2));
+ assert.equal((page.text.match(/CA：/g)||[]).length,5);
+ const visible=[...rows].sort((a,b)=>`${a.chain}:${a.wallet}:${a.address}`.localeCompare(`${b.chain}:${b.wallet}:${b.address}`)).slice(5,10);
+ assert.deepEqual(created,visible.map(p=>p.id));
+ assert.equal(page.buttons!.filter(buttons=>buttons.some(button=>button.callback_data.startsWith('sell:'))).length,5);
+});
+
+test('token-card lookup creates one capability only after resolving one unambiguous mint',()=>{
+ const mint=bs58.encode(new Uint8Array(32).fill(81)),wallet=bs58.encode(new Uint8Array(32).fill(82));let actions=0;
+ const holding:TelegramPosition={...row(0),wallet,address:mint,canClose:true,sellActionRef:undefined,sellProvider:'native'};
+ const query=new TelegramPositions(()=>[holding],{action:()=>{actions++;return 'np'+'e'.repeat(30);}});
+ assert.equal(query.findSellableSolanaMint(mint)?.sellActionRef,'np'+'e'.repeat(30));assert.equal(actions,1);
+ const ambiguous=new TelegramPositions(()=>[holding,{...holding,id:'other',wallet:bs58.encode(new Uint8Array(32).fill(83))}],
+  {action:()=>{actions++;return 'np'+'f'.repeat(30);}});
+ assert.equal(ambiguous.findSellableSolanaMint(mint),undefined);assert.equal(actions,1);
+});
+
 test('empty holdings, closed balances, source overlap and pending fills are represented without fabricated zeros',()=>{
  const sample=row(2),queries=new TelegramPositions(()=>[sample,{...sample,id:'same-token-other-source'}, {...row(4),quantity:0}],{pending:()=>2,now:()=>now});
  assert.match(result(queries.page(1)).text,/共 1 个持仓/);

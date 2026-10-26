@@ -2231,10 +2231,14 @@
     runtime.append(kv('钱包历史采集', research.enabled ? '已启用 · 长期保留' : '未启用'), kv('钱包历史 / 容量上限', `${bytes(research.store?.bytes)} / ${bytes(research.store?.maxBytes)}`), kv('最近钱包观测', date(research.store?.lastObservedAt, true)), kv('最近钱包增强采集', date(research.observer?.lastCycle?.completedAt, true)));
     const researchError = research.store?.error || research.captureError || research.observer?.feedError;
     if (researchError) runtime.append(el('p', 'detail-message detail-error', reasonNames[researchError] || scalar(researchError)));
-    const evidence = data.corroboration, rank = data.tokenRankResearch;
+    const evidence = data.corroboration, rank = data.tokenRankResearch, profiles = research.profiles || {};
+    const priorityState = worker => worker?.livePriority === true
+      ? worker.workerLivePriority === true ? '实盘计数优先 · 批处理已暂停' : '正在切换到实盘计数优先'
+      : worker?.workerLivePriority === false ? '正常处理积压' : worker?.enabled === false ? '未启用' : '等待工作线程状态';
+    runtime.append(kv('钱包画像批处理', priorityState(profiles)));
     renderPersistentStore(runtime, '来源账本', evidence, {records:evidence?.events,maxRecords:evidence?.maxEvents,recordLabel:'通知数 / 条数上限',errors:[evidence?.error,evidence?.captureError]});
     renderPersistentStore(runtime, '涨幅榜研究', rank, {records:rank?.tokens,recordLabel:'已登记币数',errors:[rank?.error]});
-    runtime.append(kv('涨幅榜研究已登记钱包 / 待更新币数', `${count(rank?.wallets)} / ${count(rank?.pending)}`), kv('涨幅榜研究最近更新', date(rank?.lastRunAt, true)));
+    runtime.append(kv('涨幅榜研究批处理', priorityState(rank)), kv('涨幅榜研究已登记钱包 / 待更新币数', `${count(rank?.wallets)} / ${count(rank?.pending)}`), kv('涨幅榜研究最近更新', date(rank?.lastRunAt, true)));
     for (const balance of Array.isArray(data.balances) ? data.balances : []) {
       runtime.append(kv(`${chainName(balance.chain)} · 余额查询`, balance.status === 'ok' ? `正常 · ${date(balance.checkedAt, true)}` : balance.status === 'stale' ? `刷新失败 · 上次成功 ${date(balance.checkedAt, true)}` : balance.status === 'loading' ? '查询中' : '暂不可用'));
       if (balance.status !== 'ok' && balance.reason) runtime.append(el('p', 'detail-message detail-error', reasonNames[balance.reason] || scalar(balance.reason)));
@@ -2694,12 +2698,13 @@
   }
   function renderRankResearch() {
     const wallets=state.rankResearchTab==='wallets',key=wallets?'rankWallets':'rankResearch',data=state[key]||{},page=state.listPages[key],status=data.status||{},items=Array.isArray(data.items)?data.items:[];
+    const priorityRequested=status.livePriority===true,priorityPaused=priorityRequested&&status.workerLivePriority===true;
     $('rankResearch-tokens-view').hidden=wallets;$('rankResearch-wallets-view').hidden=!wallets;
     document.querySelectorAll('[data-rank-research-tab]').forEach(button=>{const selected=button.dataset.rankResearchTab===state.rankResearchTab;button.classList.toggle('active',selected);button.setAttribute('aria-pressed',String(selected));});
     text('rankResearch-title',wallets?'跨币钱包 · 累积研究':'榜单代币 · 钱包研究');text('rankResearch-count',count(data.total));renderPager(key);
     text(`${key}-updated`,`${validDate(data.now)?`最近读取 ${time(data.now)} · `:''}${page.offset?'历史页暂停刷新':'首页每 15 秒更新'} · 每页 ${PAGE_SIZE} 条`);
     const label=$('rankResearch-status');label.className=`badge ${status.error?'watch':'neutral'}`;
-    label.textContent=status.error?'研究更新异常':status.enabled===false?'研究未启用':status.running===true?'持续研究运行中':data.ready===false?'等待建立研究样本':'研究数据 · 仅供观察';
+    label.textContent=status.error?'研究更新异常':status.enabled===false?'研究未启用':priorityPaused?'实盘计数优先 · 已暂停':priorityRequested?'正在切换实盘优先':status.running===true?'持续研究运行中':data.ready===false?'等待建立研究样本':'研究数据 · 仅供观察';
     const service=$('rankResearch-service');service.replaceChildren();
     for(const [field,title] of [['tokens','代币'],['wallets','钱包']])if(finite(status[field]))service.append(el('span','',`${title} ${count(status[field])}`));
     if(validDate(status.lastRunAt))service.append(el('span','',`后台更新 ${date(status.lastRunAt,true)}`));
@@ -2709,6 +2714,7 @@
     if(status.initialComplete===false)service.append(el('span','','初始历史样本正在回填'));
     else if(bootstrap?.rankDiscoveryComplete&&status.pending>0)service.append(el('span','','榜单已登记，钱包证据仍在整理'));
     if(status.inFlight)service.append(el('span','','后台正在整理新证据'));
+    if(priorityPaused)service.append(el('span','','停止计数后自动继续处理积压'));
     const warning=$(`${key}-warning`);warning.hidden=!state.resourceErrors[key]&&!status.error;warning.textContent=state.resourceErrors[key]?'研究数据暂时无法更新，保留最近一次成功结果。连接恢复后自动重试。':'后台研究暂时无法更新，当前页面保留已完成的样本；请检查运行状态。';
     const rows=$(`${key}-rows`);rows.replaceChildren();const empty=$(`${key}-empty`);empty.hidden=items.length>0;
     empty.querySelector('h3').textContent=state[`${key}Loaded`]?data.ready===false?'研究数据尚未就绪':'当前筛选下暂无研究样本':'正在读取研究数据';
@@ -3433,17 +3439,18 @@
     const enabled = data?.enabled !== false;
     const limited = data?.capacityReached === true || Boolean(data?.error);
     const running = enabled && data?.running === true;
-    const lastRun = validDate(data?.lastRunAt); const delayed = running && lastRun && Date.now() - lastRun.getTime() > Math.max(600000, (numeric(data.intervalSec) || 2) * 10000);
-    const label = failed ? '状态读取失败' : !enabled ? '画像未启用' : limited ? '更新需关注' : delayed ? '处理进度过旧' : running ? data?.inFlight ? '正在分析' : '持续更新中' : data?.running === false ? '后台任务已暂停' : '等待后台任务';
+    const priorityRequested=data?.livePriority===true,priorityPaused=priorityRequested&&data?.workerLivePriority===true;
+    const lastRun = validDate(data?.lastRunAt); const delayed = running && !priorityRequested && lastRun && Date.now() - lastRun.getTime() > Math.max(600000, (numeric(data.intervalSec) || 2) * 10000);
+    const label = failed ? '状态读取失败' : !enabled ? '画像未启用' : limited ? '更新需关注' : priorityPaused ? '实盘计数优先 · 已暂停' : priorityRequested ? '正在切换实盘优先' : delayed ? '处理进度过旧' : running ? data?.inFlight ? '正在分析' : '持续更新中' : data?.running === false ? '后台任务已暂停' : '等待后台任务';
     text('profile-status-badge', label); $('profile-status-badge').className = `badge ${failed || limited || delayed ? 'watch' : running ? 'pass' : 'neutral'}`;
-    text('profile-status-title', !enabled ? '钱包画像任务未启用' : failed || limited || delayed || data?.running === false ? '已有画像保留，更新状态需确认' : data?.initialComplete ? '已有画像持续重新评估' : '正在为已积累钱包建立画像');
+    text('profile-status-title', !enabled ? '钱包画像任务未启用' : priorityRequested ? '实盘计数优先，已有画像继续可用' : failed || limited || delayed || data?.running === false ? '已有画像保留，更新状态需确认' : data?.initialComplete ? '已有画像持续重新评估' : '正在为已积累钱包建立画像');
     text('profile-built-count', count(data?.profiles)); text('profile-source-count', count(data?.sourceWallets));
     const sourceProfiles = finite(data?.profiledSourceWallets) ? data.profiledSourceWallets : data?.profiles;
     text('profile-pending-count', finite(sourceProfiles) && finite(data?.sourceWallets) ? count(Math.max(0, data.sourceWallets - sourceProfiles)) : '—');
     const coverage = finite(sourceProfiles) && finite(data?.sourceWallets) && data.sourceWallets > 0 ? Math.min(100, sourceProfiles / data.sourceWallets * 100) : 0;
     $('profile-build-progress').value = coverage;
     $('profile-build-progress').setAttribute('aria-valuetext', `${Math.floor(coverage)}% 的已积累钱包已有画像`);
-    text('profile-status-note', `${data?.lastRunAt ? `最近处理 ${date(data.lastRunAt, true)}。` : '等待首次后台处理。'}${finite(data?.staleProfiles) ? `${count(data.staleProfiles)} 个画像已到期等待重评。` : ''}${running && !failed && !limited && !delayed ? `${finite(data?.intervalSec) ? `后台每 ${data.intervalSec} 秒调度一批，` : ''}新增证据和到期画像会分批重新评估；页面关闭后仍继续。` : '当前不能确认画像正在正常更新。'}覆盖率只表示已建档，不代表全部交易历史已覆盖。`);
+    text('profile-status-note', `${data?.lastRunAt ? `最近处理 ${date(data.lastRunAt, true)}。` : '等待首次后台处理。'}${finite(data?.staleProfiles) ? `${count(data.staleProfiles)} 个画像已到期等待重评。` : ''}${priorityPaused ? '实盘计数期间暂停批处理，停止计数后自动继续处理积压。' : priorityRequested ? '正在等待当前批次结束，随后暂停到停止计数。' : running && !failed && !limited && !delayed ? `${finite(data?.intervalSec) ? `后台每 ${data.intervalSec} 秒调度一批，` : ''}新增证据和到期画像会分批重新评估；页面关闭后仍继续。` : '当前不能确认画像正在正常更新。'}覆盖率只表示已建档，不代表全部交易历史已覆盖。`);
     const warning = failed ? '状态暂时无法更新，以下保留最近成功读取的数据。' : data?.capacityReached ? '画像库已达容量上限，更新暂停；已有画像保留，请检查服务端存储。' : data?.error ? '后台画像处理异常，已有画像可能未更新。' : delayed ? '较长时间未完成画像处理，已有结果可能过时，请查看后台任务状态。' : '';
     $('profile-status-warning').hidden = !warning; text('profile-status-warning', warning);
     text('profile-role-progress', finite(data?.roleProfiles) ? `有向行为比较：已处理 ${count(data.roleProfiles)} 个画像${finite(data.rolePending) ? ` · 尚待 ${count(data.rolePending)} 个` : ''}${data.roleLastRunAt ? ` · 最近 ${date(data.roleLastRunAt, true)}` : ''}。按每一对钱包分别比较先后方向。` : '有向行为比较尚未取得处理状态；已有历史分组不等于已完成角色辨别。');

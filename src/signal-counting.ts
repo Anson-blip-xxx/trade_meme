@@ -30,7 +30,7 @@ export function readControlledOpeningIdentities(path:string):Identity[] {
   finally {db?.close();}
 }
 
-interface Observation {signal:Signal;observedAt:string;alertMarketCapUsd?:number;
+export interface SignalCountingObservation {signal:Signal;observedAt:string;alertMarketCapUsd?:number;
   marketCapTiming?:'event_snapshot'|'unverified';name?:string;symbol?:string;}
 interface Options {
   database:string;controlledJournal:string;orders:OrderStore;
@@ -56,6 +56,9 @@ export class SignalCounting {
   private readonly dispatchConcurrency:number;
   private readonly dispatchCapacity:number;
   private activeDispatches=0;
+  private readonly postCommitWork:(()=>void)[]=[];
+  private readonly postCommitFailures:ThirdSignalCandidate[]=[];
+  private postCommitImmediate?:ReturnType<typeof setImmediate>;
   private controlledDb?:DatabaseSync;
   private controlledDataVersion=-1;
   private closed=false;
@@ -140,23 +143,68 @@ export class SignalCounting {
       `停止计数不影响现有持仓监控。`+(live&&!s.executionReady?`\n实盘未就绪：${s.readinessReason??'THIRD_SIGNAL_EXECUTION_UNAVAILABLE'}`:'')+
       (s.captureError||s.historyError?'\n状态异常，请查看 Web 系统状态。':'');
   }
-  observe(observation:Observation) {
+  private input(observation:SignalCountingObservation) {
+    const signal=observation.signal;
+    return {source:signal.source as 'debot'|'ave',chain:signal.token.chain,address:signal.token.address,
+      eventId:signal.sourceEventId,occurredAt:signal.occurredAt,receivedAt:observation.observedAt,
+      name:observation.name,symbol:observation.symbol,
+      marketCapUsd:signal.source==='debot'&&observation.marketCapTiming!=='event_snapshot'?undefined:observation.alertMarketCapUsd};
+  }
+  private observeInternal(observation:SignalCountingObservation,strict:boolean) {
     const signal=observation.signal;if(signal.source!=='ave'&&signal.source!=='debot')return;
     if(this.options.allowedChains&&!this.options.allowedChains.includes(signal.token.chain))return;
+    let result:ReturnType<ThirdSignalStrategy['observe']>;
     try {
       // Check newly submitted external controlled tests before evaluating another candidate.
       this.importControlled();
-      const result=this.strategy.observe({source:signal.source,chain:signal.token.chain,address:signal.token.address,
-        eventId:signal.sourceEventId,occurredAt:signal.occurredAt,receivedAt:observation.observedAt,
-        name:observation.name,symbol:observation.symbol,
-        marketCapUsd:signal.source==='debot'&&observation.marketCapTiming!=='event_snapshot'?undefined:observation.alertMarketCapUsd});
+      result=this.strategy.observe(this.input(observation));
       this.captureError=undefined;
-      if(result.candidate){
-        if(result.candidate.mode==='live')this.dispatchCandidate(result.candidate);
-        try{this.notifyCandidate(result.candidate);}catch{this.captureError='SIGNAL_COUNTING_NOTIFICATION_FAILED';}
-      }
-      return result;
-    } catch {this.captureError='SIGNAL_COUNTING_CAPTURE_FAILED';return;}
+    } catch(error) {
+      this.captureError='SIGNAL_COUNTING_CAPTURE_FAILED';
+      if(strict)throw error;
+      return;
+    }
+    // The source inbox may acknowledge this observation after strategy.observe
+    // commits it. Failures in execution dispatch or notification must not replay
+    // the already-counted source event.
+    if(result.candidate){
+      if(result.candidate.mode==='live')try{this.dispatchCandidate(result.candidate);}
+      catch{this.captureError='SIGNAL_COUNTING_CAPTURE_FAILED';}
+      try{this.notifyCandidate(result.candidate);}catch{this.captureError='SIGNAL_COUNTING_NOTIFICATION_FAILED';}
+    }
+    return result;
+  }
+  observe(observation:SignalCountingObservation) {return this.observeInternal(observation,false);}
+  /** Strict source-inbox handoff: throws until the observation is durably counted. */
+  observePriority(observation:SignalCountingObservation) {return this.observeInternal(observation,true);}
+  /** Strict page handoff. The entire accepted page commits atomically; execution
+   * and notifications begin only after that commit and can never replay it. */
+  observePriorityBatch(observations:readonly SignalCountingObservation[]) {
+    if(!Array.isArray(observations)||observations.length>100)throw Error('SIGNAL_COUNTING_BATCH_INVALID');
+    const accepted=observations.filter(observation=>(observation.signal.source==='ave'||observation.signal.source==='debot')&&
+      (!this.options.allowedChains||this.options.allowedChains.includes(observation.signal.token.chain)));
+    if(!accepted.length)return [];
+    let results:ReturnType<ThirdSignalStrategy['observeBatch']>;
+    try {
+      this.importControlled();results=this.strategy.observeBatch(accepted.map(observation=>this.input(observation)));
+      this.captureError=undefined;
+    }catch(error){this.captureError='SIGNAL_COUNTING_CAPTURE_FAILED';throw error;}
+    const candidates=results.flatMap(result=>result.candidate?[result.candidate]:[]);
+    const live=candidates.filter(candidate=>candidate.mode==='live');
+    if(live.length&&this.options.onCandidate)try {
+      const claimed=this.strategy.claimDispatchBatch(live);
+      for(let index=0;index<live.length;index++)if(claimed[index])this.queueClaimedCandidate(live[index],false);
+      // Preserve the original crash window: available execution workers reach
+      // their first await before the source inbox marks this page forwarded.
+      this.drainDispatches();
+    }catch{this.captureError='SIGNAL_COUNTING_CAPTURE_FAILED';}
+    // Telegram persistence is not part of the source ACK and may be much slower
+    // than local entry preflight, so run only notifications on the next turn.
+    this.schedulePostCommit(()=>{
+      for(const candidate of candidates)try{this.notifyCandidate(candidate);}
+      catch{this.captureError='SIGNAL_COUNTING_NOTIFICATION_FAILED';}
+    });
+    return results;
   }
   private notifyCandidate(candidate:ThirdSignalCandidate) {
     if(this.options.allowedChains&&!this.options.allowedChains.includes(candidate.chain))return;
@@ -187,8 +235,31 @@ export class SignalCounting {
   }
   private dispatchCandidate(candidate:ThirdSignalCandidate):void {
     if(!this.options.onCandidate||!this.strategy.claimDispatch(candidate))return;
+    this.queueClaimedCandidate(candidate);
+  }
+  private schedulePostCommit(work:()=>void):void {
+    if(this.closed)return;this.postCommitWork.push(work);this.armPostCommit();
+  }
+  private armPostCommit():void {
+    if(this.closed||this.postCommitImmediate||!this.postCommitWork.length)return;
+    this.postCommitImmediate=setImmediate(()=>{
+      this.postCommitImmediate=undefined;
+      const queued=this.postCommitWork.splice(0);
+      for(const task of queued)try{task();}catch{this.captureError='SIGNAL_COUNTING_CAPTURE_FAILED';}
+      this.armPostCommit();
+    });
+    this.postCommitImmediate.unref?.();
+  }
+  private queueClaimedCandidate(candidate:ThirdSignalCandidate,start=true):void {
     if(this.activeDispatches+this.dispatchQueue.length>=this.dispatchCapacity){
-      this.failDispatch(candidate,'THIRD_SIGNAL_DISPATCH_QUEUE_FULL');return;
+      if(start)this.failDispatch(candidate,'THIRD_SIGNAL_DISPATCH_QUEUE_FULL');
+      else {
+        this.postCommitFailures.push(candidate);this.schedulePostCommit(()=>{
+          const index=this.postCommitFailures.findIndex(item=>item.id===candidate.id);if(index>=0)this.postCommitFailures.splice(index,1);
+          this.failDispatch(candidate,'THIRD_SIGNAL_DISPATCH_QUEUE_FULL');
+        });
+      }
+      return;
     }
     let resolve!:()=>void;
     const completion=new Promise<void>(done=>{resolve=done;});
@@ -196,7 +267,7 @@ export class SignalCounting {
     this.dispatches.add(completion);this.dispatchQueue.push({candidate,complete});
     // Deliberately synchronous: the first free handler reaches its first await
     // before the source callback continues into slower research observers.
-    this.drainDispatches();
+    if(start)this.drainDispatches();
   }
   private failDispatch(candidate:ThirdSignalCandidate,why:unknown):void {
     const reason=why instanceof Error&&/^[A-Z][A-Z0-9_]{1,100}$/.test(why.message)?why.message:
@@ -229,6 +300,9 @@ export class SignalCounting {
     // snapshot can therefore return while the newly started callback is still
     // running. Keep observing the live set until both workers and queue drain.
     for(;;){
+      if(this.postCommitImmediate||this.postCommitWork.length){
+        await new Promise<void>(resolve=>setImmediate(resolve));continue;
+      }
       const pending=[...this.dispatches];
       if(!pending.length&&this.activeDispatches===0&&!this.dispatchQueue.length)return;
       if(pending.length)await Promise.allSettled(pending);
@@ -237,6 +311,9 @@ export class SignalCounting {
   }
   close(){
     if(this.closed)return;
+    if(this.postCommitImmediate)clearImmediate(this.postCommitImmediate);
+    this.postCommitImmediate=undefined;this.postCommitWork.length=0;
+    while(this.postCommitFailures.length)this.failDispatch(this.postCommitFailures.shift()!,'THIRD_SIGNAL_DISPATCH_QUEUE_FULL');
     // Normal runtime shutdown waits before close. Direct callers still get a
     // durable terminal outcome for queued callbacks and no unresolved promise.
     while(this.dispatchQueue.length){

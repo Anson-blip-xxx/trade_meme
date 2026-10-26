@@ -9,6 +9,7 @@ import {normalizeAveSignals} from '../src/providers/ave-signals.js';
 import {normalizeDebotSignals} from '../src/providers/debot-signals.js';
 import {unknown,type Signal} from '../src/types.js';
 import type {MemeMarketSample} from '../src/meme-assessment.js';
+import {DatabaseSync} from 'node:sqlite';
 
 const ca='0x610a36f996650be0561f5d74d36b7e73520a7777',wallet='0xb2374d152cf495383421355f8672a668af6f8dc6';
 function fixture(extra:Record<string,string>={}){
@@ -36,6 +37,11 @@ function localProviders(runtime:ReturnType<typeof createRuntime>){
   runtime.providers.research=undefined;runtime.providers.vendor=undefined;
   runtime.providers.evidence=async()=>[];runtime.providers.narrative=async()=>({...unknown('TEST_NO_NARRATIVE'),evidence:[]});
 }
+async function eventually(check:()=>boolean,timeoutMs=2000){
+  const deadline=Date.now()+timeoutMs;
+  while(Date.now()<deadline){if(check())return;await new Promise(resolve=>setTimeout(resolve,5));}
+  assert.equal(check(),true,'background observation drain did not finish');
+}
 
 test('Ave runtime immediately feeds cross-source evidence and Meme observation, then archives safety research without orders',async()=>{
   const {dir,config}=fixture({SOURCE_EVIDENCE_MAX_EVENTS:'300000',SOURCE_EVIDENCE_MAX_MB:'512',DEBOT_SIGNALS_MAX_MB:'256'}),original=globalThis.fetch;let network=0;
@@ -47,6 +53,7 @@ test('Ave runtime immediately feeds cross-source evidence and Meme observation, 
     assert.equal(runtime.sourceEvidence!.status().maxBytes,512*1024*1024);
     assert.equal(runtime.debotScanner!.getStatus().maxBytes,256*1024*1024);
     runtime.aveScanner!.acceptPage(page);
+    await eventually(()=>runtime.memeObserver!.list().total===1&&runtime.sourceEvidence!.assess(signal.token).freshSources.includes('ave'));
     assert.equal(runtime.archive!.list().total,0);assert.equal(runtime.memeObserver!.list().total,1);
     assert.equal(runtime.memeObserver!.list().items[0].firstSeenAt,page.observations[0].observedAt);
     assert.deepEqual(runtime.sourceEvidence!.assess(signal.token).freshSources,['ave']);
@@ -59,6 +66,7 @@ test('Ave runtime immediately feeds cross-source evidence and Meme observation, 
     assert.equal(runtime.dashboardOrders().items.length,0);
     assert.equal(runtime.sourceEvidence!.assess(signal.token).sources[0].deliveryCount,1);
     runtime.debotScanner!.acceptPage(debot());
+    await eventually(()=>runtime.sourceEvidence!.assess(signal.token).freshSourceCount===2);
     const cross=runtime.sourceEvidence!.assess(signal.token);assert.equal(cross.classification,'cross_source');
     assert.deepEqual(cross.freshSources,['ave','debot']);assert.equal(cross.scoreEffect,0);assert.equal(cross.independentEvidence,'unknown');
     runtime.aveScanner!.acceptPage(page);assert.equal(runtime.sourceEvidence!.assess(signal.token).sources[0].deliveryCount,1);
@@ -90,6 +98,7 @@ test('Ave wallet nominations survive safety rejection independently of research 
     observation.vendorWallets=Array.from({length:5},(_,i)=>({source:'ave',verification:'vendor_report',
       address:'0x'+String(i+1).repeat(40),alias:'vendor KOL',side:'buy',lastTradeAt:observation.signal.occurredAt}));
     runtime.aveScanner!.acceptPage(page);
+    await eventually(()=>runtime.walletHistory!.stats().nominations===5);
     assert.equal(runtime.walletHistory!.stats().nominations,5);assert.equal(runtime.walletHistory!.stats().events,0);
     await runtime.aveScanner!.dispatchOnce();assert.equal(runtime.archive!.list().items[0].decision,'REJECT');
     assert.equal(runtime.walletHistory!.stats().nominations,5);assert.equal(runtime.walletHistory!.stats().events,0);
@@ -101,9 +110,13 @@ test('Ave wallet nominations survive safety rejection independently of research 
     }
     assert.equal(runtime.dashboardOrders().items.length,0);
     // Failure of the durable nomination sink remains visible and cannot suppress cross-source observation.
-    runtime.walletHistory!.captureVendorNominations=()=>{throw Error('private-nomination-error');};
+    const nominationFault=new DatabaseSync(config.walletResearch.database);
+    try {nominationFault.exec("CREATE TRIGGER fail_nomination_worker BEFORE INSERT ON wh_observations WHEN NEW.kind='vendor_nomination' BEGIN SELECT RAISE(ABORT,'private-nomination-error'); END;");}
+    finally{nominationFault.close();}
     const second=structuredClone(page);second.observations[0].id='2';second.observations[0].signal.sourceEventId='ave:signal:'+'b'.repeat(64);
     runtime.aveScanner!.acceptPage(second);
+    await eventually(()=>{const state=runtime.dashboardOverview().ave;
+      return 'nominationCaptureError' in state&&state.nominationCaptureError==='WALLET_NOMINATION_CAPTURE_FAILED';});
     const status=runtime.dashboardOverview().ave;assert.ok('nominationCaptureError' in status);
     assert.equal(status.nominationCaptureError,'WALLET_NOMINATION_CAPTURE_FAILED');
     assert.equal(runtime.sourceEvidence!.assess(observation.signal.token).sources[0].notificationCount,2);
@@ -115,10 +128,12 @@ test('Meme history freezes source coverage at assessment while latest source dis
   const {dir,config}=fixture(),runtime=createRuntime(config);
   try{
     const page=ave(),token=page.observations[0].signal.token;runtime.aveScanner!.acceptPage(page);
+    await eventually(()=>runtime.memeObserver!.list().total===1);
     const market:MemeMarketSample={version:1,token,source:'dexscreener_pair',observedAt:new Date().toISOString(),
       priceUsd:1,liquidityUsd:50000,poolAddress:'0x'+'2'.repeat(40),windows:{'5m':{buys:5,sells:2,volumeUsd:1000}}};
     assert.equal(runtime.memeObserver!.recordMarket(market),true);
     runtime.debotScanner!.acceptPage(debot());
+    await eventually(()=>runtime.memeObserver!.list().items[0]?.corroboration?.freshSourceCount===2);
     assert.equal(runtime.memeObserver!.list().items[0].corroboration!.freshSourceCount,2);
     const detail=runtime.memeObserver!.detail(token)!;
     assert.equal(detail.items[0].corroboration!.freshSourceCount,1);
@@ -131,6 +146,7 @@ test('startup restoration of saved DeBot observations does not count as a new pr
   const {dir,config}=fixture({DASHBOARD_ENABLED:'false',GMGN_API_KEY:''});let runtime=createRuntime(config);
   try{
     const page=debot(),token=page.observations[0].signal.token;runtime.debotScanner!.acceptPage(page);
+    await eventually(()=>runtime.sourceEvidence!.assess(token).sources.length===1);
     const first=runtime.sourceEvidence!.assess(token).sources[0];assert.equal(first.deliveryCount,1);
     await runtime.close();runtime=createRuntime(config);
     // Exercise actual runtime startup/seed wiring while disabling external collectors.
@@ -146,8 +162,11 @@ test('startup restoration of saved DeBot observations does not count as a new pr
 test('failure of one research archive cannot suppress the independent observation sink or leak an upstream exception',async()=>{
   const {dir,config}=fixture(),runtime=createRuntime(config);
   try{
-    runtime.sourceEvidence!.record=()=>{throw Error('private-token-must-not-leak');};
-    runtime.aveScanner!.acceptPage(ave());assert.equal(runtime.memeObserver!.list().total,1);
+    const sourceFault=new DatabaseSync(config.corroboration!.database);
+    try {sourceFault.exec("CREATE TRIGGER fail_source_worker BEFORE INSERT ON source_notifications BEGIN SELECT RAISE(ABORT,'private-token-must-not-leak'); END;");}
+    finally{sourceFault.close();}
+    runtime.aveScanner!.acceptPage(ave());
+    await eventually(()=>runtime.memeObserver!.list().total===1);
     const status=runtime.dashboardOverview().corroboration;assert.ok('captureError' in status);
     assert.equal(status.captureError,'SOURCE_EVIDENCE_CAPTURE_FAILED');
     assert.equal(JSON.stringify(runtime.dashboardOverview()).includes('private-token'),false);
@@ -160,6 +179,7 @@ test('real GMGN feed coverage is independent of research cap and local wallet re
   try{
     localProviders(runtime);const page=ave(),signal=page.observations[0].signal;
     runtime.aveScanner!.acceptPage(page);
+    await eventually(()=>runtime.sourceEvidence!.assess(signal.token).freshSources.includes('ave'));
     // All discovery sources share this callback. Invoke the callback supplied to
     // the scanner to represent the local profile runner without starting timers.
     const dispatch=Reflect.get(runtime.scanner,'onSignal') as (signal:Signal)=>Promise<void>;

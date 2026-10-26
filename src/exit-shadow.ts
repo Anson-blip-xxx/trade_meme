@@ -52,6 +52,8 @@ export class ExitShadow {
   private readonly staleMs:number;
   private readonly maxPositions:number;
   private lastError?:string;
+  private sampleCount=0;
+  private eventCount=0;
   constructor(private readonly path:string,options:ExitShadowOptions={}) {
     this.now=options.now??(()=>new Date());this.maxBytes=options.maxBytes??128*1024*1024;
     this.staleMs=(options.staleAfterSec??180)*1000;this.maxPositions=options.maxPositions??1000;
@@ -95,6 +97,11 @@ export class ExitShadow {
     if(this.maxBytes>oldBudget&&this.bytes()+16384<this.maxBytes&&this.meta('last_error')==='EXIT_SHADOW_CAPACITY_REACHED')
       this.db.prepare("DELETE FROM exit_shadow_meta WHERE key='last_error'").run();
     this.db.prepare('INSERT OR REPLACE INTO exit_shadow_meta VALUES (?,?)').run('max_bytes',String(this.maxBytes));
+    // Historical totals are initialized once. All later writes below update the
+    // in-memory counters after COMMIT, so dashboard summary calls never scan the
+    // growing sample table on the event-loop thread.
+    this.sampleCount=Number(this.db.prepare('SELECT count(*) AS n FROM exit_shadow_samples').get()!.n);
+    this.eventCount=Number(this.db.prepare('SELECT count(*) AS n FROM exit_shadow_events').get()!.n);
   }
 
   recordPrice(price:ScanPrice,seed:ExitObservationSeed|undefined,pressure?:WalletPressure):void {
@@ -157,7 +164,9 @@ export class ExitShadow {
           ON CONFLICT(position_id) DO UPDATE SET peak_price=MAX(peak_price,excluded.peak_price),
           max_gap_sec=MAX(max_gap_sec,excluded.max_gap_sec),last_source=excluded.last_source`)
           .run(id,price.priceUsd,context.gapSec,price.source);
-        const emit=(event:ShadowEvent)=>this.db.prepare('INSERT INTO exit_shadow_events(position_id,at,data) VALUES (?,?,?)').run(id,event.at,JSON.stringify(event));
+        let eventsAdded=0;
+        const emit=(event:ShadowEvent)=>{eventsAdded+=Number(this.db.prepare('INSERT INTO exit_shadow_events(position_id,at,data) VALUES (?,?,?)')
+          .run(id,event.at,JSON.stringify(event)).changes);};
         if(!previous)emit({at,kind:'initialized',reason:'SHADOW_STARTED',observationOnly:true,priceUsd:price.priceUsd,gainPct:0,remainingPct:100,policyVersion:next.policyVersion,effectiveAt:next.policyEffectiveAt,dueAt:adaptiveExitDeadline(next)?.dueAt});
         else if(previous.error)emit({at,kind:'price_recovered',reason:'PRICE_SAMPLE_RECOVERED',observationOnly:true,priceUsd:price.priceUsd});
         if(state&&!state.shadowClosed&&next.protectionActive&&(!state.protectionActive||next.protectionPriceUsd>state.protectionPriceUsd))
@@ -179,7 +188,7 @@ export class ExitShadow {
         this.db.prepare('INSERT OR REPLACE INTO exit_shadow_meta VALUES (?,?)').run('last_sample_at',
           [this.meta('last_sample_at')??'',at].sort().at(-1)!);
         this.db.prepare("DELETE FROM exit_shadow_meta WHERE key='last_error'").run();
-        this.db.exec('COMMIT');this.lastError=undefined;
+        this.db.exec('COMMIT');this.sampleCount+=Number(inserted.changes);this.eventCount+=eventsAdded;this.lastError=undefined;
       }catch(error){this.db.exec('ROLLBACK');throw error;}
     }catch(error){this.fail(error instanceof Error&&/^EXIT_SHADOW_[A-Z_]+$/.test(error.message)?error.message:'EXIT_SHADOW_WRITE_FAILED');}
   }
@@ -196,9 +205,9 @@ export class ExitShadow {
       this.db.exec('BEGIN IMMEDIATE');
       this.db.prepare('UPDATE exit_shadow_positions SET error=?,error_at=?,updated_at=? WHERE id=?')
         .run(code(reason),now.toISOString(),now.toISOString(),row.id);
-      if(!row.error)this.db.prepare('INSERT INTO exit_shadow_events(position_id,at,data) VALUES (?,?,?)').run(row.id,now.toISOString(),
-        JSON.stringify({at:now.toISOString(),kind:'price_unavailable',reason:code(reason),observationOnly:true}));
-      this.db.exec('COMMIT');
+      const inserted=!row.error?Number(this.db.prepare('INSERT INTO exit_shadow_events(position_id,at,data) VALUES (?,?,?)').run(row.id,now.toISOString(),
+        JSON.stringify({at:now.toISOString(),kind:'price_unavailable',reason:code(reason),observationOnly:true})).changes):0;
+      this.db.exec('COMMIT');this.eventCount+=inserted;
     }catch(error) {try {this.db.exec('ROLLBACK');}catch{}
       this.fail(error instanceof Error&&error.message==='EXIT_SHADOW_CAPACITY_REACHED'?error.message:'EXIT_SHADOW_WRITE_FAILED');}
   }
@@ -224,7 +233,9 @@ export class ExitShadow {
       const state=next??old;
       if(this.bytes()+JSON.stringify(state).length*4+16384>this.maxBytes)this.fail('EXIT_SHADOW_CAPACITY_REACHED');
       this.db.exec('BEGIN IMMEDIATE');try{
-        const emit=(event:ShadowEvent)=>this.db.prepare('INSERT INTO exit_shadow_events(position_id,at,data) VALUES(?,?,?)').run(row.id,event.at,JSON.stringify(event));
+        let eventsAdded=0;
+        const emit=(event:ShadowEvent)=>{eventsAdded+=Number(this.db.prepare('INSERT INTO exit_shadow_events(position_id,at,data) VALUES(?,?,?)')
+          .run(row.id,event.at,JSON.stringify(event)).changes);};
         if(next){
           this.db.prepare('INSERT INTO exit_shadow_policy_history VALUES(?,?,?,?,?)')
             .run(row.id,now.toISOString(),old.policyVersion,next.policyVersion,row.state);
@@ -241,7 +252,7 @@ export class ExitShadow {
         }
         this.db.prepare('UPDATE exit_shadow_positions SET state=?,updated_at=?,phase=? WHERE id=?')
           .run(JSON.stringify(state),now.toISOString(),cancel?'tracking':row.phase,row.id);
-        this.db.exec('COMMIT');if(next)migrated++;if(cancel)cancelled++;
+        this.db.exec('COMMIT');this.eventCount+=eventsAdded;if(next)migrated++;if(cancel)cancelled++;
       }catch{this.db.exec('ROLLBACK');this.fail('EXIT_SHADOW_WRITE_FAILED');}
     }
     return {migrated,cancelled};
@@ -285,8 +296,7 @@ export class ExitShadow {
     return {enabled:true,mode:'shadow' as const,liveReady:false,policyVersion:ADAPTIVE_SHADOW_V3.version,
       status:{positions:Number(counts.positions),active:Number(counts.active??0),triggered:Number(counts.triggered??0),
         stale:Number(counts.stale??0),pending:Number(counts.pending??0),
-        samples:Number(this.db.prepare('SELECT count(*) AS n FROM exit_shadow_samples').get()!.n),
-        events:Number(this.db.prepare('SELECT count(*) AS n FROM exit_shadow_events').get()!.n),
+        samples:this.sampleCount,events:this.eventCount,
         startedAt:this.meta('started_at'),lastSampleAt:this.meta('last_sample_at'),lastError:this.lastError??this.meta('last_error'),
         maxBytes:this.maxBytes,bytes:this.bytes(),historyComplete:this.meta('history_complete')==='true',
         staleAfterSec:this.staleMs/1000,closedComparisonIntervalSec:60,execution:'observation_only',liveBlockReason:'ENTRY_UNATTENDED_PROTECTION_UNVERIFIED'}};

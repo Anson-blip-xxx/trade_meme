@@ -77,6 +77,15 @@ test('status recent-window count uses the chain and signal-time covering index',
   }finally{await f.close();}
 });
 
+test('runtime status remains a database-free scalar snapshot for HTTP composition',async()=>{
+  const f=fixture();try {
+    const observer=f.create();observer.register(signal());await observer.close();
+    const status=observer.runtimeStatus();assert.equal(status.enabled,true);assert.equal(status.maxActive,180);
+    assert.equal(status.samplingPlan.reason,'DASHBOARD_QUERY_PENDING');
+    assert.throws(()=>observer.status());
+  }finally{await f.close();}
+});
+
 test('list pagination uses first-seen ordering indexes without a temporary sort',async()=>{
   const f=fixture();
   try {
@@ -159,6 +168,39 @@ test('batch observation covers bounded chain groups fairly and enforces 30 secon
     f.advance(29);await observer.runOnce();assert.equal(f.calls.length,3);
     f.advance(30);await observer.runOnce();assert.equal(f.calls.length,4);assert.equal(f.calls[3].length,30);
     assert.equal(observer.status().fresh,65);
+  }finally{await f.close();}
+});
+
+test('live counting priority keeps registration, samples one token per turn, and pauses only catalyst research',async()=>{
+  const catalysts:Signal['token'][]=[];const f=fixture({catalyst:async input=>{catalysts.push(input.token);return catalyst(input.token,f.now());}});
+  try {
+    const observer=f.create();[1,2,3].forEach(i=>observer.register(signal(i)));
+    observer.setLivePriority(true);
+    const priority=observer.status();assert.equal(priority.livePriority,true);assert.equal(priority.marketBatchLimit,1);
+    assert.equal(priority.catalystPaused,true);assert.equal(priority.signalRegistrationPaused,false);
+    await observer.runOnce();await observer.runCatalystOnce();assert.deepEqual(f.calls.map(batch=>batch.length),[1]);assert.equal(catalysts.length,0);
+    f.advance(1);assert.equal(observer.register(signal(4,1)),true);assert.equal(observer.list().total,4);
+    observer.setLivePriority(false);await observer.runOnce();await observer.runCatalystOnce();
+    assert.deepEqual(f.calls.map(batch=>batch.length),[1,3]);assert.equal(catalysts.length,1);
+    assert.equal(observer.status().researchMode,'normal');assert.equal(observer.status().catalystPaused,false);
+  }finally{await f.close();}
+});
+
+test('entering live priority aborts optional in-flight research without reporting a collection failure',async()=>{
+  let marketAborted=false,catalystAborted=false;
+  const f=fixture({
+    marketBatch:async(_tokens,abort)=>new Promise<never>((_resolve,reject)=>abort.addEventListener('abort',()=>{
+      marketAborted=true;reject(new DOMException('priority','AbortError'));},{once:true})),
+    catalyst:async(_input,abort)=>new Promise<never>((_resolve,reject)=>abort.addEventListener('abort',()=>{
+      catalystAborted=true;reject(new DOMException('priority','AbortError'));},{once:true})),
+  });
+  try {
+    const observer=f.create();observer.register(signal());
+    const marketWork=observer.runOnce(),catalystWork=observer.runCatalystOnce();observer.setLivePriority(true);
+    await Promise.all([marketWork,catalystWork]);
+    assert.equal(marketAborted,true);assert.equal(catalystAborted,true);
+    assert.equal(observer.status().error,undefined);assert.equal(observer.status().marketInFlight,false);
+    assert.equal(observer.status().catalystInFlight,false);
   }finally{await f.close();}
 });
 

@@ -5,6 +5,8 @@ const HOST = 'https://openapi.gmgn.ai';
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 12_000;
 const MAX_QUEUE_WAIT_MS = 45_000;
+const MAX_LIVE_ENTRY_QUEUE = 16;
+const MAX_NORMAL_QUEUE = 128;
 // Only API-key GET routes verified in the official OpenApiClient. No writes,
 // signed wallet routes, arbitrary URL, guessed funding endpoint, or redirects.
 const READ_ROUTES = new Map<string, number>([
@@ -40,9 +42,129 @@ export class GmgnError extends Error {
 }
 
 interface RateState { nextAt: number; cooldownUntil: number; }
-// One process-wide request queue. Clients with the same credential also share
-// weighted pacing and cooldown, even when constructed by different providers.
-let requestTail: Promise<void> = Promise.resolve();
+export type GmgnRequestPriority = 'normal' | 'live_entry';
+export interface GmgnScheduleOptions {
+  priority?: GmgnRequestPriority;
+  /** Queue budget only. Network requests retain their own fixed timeout. */
+  queueTimeoutMs?: number;
+}
+interface ScheduledRequest<T> {
+  lane: RateState;
+  priority: GmgnRequestPriority;
+  expiresAt: number;
+  signal?: AbortSignal;
+  waitMs: () => number;
+  run: () => Promise<T>;
+  resolve: (value: T) => void;
+  reject: (error: unknown) => void;
+  timer?: ReturnType<typeof setTimeout>;
+  abort?: () => void;
+  started: boolean;
+  settled: boolean;
+}
+// One process-wide scheduler owns all queues. Requests sharing a credential are
+// strictly serial and share weighted pacing/cooldown; separate credentials have
+// independent Plus quotas and therefore cannot head-of-line block each other.
+const liveEntryQueue: ScheduledRequest<unknown>[] = [];
+const normalQueue: ScheduledRequest<unknown>[] = [];
+const activeLanes = new Set<RateState>();
+let schedulerActive = false;
+let schedulerWake: ReturnType<typeof setTimeout> | undefined;
+
+function removeScheduled(job: ScheduledRequest<unknown>): boolean {
+  const queue = job.priority === 'live_entry' ? liveEntryQueue : normalQueue;
+  const index = queue.indexOf(job);
+  if (index < 0) return false;
+  queue.splice(index, 1);
+  return true;
+}
+function cleanupScheduled(job: ScheduledRequest<unknown>): void {
+  if (job.timer) clearTimeout(job.timer);
+  if (job.abort && job.signal) job.signal.removeEventListener('abort', job.abort);
+}
+function rejectScheduled(job: ScheduledRequest<unknown>, error: unknown): void {
+  if (job.settled) return;
+  job.settled = true;
+  cleanupScheduled(job);
+  job.reject(error);
+}
+function kickScheduler(): void {
+  if (schedulerWake) { clearTimeout(schedulerWake); schedulerWake = undefined; }
+  if (!schedulerActive) void drainScheduler();
+}
+function pruneQueue(queue: ScheduledRequest<unknown>[], now: number): void {
+  for (let index = queue.length - 1; index >= 0; index--) {
+    const job = queue[index];
+    if (job.signal?.aborted || job.expiresAt <= now) {
+      queue.splice(index, 1);
+      rejectScheduled(job, new GmgnError(job.signal?.aborted ? 'GMGN_REQUEST_ABORTED' : 'GMGN_QUEUE_TIMEOUT'));
+    }
+  }
+}
+function nextReady(queue: ScheduledRequest<unknown>[]): {job?: ScheduledRequest<unknown>; wait: number} {
+  let wait = Number.POSITIVE_INFINITY;
+  for (const job of queue) {
+    if (activeLanes.has(job.lane)) continue;
+    const remaining = Math.max(0, job.waitMs());
+    if (remaining === 0) return {job, wait: 0};
+    wait = Math.min(wait, remaining);
+  }
+  return {wait};
+}
+async function drainScheduler(): Promise<void> {
+  if (schedulerActive) return;
+  schedulerActive = true;
+  try {
+    for (;;) {
+      const now = Date.now();
+      pruneQueue(liveEntryQueue, now); pruneQueue(normalQueue, now);
+      const live = nextReady(liveEntryQueue);
+      const normal = live.job ? {wait: Number.POSITIVE_INFINITY} : nextReady(normalQueue);
+      const selected = live.job ?? normal.job;
+      if (!selected) {
+        const wait = Math.min(live.wait, normal.wait);
+        if (Number.isFinite(wait)) schedulerWake = setTimeout(() => {schedulerWake = undefined; kickScheduler();}, wait);
+        return;
+      }
+      removeScheduled(selected); selected.started = true; cleanupScheduled(selected); activeLanes.add(selected.lane);
+      void (async () => {
+        try {
+          const value = await selected.run();
+          if (!selected.settled) { selected.settled = true; selected.resolve(value); }
+        } catch (error) { rejectScheduled(selected, error); }
+        // Let a completed high-priority metadata read enqueue its dependent
+        // holder reads before releasing this credential lane to background work.
+        await Promise.resolve(); activeLanes.delete(selected.lane); kickScheduler();
+      })();
+    }
+  } finally { schedulerActive = false; }
+}
+function enqueueScheduled<T>(job: Omit<ScheduledRequest<T>, 'resolve'|'reject'|'started'|'settled'>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const scheduled: ScheduledRequest<T> = {...job, resolve, reject, started: false, settled: false};
+    const queue = scheduled.priority === 'live_entry' ? liveEntryQueue : normalQueue;
+    pruneQueue(queue as ScheduledRequest<unknown>[], Date.now());
+    const capacity = scheduled.priority === 'live_entry' ? MAX_LIVE_ENTRY_QUEUE : MAX_NORMAL_QUEUE;
+    // Capacity belongs to the credential lane. One configured account must not
+    // reject live work for another account that has its own quota and pacing.
+    if (queue.reduce((count,queued)=>count+Number(queued.lane===scheduled.lane),0) >= capacity) {
+      reject(new GmgnError('GMGN_QUEUE_TIMEOUT')); return;
+    }
+    scheduled.timer = setTimeout(() => {
+      if (scheduled.started || !removeScheduled(scheduled as ScheduledRequest<unknown>)) return;
+      rejectScheduled(scheduled as ScheduledRequest<unknown>, new GmgnError('GMGN_QUEUE_TIMEOUT'));
+      kickScheduler();
+    }, Math.max(1, scheduled.expiresAt - Date.now()));
+    scheduled.abort = () => {
+      if (scheduled.started || !removeScheduled(scheduled as ScheduledRequest<unknown>)) return;
+      rejectScheduled(scheduled as ScheduledRequest<unknown>, new GmgnError('GMGN_REQUEST_ABORTED'));
+      kickScheduler();
+    };
+    scheduled.signal?.addEventListener('abort', scheduled.abort, {once: true});
+    if (scheduled.signal?.aborted) { scheduled.abort(); return; }
+    queue.push(scheduled as ScheduledRequest<unknown>); kickScheduler();
+  });
+}
 const rateStates = new Map<string, RateState>();
 const object = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -86,7 +208,8 @@ export class GmgnClient {
   /** Epoch milliseconds; allows pollers to skip work until the shared reset. */
   get cooldownUntil(): number { return this.state.cooldownUntil; }
 
-  async get(path: string, query: Record<string, string | number>, weight?: number): Promise<unknown> {
+  async get(path: string, query: Record<string, string | number>, weight?: number,
+    scheduling: GmgnScheduleOptions = {}): Promise<unknown> {
     this.checkAborted();
     if (!this.apiKey) throw new GmgnError('GMGN_API_KEY_MISSING');
     const routeWeight = READ_ROUTES.get(path);
@@ -101,44 +224,31 @@ export class GmgnClient {
     }
     const safeQuery = {...query};
     const cost = Math.max(routeWeight, Math.ceil(weight ?? routeWeight));
-    return this.scheduleRequest(cost, () => this.request(path, safeQuery));
+    return this.scheduleRequest(cost, () => this.request(path, safeQuery), scheduling);
   }
 
   /** Shared budget only: this does not expose a network write method or credentials. */
-  async scheduleRequest<T>(weight: number, execute: () => Promise<T>): Promise<T> {
+  async scheduleRequest<T>(weight: number, execute: () => Promise<T>, scheduling: GmgnScheduleOptions = {}): Promise<T> {
     this.checkAborted();
     if (!this.apiKey) throw new GmgnError('GMGN_API_KEY_MISSING');
     if (!Number.isFinite(weight) || weight < 1 || weight > 100) throw new GmgnError('GMGN_QUERY_INVALID');
-    const cost = Math.ceil(weight);
-    let expired = false;
-    let timer: ReturnType<typeof setTimeout>;
-    const timeout = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => { expired = true; reject(new GmgnError('GMGN_QUEUE_TIMEOUT')); }, MAX_QUEUE_WAIT_MS);
-    });
-    const operation = requestTail.then(async () => {
+    if (scheduling.priority !== undefined && scheduling.priority !== 'normal' && scheduling.priority !== 'live_entry')
+      throw new GmgnError('GMGN_QUERY_INVALID');
+    if (scheduling.queueTimeoutMs !== undefined && (!Number.isFinite(scheduling.queueTimeoutMs) ||
+      scheduling.queueTimeoutMs < 1 || scheduling.queueTimeoutMs > MAX_QUEUE_WAIT_MS)) throw new GmgnError('GMGN_QUERY_INVALID');
+    const cost = Math.ceil(weight), priority = scheduling.priority ?? 'normal';
+    const queueTimeoutMs = Math.floor(scheduling.queueTimeoutMs ?? MAX_QUEUE_WAIT_MS);
+    return enqueueScheduled<T>({lane: this.state, priority, expiresAt: Date.now() + queueTimeoutMs, signal: this.signal,
+      waitMs: () => Math.max(0, this.state.nextAt - this.now()), run: async () => {
       this.checkAborted();
-      if (expired) throw new GmgnError('GMGN_QUEUE_TIMEOUT');
       const now = this.now();
       if (this.state.cooldownUntil > now) {
         throw new GmgnError('GMGN_RATE_LIMITED', this.state.cooldownUntil, now);
       }
-      const wait = Math.max(0, this.state.nextAt - now);
-      if (wait >= MAX_QUEUE_WAIT_MS) throw new GmgnError('GMGN_QUEUE_TIMEOUT', this.state.nextAt, now);
-      if (wait) {
-        let waitTimer:ReturnType<typeof setTimeout>|undefined;
-        try {await abortable(new Promise<void>(resolve=>{waitTimer=setTimeout(resolve,wait);}),this.signal);}
-        finally {clearTimeout(waitTimer);}
-      }
       this.checkAborted();
-      if (expired) throw new GmgnError('GMGN_QUEUE_TIMEOUT');
-      clearTimeout(timer);
       this.state.nextAt = this.now() + this.interval * cost;
       return execute();
-    });
-    requestTail = operation.then(() => undefined, () => undefined);
-    try { return await abortable(Promise.race([operation, timeout]),this.signal); }
-    catch(error){this.checkAborted();throw error;}
-    finally { clearTimeout(timer!); }
+    }});
   }
 
   /** Signed execution uses the same cooldown without granting this client write access. */

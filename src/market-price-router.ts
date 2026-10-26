@@ -1,5 +1,6 @@
 import {abortable,type Fetcher} from './http.js';
-import {normalizePriceToken,normalizeDexSpot,priceFromInfo,GMGN_PRICE_CHAINS} from './market-price-normalizers.js';
+import {normalizePriceToken,normalizeDexPoolIdentity,createDexSpotNormalizer,priceFromInfo,GMGN_PRICE_CHAINS,
+  type DexPoolIdentity,type DexSpotNormalizer,type DexSpotSample} from './market-price-normalizers.js';
 import {fetchDebotPrice,DebotPriceError} from './providers/debot-price.js';
 import {GmgnError,type GmgnClient} from './providers/gmgn-client.js';
 import type {ScanPrice,ScanToken} from './scan-archive.js';
@@ -40,6 +41,14 @@ const SCOPE='observed_spot_not_executable_quote' as const;
 const SOURCES:MarketPriceSource[]=['dexscreener','gmgn','ave','debot','chain_pool'];
 const SOURCE_NAMES:Record<MarketPriceSource,string>={dexscreener:'dexscreener_token_pairs_sample',gmgn:'gmgn_token_info_sample',
   ave:'ave_price_stream_sample',debot:'debot_price_stream_sample',chain_pool:'chain_pool_sample'};
+const MAX_DEX_TOKENS=30;
+const MAX_DEX_ROWS=10_000;
+// A response beyond either per-token ceiling is rejected as a whole. Never
+// truncate pools: a discarded later row could contain a price conflict.
+const MAX_DEX_ROWS_PER_TOKEN=2_048;
+const MAX_DEX_POOLS_PER_TOKEN=512;
+const MAX_DEX_POOLS_TOTAL=10_000;
+const DEX_ROUTE_YIELD_ROWS=512;
 const object=(v:unknown):v is Record<string,unknown>=>v!==null&&typeof v==='object'&&!Array.isArray(v);
 const key=(t:ScanToken)=>`${t.chain}:${t.address}`;
 const instant=(v:unknown):number|undefined=>typeof v==='string'&&v.length<=40&&/^\d{4}-\d{2}-\d{2}T/.test(v)&&Number.isFinite(Date.parse(v))?Date.parse(v):undefined;
@@ -303,7 +312,8 @@ export class MarketPriceRouter {
     const at=this.now().toISOString();if(!this.accept('gmgn',token,price.priceUsd,at,at,'http_response',price.market))throw new Error('PRICE_SAMPLE_REJECTED');
   }
   private async readDex(tokens:ScanToken[],signal:AbortSignal):Promise<void> {
-    const began=this.now().getTime(),chain=tokens[0].chain;
+    const began=this.now().getTime(),chain=tokens[0]?.chain;
+    if(!chain||tokens.length>MAX_DEX_TOKENS||tokens.some(token=>token.chain!==chain))throw new Error('DEX_PRICE_INPUT_INVALID');
     // Official DEX Screener GET /tokens/v1/{chainId}/{tokenAddresses}, at most 30 full addresses.
     const response=await abortable(this.fetcher(`https://api.dexscreener.com/tokens/v1/${chain}/${tokens.map(t=>t.address).join(',')}`,
       {method:'GET',redirect:'error',credentials:'omit',headers:{accept:'application/json'},signal}),signal);
@@ -317,25 +327,59 @@ export class MarketPriceRouter {
     const age=response.headers.get('age');
     if(age!==null&&(!/^\d+$/.test(age)||Number(age)*1000>=this.maxAge)) {void response.body?.cancel().catch(()=>{});throw new Error('DEX_PRICE_STALE_RESPONSE');}
     const raw=await this.readJson(response,signal);signal.throwIfAborted();
-    if(!Array.isArray(raw)||raw.length>10_000)throw new Error('DEX_PRICE_SCHEMA_INVALID');
-    if(this.now().getTime()<began)throw new Error('PRICE_CLOCK_REGRESSED');
-    const receivedAt=this.now().toISOString(),at=new Date(this.now().getTime()-Number(age??0)*1000).toISOString();let accepted=0;
-    for(const token of tokens) {
-      const pools=new Map<string,ReturnType<typeof normalizeDexSpot>|null>();
-      for(const row of raw) {
-        const sample=normalizeDexSpot(row,token,at);if(!sample)continue;
-        const prior=pools.get(sample.poolKey);
-        if(prior===undefined)pools.set(sample.poolKey,sample);
-        else if(prior&&prior.priceUsd!==sample.priceUsd)pools.set(sample.poolKey,null);
+    if(!Array.isArray(raw)||raw.length>MAX_DEX_ROWS)throw new Error('DEX_PRICE_SCHEMA_INVALID');
+    const completed=this.now().getTime();if(completed<began)throw new Error('PRICE_CLOCK_REGRESSED');
+    const receivedAt=new Date(completed).toISOString(),atMs=completed-Number(age??0)*1000,at=new Date(atMs).toISOString();let accepted=0;
+    const requested=new Map<string,{token:ScanToken;normalize:DexSpotNormalizer}>();
+    for(const token of tokens) {const normalize=createDexSpotNormalizer(token,at);if(normalize)requested.set(token.address,{token,normalize});}
+    const indexed=new Map<string,Map<string,DexSpotSample|null>>();
+    const poolIdentities=new Map<string,DexPoolIdentity|null>();
+    const matchedRows=new Map<string,number>();
+    // A token-address index turns the provider's bounded response into one pass.
+    // Looking up the base address before normalization also avoids expensive
+    // Solana decoding for unrelated or malformed rows.
+    for(let index=0;index<raw.length;index++) {
+      if(index&&index%DEX_ROUTE_YIELD_ROWS===0) {await new Promise<void>(resolve=>setImmediate(resolve));signal.throwIfAborted();}
+      const row=raw[index];
+      if(!object(row)||row.chainId!==chain||!object(row.baseToken)||typeof row.baseToken.address!=='string')continue;
+      if(chain==='solana'?(row.baseToken.address.length<32||row.baseToken.address.length>44):row.baseToken.address.length!==42)continue;
+      const address=chain==='solana'?row.baseToken.address:row.baseToken.address.toLowerCase();
+      const target=requested.get(address);if(!target)continue;const {token,normalize}=target;
+      const count=(matchedRows.get(token.address)??0)+1;matchedRows.set(token.address,count);
+      if(count>MAX_DEX_ROWS_PER_TOKEN)throw new Error('DEX_PRICE_TOKEN_ROWS_EXCEEDED');
+      if(typeof row.pairAddress!=='string')continue;
+      if(chain==='solana'?(row.pairAddress.length<32||row.pairAddress.length>44):row.pairAddress.length!==42&&row.pairAddress.length!==66)continue;
+      let pool=poolIdentities.get(row.pairAddress);
+      if(pool===undefined&&!poolIdentities.has(row.pairAddress)) {
+        if(poolIdentities.size>=MAX_DEX_POOLS_TOTAL)throw new Error('DEX_PRICE_POOL_LIMIT_EXCEEDED');
+        pool=normalizeDexPoolIdentity(chain,row.pairAddress)??null;poolIdentities.set(row.pairAddress,pool);
       }
-      const candidates=[...pools.values()].filter((s):s is NonNullable<typeof s>=>!!s&&s.priceUsd!==undefined);
-      candidates.sort((a,b)=>(b.liquidityUsd??-1)-(a.liquidityUsd??-1)||a.poolKey.localeCompare(b.poolKey));
-      if([...pools.values()].some(p=>p===null)) {this.blocks.set(key(token),{source:'dexscreener',reason:'PRICE_POOL_CONFLICT',until:Date.parse(at)+this.maxAge});continue;}
-      const best=candidates[0];if(!best)continue;
+      const sample=normalize(row,pool);if(!sample)continue;
+      let pools=indexed.get(token.address);if(!pools){pools=new Map();indexed.set(token.address,pools);}
+      const prior=pools.get(sample.poolKey);
+      if(prior===undefined) {
+        if(pools.size>=MAX_DEX_POOLS_PER_TOKEN)throw new Error('DEX_PRICE_TOKEN_POOL_LIMIT_EXCEEDED');
+        pools.set(sample.poolKey,sample);
+      }
+      else if(prior&&prior.priceUsd!==sample.priceUsd)pools.set(sample.poolKey,null);
+    }
+    for(const token of tokens) {
+      const pools=indexed.get(token.address);if(!pools)continue;
+      let best:DexSpotSample|undefined,poolConflict=false;
+      for(const candidate of pools.values()) {
+        if(!candidate){poolConflict=true;break;}
+        const liquidity=candidate.liquidityUsd??-1,bestLiquidity=best?.liquidityUsd??-1;
+        if(!best||liquidity>bestLiquidity||liquidity===bestLiquidity&&candidate.poolKey.localeCompare(best.poolKey)<0)best=candidate;
+      }
+      if(poolConflict) {this.blocks.set(key(token),{source:'dexscreener',reason:'PRICE_POOL_CONFLICT',until:atMs+this.maxAge});continue;}
+      if(!best)continue;
       // Disagreement between substantial pools is a real ambiguity, never a manufactured gain.
-      const relevant=candidates.filter(p=>(p.liquidityUsd??0)>=Math.max(100,(best.liquidityUsd??0)*0.1));
-      if(relevant.length>1&&(Math.max(...relevant.map(p=>p.priceUsd!))/Math.min(...relevant.map(p=>p.priceUsd!))-1)*100>this.spread) {
-        this.blocks.set(key(token),{source:'dexscreener',reason:'PRICE_POOL_CONFLICT',until:Date.parse(at)+this.maxAge});continue;
+      const threshold=Math.max(100,(best.liquidityUsd??0)*0.1);let relevant=0,min=Infinity,max=-Infinity;
+      for(const candidate of pools.values())if(candidate&&(candidate.liquidityUsd??0)>=threshold) {
+        relevant++;min=Math.min(min,candidate.priceUsd);max=Math.max(max,candidate.priceUsd);
+      }
+      if(relevant>1&&(max/min-1)*100>this.spread) {
+        this.blocks.set(key(token),{source:'dexscreener',reason:'PRICE_POOL_CONFLICT',until:atMs+this.maxAge});continue;
       }
       if(this.accept('dexscreener',token,best.priceUsd!,at,receivedAt,'http_response',{
         ...(best.poolAddress?{poolAddress:best.poolAddress}:{}),...(best.liquidityUsd!==undefined?{liquidityUsd:best.liquidityUsd}:{})}))accepted++;

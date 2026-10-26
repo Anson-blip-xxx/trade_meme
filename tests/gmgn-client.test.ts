@@ -9,6 +9,7 @@ const key = () => `test-${randomUUID()}`;
 const route = '/v1/token/info';
 const query = {chain: 'bsc', address: '0x1111111111111111111111111111111111114444'};
 const rejects = (reason: string) => (error: unknown) => error instanceof GmgnError && error.reason === reason;
+function deferred<T>() {let resolve!: (value: T) => void; const promise = new Promise<T>(done => {resolve = done;}); return {promise, resolve};}
 
 test('client refuses missing credentials, writes, arbitrary URLs and auth-query overrides before fetching', async () => {
   let calls = 0;
@@ -73,6 +74,94 @@ test('all instances serialize requests and same-key instances share pacing', asy
   await Promise.all([a.get(route, query, 2), b.get(route, query)]);
   assert.equal(maxActive, 1);
   assert.ok(starts[1] - starts[0] >= 45, `weighted pacing gap: ${starts[1] - starts[0]}`);
+});
+
+test('live-entry work passes queued normal work without bypassing the global in-flight request', async () => {
+  const entered = deferred<void>(), release = deferred<void>(), order: string[] = [];
+  const client = new GmgnClient({apiKey: key(), minIntervalMs: 0, fetcher: async input => {
+    const marker = new URL(String(input)).searchParams.get('marker')!; order.push(marker);
+    if (marker === 'in-flight') {entered.resolve(); await release.promise;}
+    return response({code: 0, data: marker});
+  }});
+  const inFlight = client.get(route, {...query, marker: 'in-flight'}); await entered.promise;
+  const normal = Array.from({length: 32}, (_, index) => client.get(route, {...query, marker: `normal-${index}`}));
+  const live = client.get(route, {...query, marker: 'live-entry'}, 1, {priority: 'live_entry'});
+  release.resolve();
+  await Promise.all([inFlight, ...normal, live]);
+  assert.equal(order.length, 34);
+  assert.deepEqual(order.slice(0, 2), ['in-flight', 'live-entry']);
+});
+
+test('expired live-entry work is removed and never consumes a later request slot', async () => {
+  const entered = deferred<void>(), release = deferred<void>(); let calls = 0;
+  const client = new GmgnClient({apiKey: key(), minIntervalMs: 0, fetcher: async () => {
+    calls++; if (calls === 1) {entered.resolve(); await release.promise;}
+    return response({code: 0, data: calls});
+  }});
+  const blocker = client.get(route, query); await entered.promise;
+  const expired = client.get(route, query, 1, {priority: 'live_entry', queueTimeoutMs: 10});
+  await assert.rejects(expired, rejects('GMGN_QUEUE_TIMEOUT'));
+  assert.equal(calls, 1);
+  release.resolve(); await blocker;
+  await client.get(route, query);
+  assert.equal(calls, 2);
+});
+
+test('live-entry waiting lane is bounded while preserving accepted work', async () => {
+  const entered = deferred<void>(), release = deferred<void>(); let calls = 0;
+  const client = new GmgnClient({apiKey: key(), minIntervalMs: 0, fetcher: async () => {
+    calls++; if (calls === 1) {entered.resolve(); await release.promise;}
+    return response({code: 0, data: calls});
+  }});
+  const blocker = client.get(route, query); await entered.promise;
+  const accepted = Array.from({length: 16}, () => client.get(route, query, 1, {priority: 'live_entry'}));
+  await assert.rejects(client.get(route, query, 1, {priority: 'live_entry'}), rejects('GMGN_QUEUE_TIMEOUT'));
+  release.resolve(); await blocker; await Promise.all(accepted);
+  assert.equal(calls, 17);
+});
+
+test('normal waiting lane is bounded and aborted overflow work never executes', async () => {
+  const entered = deferred<void>(), release = deferred<void>(); let calls = 0;
+  const apiKey = key(), base = new GmgnClient({apiKey, minIntervalMs: 0, fetcher: async () => {
+    calls++; if (calls === 1) {entered.resolve(); await release.promise;}
+    return response({code: 0, data: calls});
+  }});
+  const blocker = base.get(route, query); await entered.promise;
+  const controller = new AbortController(), queued = base.withSignal(controller.signal);
+  const accepted = Array.from({length: 128}, () => queued.get(route, query));
+  const aborted = accepted.map(request => assert.rejects(request, rejects('GMGN_REQUEST_ABORTED')));
+  await assert.rejects(queued.get(route, query), rejects('GMGN_QUEUE_TIMEOUT'));
+  controller.abort(); await Promise.all(aborted);
+  release.resolve(); await blocker; await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls, 1);
+});
+
+test('an in-flight normal request on another credential cannot block live-entry work', async () => {
+  const entered = deferred<void>(), release = deferred<void>(); const order: string[] = [];
+  const normal = new GmgnClient({apiKey: key(), minIntervalMs: 0, fetcher: async () => {
+    order.push('normal-start'); entered.resolve(); await release.promise; order.push('normal-end');
+    return response({code: 0, data: {}});
+  }});
+  const live = new GmgnClient({apiKey: key(), minIntervalMs: 0, fetcher: async () => {
+    order.push('live'); return response({code: 0, data: {}});
+  }});
+  const blocked = normal.get(route, query); await entered.promise;
+  await live.get(route, query, 1, {priority: 'live_entry'});
+  assert.deepEqual(order, ['normal-start', 'live']);
+  release.resolve(); await blocked;
+});
+
+test('a full live queue on one credential cannot consume another credential capacity', async () => {
+  const entered = deferred<void>(), release = deferred<void>();
+  const first = new GmgnClient({apiKey: key(), minIntervalMs: 0, fetcher: async () => {
+    entered.resolve(); await release.promise; return response({code: 0, data: {}});
+  }});
+  const blocker = first.get(route, query); await entered.promise;
+  const queued = Array.from({length: 16}, () => first.get(route, query, 1, {priority: 'live_entry'}));
+  const second = new GmgnClient({apiKey: key(), minIntervalMs: 0,
+    fetcher: async () => response({code: 0, data: 'independent'})});
+  assert.equal(await second.get(route, query, 1, {priority: 'live_entry'}), 'independent');
+  release.resolve(); await blocker; await Promise.all(queued);
 });
 
 test('429 cooldown is shared, fails fast without retries, and clears after reset', async () => {

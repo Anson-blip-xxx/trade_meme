@@ -85,6 +85,9 @@ export class WalletSetupLedger {
         closed_at TEXT,review_withdrawn INTEGER NOT NULL DEFAULT 0,data TEXT NOT NULL,evidence TEXT NOT NULL DEFAULT '[]');
       CREATE INDEX IF NOT EXISTS wsl_due ON wsl_setups(closed_at,last_checked_at,registered_at,id);
       CREATE INDEX IF NOT EXISTS wsl_token ON wsl_setups(chain,address,registered_at DESC);
+      CREATE INDEX IF NOT EXISTS wsl_page ON wsl_setups(registered_at DESC,id);
+      CREATE INDEX IF NOT EXISTS wsl_chain_page ON wsl_setups(chain,registered_at DESC,id);
+      CREATE INDEX IF NOT EXISTS wsl_token_page ON wsl_setups(chain,address,registered_at DESC,id);
       CREATE INDEX IF NOT EXISTS wsl_status_counts ON wsl_setups(closed_at,review_withdrawn);
       CREATE INDEX IF NOT EXISTS wsl_status_state ON wsl_setups(state);
       CREATE TABLE IF NOT EXISTS wsl_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);`);

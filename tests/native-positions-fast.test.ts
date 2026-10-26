@@ -81,6 +81,40 @@ test('a dirty notification during an in-flight check schedules a second evaluati
   }finally{gate.resolve();await f.s.close();}
 });
 
+test('slow durable notification delivery cannot delay a newer protection evaluation',async t=>{
+  let now=BASE,price=1n,evaluations=0;
+  const delivery=deferred<void>(),buy:NativeConfirmedPosition={orderId:'buy-notify',wallet:address(1),mint:address(2),inputAmount:'1000',
+    outputAmount:'1000',tokenDecimals:6,signature:signature(3),buySlot:100,confirmedAt:new Date(now).toISOString(),subscriptionAccounts:[address(4)]};
+  const io:NativePositionIO={
+    balance:async input=>({wallet:input.wallet,mint:input.mint,amount:'1000',tokenDecimals:6,slot:101,commitment:'confirmed',observedAt:new Date(now).toISOString()}),
+    quote:async input=>({wallet:input.wallet,mint:input.mint,inputAmount:input.amount,outputAmount:(BigInt(input.amount)*price).toString(),
+      minimumOutputAmount:(BigInt(input.amount)*price).toString(),quotedAt:new Date(now).toISOString(),expiresAt:new Date(now+1000).toISOString()}),
+    sell:async()=>({status:'pending'}),reconcile:async()=>({status:'pending'}),
+  };
+  const s=new NativePositionSupervisor(':memory:',{io,now:()=>now,autoSchedule:false,eventDriven:true,minCheckIntervalMs:0,
+    onUpdate:()=>delivery.promise,onEvaluation:()=>{evaluations++;}});
+  try{
+    s.register(buy);s.start();
+    await s.checkNow(buy.orderId);assert.equal(evaluations,1);
+    const started=performance.now();price=3n;now++;s.markDirty(buy.orderId,{slot:101,observedAt:new Date(now).toISOString()});
+    await until(()=>evaluations===2);
+    t.diagnostic(JSON.stringify({type:'slow-notification',deliveryStillBlocked:true,evaluationMs:performance.now()-started}));
+    assert.equal(s.get(buy.orderId)!.quote?.outputAmount,'3000');
+  }finally{delivery.resolve();await s.close();}
+});
+
+test('30 and 100 positions evaluate independently while every quote source is slow',async t=>{
+  for(const count of [30,100]){
+    const f=fixture(count);try{
+      f.onQuote(async()=>sleep(25));const started=performance.now();
+      await Promise.all(f.buys.map(buy=>f.s.checkNow(buy.orderId)));
+      const elapsed=performance.now()-started;
+      t.diagnostic(JSON.stringify({type:'slow-quote',positions:count,delayPerQuoteMs:25,elapsedMs:elapsed,evaluated:f.s.list().filter(p=>p.quote).length}));
+      assert.equal(f.s.list().filter(p=>p.quote).length,count);assert.ok(elapsed<500);
+    }finally{await f.s.close();}
+  }
+});
+
 test('bursts while an exit is in flight never create a second sell',async()=>{
   const f=fixture(1),gate=deferred<NativePositionExitResult>();try{
     f.prices.set('buy-0',{n:2n,d:1n});f.onSale(async()=>gate.promise);
@@ -135,7 +169,7 @@ test('stopping rejects late balance failures and late sell results without state
 });
 
 test('graduated local replay measures dirty-to-valuation work without network or trading',async(t)=>{
-  for(const count of [3,10,20,50,100,200]){
+  for(const count of [3,10,20,30,50,100,200]){
     const dir=mkdtempSync(join(tmpdir(),'native-stream-replay-')),f=fixture(count,join(dir,'positions.sqlite'));
     try{
       await Promise.all(f.buys.map(b=>f.s.checkNow(b.orderId)));f.advance();

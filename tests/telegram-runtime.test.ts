@@ -639,6 +639,9 @@ test('owner TG start enables SOL third-signal live entry with attached exits, du
  const {dir,config}=fixture({DASHBOARD_ENABLED:'false',GMGN_API_KEY:'synthetic-live-runtime-key',GMGN_PRIVATE_KEY:pem,
    ENTRY_WALLET_SOLANA:solWallet,SOLANA_RPC_URL:'https://runtime-rpc.invalid',SCANNER_CHAINS:'solana',
    THIRD_SIGNAL_EXECUTION_MODE:'live',ENTRY_BALANCE_BPS_SOLANA:'300',ENTRY_INPUT_TOKEN_SOLANA:sol});
+ config.walletResearch={...config.walletResearch,enabled:true,database:join(dir,'wallet-history.sqlite')};
+ config.walletProfiles={...config.walletProfiles,enabled:true,database:join(dir,'wallet-profiles.sqlite')};
+ config.tokenRankResearch={...config.tokenRankResearch!,enabled:true,database:join(dir,'token-rank.sqlite')};
  config.exitPolicy={enabled:true,sellRatioType:'hold_amount',takeProfit:[{gainPct:100,sellPct:50}],stopLoss:{dropPct:60,sellPct:100}};
  const tg=telegramHarness(),state={posts:0,quotes:0,balanceReads:0};let runtime:ReturnType<typeof createRuntime>;
  const entryFetcher:typeof fetch=async(input,init)=>{
@@ -689,6 +692,9 @@ test('owner TG start enables SOL third-signal live entry with attached exits, du
    const started=await pollTelegram(runtime,config.telegram!.database,tg,[privateMessage(11,'启动计数')]);
    assert.ok(started.some(message=>message.text.includes('达标自动实盘买入')));
    assert.equal(runtime.signalCounting.status().executionEnabled,true);assert.equal(runtime.telegramControls!.status().countingMode,'live');
+   assert.equal(runtime.walletIndexRunner?.snapshot().livePriority,true);
+   assert.equal(runtime.walletProfiles?.status().livePriority,true);
+   assert.equal(runtime.tokenRankResearch?.status().livePriority,true);
    for(let n=0;n<3;n++){observe('debot');observe('ave');}
    await runtime.signalCounting.waitForDispatches();
    assert.equal(state.posts,1);assert.equal(state.quotes,1);assert.equal(state.balanceReads,2);
@@ -704,6 +710,9 @@ test('owner TG start enables SOL third-signal live entry with attached exits, du
    const events=runtime.signalCounting.status().events;
    for(let n=0;n<3;n++)observe('debot',otherMint);
    await runtime.signalCounting.waitForDispatches();assert.equal(state.posts,1);assert.equal(runtime.signalCounting.status().events,events);
+   assert.equal(runtime.walletIndexRunner?.snapshot().livePriority,false);
+   assert.equal(runtime.walletProfiles?.status().livePriority,false);
+   assert.equal(runtime.tokenRankResearch?.status().livePriority,false);
    assert.equal(runtime.signalCounting.status().executionEnabled,false);assert.equal(runtime.orders.list().length,1);
    assert.equal(globalNetwork.mock.callCount(),0);
  }finally{await runtime.close();rmSync(dir,{recursive:true,force:true});}

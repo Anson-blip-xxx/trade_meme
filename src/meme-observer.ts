@@ -42,6 +42,34 @@ function validToken(token:Token):Token|undefined {
 }
 function time(value:unknown):number {return typeof value==='string'&&/^\d{4}-\d\d-\d\dT/.test(value)?Date.parse(value):NaN;}
 const iso=(n:number)=>new Date(n).toISOString();
+export interface MemeSignalRegistrationOptions {
+  now:Date;windowMs:number;chains:readonly Chain[];display?:{name?:string;symbol?:string};
+}
+
+/** Small, synchronous write shared with the source-observation worker. The
+ * caller owns the connection and must initialize the MemeObserver schema
+ * before using it. */
+export function registerMemeSignal(db:DatabaseSync,signal:Signal,receivedAt:string,
+  options:MemeSignalRegistrationOptions):boolean {
+  const token=validToken(signal.token),at=time(receivedAt),now=options.now.getTime(),eventAt=time(signal.occurredAt);
+  if(!token||!options.chains.includes(token.chain)||!Number.isFinite(at)||at>now||!Number.isFinite(eventAt)||
+    eventAt>now+30000||eventAt<now-options.windowMs)return false;
+  const key=hash([signal.source,signal.sourceEventId,token]);
+  db.exec('SAVEPOINT meme_register');
+  try {
+    const inserted=db.prepare('INSERT OR IGNORE INTO meme_signals VALUES (?,?)').run(key,receivedAt);
+    if(!inserted.changes){db.exec('RELEASE meme_register');return false;}
+    const clean:Signal={...signal,token,text:signal.text.slice(0,4000),evidenceUrls:signal.evidenceUrls.slice(0,12)};
+    delete clean.vendorNarrative;
+    db.prepare(`INSERT INTO meme_tokens(chain,address,first_seen_at,last_signal_at,signal,name,symbol) VALUES(?,?,?,?,?,?,?)
+      ON CONFLICT(chain,address) DO UPDATE SET last_signal_at=MAX(last_signal_at,excluded.last_signal_at),
+      signal=CASE WHEN excluded.last_signal_at>=last_signal_at THEN excluded.signal ELSE signal END,
+      name=COALESCE(excluded.name,name),symbol=COALESCE(excluded.symbol,symbol)`)
+      .run(token.chain,token.address,receivedAt,receivedAt,JSON.stringify(clean),
+        tokenDisplayText(options.display?.name,100)??null,tokenDisplayText(options.display?.symbol,32)??null);
+    db.exec('RELEASE meme_register');return true;
+  }catch(error){db.exec('ROLLBACK TO meme_register; RELEASE meme_register');throw error;}
+}
 // This projection is covered by meme_tokens_sampling. Active-set scheduling and
 // status must not deserialize each token's large wallet or catalyst evidence.
 const samplingFields="chain,address,last_signal_at,first_seen_at,market_attempt_at,last_sample_at,catalyst_attempt_at,fallback_attempt_at,json_extract(signal,'$.source') AS sampling_source,json_extract(catalyst,'$.status') AS sampling_catalyst_status,json_extract(catalyst,'$.expiresAt') AS sampling_catalyst_expires_at,catalyst IS NULL AS sampling_catalyst_missing";
@@ -53,7 +81,7 @@ export class MemeObserver {
   private readonly maxActive:number;private readonly windowMs:number;private readonly maxBytes:number;
   private readonly chains:Chain[];
   private readonly samplingReader:ReviewSamplingPlanReader;
-  private running=false;private closed=false;private marketWork?:Promise<void>;private catalystWork?:Promise<void>;
+  private running=false;private closed=false;private livePriority=false;private marketWork?:Promise<void>;private catalystWork?:Promise<void>;
   private timer?:ReturnType<typeof setTimeout>;private socialTimer?:ReturnType<typeof setTimeout>;
   private marketAbort?:AbortController;private socialAbort?:AbortController;
   private lastCycleAt?:string;private error?:string;private catalystError?:string;private nextPrune=0;private dexCooldown=0;
@@ -118,23 +146,7 @@ export class MemeObserver {
   }
   register(signal:Signal,receivedAt=this.now().toISOString(),display:{name?:string;symbol?:string}={}):boolean {
     if(this.closed)return false;
-    const token=validToken(signal.token),at=time(receivedAt),now=this.now().getTime(),eventAt=time(signal.occurredAt);
-    if(!token||!this.chains.includes(token.chain)||!Number.isFinite(at)||at>now||!Number.isFinite(eventAt)||eventAt>now+30000||eventAt<now-this.windowMs)return false;
-    const key=hash([signal.source,signal.sourceEventId,token]);
-    this.db.exec('SAVEPOINT meme_register');
-    try {
-      const inserted=this.db.prepare('INSERT OR IGNORE INTO meme_signals VALUES (?,?)').run(key,receivedAt);
-      if(!inserted.changes){this.db.exec('RELEASE meme_register');return false;}
-      const clean:Signal={...signal,token,text:signal.text.slice(0,4000),evidenceUrls:signal.evidenceUrls.slice(0,12)};
-      // Do not persist large optional raw narrative material in the discovery queue.
-      delete clean.vendorNarrative;
-      this.db.prepare(`INSERT INTO meme_tokens(chain,address,first_seen_at,last_signal_at,signal,name,symbol) VALUES(?,?,?,?,?,?,?)
-        ON CONFLICT(chain,address) DO UPDATE SET last_signal_at=MAX(last_signal_at,excluded.last_signal_at),
-        signal=CASE WHEN excluded.last_signal_at>=last_signal_at THEN excluded.signal ELSE signal END,
-        name=COALESCE(excluded.name,name),symbol=COALESCE(excluded.symbol,symbol)`)
-        .run(token.chain,token.address,receivedAt,receivedAt,JSON.stringify(clean),tokenDisplayText(display.name,100)??null,tokenDisplayText(display.symbol,32)??null);
-      this.db.exec('RELEASE meme_register');return true;
-    }catch(error){this.db.exec('ROLLBACK TO meme_register; RELEASE meme_register');throw error;}
+    return registerMemeSignal(this.db,signal,receivedAt,{now:this.now(),windowMs:this.windowMs,chains:this.chains,display});
   }
   captureReport(report:Report):void {
     if(this.closed||report.mode!=='live')return;
@@ -336,7 +348,10 @@ export class MemeObserver {
     const catalystFresh=active.filter(row=>!row.sampling_catalyst_missing&&row.sampling_catalyst_status!=='unknown'&&time(row.sampling_catalyst_expires_at)>now).length;
     const catalystPending=active.filter(row=>row.sampling_catalyst_missing).length,catalystUnknown=active.filter(row=>row.sampling_catalyst_status==='unknown').length;
     const sampling=this.samplingReader.read();
-    return {enabled:true,running:this.running,activeChains:[...this.chains],active:active.length,waiting:Math.max(0,recent-active.length),fresh,stale:active.length-fresh,
+    return {enabled:true,running:this.running,livePriority:this.livePriority,
+      researchMode:this.livePriority?'live_counting_priority':'normal',marketBatchLimit:this.livePriority?1:30,
+      catalystPaused:this.livePriority,catalystPausedReason:this.livePriority?'LIVE_SIGNAL_COUNTING_PRIORITY':undefined,
+      signalRegistrationPaused:false,activeChains:[...this.chains],active:active.length,waiting:Math.max(0,recent-active.length),fresh,stale:active.length-fresh,
       samplingPlan:{status:sampling.status,reason:sampling.reason,scope:'research_sampling_only',candidateLimit:1200,
         ...(sampling.plan?{id:sampling.plan.id,policyVersion:sampling.plan.policyVersion,effectiveAt:sampling.plan.effectiveAt,
           expiresAt:sampling.plan.expiresAt,fairShare:sampling.plan.fairShare,cohorts:sampling.plan.cohorts}:{})},
@@ -349,10 +364,26 @@ export class MemeObserver {
         ...(this.maintenance?{maintenance:this.maintenance.snapshot()}:{})},
       experimental:true,tradingEnabled:false,retentionDays:30,maxSnapshots:250000,learningScope:'frozen_features_and_subsequent_sampled_returns'};
   }
+  /** Pure in-memory half of status for HTTP paths. A read-only dashboard worker
+   * replaces the aggregate placeholders before the response is sent. */
+  runtimeStatus(){
+    return {enabled:true,running:this.running,livePriority:this.livePriority,
+      researchMode:this.livePriority?'live_counting_priority':'normal',marketBatchLimit:this.livePriority?1:30,
+      catalystPaused:this.livePriority,catalystPausedReason:this.livePriority?'LIVE_SIGNAL_COUNTING_PRIORITY':undefined,
+      signalRegistrationPaused:false,activeChains:[...this.chains],active:0,waiting:0,fresh:0,stale:0,
+      samplingPlan:{status:'unavailable',reason:'DASHBOARD_QUERY_PENDING',scope:'research_sampling_only',candidateLimit:1200},
+      catalystFresh:0,catalystPending:0,catalystUnknown:0,catalystStale:0,catalystMinRetrySec:600,catalystQueueIntervalSec:15,
+      maxActive:this.maxActive,activeWindowSec:this.windowMs/1000,intervalSec:5,targetSampleIntervalSec:30,
+      lastCycleAt:this.lastCycleAt,error:this.catalystError??this.error,marketInFlight:!!this.marketWork,catalystInFlight:!!this.catalystWork,
+      marketSampleCallbackError:this.marketSampleCallbackError,
+      storage:{maxBytes:this.maxBytes,usedBytes:this.usedBytes,checkedAt:this.storageCheckedAt,pressure:this.storagePressure,reclaimedSnapshots:this.reclaimedSnapshots,
+        ...(this.maintenance?{maintenance:this.maintenance.snapshot()}:{})},experimental:true,tradingEnabled:false,retentionDays:30,maxSnapshots:250000,
+      learningScope:'frozen_features_and_subsequent_sampled_returns'};
+  }
   runOnce():Promise<void>{
     if(this.marketWork)return this.marketWork;if(this.closed)return Promise.resolve();
     this.marketAbort=new AbortController();const signal=this.marketAbort.signal;
-    this.marketWork=this.collect(signal).catch(()=>{this.error='MEME_OBSERVATION_UNAVAILABLE';})
+    this.marketWork=this.collect(signal).catch(()=>{if(!signal.aborted&&!this.closed)this.error='MEME_OBSERVATION_UNAVAILABLE';})
       .finally(()=>{this.marketWork=undefined;this.marketAbort=undefined;});return this.marketWork;
   }
   private async collect(signal:AbortSignal){
@@ -360,7 +391,9 @@ export class MemeObserver {
     const due=this.activeRows().filter(r=>!r.market_attempt_at||now-time(r.market_attempt_at)>=30000)
       .sort((a,b)=>String(a.market_attempt_at??'').localeCompare(String(b.market_attempt_at??''))||String(b.last_signal_at).localeCompare(String(a.last_signal_at)));
     const first=due[0];if(!first)return;
-    const rows=due.filter(row=>row.chain===first.chain).slice(0,30);
+    // Real-time signal counting still contributes one market sample per cycle,
+    // while bounding each main-thread assessment/write turn to a single token.
+    const rows=due.filter(row=>row.chain===first.chain).slice(0,this.livePriority?1:30);
     // Only the actual request batch needs pool metadata; do not load the full
     // active set's evidence merely to choose its next thirty observations.
     const pools=new Map(this.db.prepare(`SELECT chain,address,json_extract(market,'$.poolAddress') pool FROM meme_tokens WHERE (chain,address) IN (VALUES ${rows.map(()=>'(?,?)').join(',')})`)
@@ -378,7 +411,8 @@ export class MemeObserver {
     let samples:MemeMarketSample[]=[];
     try {samples=await this.options.marketBatch(rows.map(row=>{const pool=pools.get(tokenKey({chain:row.chain,address:row.address}));
       return {chain:row.chain,address:row.address,poolAddress:typeof pool==='string'?pool:undefined};}),signal);}
-    catch(error){if(error instanceof Error&&error.message==='MEME_MARKET_RATE_LIMITED')this.dexCooldown=now+60000;this.error='MEME_MARKET_BATCH_UNAVAILABLE';}
+    catch(error){if(signal.aborted||this.closed)return;
+      if(error instanceof Error&&error.message==='MEME_MARKET_RATE_LIMITED')this.dexCooldown=now+60000;this.error='MEME_MARKET_BATCH_UNAVAILABLE';}
     if(signal.aborted||this.closed)return;
     const requested=new Set(rows.map(row=>tokenKey({chain:row.chain,address:row.address}))),received=new Set<string>();
     let storeError:unknown;
@@ -386,6 +420,9 @@ export class MemeObserver {
     // cannot discard earlier evidence, and no transaction spans the yield.
     const candidates=samples.filter(sample=>requested.has(tokenKey(sample.token)));
     for(const sample of candidates){
+      // A completed HTTP batch must yield before each synchronous assessment so
+      // queued signal/socket callbacks get the first turn.
+      await new Promise<void>(resolve=>setImmediate(resolve));if(signal.aborted||this.closed)return;
       try {if(this.recordMarket(sample))received.add(tokenKey(sample.token));}
       catch(error){storeError=error;break;}
       await new Promise<void>(resolve=>setImmediate(resolve));if(signal.aborted||this.closed)return;
@@ -410,14 +447,14 @@ export class MemeObserver {
     this.lastCycleAt=this.now().toISOString();this.prune();
   }
   runCatalystOnce():Promise<void>{
-    if(this.catalystWork)return this.catalystWork;if(this.closed||!this.options.catalyst)return Promise.resolve();
+    if(this.catalystWork)return this.catalystWork;if(this.closed||this.livePriority||!this.options.catalyst)return Promise.resolve();
     this.socialAbort=new AbortController();const abort=this.socialAbort.signal;
-    this.catalystWork=this.collectCatalyst(abort).catch(()=>{this.catalystError='MEME_CATALYST_UNAVAILABLE';})
+    this.catalystWork=this.collectCatalyst(abort).catch(()=>{if(!abort.aborted&&!this.closed)this.catalystError='MEME_CATALYST_UNAVAILABLE';})
       .finally(()=>{this.catalystWork=undefined;this.socialAbort=undefined;});
     return this.catalystWork;
   }
   private async collectCatalyst(abort:AbortSignal):Promise<void>{
-    if(this.storagePressure)return;
+    if(this.livePriority||this.storagePressure)return;
     const now=this.now().getTime(),row=this.activeRows().filter(r=>!r.catalyst_attempt_at||now-time(r.catalyst_attempt_at)>=600000)
       .sort((a,b)=>String(a.catalyst_attempt_at??'').localeCompare(String(b.catalyst_attempt_at??''))||String(b.last_signal_at).localeCompare(String(a.last_signal_at)))[0];
     if(!row)return;
@@ -491,6 +528,17 @@ export class MemeObserver {
     const tick=()=>{if(!this.running)return;void this.runOnce().finally(()=>{if(this.running){this.timer=setTimeout(tick,5000);this.timer.unref();}});};
     const social=()=>{if(!this.running)return;void this.runCatalystOnce().finally(()=>{if(this.running){this.socialTimer=setTimeout(social,15000);this.socialTimer.unref();}});};
     tick();social();
+  }
+  /** Live counting keeps signal registration active, limits market learning to
+   * one token per turn, and pauses optional catalyst work until counting stops. */
+  setLivePriority(active:boolean):void {
+    if(this.closed||this.livePriority===active)return;this.livePriority=active;
+    if(active){this.marketAbort?.abort();this.socialAbort?.abort();return;}
+    if(!this.running)return;
+    const resume=(work:Promise<void>|undefined,run:()=>Promise<void>)=>{
+      void (work??Promise.resolve()).then(()=>{if(this.running&&!this.livePriority)void run();},()=>{if(this.running&&!this.livePriority)void run();});
+    };
+    resume(this.marketWork,()=>this.runOnce());resume(this.catalystWork,()=>this.runCatalystOnce());
   }
   async close(){if(this.closed)return;this.running=false;clearTimeout(this.timer);clearTimeout(this.socialTimer);
     this.marketAbort?.abort();this.socialAbort?.abort();await Promise.all([this.marketWork,this.catalystWork]);await this.maintenance?.stop();this.closed=true;this.db.close();}

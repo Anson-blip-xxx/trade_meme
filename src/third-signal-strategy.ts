@@ -56,6 +56,12 @@ const identifier=(v:unknown):v is string=>typeof v==='string'&&v.length>0&&v.len
 const time=(v:unknown)=>typeof v==='string'&&/^\d{4}-\d{2}-\d{2}T/.test(v)?Date.parse(v):NaN;
 const label=(v:unknown,max:number)=>typeof v==='string'?v.replace(/[\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069]/g,' ').trim().slice(0,max)||undefined:undefined;
 const cap=(v:unknown):number|undefined=>typeof v==='number'&&Number.isFinite(v)&&v>0?v:undefined;
+const stableJson=(value:unknown):string=>JSON.stringify((function sort(item:unknown):unknown {
+  if(Array.isArray(item))return item.map(sort);
+  if(item!==null&&typeof item==='object')return Object.fromEntries(Object.entries(item as Record<string,unknown>)
+    .sort(([left],[right])=>left<right?-1:left>right?1:0).map(([key,nested])=>[key,sort(nested)]));
+  return item;
+})(value));
 function fail(reason:string):never {throw new Error(reason);}
 function normalize(chain:ThirdSignalChain,address:unknown):string|undefined {
   if(typeof address!=='string')return;
@@ -169,9 +175,8 @@ export class ThirdSignalStrategy {
       return {created:!existing,phase:'actual_opened_imported'};
     });
   }
-  observe(input:ThirdSignalInput):ThirdSignalResult {
-    return this.transaction(()=>{
-      const run=this.current();if(!run?.running)return {status:'ignored',reason:'STRATEGY_STOPPED'};
+  private observeInTransaction(input:ThirdSignalInput,run:Run|undefined):ThirdSignalResult {
+      if(!run?.running)return {status:'ignored',reason:'STRATEGY_STOPPED'};
       const now=this.clock(),address=normalize(input.chain,input.address),occurred=time(input.occurredAt),received=time(input.receivedAt);
       if(!['debot','ave'].includes(input.source)||!address||!identifier(input.eventId)||!Number.isFinite(occurred)||!Number.isFinite(received))
         return {status:'ignored',reason:'SIGNAL_INVALID'};
@@ -224,6 +229,18 @@ export class ThirdSignalStrategy {
       this.db.prepare('INSERT INTO third_signal_events VALUES (?,?,?,?,?,?,?,?,?)')
         .run(...identity,input.eventId,occurred,received,count,JSON.stringify(result));
       return result;
+  }
+  observe(input:ThirdSignalInput):ThirdSignalResult {
+    return this.transaction(()=>this.observeInTransaction(input,this.current()));
+  }
+  /** A source page is one durable unit: preserve its event order while paying
+   * for one WAL commit instead of one synchronous fsync per notification. */
+  observeBatch(inputs:readonly ThirdSignalInput[]):ThirdSignalResult[] {
+    if(!Array.isArray(inputs)||inputs.length>100)fail('THIRD_SIGNAL_BATCH_INVALID');
+    if(!inputs.length)return [];
+    return this.transaction(()=>{
+      const run=this.current();
+      return inputs.map(input=>this.observeInTransaction(input,run));
     });
   }
   list(options:ThirdSignalPageOptions={}) {
@@ -274,6 +291,17 @@ export class ThirdSignalStrategy {
         .run(this.clock(),candidate.id).changes===1;
     });
   }
+  /** Claim every committed page candidate in one transaction. Results retain
+   * input order so the caller can enqueue exactly the rows it owns. */
+  claimDispatchBatch(candidates:readonly ThirdSignalCandidate[]):boolean[] {
+    if(!Array.isArray(candidates)||candidates.length>100)fail('THIRD_SIGNAL_BATCH_INVALID');
+    if(!candidates.length)return [];
+    return this.transaction(()=>candidates.map(candidate=>{
+      if(!this.isActive(candidate))return false;
+      return this.db.prepare("UPDATE third_signal_dispatch SET state='dispatched',updated_at=? WHERE candidate_id=? AND state='claimed'")
+        .run(this.clock(),candidate.id).changes===1;
+    }));
+  }
   finishDispatch(candidate:ThirdSignalCandidate,reason?:string):void {
     const safeReason=reason&&/^[A-Z][A-Z0-9_]{1,100}$/.test(reason)?reason:reason?'THIRD_SIGNAL_ENTRY_CALLBACK_FAILED':undefined;
     this.transaction(()=>{
@@ -288,9 +316,26 @@ export class ThirdSignalStrategy {
       execution.reason!==undefined&&!/^[A-Z][A-Z0-9_]{1,100}$/.test(execution.reason))fail('THIRD_SIGNAL_EXECUTION_INVALID');
     const holderRisk=normalizeStoredEntryHolderRisk(execution.holderRisk,{chain:candidate.chain,address:candidate.address});
     this.transaction(()=>{
-      this.db.prepare(`UPDATE third_signal_dispatch SET execution_status=?,execution_order_id=COALESCE(?,execution_order_id),
-        execution_reason=?,execution_holder_risk=COALESCE(?,execution_holder_risk),updated_at=? WHERE candidate_id=? AND EXISTS(SELECT 1 FROM third_signal_candidates WHERE id=? AND run_id=?)`)
-        .run(execution.status,execution.orderId??null,execution.reason??null,holderRisk?JSON.stringify(holderRisk):null,this.clock(),candidate.id,candidate.id,candidate.runId);
+      const row=this.db.prepare(`SELECT d.execution_status,d.execution_order_id,d.execution_reason,d.execution_holder_risk
+        FROM third_signal_dispatch d JOIN third_signal_candidates c ON c.id=d.candidate_id
+        WHERE d.candidate_id=? AND c.run_id=?`).get(candidate.id,candidate.runId) as {execution_status:string|null;
+          execution_order_id:string|null;execution_reason:string|null;execution_holder_risk:string|null}|undefined;
+      if(!row)return;
+      const orderId=execution.orderId??row.execution_order_id,reason=execution.reason??null;
+      let holderRiskJson=row.execution_holder_risk;
+      if(holderRisk){
+        const incoming=stableJson(holderRisk);let same=false;
+        if(row.execution_holder_risk)try {
+          const stored=normalizeStoredEntryHolderRisk(JSON.parse(row.execution_holder_risk),{chain:candidate.chain,address:candidate.address});
+          same=!!stored&&stableJson(stored)===incoming;
+        }catch{/* A valid incoming snapshot replaces malformed historical data. */}
+        if(!same)holderRiskJson=incoming;
+      }
+      if(row.execution_status===execution.status&&row.execution_order_id===orderId&&row.execution_reason===reason&&
+        row.execution_holder_risk===holderRiskJson)return;
+      this.db.prepare(`UPDATE third_signal_dispatch SET execution_status=?,execution_order_id=?,execution_reason=?,
+        execution_holder_risk=?,updated_at=? WHERE candidate_id=?`)
+        .run(execution.status,orderId,reason,holderRiskJson,this.clock(),candidate.id);
     });
   }
   close():void {if(!this.closed){this.db.close();this.closed=true;}}

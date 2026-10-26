@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {mkdtempSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
+import {DatabaseSync} from 'node:sqlite';
 import {readConfig} from '../src/config.js';
 import {createRuntime} from '../src/runtime.js';
 import {GmgnError} from '../src/providers/gmgn-client.js';
@@ -11,6 +12,17 @@ import {normalizeDebotSignals} from '../src/providers/debot-signals.js';
 import {unknown} from '../src/types.js';
 
 const ca='0x'+'a'.repeat(40),otherCa='0x'+'b'.repeat(40),wallet='0x'+'c'.repeat(40);
+async function waitFor(check:()=>boolean,label:string,timeoutMs=8_000){
+  const deadline=Date.now()+timeoutMs;
+  while(!check()){
+    if(Date.now()>=deadline)assert.fail(`${label} timed out`);
+    await new Promise(resolve=>setTimeout(resolve,10));
+  }
+}
+function tableCount(path:string,table:string){
+  const db=new DatabaseSync(path,{readOnly:true});
+  try{return Number(db.prepare(`SELECT count(*) AS n FROM ${table}`).get()!.n);}finally{db.close();}
+}
 function fixture(extra:Record<string,string>={}){
   const dir=mkdtempSync(join(tmpdir(),'gmgn-focused-'));
   const env={ENTRY_MODE:'off',GMGN_BACKGROUND_RESEARCH_ENABLED:'false',SCANNER_ENABLED:'true',
@@ -83,6 +95,8 @@ test(`focused DeBot/Ave still analyze signals during ${failure}, preserving unkn
     runtime.client.get=async path=>{requests.push(path);throw new GmgnError(failure);};
     if(failure==='GMGN_RATE_LIMITED')runtime.client.recordRateLimit(new Headers({'retry-after':'60'}));
     const page=pages();runtime.aveScanner!.acceptPage(page.ave);runtime.debotScanner!.acceptPage(page.debot);
+    await waitFor(()=>tableCount(config.ave!.database,'ave_observation_inbox')===0&&
+      tableCount(config.debotSignalsDatabase,'debot_observation_inbox')===0,'source observation ACK');
     await runtime.aveScanner!.dispatchOnce();await runtime.debotScanner!.dispatchOnce();
     assert.equal(runtime.archive!.list().total,2);
     assert.deepEqual(new Set(runtime.archive!.list().items.map(item=>item.source)),new Set(['ave','debot']));

@@ -6,6 +6,7 @@ import {join} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
 import bs58 from 'bs58';
 import {generateKeyPairSync} from 'node:crypto';
+import {performance} from 'node:perf_hooks';
 import {ThirdSignalEntryController} from '../src/third-signal-entry.js';
 import type {Config} from '../src/config.js';
 import type {ThirdSignalExecution} from '../src/third-signal-strategy.js';
@@ -16,6 +17,7 @@ import {createRuntime} from '../src/runtime.js';
 import {readConfig} from '../src/config.js';
 import {ControlledTestJournal} from '../src/controlled-test/journal.js';
 import type {TestRun} from '../src/controlled-test/types.js';
+import {TelegramNotifier} from '../src/telegram-notifier.js';
 
 const ca='0x'+'a'.repeat(40),mint=bs58.encode(Buffer.alloc(32,1)),wallet=bs58.encode(Buffer.alloc(32,2));
 function fixture() {
@@ -31,6 +33,9 @@ function observation(source:'debot'|'ave'='debot',address=ca,chain:'bsc'|'solana
  return {id:String(++seq),signal:parseSignal({source,sourceEventId:`${source}:signal:${seq.toString(16).padStart(64,'0')}`,
    token:{chain,address},occurredAt:at,text:'test',claim:'unspecified',evidenceUrls:[]}),observedAt:at,
    alertMarketCapUsd:99000,marketCapTiming:'event_snapshot' as const,walletCount:0,addressCount:0,aliases:[]};
+}
+function solanaBatch(size=20,source:'debot'|'ave'='ave') {
+ return Array.from({length:size},(_,index)=>observation(source,bs58.encode(Buffer.alloc(32,index+10)),'solana'));
 }
 function journal(path:string,invalid=false) {
  const db=new DatabaseSync(path);
@@ -61,6 +66,102 @@ test('unverified DeBot cap stays unknown and a fourth alert cannot repair the th
    s.control('start','web');s.observe(observation());s.observe(observation());
    assert.equal(s.observe({...observation(),marketCapTiming:'unverified'})?.reason,'THIRD_MARKET_CAP_UNKNOWN');
    s.observe(observation());assert.equal(s.status().candidates,0);assert.equal(f.messages.length,0);
+ }finally{s.close();f.close();}
+});
+
+test('priority observation only acknowledges a durable strategy write',()=>{
+ const f=fixture(),s=new SignalCounting(f.options);try {
+   s.control('start','web');const event=observation();
+   const original=s.strategy.observe.bind(s.strategy);let attempts=0;
+   s.strategy.observe=((input:Parameters<typeof original>[0])=>{
+     if(++attempts===1)throw Error('SQLITE_BUSY');
+     return original(input);
+   }) as typeof s.strategy.observe;
+   assert.throws(()=>s.observePriority(event),/SQLITE_BUSY/);
+   assert.equal(s.status().events,0);assert.equal(s.status().captureError,'SIGNAL_COUNTING_CAPTURE_FAILED');
+   assert.equal(s.observePriority(event)?.status,'counted');
+   assert.equal(s.status().events,1);assert.equal(s.status().captureError,undefined);
+ }finally{s.close();f.close();}
+});
+
+test('priority page commits twenty ordered observations once and stays below the 100ms fast-path budget',()=>{
+ const f=fixture(),s=new SignalCounting({...f.options,allowedChains:['solana']});try {
+   s.control('start','web');const page=solanaBatch(),started=performance.now();
+   const results=s.observePriorityBatch(page),elapsed=performance.now()-started;
+   assert.equal(results.length,20);assert.ok(results.every(result=>result.status==='counted'));
+   assert.equal(s.status().events,20);assert.ok(elapsed<100,`twenty-signal batch took ${elapsed.toFixed(1)}ms`);
+   const db=new DatabaseSync(f.options.database,{readOnly:true});try {
+     assert.deepEqual(db.prepare('SELECT event_id FROM third_signal_events ORDER BY rowid').all().map(row=>row.event_id),
+       page.map(item=>item.signal.sourceEventId));
+   }finally{db.close();}
+ }finally{s.close();f.close();}
+});
+
+test('priority page rolls back every observation when a middle durable write fails',()=>{
+ const f=fixture(),s=new SignalCounting({...f.options,allowedChains:['solana']});try {
+   s.control('start','web');const page=solanaBatch(),failedId=page[9].signal.sourceEventId;
+   const db=new DatabaseSync(f.options.database);try {db.exec(`CREATE TRIGGER reject_middle_count BEFORE INSERT ON third_signal_events
+     WHEN NEW.event_id='${failedId}' BEGIN SELECT RAISE(ABORT,'TEST_BATCH_FAILURE'); END;`);}finally{db.close();}
+   assert.throws(()=>s.observePriorityBatch(page),/TEST_BATCH_FAILURE/);
+   assert.equal(s.status().events,0);assert.equal(s.status().groups,0);
+   const repair=new DatabaseSync(f.options.database);try{repair.exec('DROP TRIGGER reject_middle_count');}finally{repair.close();}
+   assert.equal(s.observePriorityBatch(page).length,20);assert.equal(s.status().events,20);
+ }finally{s.close();f.close();}
+});
+
+test('twenty simultaneous third candidates batch claims once, dispatch exactly once, and finish below 100ms',async()=>{
+ const f=fixture();let calls=0,notifications=0;
+ const notifier=new TelegramNotifier(join(f.dir,'telegram.sqlite'),{token:'12345:TEST',chatId:'1'});
+ const s=new SignalCounting({...f.options,executionMode:'live',allowedChains:['solana'],dispatchConcurrency:1,dispatchCapacity:32,
+   onCandidate:async()=>{calls++;},
+   enqueue:event=>{notifications++;const until=performance.now()+10;while(performance.now()<until){/* slow durable notifier */}
+     return notifier.enqueue(event);}});try {
+   s.control('start','tg');const pages=[solanaBatch(),solanaBatch(),solanaBatch()];
+   // Reuse token identities while keeping each source event distinct.
+   for(let index=1;index<3;index++)for(let item=0;item<pages[index].length;item++)
+     pages[index][item]={...pages[index][item],signal:{...pages[index][item].signal,token:pages[0][item].signal.token}};
+   s.observePriorityBatch(pages[0]);s.observePriorityBatch(pages[1]);
+   const started=performance.now(),results=s.observePriorityBatch(pages[2]),elapsed=performance.now()-started;
+   assert.equal(results.filter(result=>result.status==='candidate').length,20);
+   assert.ok(elapsed<100,`twenty-candidate batch took ${elapsed.toFixed(1)}ms`);
+   await s.waitForDispatches();assert.equal(calls,20);assert.equal(notifications,20);assert.equal(s.status().candidates,20);
+   assert.ok(s.page({limit:20}).items.every(item=>item.dispatchState==='handled'));
+   s.observePriorityBatch(pages[2]);await s.waitForDispatches();assert.equal(calls,20,'committed duplicate page cannot replay dispatch');
+ }finally{s.close();await notifier.close();f.close();}
+});
+
+test('batch queue saturation is failed durably after source ACK and never replays the overflow candidate',async()=>{
+ const f=fixture();let pages:ReturnType<typeof solanaBatch>[]=[];
+ let release!:()=>void,calls=0;const gate=new Promise<void>(resolve=>{release=resolve;});
+ const s=new SignalCounting({...f.options,executionMode:'live',allowedChains:['solana'],dispatchConcurrency:1,dispatchCapacity:2,
+   onCandidate:async()=>{calls++;if(calls===1)await gate;}});try {
+   s.control('start','tg');pages=[solanaBatch(3),solanaBatch(3),solanaBatch(3)];
+   for(let index=1;index<3;index++)for(let item=0;item<pages[index].length;item++)
+     pages[index][item]={...pages[index][item],signal:{...pages[index][item].signal,token:pages[0][item].signal.token}};
+   s.observePriorityBatch(pages[0]);s.observePriorityBatch(pages[1]);
+   const started=performance.now(),results=s.observePriorityBatch(pages[2]),elapsed=performance.now()-started;
+   assert.equal(results.filter(result=>result.status==='candidate').length,3);
+   assert.ok(elapsed<100,`saturated candidate batch ACK took ${elapsed.toFixed(1)}ms`);
+   assert.equal(calls,1,'only the available worker starts in the source stack');
+   release();await s.waitForDispatches();assert.equal(calls,2);
+   const windows=s.page({limit:20}).items;
+   assert.equal(windows.find(item=>item.address===pages[2][2].signal.token.address)?.dispatchReason,'THIRD_SIGNAL_DISPATCH_QUEUE_FULL');
+   s.observePriorityBatch(pages[2]);await s.waitForDispatches();assert.equal(calls,2,'durably failed overflow cannot replay');
+ }finally{release();s.close();f.close();}
+});
+
+test('post-commit batch dispatch failure does not reject the source ACK or replay candidates',async()=>{
+ const f=fixture();let calls=0;const s=new SignalCounting({...f.options,executionMode:'live',allowedChains:['solana'],
+   onCandidate:async()=>{calls++;}});try {
+   s.control('start','tg');const pages=[solanaBatch(),solanaBatch(),solanaBatch()];
+   for(let index=1;index<3;index++)for(let item=0;item<pages[index].length;item++)
+     pages[index][item]={...pages[index][item],signal:{...pages[index][item].signal,token:pages[0][item].signal.token}};
+   s.observePriorityBatch(pages[0]);s.observePriorityBatch(pages[1]);
+   const claim=s.strategy.claimDispatchBatch.bind(s.strategy);
+   s.strategy.claimDispatchBatch=(()=>{throw Error('SQLITE_BUSY');}) as typeof s.strategy.claimDispatchBatch;
+   assert.doesNotThrow(()=>s.observePriorityBatch(pages[2]));assert.equal(s.status().events,60);assert.equal(calls,0);
+   s.strategy.claimDispatchBatch=claim;s.observePriorityBatch(pages[2]);await s.waitForDispatches();
+   assert.equal(calls,0);assert.equal(s.status().events,60);assert.equal(s.status().candidates,20);
  }finally{s.close();f.close();}
 });
 
@@ -103,14 +204,21 @@ test('runtime source callbacks feed simulation before research while existing en
  const dir=mkdtempSync(join(tmpdir(),'signal-counting-runtime-'));
  const config=readConfig({ENTRY_MODE:'off',GMGN_BACKGROUND_RESEARCH_ENABLED:'false',
    DASHBOARD_ENABLED:'false',WATCH_RECHECK_ENABLED:'false',EXIT_SHADOW_ENABLED:'false',CHAIN_STREAM_ENABLED:'false',
-   WALLET_RESEARCH_ENABLED:'false',MEME_OBSERVER_ENABLED:'false',DEBOT_SCANNER_ENABLED:'true',AVE_SCANNER_ENABLED:'true',
+   WALLET_RESEARCH_ENABLED:'true',WALLET_PROFILES_ENABLED:'true',WALLET_SCREENING_ENABLED:'false',TOKEN_RANK_RESEARCH_ENABLED:'true',
+   MEME_OBSERVER_ENABLED:'true',DEBOT_SCANNER_ENABLED:'true',AVE_SCANNER_ENABLED:'true',
    DEBOT_TRANSPORT:'anonymous_poll',SCANNER_CHAINS:'bsc',
    ORDERS_DATABASE_PATH:join(dir,'orders.sqlite'),SCAN_DATABASE_PATH:join(dir,'scans.sqlite'),
    DEBOT_SIGNALS_DATABASE_PATH:join(dir,'debot.sqlite'),DEBOT_SESSION_PATH:join(dir,'debot.json'),
    AVE_SIGNALS_DATABASE_PATH:join(dir,'ave.sqlite'),AVE_SESSION_PATH:join(dir,'ave.json'),
-   SOURCE_EVIDENCE_DATABASE_PATH:join(dir,'source.sqlite')});
+   SOURCE_EVIDENCE_DATABASE_PATH:join(dir,'source.sqlite'),MEME_DATABASE_PATH:join(dir,'meme.sqlite'),WALLET_HISTORY_DATABASE_PATH:join(dir,'history.sqlite'),
+   WALLET_PROFILES_DATABASE_PATH:join(dir,'profiles.sqlite'),TOKEN_RANK_RESEARCH_DATABASE_PATH:join(dir,'rank.sqlite')});
  const runtime=createRuntime(config);try {
    runtime.signalCountingControl('start','web');
+   assert.equal(runtime.walletIndexRunner?.snapshot().livePriority,true);
+   assert.equal(runtime.walletProfiles?.status().livePriority,true);
+   assert.equal(runtime.tokenRankResearch?.status().livePriority,true);
+   assert.equal(runtime.memeObserver?.status().livePriority,true);
+   assert.equal(runtime.memeObserver?.status().marketBatchLimit,1);
    for(let i=0;i<3;i++){
      runtime.debotScanner!.acceptPage({observations:[observation()],received:1,rejected:0});
      runtime.aveScanner!.acceptPage({observations:[observation('ave')],received:1,rejected:0});
@@ -119,9 +227,42 @@ test('runtime source callbacks feed simulation before research while existing en
    assert.equal(runtime.signalCountingPage().status.candidates,1);
    assert.equal(runtime.orders.list().length,0);assert.equal(runtime.dashboardOverview().entryMode,'off');
    runtime.signalCountingControl('stop','web');
+   assert.equal(runtime.walletIndexRunner?.snapshot().livePriority,false);
+   assert.equal(runtime.walletProfiles?.status().livePriority,false);
+   assert.equal(runtime.tokenRankResearch?.status().livePriority,false);
+   assert.equal(runtime.memeObserver?.status().livePriority,false);
+   assert.equal(runtime.memeObserver?.status().marketBatchLimit,30);
    runtime.debotScanner!.acceptPage({observations:[observation()],received:1,rejected:0});
    assert.equal(runtime.signalCountingPage().status.events,6);
  }finally{await runtime.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('runtime restart restores research pause before workers process a persisted active count run',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'signal-counting-priority-restart-'));
+ const config=readConfig({ENTRY_MODE:'off',GMGN_BACKGROUND_RESEARCH_ENABLED:'false',SCANNER_ENABLED:'false',
+   DASHBOARD_ENABLED:'false',WATCH_RECHECK_ENABLED:'false',EXIT_SHADOW_ENABLED:'false',CHAIN_STREAM_ENABLED:'false',
+   DEBOT_SCANNER_ENABLED:'false',AVE_SCANNER_ENABLED:'false',MEME_OBSERVER_ENABLED:'true',
+   WALLET_RESEARCH_ENABLED:'true',WALLET_PROFILES_ENABLED:'true',WALLET_SCREENING_ENABLED:'false',TOKEN_RANK_RESEARCH_ENABLED:'true',
+   ORDERS_DATABASE_PATH:join(dir,'orders.sqlite'),SCAN_DATABASE_PATH:join(dir,'scans.sqlite'),
+   WALLET_HISTORY_DATABASE_PATH:join(dir,'history.sqlite'),WALLET_PROFILES_DATABASE_PATH:join(dir,'profiles.sqlite'),
+   SOURCE_EVIDENCE_DATABASE_PATH:join(dir,'sources.sqlite'),MEME_DATABASE_PATH:join(dir,'meme.sqlite'),
+   TOKEN_RANK_RESEARCH_DATABASE_PATH:join(dir,'rank.sqlite')});
+ let runtime=createRuntime(config);
+ try {
+   runtime.signalCountingControl('start','web');await runtime.close();
+   runtime=createRuntime(config);assert.equal(runtime.signalCounting.status().running,true);
+   runtime.start();
+   assert.equal(runtime.memeObserver?.status().livePriority,true);
+   assert.equal(runtime.memeObserver?.status().marketBatchLimit,1);
+   const deadline=Date.now()+15_000;
+   while(runtime.walletIndexRunner?.snapshot().workerLivePriority!==true||
+     runtime.walletProfiles?.status().workerLivePriority!==true||runtime.tokenRankResearch?.status().workerLivePriority!==true){
+     assert.ok(Date.now()<deadline,'research workers did not acknowledge restored live priority');
+     await new Promise(resolve=>setTimeout(resolve,50));
+   }
+   assert.equal(runtime.walletProfiles?.status().inFlight,false);
+   assert.equal(runtime.tokenRankResearch?.status().inFlight,false);
+ } finally {await runtime.close();rmSync(dir,{recursive:true,force:true});}
 });
 
 test('regular orders and controlled tests atomically share one real token claim in both directions',()=>{

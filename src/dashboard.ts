@@ -16,10 +16,11 @@ import type {DebotSignalListOptions} from './debot-scanner.js';
 import type {FollowupListOptions} from './signal-followup.js';
 
 export interface DashboardPageOptions {limit:number;offset:number;chain?:Chain;}
-function pageOptions(url:URL):DashboardPageOptions {
+type Awaitable<T>=T|Promise<T>;
+function pageOptions(url:URL,maxLimit=100):DashboardPageOptions {
   const bounded=(name:string,def:number,max:number)=>{const raw=url.searchParams.get(name);if(raw===null)return def;
     if(!/^\d{1,8}$/.test(raw)||Number(raw)>max)throw new Error('INVALID_FILTER');return Number(raw);};
-  const chain=url.searchParams.get('chain')||undefined,limit=bounded('limit',20,100),offset=bounded('offset',0,1000000);
+  const chain=url.searchParams.get('chain')||undefined,limit=bounded('limit',20,maxLimit),offset=bounded('offset',0,1000000);
   if(limit<1||chain&&!['bsc','solana','robinhood'].includes(chain))throw new Error('INVALID_FILTER');
   return {limit,offset,...(chain?{chain:chain as Chain}:{})};
 }
@@ -40,7 +41,7 @@ function followupOptions(url:URL):FollowupListOptions {
 
 export interface DashboardServices {
   archive:ScanArchive;
-  overview:()=>unknown;
+  overview:()=>Awaitable<unknown>;
   home?:()=>unknown;
   orders:(options?:DashboardPageOptions)=>unknown;
   signalCountingPage?:(options:{limit:number;offset:number})=>unknown;
@@ -54,20 +55,31 @@ export interface DashboardServices {
   debotHistory?:(chain:Chain,address:string,options:{limit:number;offset:number;asOf?:string})=>unknown;
   aveSignals?:(options:DashboardPageOptions&{asOf?:string})=>unknown;
   sourceHistory?:(chain:Chain,address:string,options:{limit:number;offset:number;asOf?:string})=>unknown;
-  memeSignals?:(options:DashboardPageOptions&{asOf?:string})=>unknown;
-  memeDetail?:(chain:Chain,address:string,options:{limit:number;offset:number;asOf?:string})=>unknown;
+  memeSignals?:(options:DashboardPageOptions&{asOf?:string})=>Awaitable<unknown>;
+  memeDetail?:(chain:Chain,address:string,options:{limit:number;offset:number;asOf?:string})=>Awaitable<unknown>;
   tokenRankResearch?:(options:DashboardPageOptions&{asOf?:string})=>unknown;
   tokenRankResearchDetail?:(chain:Chain,address:string,options:{limit:number;offset:number;asOf?:string})=>unknown;
   tokenRankWallets?:(options:DashboardPageOptions&{asOf?:string;sort?:'early'|'realized'})=>unknown;
   tokenRankWallet?:(chain:Chain,address:string,options:{limit:number;offset:number;asOf?:string})=>unknown;
+  scanList?:(options:{limit:number;offset:number;chain?:Chain;decision?:'BUY_CANDIDATE'|'WATCH'|'REJECT';search?:string;eligible?:boolean})=>Awaitable<unknown>;
+  scanDetail?:(id:string)=>Awaitable<unknown|undefined>;
   protectionDetail?:(id:string)=>unknown;
-  walletHistory?:Pick<WalletHistory,'listWallets'|'getWallet'>;
+  walletHistory?:{listWallets:(options?:Parameters<WalletHistory['listWallets']>[0])=>Awaitable<ReturnType<WalletHistory['listWallets']>>};
+  /** Production detail reads run in a separate read-only worker. */
+  walletDetail?:(chain:Chain,address:string)=>Promise<ReturnType<WalletHistory['getWallet']>>;
   walletResearchStatus?:()=>unknown;
   walletResearchHints?:WalletHistory['researchSeedHints'];
-  walletAssociations?:Pick<WalletHistory,'listAssociations'|'getAssociation'|'associationStats'>;
+  walletAssociations?:{
+    listAssociations:(options?:Parameters<WalletHistory['listAssociations']>[0])=>Awaitable<ReturnType<WalletHistory['listAssociations']>>;
+    getAssociation:(...input:Parameters<WalletHistory['getAssociation']>)=>Awaitable<ReturnType<WalletHistory['getAssociation']>>;
+    associationStats?:WalletHistory['associationStats'];
+  };
   /** Worker-produced aggregate; avoids scanning the 9 GB graph on an HTTP request. */
   walletAssociationsStatus?:()=>unknown;
-  walletProfiles?:Pick<WalletProfileReader,'list'|'get'>;
+  walletProfiles?:{
+    list:(options?:Parameters<WalletProfileReader['list']>[0])=>Awaitable<ReturnType<WalletProfileReader['list']>>;
+    get:(...input:Parameters<WalletProfileReader['get']>)=>Awaitable<ReturnType<WalletProfileReader['get']>>;
+  };
   walletProfilesStatus?:()=>unknown;
   walletScreening?:Pick<WalletSetupLedger,'list'|'status'>;
 }
@@ -198,7 +210,9 @@ export function buildDashboard(config:Config,services:DashboardServices,assetDir
       if(req.method!=='GET') {send(res,405,{error:'READ_ONLY'});return;}
       if(url.pathname==='/dashboard/api/session') {send(res,200,{authenticated:true,readOnly:!services.signalCountingControl,
         signalCountingControlEnabled:!!services.signalCountingControl,authentication:proxyAuthenticated(req)?'proxy':'session'});return;}
-      if(url.pathname==='/dashboard/api/overview') {send(res,200,services.overview());return;}
+      if(url.pathname==='/dashboard/api/overview') {
+        try{send(res,200,await services.overview());}catch{send(res,503,{error:'OVERVIEW_QUERY_UNAVAILABLE'});}return;
+      }
       if(url.pathname==='/dashboard/api/home') {send(res,200,services.home?.()??{enabled:false});return;}
       if(url.pathname==='/dashboard/api/signal-counting') {
         if([...url.searchParams.keys()].some(key=>!['limit','offset'].includes(key))||
@@ -252,16 +266,19 @@ export function buildDashboard(config:Config,services:DashboardServices,assetDir
           total:0,limit:options.limit,offset:options.offset,hasMore:false,items:[]});return;
       }
       if(url.pathname==='/dashboard/api/meme'){
-        const options={...pageOptions(url),...pageAsOf(url)};
-        send(res,200,services.memeSignals?.(options)??{now:new Date().toISOString(),asOf:options.asOf??new Date().toISOString(),
-          status:{enabled:false},total:0,items:[],...options,hasMore:false});return;
+        const options={...pageOptions(url,20),...pageAsOf(url)};
+        let result:unknown;
+        try{result=await services.memeSignals?.(options);}catch{send(res,503,{error:'MEME_QUERY_UNAVAILABLE'});return;}
+        send(res,200,result??{now:new Date().toISOString(),asOf:options.asOf??new Date().toISOString(),status:{enabled:false},total:0,items:[],...options,hasMore:false});return;
       }
       if(['/dashboard/api/token-rank-research','/dashboard/api/token-rank-research/wallets'].includes(url.pathname)){
         const options={...pageOptions(url),...pageAsOf(url)};
         if(options.asOf&&Date.parse(options.asOf)>Date.now())throw new Error('INVALID_FILTER');
         const wallets=url.pathname.endsWith('/wallets'),sort=url.searchParams.get('sort')||undefined;
         if(sort&&(!wallets||!['early','realized'].includes(sort)))throw new Error('INVALID_FILTER');
-        const result=wallets?services.tokenRankWallets?.({...options,...(sort?{sort:sort as 'early'|'realized'}:{})}):services.tokenRankResearch?.(options);
+        let result:unknown;
+        try {result=await (wallets?services.tokenRankWallets?.({...options,...(sort?{sort:sort as 'early'|'realized'}:{})}):services.tokenRankResearch?.(options));}
+        catch {send(res,503,{error:'TOKEN_RANK_QUERY_UNAVAILABLE'});return;}
         send(res,200,result??{now:new Date().toISOString(),asOf:options.asOf??new Date().toISOString(),ready:false,status:{enabled:false},total:0,items:[],...options,hasMore:false});return;
       }
       if(url.pathname==='/dashboard/api/ave/signals'){
@@ -283,13 +300,18 @@ export function buildDashboard(config:Config,services:DashboardServices,assetDir
           if(chain==='solana'){if(address.length>44||bs58.decode(address).length!==32)throw new Error();}
           else {if(!/^0x[0-9a-fA-F]{40}$/.test(address))throw new Error();address=address.toLowerCase();}
         }catch{throw new Error('INVALID_FILTER');}
-        const options={...pageOptions(url),...pageAsOf(url)};
+        const options={...pageOptions(url,memeMatch?20:100),...pageAsOf(url)};
         if(rankMatch||rankWalletMatch){
           if(options.asOf&&Date.parse(options.asOf)>Date.now())throw new Error('INVALID_FILTER');
-          const result=rankWalletMatch?services.tokenRankWallet?.(chain as Chain,address,options):services.tokenRankResearchDetail?.(chain as Chain,address,options);
+          let result:unknown;
+          try {result=await (rankWalletMatch?services.tokenRankWallet?.(chain as Chain,address,options):services.tokenRankResearchDetail?.(chain as Chain,address,options));}
+          catch {send(res,503,{error:'TOKEN_RANK_QUERY_UNAVAILABLE'});return;}
           send(res,200,result??{[rankWalletMatch?'wallet':'token']:{chain,address},ready:false,asOf:options.asOf??new Date().toISOString(),total:0,items:[],...options,hasMore:false});return;
         }
-        if(memeMatch){send(res,200,services.memeDetail?.(chain as Chain,address,options)??{token:{chain,address},total:0,items:[],...options,hasMore:false});return;}
+        if(memeMatch){
+          let result:unknown;try{result=await services.memeDetail?.(chain as Chain,address,options);}catch{send(res,503,{error:'MEME_QUERY_UNAVAILABLE'});return;}
+          send(res,200,result??{token:{chain,address},total:0,items:[],...options,hasMore:false});return;
+        }
         if(sourceMatch){
           if(options.asOf&&Date.parse(options.asOf)>Date.now())throw new Error('INVALID_FILTER');
           send(res,200,services.sourceHistory?.(chain as Chain,address,options)??{token:{chain,address},asOf:options.asOf??new Date().toISOString(),
@@ -326,7 +348,9 @@ export function buildDashboard(config:Config,services:DashboardServices,assetDir
           if(!/^\d{1,8}$/.test(raw)||Number(raw)>max)throw new Error('INVALID_FILTER');return Number(raw);};
         if(chain&&!['bsc','solana','robinhood'].includes(chain)||search.length>160||group&&!(WALLET_PROFILE_GROUPS as readonly string[]).includes(group))throw new Error('INVALID_FILTER');
         const limit=bounded('limit',25,100),offset=bounded('offset',0,1000000);if(limit<1)throw new Error('INVALID_FILTER');
-        const page=services.walletProfiles?.list({chain:chain as any,group:group as any,search,limit,offset})??{ready:false,items:[],total:0};
+        let page:Awaited<ReturnType<NonNullable<DashboardServices['walletProfiles']>['list']>>;
+        try {page=await services.walletProfiles?.list({chain:chain as any,group:group as any,search,limit,offset})??{ready:false,items:[],total:0};}
+        catch {send(res,503,{error:'WALLET_PROFILE_QUERY_UNAVAILABLE'});return;}
         send(res,200,{...page,items:page.items.map(withResearchHints)});return;
       }
       const profileMatch=url.pathname.match(/^\/dashboard\/api\/wallet-profiles\/([^/]+)\/([^/]+)$/);
@@ -337,11 +361,13 @@ export function buildDashboard(config:Config,services:DashboardServices,assetDir
           if(chain==='solana'){if(address.length>44||bs58.decode(address).length!==32)throw new Error();}
           else {if(!/^0x[0-9a-fA-F]{40}$/.test(address))throw new Error();address=address.toLowerCase();}
         }catch {throw new Error('INVALID_FILTER');}
-        const profile=services.walletProfiles?.get(chain as any,address);
+        let profile:Awaited<ReturnType<NonNullable<DashboardServices['walletProfiles']>['get']>>;
+        try {profile=await services.walletProfiles?.get(chain as any,address);}
+        catch {send(res,503,{error:'WALLET_PROFILE_QUERY_UNAVAILABLE'});return;}
         send(res,profile?200:404,profile?withResearchHints(profile):{error:'NOT_FOUND'});return;
       }
       if(url.pathname==='/dashboard/api/wallet-associations/status') {
-        send(res,200,services.walletAssociations?{enabled:true,...(services.walletAssociationsStatus?.()??services.walletAssociations.associationStats())}:{enabled:false});return;
+        send(res,200,services.walletAssociations?{enabled:true,...(services.walletAssociationsStatus?.()??{})}:{enabled:false});return;
       }
       if(url.pathname==='/dashboard/api/wallet-associations') {
         const chain=url.searchParams.get('chain')||undefined,search=url.searchParams.get('search')??'';
@@ -349,7 +375,8 @@ export function buildDashboard(config:Config,services:DashboardServices,assetDir
           if(!/^\d{1,8}$/.test(raw)||Number(raw)>max)throw new Error('INVALID_FILTER');return Number(raw);};
         if(chain&&!['bsc','solana','robinhood'].includes(chain)||search.length>160)throw new Error('INVALID_FILTER');
         const limit=bounded('limit',25,100),offset=bounded('offset',0,1000000);if(limit<1)throw new Error('INVALID_FILTER');
-        send(res,200,services.walletAssociations?.listAssociations({chain:chain as any,search,limit,offset})??{items:[],total:0});return;
+        try {send(res,200,await services.walletAssociations?.listAssociations({chain:chain as any,search,limit,offset})??{items:[],total:0});}
+        catch {send(res,503,{error:'WALLET_ASSOCIATION_QUERY_UNAVAILABLE'});}return;
       }
       const associationMatch=url.pathname.match(/^\/dashboard\/api\/wallet-associations\/([^/]+)\/([^/]+)\/([^/]+)$/);
       if(associationMatch) {
@@ -363,7 +390,9 @@ export function buildDashboard(config:Config,services:DashboardServices,assetDir
           });
           if(addresses[0]===addresses[1])throw new Error();
         }catch{throw new Error('INVALID_FILTER');}
-        const association=services.walletAssociations?.getAssociation(chain as any,addresses[0],addresses[1]);
+        let association:Awaited<ReturnType<NonNullable<DashboardServices['walletAssociations']>['getAssociation']>>;
+        try {association=await services.walletAssociations?.getAssociation(chain as any,addresses[0],addresses[1]);}
+        catch {send(res,503,{error:'WALLET_ASSOCIATION_QUERY_UNAVAILABLE'});return;}
         send(res,association?200:404,association??{error:'NOT_FOUND'});return;
       }
       if(url.pathname==='/dashboard/api/wallets') {
@@ -375,7 +404,8 @@ export function buildDashboard(config:Config,services:DashboardServices,assetDir
         if(chain&&!['bsc','solana','robinhood'].includes(chain)||!['profit','gain','coordination','recent'].includes(sort)||search.length>160)
           throw new Error('INVALID_FILTER');
         const limit=bounded('limit',25,100),offset=bounded('offset',0,1000000);if(limit<1)throw new Error('INVALID_FILTER');
-        send(res,200,services.walletHistory.listWallets({chain:chain as any,sort:sort as any,search,limit,offset}));return;
+        try {send(res,200,await services.walletHistory.listWallets({chain:chain as any,sort:sort as any,search,limit,offset}));}
+        catch {send(res,503,{error:'WALLET_LIST_QUERY_UNAVAILABLE'});}return;
       }
       const walletMatch=url.pathname.match(/^\/dashboard\/api\/wallets\/([^/]+)\/([^/]+)$/);
       if(walletMatch) {
@@ -385,8 +415,13 @@ export function buildDashboard(config:Config,services:DashboardServices,assetDir
           if(chain==='solana'){if(address.length>44||bs58.decode(address).length!==32)throw new Error();}
           else {if(!/^0x[0-9a-fA-F]{40}$/.test(address))throw new Error();address=address.toLowerCase();}
         } catch {throw new Error('INVALID_FILTER');}
-        const wallet=services.walletHistory?.getWallet(chain as any,address);
-        const profile=wallet?services.walletProfiles?.get(chain as any,address):undefined;
+        if(services.walletHistory&&!services.walletDetail){send(res,503,{error:'WALLET_DETAIL_UNAVAILABLE'});return;}
+        let wallet:ReturnType<WalletHistory['getWallet']>;
+        try {wallet=await services.walletDetail?.(chain as Chain,address);}
+        catch {send(res,503,{error:'WALLET_DETAIL_UNAVAILABLE'});return;}
+        let profile:Awaited<ReturnType<NonNullable<DashboardServices['walletProfiles']>['get']>>;
+        try {profile=wallet?await services.walletProfiles?.get(chain as any,address):undefined;}
+        catch {send(res,503,{error:'WALLET_PROFILE_QUERY_UNAVAILABLE'});return;}
         send(res,wallet?200:404,wallet?{...wallet,behaviorProfile:profile?withResearchHints(profile):undefined}:{error:'NOT_FOUND'});return;
       }
       if(url.pathname==='/dashboard/api/scans') {
@@ -396,12 +431,17 @@ export function buildDashboard(config:Config,services:DashboardServices,assetDir
         if(chain&&!['bsc','solana','robinhood'].includes(chain)||decision&&!['BUY_CANDIDATE','WATCH','REJECT'].includes(decision)) throw new Error('INVALID_FILTER');
         const search=url.searchParams.get('search')??'';if(search.length>160) throw new Error('INVALID_FILTER');
         const eligible=url.searchParams.get('eligible');if(eligible!==null&&!['true','false'].includes(eligible))throw new Error('INVALID_FILTER');
-        const limit=number('limit',20,200),offset=number('offset',0,100000);if(limit<1)throw new Error('INVALID_FILTER');
-        send(res,200,services.archive.dashboardList({chain:chain as any,decision:decision as any,search,limit,offset,
-          ...(eligible!==null?{eligible:eligible==='true'}:{})}));return;
+        const limit=number('limit',20,20),offset=number('offset',0,100000);if(limit<1)throw new Error('INVALID_FILTER');
+        const options={chain:chain as any,decision:decision as any,search,limit,offset,...(eligible!==null?{eligible:eligible==='true'}:{})};
+        try {send(res,200,await (services.scanList?.(options)??services.archive.dashboardList(options)));}
+        catch {send(res,503,{error:'SCAN_QUERY_UNAVAILABLE'});}return;
       }
       const match=url.pathname.match(/^\/dashboard\/api\/scans\/([0-9a-f-]{36})$/);
-      if(match) {const row=services.archive.get(match[1]);send(res,row?200:404,row??{error:'NOT_FOUND'});return;}
+      if(match) {
+        let row:unknown;try {row=await (services.scanDetail?.(match[1])??services.archive.get(match[1]));}
+        catch {send(res,503,{error:'SCAN_QUERY_UNAVAILABLE'});return;}
+        send(res,row?200:404,row??{error:'NOT_FOUND'});return;
+      }
       send(res,404,{error:'NOT_FOUND'});
     } catch(error) {send(res,error instanceof Error&&error.message==='INVALID_FILTER'?400:500,
       {error:error instanceof Error&&error.message==='INVALID_FILTER'?'INVALID_FILTER':'DASHBOARD_UNAVAILABLE'});}

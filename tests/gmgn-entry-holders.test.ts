@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import bs58 from 'bs58';
 import {GmgnEntryHolderReader} from '../src/providers/gmgn-entry-holders.js';
 import {GmgnError} from '../src/providers/gmgn-client.js';
+import type {GmgnScheduleOptions} from '../src/providers/gmgn-client.js';
 import {assessEntryHolderRiskValues, normalizeStoredEntryHolderRisk, type EntryHolderRiskValues} from '../src/entry-holder-risk.js';
 
 const NOW = '2026-10-25T14:00:00.000Z';
@@ -16,9 +17,10 @@ const row = (n: number, percentage: unknown = '0.01', tag = 'bundler'): Record<s
 const info = () => ({address: TOKEN, chain: 'sol', stat: {top_10_holder_rate: '0.2319'}});
 type Fixture = {info?: unknown; bundler?: unknown; ratTrader?: unknown; topHolders?: unknown};
 function setup(fixture: Fixture = {}, now: () => Date = () => new Date(NOW)) {
-  const calls: {path: string; query: Record<string, string | number>; weight?: number}[] = [];
-  const client = {async get(path: string, query: Record<string, string | number>, weight?: number): Promise<unknown> {
-    calls.push({path, query, weight});
+  const calls: {path: string; query: Record<string, string | number>; weight?: number; scheduling?: GmgnScheduleOptions}[] = [];
+  const client = {async get(path: string, query: Record<string, string | number>, weight?: number,
+    scheduling?: GmgnScheduleOptions): Promise<unknown> {
+    calls.push({path, query, weight, scheduling});
     const key = path === '/v1/token/info' ? 'info' : query.tag === 'bundler' ? 'bundler' : query.tag === 'rat_trader' ? 'ratTrader' : 'topHolders';
     const defaults = {info: info(), bundler: {list: [row(1)]}, ratTrader: {list: [row(2, '0.02', 'rat_trader')]}, topHolders: {list: []}};
     const value = Object.hasOwn(fixture, key) ? fixture[key] : defaults[key];
@@ -34,10 +36,12 @@ test('uses only verified read routes with weights, SOL identity and descending s
   const {reader, calls} = setup();
   const result = await reader.readHolderRisk(TOKEN);
   assert.equal(result.provider, 'gmgn'); assert.equal(result.chain, 'solana'); assert.equal(result.address, TOKEN);
+  const scheduling = {priority: 'live_entry', queueTimeoutMs: 20_000};
   assert.deepEqual(calls, [
-    {path: '/v1/token/info', query: {chain: 'sol', address: TOKEN}, weight: 1},
+    {path: '/v1/token/info', query: {chain: 'sol', address: TOKEN}, weight: 1, scheduling},
     ...['bundler', 'rat_trader', undefined].map(tag => ({path: '/v1/market/token_top_holders', weight: 5,
-      query: {chain: 'sol', address: TOKEN, limit: 100, order_by: 'amount_percentage', direction: 'desc', ...(tag ? {tag} : {})}})),
+      query: {chain: 'sol', address: TOKEN, limit: 100, order_by: 'amount_percentage', direction: 'desc', ...(tag ? {tag} : {})},
+      scheduling})),
   ]);
   assert.deepEqual(result.values.top10, {value: '0.2319', sourceField: 'info.stat.top_10_holder_rate', coverage: 'complete'});
   assert.equal(result.values.bundler.value, '0.01'); assert.equal(result.values.ratTrader.value, '0.02');

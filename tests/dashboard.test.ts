@@ -126,8 +126,8 @@ test('disabled JEV supplies empty pages and the homepage never loads its records
 
 test('ranking research is authenticated and read-only with chain scoped stable pagination for tokens and wallets',async()=>{
   const calls:unknown[]=[],headers={'x-dashboard-access':password},stamp='2026-10-15T08:00:00.000Z',address='0x'+'A'.repeat(40);
-  const page=(kind:string)=>(options:unknown)=>{calls.push({kind,options});return {items:[],total:0};};
-  const detail=(kind:string)=>(chain:string,address:string,options:unknown)=>{calls.push({kind,chain,address,options});return {items:[]};};
+  const page=(kind:string)=>async(options:unknown)=>{calls.push({kind,options});return {items:[],total:0};};
+  const detail=(kind:string)=>async(chain:string,address:string,options:unknown)=>{calls.push({kind,chain,address,options});return {items:[]};};
   const f=await fixture({tokenRankResearch:page('tokens'),tokenRankWallets:page('wallets'),tokenRankResearchDetail:detail('token'),tokenRankWallet:detail('wallet'),
     orders:()=>{throw new Error('RESEARCH_MUST_NOT_ACCESS_ORDERS');}});
   try {
@@ -160,6 +160,33 @@ test('unconfigured ranking research gives bounded empty pages and is not invoked
   }finally{await f.close();}
   const isolated=await fixture({home:()=>({compact:true}),tokenRankResearch:()=>{throw new Error('MUST_BE_LAZY');},tokenRankWallets:()=>{throw new Error('MUST_BE_LAZY');}});
   try{assert.deepEqual(await(await fetch(`${isolated.base}/dashboard/api/home`,{headers})).json(),{compact:true});}finally{await isolated.close();}
+});
+
+test('asynchronous ranking, scan, meme and overview reads leave lightweight dashboard requests responsive',async()=>{
+  const headers={'x-dashboard-access':password};let releaseRank:(value:{items:never[];total:number})=>void=()=>{},
+    releaseScan:(value:{items:never[];total:number})=>void=()=>{},releaseMeme:(value:{items:never[];total:number})=>void=()=>{},
+    rankEntered:()=>void=()=>{},scanEntered:()=>void=()=>{},memeEntered:()=>void=()=>{},overviewEntered:()=>void=()=>{};
+  const rankStarted=new Promise<void>(resolve=>{rankEntered=resolve;}),scanStarted=new Promise<void>(resolve=>{scanEntered=resolve;}),
+    memeStarted=new Promise<void>(resolve=>{memeEntered=resolve;}),rankPage=new Promise<{items:never[];total:number}>(resolve=>{releaseRank=resolve;}),
+    scanPage=new Promise<{items:never[];total:number}>(resolve=>{releaseScan=resolve;}),memePage=new Promise<{items:never[];total:number}>(resolve=>{releaseMeme=resolve;}),
+    overviewStarted=new Promise<void>(resolve=>{overviewEntered=resolve;});let releaseOverview:(value:{ready:boolean})=>void=()=>{};
+  const overviewPage=new Promise<{ready:boolean}>(resolve=>{releaseOverview=resolve;});
+  const f=await fixture({tokenRankResearch:async()=>{rankEntered();return rankPage;},scanList:async()=>{scanEntered();return scanPage;},
+    memeSignals:async()=>{memeEntered();return memePage;},overview:async()=>{overviewEntered();return overviewPage;}});
+  try {
+    const rank=fetch(`${f.base}/dashboard/api/token-rank-research`,{headers});await rankStarted;
+    assert.equal((await Promise.race([fetch(`${f.base}/dashboard/api/session`,{headers}),new Promise<never>((_,reject)=>setTimeout(()=>reject(new Error('LIGHT_REQUEST_BLOCKED')),250))])).status,200);
+    releaseRank({items:[],total:0});assert.equal((await rank).status,200);
+    const scan=fetch(`${f.base}/dashboard/api/scans?search=z`,{headers});await scanStarted;
+    assert.equal((await Promise.race([fetch(`${f.base}/dashboard/api/session`,{headers}),new Promise<never>((_,reject)=>setTimeout(()=>reject(new Error('LIGHT_REQUEST_BLOCKED')),250))])).status,200);
+    releaseScan({items:[],total:0});assert.equal((await scan).status,200);
+    const meme=fetch(`${f.base}/dashboard/api/meme`,{headers});await memeStarted;
+    assert.equal((await Promise.race([fetch(`${f.base}/dashboard/api/session`,{headers}),new Promise<never>((_,reject)=>setTimeout(()=>reject(new Error('LIGHT_REQUEST_BLOCKED')),250))])).status,200);
+    releaseMeme({items:[],total:0});assert.equal((await meme).status,200);
+    const overview=fetch(`${f.base}/dashboard/api/overview`,{headers});await overviewStarted;
+    assert.equal((await Promise.race([fetch(`${f.base}/dashboard/api/session`,{headers}),new Promise<never>((_,reject)=>setTimeout(()=>reject(new Error('LIGHT_REQUEST_BLOCKED')),250))])).status,200);
+    releaseOverview({ready:true});assert.equal((await overview).status,200);
+  } finally {await f.close();}
 });
 
 test('Ave signal pages and token source history are authenticated read-only bounded routes with stable filters',async()=>{
@@ -208,7 +235,7 @@ test('Meme research pages validate scoped identity and stable pagination without
     assert.equal(detail.token.address,address.toLowerCase());
     assert.deepEqual(calls[1],{chain:'bsc',address:address.toLowerCase(),limit:7,offset:14,asOf:stamp});
     for(const path of ['meme?asOf=2026-02-31T00:00:00.000Z','meme/eth/'+address,'meme/bsc/invalid',
-      'meme/solana/'+address,'meme/bsc/'+address+'?offset=-1','meme/bsc/'+address+'?limit=101'])
+      'meme/solana/'+address,'meme?limit=21','meme/bsc/'+address+'?offset=-1','meme/bsc/'+address+'?limit=21'])
       assert.equal((await fetch(`${f.base}/dashboard/api/${path}`,{headers})).status,400,path);
     assert.equal(calls.length,2);
   }finally{await f.close();}
@@ -276,7 +303,7 @@ test('local authenticated proxy reaches only read-only whitelist and valid filte
   const f=await fixture();try {
     const headers={'x-dashboard-access':password};
     assert.equal((await fetch(f.base+'/dashboard/api/session',{headers})).status,200);
-    for(const query of ['limit=-1','limit=0','limit=201','offset=nan','chain=eth','decision=EXECUTE','eligible=yes'])
+    for(const query of ['limit=-1','limit=0','limit=21','limit=201','offset=nan','chain=eth','decision=EXECUTE','eligible=yes'])
       assert.equal((await fetch(f.base+'/dashboard/api/scans?'+query,{headers})).status,400,query);
     assert.deepEqual(await (await fetch(f.base+'/dashboard/api/scans?eligible=true',{headers})).json(),{items:[],total:0});
     assert.deepEqual(await (await fetch(f.base+'/dashboard/api/chain-stream',{headers})).json(),{enabled:false,running:false,chains:[],recentEvents:[]});

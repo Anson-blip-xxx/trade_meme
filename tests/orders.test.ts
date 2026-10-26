@@ -130,6 +130,24 @@ test('发送前事务再次核验其他仓位，阻止报价后新增的未知�
   } finally {store.close();}
 });
 
+test('funding coverage keeps uncached closed debits but omits durable proofs included by the snapshot',()=>{
+  const store=new OrderStore(':memory:'),now=new Date('2026-10-11T00:00:00Z');
+  try {
+    const scope={chain:'solana' as const,mode:'paper' as const,wallet:'0x'+'2'.repeat(40),inputToken:'0x'+'0'.repeat(40)};
+    const open=store.reserve({...input('coverage-open'),...scope},10,now).order!;
+    store.update(open.id,['prepared'],{status:'confirmed',transactionHash:'0x'+'a'.repeat(64)},now);
+    const closed=store.reserve({...input('coverage-closed'),...scope,tokenAddress:'0x'+'8'.repeat(40),
+      exit:{positionClosed:true} as never},10,now).order!;
+    store.update(closed.id,['prepared'],{status:'confirmed',transactionHash:'0x'+'b'.repeat(64)},now);
+    const failed=store.reserve({...input('coverage-failed'),...scope,tokenAddress:'0x'+'9'.repeat(40)},10,now).order!;
+    store.update(failed.id,['prepared'],{status:'failed'},now);
+    assert.deepEqual(store.fundingOrders(scope).map(order=>order.id),[open.id,closed.id]);
+    store.update(closed.id,['confirmed'],{details:{...store.get(closed.id)!.details,
+      nativeDebitCoverage:{transactionHash:'0x'+'b'.repeat(64),slot:90,checkedAt:now.toISOString()}}},now);
+    assert.deepEqual(store.fundingOrders(scope,{slot:100}).map(order=>order.id),[open.id]);
+  } finally {store.close();}
+});
+
 test('研究缓存有时长/条数上限且保留活动租约；旧DATABASE_PATH不会恢复全文持久化',()=>{
   const config=readConfig({DATABASE_PATH:'/should-not-be-used.sqlite'});
   assert.equal(config.database,':memory:');

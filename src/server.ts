@@ -15,6 +15,8 @@ import type {EntryController} from './entry.js';
 import type {GmgnScanner} from './scanner.js';
 import {createRuntime} from './runtime.js';
 import {buildDashboard} from './dashboard.js';
+import {WalletHistoryDetailRunner} from './wallet-history-detail.js';
+import {reviewSamplingPath} from './daily-review.js';
 
 function send(res:ServerResponse,status:number,data:unknown) {res.writeHead(status,{'content-type':'application/json; charset=utf-8','cache-control':'no-store'});res.end(JSON.stringify(data,null,2));}
 function authorized(req:IncomingMessage,token:string):boolean {
@@ -138,8 +140,23 @@ export function buildServer(config:Config,store:Store,providers:Providers=livePr
 if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href) {
   const config=readConfig(),runtime=createRuntime(config);
   const server=buildServer(config,runtime.store,runtime.providers,runtime);
+  const walletQueries=config.dashboard.enabled&&runtime.archive?new WalletHistoryDetailRunner({
+    database:runtime.walletHistory?config.walletResearch.database:undefined,
+    profileDatabase:runtime.walletProfiles?config.walletProfiles.database:undefined,
+    scanDatabase:config.dashboard.archivePath,
+    tokenRankDatabase:runtime.tokenRankResearch?config.tokenRankResearch?.database:undefined,
+    memeDatabase:runtime.memeObserver?config.meme?.database:undefined,memeMaxActive:config.meme?.maxActive,
+    memeActiveWindowSec:config.meme?.activeWindowSec,memeAllowedChains:config.scannerChains,
+    memeSamplingPlanPath:reviewSamplingPath(config.dashboard.archivePath),
+    corroborationDatabase:runtime.sourceEvidence?config.corroboration?.database:undefined}):undefined;
+  walletQueries?.start();
   const dashboard=config.dashboard.enabled&&runtime.archive?buildDashboard(config,{
-    archive:runtime.archive,home:runtime.dashboardHome,overview:runtime.dashboardOverview,orders:runtime.dashboardOrders,
+    archive:runtime.archive,home:runtime.dashboardHome,overview:async()=>{
+      const value=runtime.dashboardOverview();
+      if(!runtime.memeObserver||!walletQueries)return value;
+      const current=value as typeof value&{meme:unknown};
+      return {...current,meme:await walletQueries.getMemeStatus({now:new Date().toISOString(),status:current.meme})};
+    },orders:runtime.dashboardOrders,
     signalCountingPage:runtime.signalCountingPage,signalCountingControl:runtime.signalCountingControl,
     dailyReview:options=>runtime.dailyReview?.page(options),
     jev:runtime.jevShadow?{status:runtime.jevStatus,list:options=>runtime.jevShadow!.list(options),detail:id=>runtime.jevShadow!.detail(id)}:undefined,
@@ -149,20 +166,29 @@ if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href) {
     debotHistory:(chain,address,options)=>runtime.debotScanner?.notificationHistory(chain,address,options),
     aveSignals:options=>runtime.aveScanner?.list(options),
     sourceHistory:(chain,address,options)=>runtime.sourceEvidence?.history({chain,address},options),
-    tokenRankResearch:options=>runtime.tokenRankResearch?{...runtime.tokenRankResearch.reader.list(options),status:runtime.tokenRankResearch.status()}:undefined,
-    tokenRankResearchDetail:(chain,address,options)=>runtime.tokenRankResearch?.reader.detail(chain,address,options),
-    tokenRankWallets:options=>runtime.tokenRankResearch?{...runtime.tokenRankResearch.reader.wallets(options),status:runtime.tokenRankResearch.status()}:undefined,
-    tokenRankWallet:(chain,address,options)=>runtime.tokenRankResearch?.reader.wallet(chain,address,options),
-    memeSignals:options=>runtime.memeObserver?.list(options),
-    memeDetail:(chain,address,options)=>runtime.memeObserver?.detail({chain,address},options),
+    tokenRankResearch:runtime.tokenRankResearch&&walletQueries?async options=>({...await walletQueries.listTokenRank(options),status:runtime.tokenRankResearch!.status()}):undefined,
+    tokenRankResearchDetail:runtime.tokenRankResearch&&walletQueries?(chain,address,options)=>walletQueries.getTokenRank(chain,address,options):undefined,
+    tokenRankWallets:runtime.tokenRankResearch&&walletQueries?async options=>({...await walletQueries.listTokenRankWallets(options),status:runtime.tokenRankResearch!.status()}):undefined,
+    tokenRankWallet:runtime.tokenRankResearch&&walletQueries?(chain,address,options)=>walletQueries.getTokenRankWallet(chain,address,options):undefined,
+    memeSignals:runtime.memeObserver&&walletQueries?options=>walletQueries.listMeme(options,
+      {now:new Date().toISOString(),status:runtime.memeObserver!.runtimeStatus()}):undefined,
+    memeDetail:runtime.memeObserver&&walletQueries?(chain,address,options)=>walletQueries.getMeme(chain,address,options,
+      {now:new Date().toISOString()}):undefined,
+    scanList:walletQueries?options=>walletQueries.listScans(options):undefined,
+    scanDetail:walletQueries?id=>walletQueries.getScan(id):undefined,
     chainStream:runtime.chainStreamStatus,protection:runtime.dashboardProtection,protectionDetail:id=>{
       const detail=runtime.exitShadow?.detail(id);if(!detail)return;
       return {...detail,priceRouter:runtime.priceRouter.getStatus(),item:{...detail.item,priceRoute:runtime.priceRouter.latest(detail.item)}};
     },
-    walletHistory:runtime.walletHistory,walletResearchStatus:runtime.walletResearchStatus,walletAssociations:runtime.walletHistory,
+    walletHistory:walletQueries?{listWallets:options=>walletQueries.listWallets(options)}:undefined,
+    walletDetail:walletQueries?(chain,address)=>walletQueries.getWallet(chain,address):undefined,
+    walletResearchStatus:runtime.walletResearchStatus,walletAssociations:walletQueries?{
+      listAssociations:options=>walletQueries.listAssociations(options),
+      getAssociation:(chain,leader,candidate)=>walletQueries.getAssociation(chain,leader,candidate)}:undefined,
     walletAssociationsStatus:runtime.walletAssociationsStatus,
-    walletResearchHints:(chain,address)=>runtime.walletHistory?.researchSeedHints(chain,address)??[],
-    walletProfiles:runtime.walletProfiles?.reader,walletProfilesStatus:runtime.walletProfilesStatus,walletScreening:runtime.walletScreening?.ledger}):undefined;
+    walletProfiles:walletQueries&&runtime.walletProfiles?{list:options=>walletQueries.listProfiles(options),
+      get:(chain,address)=>walletQueries.getProfile(chain,address)}:undefined,
+    walletProfilesStatus:runtime.walletProfilesStatus,walletScreening:runtime.walletScreening?.ledger}):undefined;
   const fatal=()=>{console.error('SERVICE_LISTEN_FAILED');process.exit(1);};
   server.on('error',fatal);dashboard?.on('error',fatal);
   dashboard?.listen(config.dashboard.port,config.dashboard.host,()=>console.log(`Dashboard listening at http://${config.dashboard.host}:${config.dashboard.port}/dashboard/`));
@@ -171,6 +197,6 @@ if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href) {
   for(const sig of ['SIGINT','SIGTERM']) process.on(sig,()=>{
     if(stopping)return;stopping=true;
     runtime.scanner.stop();dashboard?.close();
-    server.close(()=>{void runtime.close().then(()=>process.exit(0));});
+    server.close(()=>{void (async()=>{await walletQueries?.stop();await runtime.close();process.exit(0);})();});
   });
 }

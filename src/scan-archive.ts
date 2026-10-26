@@ -616,7 +616,7 @@ export class ScanArchive {
     if(price.source==='chain_pool_sample'&&!evidence)return;
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      if(this.comparison.price({...price,...identity,observedAt:at},now))this.cachedStats=undefined;
+      this.comparison.price({...price,...identity,observedAt:at},now);
       this.followup?.price({...price,...identity,observedAt:at},now,walletEvidence);
       for(const row of this.db.prepare('SELECT record,last_price_attempt_at FROM scan_summaries WHERE chain=? AND address=? AND eligible_at IS NOT NULL')
         .all(identity.chain,identity.address)) {
@@ -645,7 +645,7 @@ export class ScanArchive {
     const error=reasonCodes([reason])[0]??'PRICE_SAMPLE_UNAVAILABLE';
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      if(this.comparison.error(identity,error,now))this.cachedStats=undefined;
+      this.comparison.error(identity,error,now);
       this.followup?.error(identity,error,now);
       for(const row of this.db.prepare('SELECT record,last_price_attempt_at FROM scan_summaries WHERE chain=? AND address=? AND eligible_at IS NOT NULL')
         .all(identity.chain,identity.address)) {
@@ -758,7 +758,10 @@ export class ScanArchive {
       .run(record.id,record.chain,record.address,record.status,record.receivedAt,record.decision??null,
         record.performance?.eligibleAt??null,lastAttempt??null,lease??null,record.performance?.status??null,
         record.performance?.maxGainPct??null,JSON.stringify(record));
-    this.cachedStats=undefined;
+    // Dashboard aggregates are informational and may lag ordinary inserts or
+    // price updates by STATS_CACHE_MS. Invalidating on every live quote made an
+    // overview request rescan the archive on the source-event thread. Explicit
+    // retention maintenance below still invalidates immediately.
   }
   private maybeMaintain(now:Date):void {
     if(Number.isFinite(now.getTime())&&now.getTime()>=this.nextRetentionAt)this.maintenance(now);
@@ -783,14 +786,16 @@ export class ScanArchive {
       .run(now.toISOString());
     this.db.prepare("UPDATE watch_jobs SET state='scheduled',next_check_at=?,lease_until=NULL,claim_id=NULL WHERE state='processing' AND lease_until<=?")
       .run(now.toISOString(),now.toISOString());
+    let aggregateChanged=false;
     for(const row of this.db.prepare("SELECT record FROM scan_summaries WHERE status='processing' AND (lease_expires_at IS NULL OR lease_expires_at<=?)").all(now.toISOString())) {
       const record=JSON.parse(String(row.record)) as ScanRecord;
-      record.status='interrupted';this.write(record);
+      record.status='interrupted';this.write(record);aggregateChanged=true;
     }
     const ended=new Date(now.getTime()-this.trackingMs).toISOString();
     for(const row of this.db.prepare("SELECT record FROM scan_summaries WHERE eligible_at<=? AND performance_status<>'ended'").all(ended)) {
       const record=JSON.parse(String(row.record)) as ScanRecord;
-      record.performance={...record.performance!,status:'ended'};this.write(record);
+      record.performance={...record.performance!,status:'ended'};this.write(record);aggregateChanged=true;
     }
+    if(aggregateChanged)this.cachedStats=undefined;
   }
 }

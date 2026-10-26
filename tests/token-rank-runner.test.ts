@@ -32,6 +32,24 @@ test('rank research runs without dashboard requests, processes new evidence and 
     assert.equal(runner.reader.list({limit:20,offset:0}).total,2);
   }finally{await runner.stop();history.close();rmSync(dir,{recursive:true,force:true});}
 });
+test('rank live priority pauses research writes and resumes the accumulated backlog',async()=>{
+  const dir=mkdtempSync(join(tmpdir(),'token-rank-live-priority-'));
+  const history=new WalletHistory(join(dir,'history.sqlite'));
+  const runner=new TokenRankResearchRunner({database:join(dir,'rank.sqlite'),historyDatabase:join(dir,'history.sqlite'),
+    maxBytes:16*1024*1024,intervalSec:1,batchSize:100});
+  const rank=(n:number)=>history.captureTokenRanks('bsc',[{address:address(n),rank:1,interval:'1h',changeMetric:'20',changeUnit:'vendor_unspecified'}],
+    {source:'gmgn_change1h_rank',observedAt:new Date().toISOString()});
+  try {
+    rank(1);runner.setLivePriority(true);runner.start();
+    await until(()=>runner.status().workerLivePriority===true);
+    await new Promise(resolve=>setTimeout(resolve,1100));assert.equal(runner.reader.list({limit:20,offset:0}).total,0);
+    runner.setLivePriority(false);await until(()=>runner.status().workerLivePriority===false);
+    await until(()=>runner.reader.list({limit:20,offset:0}).total>=1);
+    runner.setLivePriority(true);await until(()=>runner.status().workerLivePriority===true);rank(2);
+    await new Promise(resolve=>setTimeout(resolve,1100));assert.equal(runner.reader.list({limit:20,offset:0}).total,1);
+    runner.setLivePriority(false);await until(()=>runner.reader.list({limit:20,offset:0}).total>=2);
+  } finally {await runner.stop();history.close();rmSync(dir,{recursive:true,force:true});}
+});
 test('rank research startup errors expose fixed diagnostics and stop cancels restart',async()=>{
   const dir=mkdtempSync(join(tmpdir(),'token-rank-failure-'));
   const runner=new TokenRankResearchRunner({database:join(dir,'rank.sqlite'),historyDatabase:join(dir,'private-missing.sqlite'),

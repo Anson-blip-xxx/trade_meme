@@ -56,24 +56,38 @@ export interface DexSpotSample {
   /** V4 pool IDs identify pools but are not contract addresses. */
   poolAddress?:string;liquidityUsd?:number;
 }
+export interface DexPoolIdentity {poolKey:string;poolAddress?:string}
+export function normalizeDexPoolIdentity(chain:Chain,address:unknown):DexPoolIdentity|undefined {
+  if(!Object.hasOwn(GMGN_CHAINS,chain))return;
+  const pool=normalizePriceToken({chain,address});
+  const poolId=chain!=='solana'&&typeof address==='string'&&/^0x[0-9a-f]{64}$/i.test(address)&&
+    !/^0x0{64}$/i.test(address)?address.toLowerCase():undefined;
+  if(!pool&&!poolId)return;
+  return {poolKey:pool?.address??poolId!,...(pool?{poolAddress:pool.address}:{})};
+}
+export type DexSpotNormalizer=(raw:unknown,knownPool?:DexPoolIdentity|null)=>DexSpotSample|undefined;
+/** Validate stable request context once, then reuse it for every returned pool. */
+export function createDexSpotNormalizer(input:ScanToken,observedAt:string):DexSpotNormalizer|undefined {
+  const token=normalizePriceToken(input),at=Date.parse(observedAt);if(!token||!Number.isFinite(at))return;
+  const canonicalAt=new Date(at).toISOString();
+  return (raw,knownPool)=>{
+    if(!object(raw)||raw.chainId!==token.chain||!object(raw.baseToken)||typeof raw.baseToken.address!=='string'||
+      (token.chain==='solana'?raw.baseToken.address!==token.address:raw.baseToken.address.toLowerCase()!==token.address))return;
+    if(typeof raw.priceUsd!=='string'||raw.priceUsd.length>128||
+      !/^(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d{1,3})?$/.test(raw.priceUsd))return;
+    const priceUsd=Number(raw.priceUsd);if(!Number.isFinite(priceUsd)||priceUsd<=0)return;
+    const pool=knownPool===undefined?normalizeDexPoolIdentity(token.chain,raw.pairAddress):knownPool??undefined;
+    if(!pool||pool.poolAddress===token.address)return;
+    const liquidity=object(raw.liquidity)&&typeof raw.liquidity.usd==='number'&&Number.isFinite(raw.liquidity.usd)&&raw.liquidity.usd>=0
+      ?raw.liquidity.usd:undefined;
+    return {token,observedAt:canonicalAt,priceUsd,poolKey:pool.poolKey,
+      ...(pool.poolAddress?{poolAddress:pool.poolAddress}:{}),...(liquidity!==undefined?{liquidityUsd:liquidity}:{})};
+  };
+}
 /** Current base-token USD observation only. Robinhood's official DEX Screener
  * response was verified on 2026-10-16: Uniswap v4 pairAddress is a bytes32 pool ID.
  * Keep that identifier internal; never expose it as an EVM contract address.
  */
 export function normalizeDexSpot(raw:unknown,input:ScanToken,observedAt:string):DexSpotSample|undefined {
-  const token=normalizePriceToken(input);
-  if(!token||!object(raw)||raw.chainId!==token.chain||!object(raw.baseToken)||
-    normalizePriceToken({chain:token.chain,address:raw.baseToken.address})?.address!==token.address||
-    !Number.isFinite(Date.parse(observedAt)))return;
-  if(typeof raw.priceUsd!=='string'||raw.priceUsd.length>128||
-    !/^(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d{1,3})?$/.test(raw.priceUsd))return;
-  const priceUsd=Number(raw.priceUsd);if(!Number.isFinite(priceUsd)||priceUsd<=0)return;
-  const pool=normalizePriceToken({chain:token.chain,address:raw.pairAddress});
-  const poolId=token.chain!=='solana'&&typeof raw.pairAddress==='string'&&/^0x[0-9a-f]{64}$/i.test(raw.pairAddress)&&
-    !/^0x0{64}$/i.test(raw.pairAddress)?raw.pairAddress.toLowerCase():undefined;
-  if((!pool&&!poolId)||pool?.address===token.address)return;
-  const liquidity=object(raw.liquidity)&&typeof raw.liquidity.usd==='number'&&Number.isFinite(raw.liquidity.usd)&&raw.liquidity.usd>=0
-    ?raw.liquidity.usd:undefined;
-  return {token,observedAt:new Date(observedAt).toISOString(),priceUsd,poolKey:pool?.address??poolId!,
-    ...(pool?{poolAddress:pool.address}:{}),...(liquidity!==undefined?{liquidityUsd:liquidity}:{})};
+  return createDexSpotNormalizer(input,observedAt)?.(raw);
 }

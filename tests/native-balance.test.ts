@@ -311,3 +311,18 @@ test('order coverage fails closed on upstream failure without retries', async ()
   assert.equal(await nativeBalanceCoversOrder({chain: 'bsc', transactionHash}, snapshot(), config, fetcher), false);
   assert.equal(calls, 1);
 });
+
+test('order coverage obeys one caller deadline and never accepts a late RPC result', async () => {
+  let aborted = false;
+  const controller = new AbortController();
+  const fetcher: Fetcher = async (_input, init) => new Promise((_resolve, reject) => {
+    const signal = init?.signal;
+    assert.ok(signal instanceof AbortSignal);
+    signal.addEventListener('abort', () => {aborted = true; reject(signal.reason);}, {once: true});
+  });
+  const pending = nativeBalanceCoversOrder({chain: 'solana', transactionHash: signature},
+    snapshot({blockNumber: undefined, slot: 100}), config, fetcher, controller.signal);
+  controller.abort(new DOMException('coverage deadline', 'TimeoutError'));
+  assert.equal(await pending, false);
+  assert.equal(aborted, true);
+});

@@ -23,6 +23,13 @@ function deferred<T>() {
   const promise=new Promise<T>(r=>{resolve=r;});
   return {promise,resolve};
 }
+async function waitFor(check:()=>boolean,label:string,timeoutMs=3000):Promise<void> {
+  const deadline=Date.now()+timeoutMs;
+  while(!check()){
+    if(Date.now()>=deadline)assert.fail(`${label} timed out`);
+    await new Promise(resolve=>setTimeout(resolve,10));
+  }
+}
 function fixture(overrides:Partial<DebotScannerOptions>={}) {
   const root=mkdtempSync(join(tmpdir(),'debot-scanner-')),database=join(root,'inbox.sqlite');
   let seconds=1000;
@@ -99,6 +106,15 @@ test('DeBot status caches database facts for five seconds and uses the latest-di
       const plan=db.prepare(`EXPLAIN QUERY PLAN SELECT observed_at,dispatched_at FROM debot_signals
         WHERE dispatched_at IS NOT NULL ORDER BY dispatched_at DESC LIMIT 1`).all().map(row=>String(row.detail));
       assert.ok(plan.some(detail=>detail.includes('debot_signals_dispatched_latest')),plan.join('\n'));
+      const statePlan=db.prepare(`EXPLAIN QUERY PLAN SELECT state,count(*) FROM debot_signals
+        INDEXED BY debot_signals_queue GROUP BY state`).all().map(row=>String(row.detail));
+      assert.ok(statePlan.some(detail=>detail.includes('COVERING INDEX debot_signals_queue')),statePlan.join('\n'));
+      const detailsPlan=db.prepare(`EXPLAIN QUERY PLAN SELECT count(*) FROM debot_signals
+        INDEXED BY debot_signals_details_present WHERE details IS NOT NULL`).all().map(row=>String(row.detail));
+      assert.ok(detailsPlan.some(detail=>detail.includes('INDEX debot_signals_details_present')),detailsPlan.join('\n'));
+      const errorsPlan=db.prepare(`EXPLAIN QUERY PLAN SELECT count(*) FROM debot_signals
+        INDEXED BY debot_signals_details_error_present WHERE details_error IS NOT NULL`).all().map(row=>String(row.detail));
+      assert.ok(errorsPlan.some(detail=>detail.includes('INDEX debot_signals_details_error_present')),errorsPlan.join('\n'));
     }finally{db.close();}
     f.advance(1004);
     const cached=scanner.getStatus();assert.equal(cached.stored,1);assert.equal(cached.pending,1);assert.equal(cached.dispatched,0);
@@ -133,7 +149,9 @@ test('DeBot inbox survives restart and freezes the first observed payload while 
       signal:{...current.signal,text:'updated card text'}};
     const restarted=f.create();await restarted.runOnce();
     assert.equal(restarted.getStatus().stored,1);assert.equal(restarted.getStatus().lastCycle?.added,0);
-    assert.deepEqual(f.rows()[0],before);
+    const after=f.rows()[0],{observation_payload_hash:beforeHash,...beforeStable}=before,
+      {observation_payload_hash:afterHash,...afterStable}=after;
+    assert.deepEqual(afterStable,beforeStable);assert.notEqual(afterHash,beforeHash);
     await restarted.dispatchOnce();assert.equal(f.signals.length,1);
     assert.equal(f.signals[0].text,'DeBot signal 1');
     await restarted.close();
@@ -357,6 +375,318 @@ test('stream arrivals begin immediately and queued arrivals drain serially when 
   }finally{release.resolve();await f.close();}
 });
 
+test('a twenty-alert stream page forwards every new observation from the durable fast inbox before slow persistence',async()=>{
+  let probe:DatabaseSync|undefined;const offsets:number[]=[],mainCounts:number[]=[],inboxCounts:number[]=[];
+  let started=0;
+  const f=fixture({mode:'authenticated_stream',onPriorityObservation:()=>{
+    offsets.push(performance.now()-started);
+    mainCounts.push(Number(probe!.prepare('SELECT count(*) AS n FROM debot_signals').get()!.n));
+    inboxCounts.push(Number(probe!.prepare('SELECT count(*) AS n FROM debot_observation_inbox').get()!.n));
+  }});
+  try {
+    const scanner=f.create();probe=new DatabaseSync(f.database,{readOnly:true});started=performance.now();
+    scanner.acceptPage(page(...Array.from({length:20},(_,i)=>observation(i+1))));
+    assert.equal(offsets.length,20);assert.ok(offsets.at(-1)!<1000,`last fast observation took ${offsets.at(-1)}ms`);
+    assert.deepEqual(new Set(mainCounts),new Set([0]));assert.deepEqual(new Set(inboxCounts),new Set([20]));
+    await waitFor(()=>f.rows().length===20,'twenty-alert research drain');
+    assert.equal(f.rows().length,20);
+    assert.equal(Number(probe.prepare('SELECT count(*) AS n FROM debot_observation_inbox').get()!.n),0);
+  }finally{probe?.close();await f.close();}
+});
+
+test('page-priority batch is one strict ACK and a failed batch forwards no DeBot row',async()=>{
+  let single=0,batches=0;
+  const f=fixture({mode:'authenticated_stream',onPriorityObservation:()=>{single++;},
+    onPriorityObservations:items=>{batches++;assert.equal(items.length,20);throw Error('batch failed');}});
+  try {
+    const scanner=f.create();scanner.acceptPage(page(...Array.from({length:20},(_,i)=>observation(i+1))));
+    assert.equal(batches,1);assert.equal(single,0);
+    const db=new DatabaseSync(f.database,{readOnly:true});try {
+      const rows=db.prepare('SELECT forwarded FROM debot_observation_inbox ORDER BY rowid').all();
+      assert.equal(rows.length,20);assert.ok(rows.every(row=>Number(row.forwarded)===0));
+    }finally{db.close();}
+    await waitFor(()=>single===20&&f.rows().length===20,'single-row recovery after page batch failure');
+    assert.equal(batches,1,'single-row recovery must not rerun the page batch');
+  }finally{await f.close();}
+});
+
+test('the legacy single observation callback still runs only after its source row is durable',async()=>{
+  let probe:DatabaseSync|undefined;const visible:number[]=[];
+  const f=fixture({mode:'authenticated_stream',onObservation:()=>{
+    visible.push(Number(probe!.prepare('SELECT count(*) AS n FROM debot_signals').get()!.n));
+  }});
+  try {
+    const scanner=f.create();probe=new DatabaseSync(f.database,{readOnly:true});
+    scanner.acceptPage(page(observation(1),observation(2)));
+    assert.deepEqual(visible,[1,2]);assert.equal(f.rows().length,2);
+  }finally{probe?.close();await f.close();}
+});
+
+test('priority observations for a page all run before durable research callbacks',async()=>{
+  const order:string[]=[];
+  const f=fixture({mode:'authenticated_stream',onPriorityObservation:observation=>{order.push(`priority:${observation.id}`);},
+    onObservation:observation=>{order.push(`research:${observation.id}`);}});
+  try {
+    const scanner=f.create();scanner.acceptPage(page(observation(1),observation(2),observation(3)));
+    assert.deepEqual(order,['priority:1','priority:2','priority:3']);
+    await waitFor(()=>order.length===6,'priority research drain');
+    assert.deepEqual(order,['priority:1','priority:2','priority:3','research:1','research:2','research:3']);
+    const db=new DatabaseSync(f.database,{readOnly:true});
+    try {assert.equal(Number(db.prepare('SELECT count(*) AS n FROM debot_observation_inbox').get()!.n),0);}
+    finally{db.close();}
+  }finally{await f.close();}
+});
+
+test('a pending source ACK gates analysis and live mode dispatches immediately after the ACK',async()=>{
+  let release!:()=>void,researchStarted=false;const research=new Promise<void>(resolve=>{release=resolve;}),analyzed:Signal[]=[];
+  const f=fixture({mode:'authenticated_stream',onPriorityObservation:()=>{},
+    onObservation:async()=>{researchStarted=true;await research;},onSignal:async signal=>{analyzed.push(signal);}});
+  try {
+    const scanner=f.create();scanner.start();scanner.acceptPage(page(observation(1)));
+    await waitFor(()=>researchStarted,'source callback start');
+    const db=new DatabaseSync(f.database,{readOnly:true});
+    try {
+      assert.equal(Number(db.prepare('SELECT count(*) AS n FROM debot_signals').get()!.n),1);
+      assert.equal(Number(db.prepare('SELECT count(*) AS n FROM debot_observation_inbox').get()!.n),1);
+      await scanner.dispatchOnce();assert.equal(analyzed.length,0,'analysis must wait for the source ACK');
+      release();await waitFor(()=>analyzed.length===1,'post-ACK automatic dispatch');
+      assert.equal(Number(db.prepare('SELECT count(*) AS n FROM debot_observation_inbox').get()!.n),0);
+    }finally{db.close();}
+  }finally{release();await f.close();}
+});
+
+test('a changed payload for an existing source event updates the ledger asynchronously without recounting priority',async()=>{
+  let priority=0;const research:string[]=[];
+  const f=fixture({mode:'authenticated_stream',onPriorityObservation:()=>{priority++;},
+    onObservation:item=>{research.push(`${item.walletCount}:${item.name??''}`);}});
+  try {
+    const scanner=f.create(),original=observation(1);
+    scanner.acceptPage(page(original));
+    await waitFor(()=>research.length===1,'initial observation drain');
+    assert.equal(priority,1);assert.equal(scanner.notificationHistory('bsc',original.signal.token.address).total,1);
+
+    f.advance(1001);
+    const update={...original,observedAt:iso(1001),walletCount:4,name:'Updated Token',aliases:['platform-alias','new-wallet']};
+    scanner.acceptPage(page(update));
+    assert.equal(priority,1,'a vendor revision with the same source id must not increment the signal count');
+    const db=new DatabaseSync(f.database,{readOnly:true});
+    try {
+      const pending=db.prepare('SELECT forwarded,research_forwarded,payload FROM debot_observation_inbox WHERE id=?')
+        .get(original.signal.sourceEventId);
+      assert.equal(pending?.forwarded,1);assert.equal(pending?.research_forwarded,0);
+      assert.equal((JSON.parse(String(pending?.payload)) as DebotSignalObservation).walletCount,4);
+    }finally{db.close();}
+
+    await scanner.close();const restarted=f.create();restarted.start();
+    await waitFor(()=>restarted.notificationHistory('bsc',original.signal.token.address).total===2,'changed card slow drain');
+    assert.deepEqual(research,['3:','4:Updated Token']);assert.equal(priority,1);
+    const history=restarted.notificationHistory('bsc',original.signal.token.address);
+    assert.equal(history.aggregation?.notificationCount,1);assert.equal(history.aggregation?.deliveryCount,2);
+    assert.equal(history.aggregation?.lastChange?.kind,'wallet_hint');
+    assert.equal(restarted.list({limit:1}).items[0].name,'Updated Token');
+    const probe=new DatabaseSync(f.database,{readOnly:true});
+    try {assert.equal(Number(probe.prepare('SELECT count(*) AS n FROM debot_observation_inbox').get()!.n),0);}
+    finally{probe.close();}
+  }finally{await f.close();}
+});
+
+test('a second stream page reaches priority before the first page slow research tail',async()=>{
+  const order:string[]=[];let research=0,secondPriorityAt=0;
+  let began!:()=>void;const researchBegan=new Promise<void>(resolve=>{began=resolve;});
+  const f=fixture({mode:'authenticated_stream',
+    onPriorityObservation:observation=>{order.push(`priority:${observation.id}`);if(observation.id==='21')secondPriorityAt=performance.now();},
+    onObservation:async observation=>{research++;order.push(`research:${observation.id}`);began();await new Promise(resolve=>setTimeout(resolve,150));}});
+  try {
+    const scanner=f.create();
+    scanner.acceptPage(page(...Array.from({length:20},(_,i)=>observation(i+1))));
+    await researchBegan;const started=performance.now();
+    scanner.acceptPage(page(...Array.from({length:20},(_,i)=>observation(i+21))));
+    assert.ok(secondPriorityAt-started<100,`second-page priority waited ${secondPriorityAt-started}ms`);
+    assert.equal(research,1,'the 150ms research request must remain outside the priority path');
+    assert.equal(order.filter(item=>item.startsWith('priority:')).length,40);
+  }finally{await f.close();}
+});
+
+test('five full pages reach priority exactly once while a slow research callback is blocked',async()=>{
+  const priority:string[]=[];let batches=0,research=0,release!:()=>void;
+  const blocked=new Promise<void>(resolve=>{release=resolve;});
+  const f=fixture({mode:'authenticated_stream',
+    onPriorityObservations:items=>{batches++;priority.push(...items.map(item=>item.signal.sourceEventId));},
+    onObservation:async()=>{research++;await blocked;}});
+  try {
+    const scanner=f.create();
+    for(let offset=0;offset<100;offset+=20)scanner.acceptPage(page(
+      ...Array.from({length:20},(_,i)=>observation(offset+i+1))));
+    assert.equal(batches,5);assert.equal(priority.length,100);assert.equal(new Set(priority).size,100);
+    assert.equal(research,0,'research must stay off the synchronous priority path');
+    const db=new DatabaseSync(f.database,{readOnly:true});
+    try {assert.equal(Number(db.prepare('SELECT count(*) AS n FROM debot_observation_inbox').get()!.n),100);}
+    finally{db.close();}
+    await new Promise<void>(resolve=>setImmediate(resolve));assert.equal(research,1);
+  }finally{release();await f.close();}
+});
+
+test('two-stage inbox recovers slow persistence and research without replaying priority delivery',async()=>{
+  let priority=0,research=0;
+  const f=fixture({mode:'authenticated_stream',onPriorityObservation:()=>{priority++;},onObservation:()=>{research++;}});
+  try {
+    const first=f.create();let db=new DatabaseSync(f.database);
+    try{db.exec("CREATE TRIGGER reject_two_stage_slow BEFORE INSERT ON debot_signals BEGIN SELECT RAISE(ABORT,'TEST_SLOW_WRITE_FAILURE'); END;");}
+    finally{db.close();}
+    assert.doesNotThrow(()=>first.acceptPage(page(observation(1))));
+    assert.equal(priority,1);assert.equal(research,0);await first.close();
+    db=new DatabaseSync(f.database);try{db.exec('DROP TRIGGER reject_two_stage_slow');}finally{db.close();}
+    const restarted=f.create();restarted.start();
+    assert.equal(priority,1);assert.equal(research,0,'start must not synchronously drain slow research');
+    await waitFor(()=>research===1&&f.rows().length===1,'nonblocking restart recovery');
+    db=new DatabaseSync(f.database,{readOnly:true});
+    try {assert.equal(Number(db.prepare('SELECT count(*) AS n FROM debot_observation_inbox').get()!.n),0);}
+    finally{db.close();}
+  }finally{await f.close();}
+});
+
+test('a failed priority callback keeps its durable row and retries in the background',async()=>{
+  let attempts=0,research=0;
+  const f=fixture({mode:'authenticated_stream',onPriorityObservation:()=>{if(++attempts===1)throw Error('temporary capture failure');},
+    onObservation:()=>{research++;}});
+  try {
+    const scanner=f.create();const started=performance.now();
+    assert.doesNotThrow(()=>scanner.acceptPage(page(observation(1))));
+    assert.ok(performance.now()-started<1000);
+    let db=new DatabaseSync(f.database,{readOnly:true});
+    try {
+      const pending=db.prepare('SELECT forwarded,research_forwarded FROM debot_observation_inbox').get();
+      assert.equal(pending?.forwarded,0);assert.equal(pending?.research_forwarded,0);assert.equal(f.rows().length,0);
+    }finally{db.close();}
+    await waitFor(()=>f.rows().length===1,'priority callback retry');
+    assert.equal(attempts,2);assert.equal(research,1);
+    db=new DatabaseSync(f.database,{readOnly:true});
+    try{assert.equal(Number(db.prepare('SELECT count(*) AS n FROM debot_observation_inbox').get()!.n),0);}finally{db.close();}
+  }finally{await f.close();}
+});
+
+test('a full two-stage inbox rejects a new event instead of persisting it without priority delivery',async()=>{
+  const priority:string[]=[],research:string[]=[];
+  const f=fixture({mode:'authenticated_stream',
+    onPriorityObservation:item=>{priority.push(item.signal.sourceEventId);},
+    onObservation:item=>{research.push(item.signal.sourceEventId);}});
+  try {
+    const first=f.create();let db=new DatabaseSync(f.database);
+    try{db.exec("CREATE TRIGGER reject_capacity_slow BEFORE INSERT ON debot_signals BEGIN SELECT RAISE(ABORT,'TEST_SLOW_WRITE_FAILURE'); END;");}
+    finally{db.close();}
+    for(let offset=0;offset<200;offset+=20)assert.doesNotThrow(()=>first.acceptPage(page(
+      ...Array.from({length:20},(_,i)=>observation(offset+i+1)))));
+    assert.equal(priority.length,200);assert.equal(new Set(priority).size,200);assert.equal(research.length,0);
+    // A persistent slow-store failure cannot make the 201st event disappear:
+    // the bounded pre-drain fails, then capacity is reported synchronously.
+    assert.throws(()=>first.acceptPage(page(observation(201))),/DEBOT_SIGNAL_STORE_FULL/);
+    assert.equal(priority.length,200);assert.equal(research.length,0);assert.equal(f.rows().length,0);
+    db=new DatabaseSync(f.database,{readOnly:true});
+    try {assert.equal(Number(db.prepare('SELECT count(*) AS n FROM debot_observation_inbox').get()!.n),200);}
+    finally{db.close();}
+  }finally{await f.close();}
+});
+
+test('a transient slow-write failure drains its two-stage inbox in the same process',async()=>{
+  let priority=0,research=0;
+  const f=fixture({mode:'authenticated_stream',onPriorityObservation:()=>{priority++;},onObservation:()=>{research++;}});
+  try {
+    const scanner=f.create();let db=new DatabaseSync(f.database);
+    try{db.exec("CREATE TRIGGER reject_transient_slow BEFORE INSERT ON debot_signals BEGIN SELECT RAISE(ABORT,'TEST_SLOW_WRITE_FAILURE'); END;");}
+    finally{db.close();}
+    const firstPage=page(...Array.from({length:20},(_,i)=>observation(i+1)));
+    const secondPage=page(...Array.from({length:20},(_,i)=>observation(i+21)));
+    assert.doesNotThrow(()=>scanner.acceptPage(firstPage));
+    assert.doesNotThrow(()=>scanner.acceptPage(secondPage));
+    assert.equal(priority,40);assert.equal(research,0);
+    db=new DatabaseSync(f.database);try{db.exec('DROP TRIGGER reject_transient_slow');}finally{db.close();}
+    const deadline=Date.now()+3000;
+    for(;;){
+      db=new DatabaseSync(f.database,{readOnly:true});let pending:number;
+      try{pending=Number(db.prepare('SELECT count(*) AS n FROM debot_observation_inbox').get()!.n);}finally{db.close();}
+      if(!pending)break;
+      if(Date.now()>=deadline)assert.fail(`inbox recovery timed out with ${pending} rows`);
+      await new Promise(resolve=>setTimeout(resolve,10));
+    }
+    assert.equal(priority,40);assert.equal(research,40);assert.equal(f.rows().length,40);
+    scanner.acceptPage(page(observation(41)));
+    await waitFor(()=>research===41,'post-recovery event drain');
+    assert.equal(priority,41);assert.equal(research,41);assert.equal(f.rows().length,41);
+  }finally{await f.close();}
+});
+
+test('a page that exceeds remaining fast-inbox capacity is rejected atomically before priority delivery',async()=>{
+  let priority=0;
+  const f=fixture({mode:'authenticated_stream',onPriorityObservation:()=>{priority++;}});
+  try {
+    const scanner=f.create();let db=new DatabaseSync(f.database);
+    try{db.exec("CREATE TRIGGER reject_partial_capacity BEFORE INSERT ON debot_signals BEGIN SELECT RAISE(ABORT,'TEST_SLOW_WRITE_FAILURE'); END;");}
+    finally{db.close();}
+    for(let offset=0;offset<180;offset+=20)assert.doesNotThrow(()=>scanner.acceptPage(page(
+      ...Array.from({length:20},(_,i)=>observation(offset+i+1)))));
+    assert.doesNotThrow(()=>scanner.acceptPage(page(...Array.from({length:19},(_,i)=>observation(i+181)))));
+    assert.equal(priority,199);
+    assert.throws(()=>scanner.acceptPage(page(observation(200),observation(201))),/DEBOT_SIGNAL_STORE_FULL/);
+    assert.equal(priority,199);
+    db=new DatabaseSync(f.database,{readOnly:true});
+    try {assert.equal(Number(db.prepare('SELECT count(*) AS n FROM debot_observation_inbox').get()!.n),199);}
+    finally{db.close();}
+  }finally{await f.close();}
+});
+
+test('the durable fast inbox completes a failed slow write after restart without forwarding the event twice',async()=>{
+  let observed=0;const f=fixture({mode:'authenticated_stream',onPriorityObservation:()=>{observed++;}});
+  try {
+    const first=f.create();let db=new DatabaseSync(f.database);
+    try{db.exec("CREATE TRIGGER reject_slow_inbox BEFORE INSERT ON debot_signals BEGIN SELECT RAISE(ABORT,'TEST_SLOW_WRITE_FAILURE'); END;");}
+    finally{db.close();}
+    assert.doesNotThrow(()=>first.acceptPage(page(observation(1))));assert.equal(observed,1);
+    db=new DatabaseSync(f.database,{readOnly:true});
+    try {
+      assert.equal(Number(db.prepare('SELECT count(*) AS n FROM debot_signals').get()!.n),0);
+      const pending=db.prepare('SELECT id,forwarded FROM debot_observation_inbox').get();
+      assert.equal(pending?.id,'debot:signal:1');assert.equal(pending?.forwarded,1);
+    }finally{db.close();}
+    await first.close();db=new DatabaseSync(f.database);try{db.exec('DROP TRIGGER reject_slow_inbox');}finally{db.close();}
+    const restarted=f.create();restarted.start();
+    assert.equal(observed,1);assert.equal(f.rows().length,0,'start must leave recovery off the caller thread');
+    await waitFor(()=>f.rows().length===1,'restart slow-write recovery');
+    db=new DatabaseSync(f.database,{readOnly:true});
+    try{assert.equal(Number(db.prepare('SELECT count(*) AS n FROM debot_observation_inbox').get()!.n),0);}finally{db.close();}
+  }finally{await f.close();}
+});
+
+test('retrying a page after a middle slow-write failure does not forward its committed prefix twice',async()=>{
+  const observed:string[]=[];const f=fixture({mode:'authenticated_stream',onPriorityObservation:event=>observed.push(event.signal.sourceEventId)});
+  try {
+    const scanner=f.create();let db=new DatabaseSync(f.database);
+    try {
+      db.exec(`CREATE TRIGGER reject_slow_page BEFORE INSERT ON debot_signals
+        WHEN (SELECT count(*) FROM debot_signals)>=5
+        BEGIN SELECT RAISE(ABORT,'TEST_MID_PAGE_FAILURE'); END;`);
+    }finally{db.close();}
+    const batch=page(...Array.from({length:20},(_,i)=>observation(i+1)));
+    assert.doesNotThrow(()=>scanner.acceptPage(batch));
+    assert.equal(observed.length,20);assert.equal(new Set(observed).size,20);
+    await waitFor(()=>f.rows().length===5,'partial slow-page drain');
+    db=new DatabaseSync(f.database,{readOnly:true});
+    try {
+      assert.equal(Number(db.prepare('SELECT count(*) AS n FROM debot_signals').get()!.n),5);
+      assert.equal(Number(db.prepare('SELECT count(*) AS n FROM debot_signals WHERE observation_payload_hash IS NOT NULL').get()!.n),5);
+      assert.equal(Number(db.prepare('SELECT count(*) AS n FROM debot_observation_inbox').get()!.n),15);
+    }finally{db.close();}
+    db=new DatabaseSync(f.database);try{db.exec('DROP TRIGGER reject_slow_page');}finally{db.close();}
+    scanner.acceptPage(batch);
+    await waitFor(()=>f.rows().length===20,'retried slow-page drain');
+    assert.equal(observed.length,20);assert.equal(new Set(observed).size,20);
+    db=new DatabaseSync(f.database,{readOnly:true});
+    try {
+      assert.equal(Number(db.prepare('SELECT count(*) AS n FROM debot_signals').get()!.n),20);
+      assert.equal(Number(db.prepare('SELECT count(*) AS n FROM debot_observation_inbox').get()!.n),0);
+    }finally{db.close();}
+  }finally{await f.close();}
+});
+
 test('stream dispatcher yields after twenty events and rechecks workload pressure between analyses',async()=>{
   let attempts=0,blocked=false;
   const f=fixture({mode:'authenticated_stream',shouldDefer:()=>blocked?'RESEARCH_BUSY':undefined,
@@ -491,9 +821,14 @@ test('a larger DeBot byte budget resumes a full database with its original event
     assert.equal(scanner.notificationHistory('bsc',failed.signal.token.address).total,0);
     await scanner.close();f.options.maxBytes=4*1024*1024;
     const reopened=f.create();assert.equal(reopened.getStatus().maxBytes,4*1024*1024);
-    assert.equal(reopened.getStatus().lastError,undefined);assert.deepEqual(f.rows(),before);
+    assert.equal(reopened.getStatus().lastError,undefined);
+    assert.deepEqual(f.rows(),before);
     const original=JSON.parse(String(before[0].payload)) as DebotSignalObservation;
-    reopened.acceptPage(page(original));assert.deepEqual(f.rows(),before);
+    // New pages never synchronously drain old research. The durable recovery
+    // turn commits the previously rejected write without delaying priority.
+    reopened.start();reopened.acceptPage(page(original));
+    await waitFor(()=>f.rows().length===before.length+1,'expanded-store async recovery');
+    assert.equal(f.rows().some(row=>row.id===failed!.signal.sourceEventId),true);
     assert.equal(reopened.notificationHistory('bsc',original.signal.token.address).aggregation?.notificationCount,1);
     reopened.acceptPage(page(failed));assert.equal(reopened.getStatus().stored,before.length+1);
     assert.equal(reopened.notificationHistory('bsc',failed.signal.token.address).total,1);

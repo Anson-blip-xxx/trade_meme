@@ -11,14 +11,26 @@ export class NativeProcessStore {
     mkdirSync(dirname(path),{recursive:true,mode:0o700});this.db=new DatabaseSync(path);chmodSync(path,0o600);
     this.db.exec(`PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;PRAGMA busy_timeout=5;
       CREATE TABLE IF NOT EXISTS process_actions(ref TEXT PRIMARY KEY,order_id TEXT NOT NULL,expires INTEGER NOT NULL,native_ref TEXT);
+      CREATE INDEX IF NOT EXISTS process_actions_reusable ON process_actions(order_id,expires) WHERE native_ref IS NULL;
+      CREATE INDEX IF NOT EXISTS process_actions_expired ON process_actions(expires);
       CREATE TABLE IF NOT EXISTS process_notices(key TEXT PRIMARY KEY,text TEXT NOT NULL,delivered INTEGER NOT NULL DEFAULT 0);
       CREATE INDEX IF NOT EXISTS process_notices_pending ON process_notices(delivered) WHERE delivered=0;
       CREATE TABLE IF NOT EXISTS process_orders(order_id TEXT PRIMARY KEY,version TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS process_health(id INTEGER PRIMARY KEY,checked INTEGER NOT NULL);`);
   }
   createAction(orderId:string,now=Date.now()):string{
-    const ref='np'+randomBytes(15).toString('hex');
-    this.db.prepare('INSERT INTO process_actions VALUES(?,?,?,NULL)').run(ref,orderId,now+86400000);return ref;
+    this.db.exec('BEGIN IMMEDIATE');
+    try{
+      // Keep deletion work bounded. New rows are rare because an unconsumed
+      // capability is reused until it expires or is mapped to a native action.
+      this.db.prepare('DELETE FROM process_actions WHERE rowid IN (SELECT rowid FROM process_actions WHERE expires<=? LIMIT 128)').run(now);
+      const current=this.db.prepare(`SELECT ref FROM process_actions
+        WHERE order_id=? AND native_ref IS NULL AND expires>? ORDER BY expires DESC LIMIT 1`).get(orderId,now);
+      if(current){this.db.exec('COMMIT');return String(current.ref);}
+      const ref='np'+randomBytes(15).toString('hex');
+      this.db.prepare('INSERT INTO process_actions VALUES(?,?,?,NULL)').run(ref,orderId,now+86400000);
+      this.db.exec('COMMIT');return ref;
+    }catch(error){try{this.db.exec('ROLLBACK');}catch{}throw error;}
   }
   action(ref:string):{ref:string;orderId:string;expires:number;nativeRef?:string}|undefined{
     if(!/^np[0-9a-f]{30}$/.test(ref))return;

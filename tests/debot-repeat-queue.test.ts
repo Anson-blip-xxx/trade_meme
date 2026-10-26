@@ -25,6 +25,9 @@ const wallet=(n:number):DebotVendorWalletDetail=>({address:address(n),alias:`res
 function details(milliseconds:number,rows:DebotVendorWalletDetail[]):DebotWalletDetails {
   return {fetchedAt:at(milliseconds),received:rows.length,rejected:0,vendorWallets:rows};
 }
+function withoutObservationPayloadHash(row:Record<string,unknown>){
+  const {observation_payload_hash:_,...stable}=row;return stable;
+}
 function report(signal:Signal,milliseconds:number,second=false):Report {
   const checked:Check={status:'pass',reasons:['TEST_PASSED'],checkedAt:at(milliseconds),facts:{}};
   return {id:second?'22222222-2222-4222-8222-222222222222':'11111111-1111-4111-8111-111111111111',policyVersion:'repeat-test',mode:'live',
@@ -59,7 +62,9 @@ test('a revised vendor event reassesses only after fresh details reveal a new ex
     scanner.acceptPage(page(updated));await scanner.dispatchOnce();
     assert.equal(f.calls.length,2);assert.equal(f.calls[1].repeat,true);assert.match(f.calls[1].signal.sourceEventId,/^debot:revision:/);
     assert.equal(f.calls[1].signal.occurredAt,original.signal.occurredAt);assert.equal(detailCalls,2);
-    const rows=f.rows();assert.deepEqual(rows.find(row=>row.id===original.signal.sourceEventId),baseline);
+    const rows=f.rows(),originalRow=rows.find(row=>row.id===original.signal.sourceEventId)!;
+    assert.deepEqual(withoutObservationPayloadHash(originalRow),withoutObservationPayloadHash(baseline));
+    assert.notEqual(originalRow.observation_payload_hash,baseline.observation_payload_hash);
     const grouped=scanner.list();assert.equal(grouped.total,1);assert.equal(grouped.items[0].decision,'REJECT');
     assert.equal(grouped.items[0].aggregation.firstSeenAt,at());assert.equal(grouped.items[0].aggregation.notificationCount,1);
     assert.equal(grouped.items[0].aggregation.analysisCount,2);
@@ -162,7 +167,9 @@ test('restart preserves revision deduplication and does not replay completed ana
     first.acceptPage(page(updated));await first.dispatchOnce();assert.equal(f.calls.length,2);await first.close();
     const persisted=f.rows(),restarted=f.create();await restarted.dispatchOnce();assert.equal(f.calls.length,2);
     f.advance(2000);restarted.acceptPage(page({...updated,observedAt:at(2000)}));await restarted.dispatchOnce();
-    assert.equal(f.calls.length,2);assert.equal(detailCalls,2);assert.deepEqual(f.rows(),persisted);
+    assert.equal(f.calls.length,2);assert.equal(detailCalls,2);
+    const after=f.rows();assert.deepEqual(after.map(withoutObservationPayloadHash),persisted.map(withoutObservationPayloadHash));
+    assert.notEqual(after[0].observation_payload_hash,persisted[0].observation_payload_hash);
     const history=restarted.notificationHistory('bsc',address(100));assert.equal(history.total,2);assert.equal(history.aggregation?.notificationCount,1);
     assert.equal(history.aggregation?.deliveryCount,3);assert.equal(history.aggregation?.firstSeenAt,at());
   }finally{await f.close();}
@@ -255,7 +262,9 @@ test('an old card with a genuinely fresh wallet trade can reassess while origina
     assert.equal(f.calls.length,2);assert.equal(f.calls[1].repeat,true);assert.equal(f.calls[1].signal.occurredAt,at(140900));
     const rows=f.rows(),revision=rows.find(row=>row.id!==original.signal.sourceEventId)!;
     assert.equal(revision.occurred_at,original.signal.occurredAt);assert.equal(revision.analysis_occurred_at,at(140900));
-    assert.deepEqual(rows.find(row=>row.id===original.signal.sourceEventId),baseline);
+    const originalRow=rows.find(row=>row.id===original.signal.sourceEventId)!;
+    assert.deepEqual(withoutObservationPayloadHash(originalRow),withoutObservationPayloadHash(baseline));
+    assert.notEqual(originalRow.observation_payload_hash,baseline.observation_payload_hash);
     const history=scanner.notificationHistory('bsc',address(100));assert.equal(history.aggregation.firstSeenAt,at());
     assert.equal(history.items[0].occurredAt,original.signal.occurredAt);assert.equal(history.items[0].classification,'reassessment');
     assert.ok(history.items[0].evidence.vendorChanges.some((change:{kind:string;eventAt:string})=>change.kind==='last_trade_at'&&change.eventAt===at(140900)));

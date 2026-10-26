@@ -27,6 +27,7 @@ test('near-gate observations never create eligible tokens, exit seeds or histori
     ms=1000;a.recordPrice({chain:'bsc',address:address(),priceUsd:10,observedAt:iso(),source:'gmgn_token_info_sample'});
     assert.equal(a.stats().comparison!.sampled,0);
     a.recordPrice({chain:'bsc',address:address(),priceUsd:10,observedAt:iso(ms),source:'gmgn_token_info_sample'});
+    ms=16_001;
     assert.equal(a.stats().comparison!.sampled,1);assert.equal(a.get('scan1')!.performance,undefined);
     assert.equal(a.stats().comparison!.items[0].performance.baselinePriceUsd,10);
   }finally{a.close();}
@@ -70,7 +71,7 @@ test('late baselines, stale samples, equal-time duplicates and errors do not inv
     a.capture(entry());ms=900000;send(1000,10);assert.equal(a.stats().comparison!.sampled,0);
     send(ms,10);send(ms,100);ms=3600000;send(ms,20);
     let r=a.stats().comparison!.items[0];assert.equal(r.performance.samples,2);assert.deepEqual(r.horizons,{});
-    a.recordPriceError({chain:'bsc',address:address()},'GMGN_RATE_LIMITED');r=a.stats().comparison!.items[0];
+    a.recordPriceError({chain:'bsc',address:address()},'GMGN_RATE_LIMITED');ms+=15_001;r=a.stats().comparison!.items[0];
     assert.equal(r.performance.error,'GMGN_RATE_LIMITED');assert.equal(r.performance.samples,2);
   }finally{a.close();}
 });

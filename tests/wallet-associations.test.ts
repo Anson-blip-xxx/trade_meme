@@ -41,6 +41,10 @@ test('existing histories gain the token invalidation covering index without chan
         ['chain','token_address','active','leader','candidate']);
       assert.deepEqual(reader.prepare('PRAGMA index_info(wh_assoc_anchor_recent)').all().map(row=>row.name),
         ['chain','public_observed_at','leader','token_address']);
+      assert.deepEqual(reader.prepare('PRAGMA index_info(wh_assoc_relation_page)').all().map(row=>row.name),
+        ['token_count','funding_count','forward_count','updated_at','leader','candidate']);
+      assert.deepEqual(reader.prepare('PRAGMA index_info(wh_assoc_relation_chain_page)').all().map(row=>row.name),
+        ['chain','token_count','funding_count','forward_count','updated_at','leader','candidate']);
       const lookup='SELECT leader,candidate FROM wh_assoc_episodes WHERE chain=? AND token_address=? AND active=1';
       const plan=reader.prepare(`EXPLAIN QUERY PLAN ${lookup}`).all(chain,token).map(row=>String(row.detail));
       assert.ok(plan.some(detail=>detail.includes('COVERING INDEX wh_assoc_episode_token')&&detail.includes('chain=? AND token_address=? AND active=?')));
@@ -57,6 +61,13 @@ test('existing histories gain the token invalidation covering index without chan
         ORDER BY COALESCE(collection_checked_at,''),token_count DESC,funding_count DESC,leader,candidate LIMIT 20`)
         .all(chain).map(row=>String(row.detail));
       assert.ok(knownPlan.some(detail=>detail.includes('INDEX wh_assoc_relation_targets')&&detail.includes('chain=?')));
+      const pages=[
+        reader.prepare(`EXPLAIN QUERY PLAN SELECT r.* FROM wh_assoc_relations r INDEXED BY wh_assoc_relation_page
+          WHERE r.token_count>0 ORDER BY r.token_count DESC,r.funding_count DESC,r.forward_count DESC,r.updated_at DESC,r.leader,r.candidate LIMIT 25 OFFSET 0`).all(),
+        reader.prepare(`EXPLAIN QUERY PLAN SELECT r.* FROM wh_assoc_relations r INDEXED BY wh_assoc_relation_chain_page
+          WHERE r.token_count>0 AND r.chain=? ORDER BY r.token_count DESC,r.funding_count DESC,r.forward_count DESC,r.updated_at DESC,r.leader,r.candidate LIMIT 25 OFFSET 0`).all(chain),
+      ];
+      for(const plan of pages)assert.ok(plan.every(row=>!String(row.detail).includes('USE TEMP B-TREE')),plan.map(row=>row.detail).join('\n'));
     } finally {reader.close();}
     history.recordTrade(trade({wallet:address(8),eventAt:iso(40),observedAt:iso(80),txHash:hash(800)}));
     assert.equal(history.getAssociation(chain,leader,candidate)!.association.status,'stale');

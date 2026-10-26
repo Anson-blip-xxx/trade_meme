@@ -10,19 +10,21 @@ const kp=Keypair.fromSeed(new Uint8Array(32).fill(1)),wallet=kp.publicKey.toBase
 const ata=Keypair.fromSeed(new Uint8Array(32).fill(3)).publicKey.toBase58(),tip=Keypair.fromSeed(new Uint8Array(32).fill(4)).publicKey.toBase58();
 const blockhash=Keypair.fromSeed(new Uint8Array(32).fill(5)).publicKey.toBase58(),pump='6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',TOKEN='TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
 const SOL='So11111111111111111111111111111111111111112';
-function fixture(t:any,options:{sendError?:boolean;badSimulation?:boolean;badPlan?:boolean;side?:'buy'|'sell';monotonicNow?:()=>number}={}){
+function fixture(t:any,options:{sendError?:boolean;badSimulation?:boolean;badPlan?:boolean;side?:'buy'|'sell';monotonicNow?:()=>number;
+  advanceClockOnSendMs?:number}={}){
  const dir=mkdtempSync(join(tmpdir(),'native-executor-')),keyfile=join(dir,'key.json'),journal=join(dir,'state.sqlite');
  writeFileSync(keyfile,JSON.stringify([...kp.secretKey]),{mode:0o600});
  const state={now:Date.now(),sends:0,plans:0,calls:[] as string[],sent:[] as string[],status:null as any,height:100,transaction:undefined as any};
  const request:NativeExecuteRequest={intentId:'intent',orderId:'order',wallet,mint,side:options.side??'buy',amount:options.side==='sell'?'1000':'10000000',slippageBps:500};
  const plan=async(r:any):Promise<NativeSwapPlan>=>{state.plans++;return {venue:'pump',mint:r.mint,side:r.side,inputAmount:r.amount,expectedOutputAmount:r.side==='buy'?'1000':'10000000',minimumOutputAmount:r.side==='buy'?'950':'9500000',
   quotedAt:new Date(state.now).toISOString(),tokenDecimals:6,subscriptionAccounts:[ata],instructions:[new TransactionInstruction({programId:new PublicKey(options.badPlan?tip:pump),
-   keys:[{pubkey:kp.publicKey,isSigner:true,isWritable:true},{pubkey:new PublicKey(mint),isSigner:false,isWritable:false},{pubkey:new PublicKey(ata),isSigner:false,isWritable:true}],data:Buffer.from([1])})]};};
+   keys:[{pubkey:kp.publicKey,isSigner:true,isWritable:true},{pubkey:new PublicKey(r.mint),isSigner:false,isWritable:false},{pubkey:new PublicKey(ata),isSigner:false,isWritable:true}],data:Buffer.from([1])})]};};
  const fetcher:typeof fetch=async(input,init)=>{const url=new URL(String(input)),body=JSON.parse(String(init?.body));state.calls.push(body.method);let result:any;
   if(url.hostname.endsWith('jito.wtf')){
    if(body.method==='getTipAccounts')result=[tip];else {assert.equal(body.method,'sendTransaction');assert.equal(url.search,'?bundleOnly=true');state.sends++;state.sent.push(body.params[0]);
     const signed=VersionedTransaction.deserialize(Buffer.from(body.params[0],'base64'));const sig=bs58.encode(signed.signatures[0]);
-    const db=new NativeJournal(journal);try{const stored=db.get(request.intentId);assert.equal(stored?.rawTransaction,body.params[0]);assert.equal(stored?.signature,sig);assert.equal(stored?.armed,true);}finally{db.close();}
+    const db=new NativeJournal(journal);try{const stored=db.listPending().find(row=>row.rawTransaction===body.params[0]);assert.equal(stored?.signature,sig);assert.equal(stored?.armed,true);}finally{db.close();}
+    if(options.advanceClockOnSendMs)state.now+=options.advanceClockOnSendMs;
     if(options.sendError)throw Error('network-sensitive-detail');result=sig;
    }
   }else {assert.equal(url.hostname,'rpc.test');switch(body.method){
@@ -96,6 +98,28 @@ test('finalized failure and malformed fill do not report sale completion',async 
 test('concurrent sells share one unresolved lock across executor handles',async t=>{const f=fixture(t,{side:'sell'});
  const results=await Promise.all([f.executor.execute(f.request),f.executor.execute({...f.request,intentId:'other'})]);
  assert.equal(f.state.sends,1);assert.ok(results.some(r=>r.failureReason==='NATIVE_SELL_IN_PROGRESS'));
+});
+test('five and twenty concurrent exits build fresh plans only after their Jito turn and never double broadcast',async t=>{
+ for(const count of [5,20]){
+  const f=fixture(t,{side:'sell',advanceClockOnSendMs:1000}),ages:number[]=[];
+  const requests=Array.from({length:count},(_,index)=>({...f.request,intentId:`exit-${count}-${index}`,orderId:`order-${count}-${index}`,
+   mint:Keypair.fromSeed(new Uint8Array(32).fill(index+10)).publicKey.toBase58(),beforeBroadcast:async(plan:Readonly<NativeSwapPlan>)=>{
+    ages.push(f.state.now-Date.parse(plan.quotedAt));
+   }}));
+  const results=await Promise.all(requests.map(request=>f.executor.execute(request)));
+  assert.equal(results.every(result=>result.status==='submitted'),true);
+  assert.equal(f.state.plans,count);assert.equal(f.state.sends,count);assert.equal(new Set(f.state.sent).size,count);
+  assert.equal(ages.length,count);assert.equal(ages.every(age=>age>=0&&age<=10_000),true);
+  const blockhashes=f.state.calls.flatMap((method,index)=>method==='getLatestBlockhash'?[index]:[]);
+  const sends=f.state.calls.flatMap((method,index)=>method==='sendTransaction'?[index]:[]);
+  assert.equal(blockhashes.length,count);assert.equal(sends.length,count);
+  for(let index=0;index<count;index++){
+   assert.ok(blockhashes[index]<sends[index]);
+   if(index)assert.ok(blockhashes[index]>sends[index-1],'the next blockhash is fetched only after its Jito turn opens');
+  }
+  await Promise.all(requests.map(request=>f.executor.execute(request)));
+  assert.equal(f.state.plans,count);assert.equal(f.state.sends,count,'durable intent idempotency prevents duplicate broadcasts');
+ }
 });
 test('fill accounting supports negative net SOL small sales, WSOL receipts and exact bigint token precision',()=>{
  const signature=bs58.encode(new Uint8Array(64).fill(6));const r:NativeJournalRecord={intentId:'i',orderId:'o',wallet,mint,side:'sell',amount:'1000',slippageBps:500,status:'submitted',
@@ -173,15 +197,15 @@ test('timing measures every stage monotonically without additional RPCs or durab
  const expected=['getGenesisHash','getTipAccounts','getLatestBlockhash','getFeeForMessage','getBalance','simulateTransaction','sendTransaction'];
  assert.deepEqual([...f.state.calls].sort(),expected.sort());assert.equal(f.state.calls.at(-1),'sendTransaction');
  assert.equal(writes.mock.callCount(),2,'timing uses the existing pre-send and post-send journal writes');
- const stored=f.executor.get(f.request.intentId)!;assert.deepEqual(stored.timing,result.timing);
- result.timing.stagesMs.plan=999;assert.equal(f.executor.get(f.request.intentId)!.timing!.stagesMs.plan,1,'public timing is a detached projection');
+ const stored=f.executor.get(f.request.intentId)!;assert.deepEqual(stored.timing,result.timing);const storedPlanMs=stored.timing!.stagesMs.plan;
+ result.timing.stagesMs.plan=999;assert.equal(f.executor.get(f.request.intentId)!.timing!.stagesMs.plan,storedPlanMs,'public timing is a detached projection');
  const repeat=await f.executor.execute(f.request);assert.deepEqual(repeat.timing,stored.timing);assert.equal(f.state.sends,1);
 });
 
 test('failed simulation and failed final guard retain completed or attempted stages without inventing broadcast times',async t=>{
  let mono=0;const a=fixture(t,{badSimulation:true,monotonicNow:()=>mono+=2});const failed=await a.executor.execute(a.request);
  const failedTiming=failed.timing!;assert.equal(failed.status,'failed');assert.ok(failedTiming.stagesMs.simulation!>=2&&failedTiming.stagesMs.simulation!<=6);
- assert.equal(failedTiming.stagesMs.broadcastQueue,undefined);assert.equal(failedTiming.stagesMs.sign,undefined);
+ assert.ok(failedTiming.stagesMs.broadcastQueue!>=2);assert.equal(failedTiming.stagesMs.sign,undefined);
  assert.equal(failedTiming.broadcastStartedAt,undefined);assert.equal(failedTiming.submittedAfterMs,undefined);
  assert.equal(a.state.sends,0);
  const b=fixture(t,{monotonicNow:()=>mono+=3});const guarded=await b.executor.execute({...b.request,beforeBroadcast:async()=>{throw Error('ENTRY_TIMING_TEST_REJECTED');}});

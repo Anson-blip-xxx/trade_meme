@@ -16,7 +16,11 @@ export interface AveSocket {
 }
 export interface AveScannerOptions {
   database:string;chains:Chain[];fetcher?:Fetcher;now?:()=>Date;
-  onObservation:(observation:AveSignalObservation)=>void;
+  /** Latency-critical consumers run from the durable page inbox before the
+   * slower source and research writes. */
+  onPriorityObservation?:(observation:AveSignalObservation)=>void;
+  onPriorityObservations?:(observations:readonly AveSignalObservation[])=>void;
+  onObservation:(observation:AveSignalObservation)=>unknown|Promise<unknown>;
   onSignal:(signal:Signal,firstObservedAt:string)=>Promise<unknown>;
   shouldDefer?:()=>string|undefined;socketFactory?:(url:string)=>AveSocket;
   onPriceFrame?:(payload:unknown,receivedAt:string)=>void;
@@ -24,9 +28,13 @@ export interface AveScannerOptions {
 export interface AveSignalListOptions {limit?:number;offset?:number;chain?:Chain;asOf?:string;}
 type Row={id:string;chain:Chain;address:string;occurred_at:string;observed_at:string;payload:string;
   state:string;reason:string|null;dispatched_at:string|null;completed_at:string|null;report:string|null};
+type FastInboxRow={id:string;chain:Chain;address:string;observed_at:string;payload:string;forwarded:number};
+type PreparedObservation={observation:AveSignalObservation;signal:Signal;payload:string};
+type CapturedObservation=PreparedObservation&{state:'new'|'forwarded'|'existing'};
 const safeReasons=(value:unknown)=>Array.isArray(value)?value.filter((v):v is string=>typeof v==='string'&&/^[A-Z][A-Z0-9_]{0,99}$/.test(v)).slice(0,24):[];
 const parseDate=(value:string)=>/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(value)&&Number.isFinite(Date.parse(value))&&new Date(value).toISOString()===value;
-const MAX_AGE_MS=120_000,PER_TOKEN_MS=60_000,MAX_FRAME_BYTES=2*1024*1024;
+const MAX_AGE_MS=120_000,PER_TOKEN_MS=60_000,MAX_FRAME_BYTES=2*1024*1024,MAX_FAST_INBOX=200;
+const SLOW_DRAIN_RETRY_MIN_MS=100,SLOW_DRAIN_RETRY_MAX_MS=10_000;
 const MAX_PRICE_TOPICS=200,PRICE_FRESH_MS=30_000,PRICE_RECOVERY_MIN_MS=60_000,PRICE_RECOVERY_MAX_MS=600_000;
 const object=(value:unknown):value is Record<string,unknown>=>value!==null&&typeof value==='object'&&!Array.isArray(value);
 const priceTopic=(raw:ScanToken)=>{const token=normalizePriceToken(raw);return token?`${token.address}-${token.chain}`:undefined;};
@@ -40,6 +48,8 @@ export class AveScanner {
   private socketListeners:[string,(event:any)=>void][]=[];
   private reconnectTimer?:ReturnType<typeof setTimeout>;private pollTimer?:ReturnType<typeof setTimeout>;
   private dispatchTimer?:ReturnType<typeof setTimeout>;private heartbeatTimer?:ReturnType<typeof setTimeout>;
+  private slowDrainImmediate?:ReturnType<typeof setImmediate>;private slowDrainTimer?:ReturnType<typeof setTimeout>;
+  private slowDraining=false;private slowDrainFailures=0;private slowDrainWork?:Promise<void>;
   private collecting?:Promise<void>;private dispatching?:Promise<void>;
   private connectionState:'stopped'|'connecting'|'connected'|'backoff'='stopped';
   private lastConnectedAt?:string;private lastMessageAt?:string;private lastSignalAt?:string;private lastPollAt?:string;
@@ -54,6 +64,7 @@ export class AveScanner {
   private lastPriceFrameAt?:string;private lastPriceAt?:string;private lastPriceReceivedAt?:string;
   private lastPriceSubscribeAt?:string;private lastPriceRecoveryAt?:string;private priceRecoveries=0;private priceError?:string;
   private readonly performance:VendorPerformanceLedger;private vendorPerformanceError?:string;
+  private readonly duplicateUpdates=new Map<string,PreparedObservation>();
 
   constructor(private readonly options:AveScannerOptions){
     this.now=options.now??(()=>new Date());this.chains=[...new Set(options.chains)];
@@ -69,6 +80,10 @@ export class AveScanner {
       CREATE INDEX IF NOT EXISTS ave_signals_queue ON ave_signals(state,occurred_at);
       CREATE INDEX IF NOT EXISTS ave_signals_observed ON ave_signals(observed_at,id);
       CREATE INDEX IF NOT EXISTS ave_signals_token ON ave_signals(chain,address,dispatched_at);
+      CREATE TABLE IF NOT EXISTS ave_observation_inbox (
+        id TEXT PRIMARY KEY,chain TEXT NOT NULL,address TEXT NOT NULL,observed_at TEXT NOT NULL,
+        payload TEXT NOT NULL,forwarded INTEGER NOT NULL DEFAULT 0 CHECK(forwarded IN (0,1))
+      );
       CREATE TABLE IF NOT EXISTS review_retention_watermarks(source TEXT PRIMARY KEY,pruned_through TEXT NOT NULL);
       CREATE TRIGGER IF NOT EXISTS ave_review_retention AFTER DELETE ON ave_signals BEGIN
         INSERT INTO review_retention_watermarks(source,pruned_through) VALUES('ave',OLD.observed_at)
@@ -195,17 +210,34 @@ export class AveScanner {
     this.db.exec(`DELETE FROM ave_signals WHERE id IN (SELECT id FROM ave_signals ORDER BY observed_at DESC,id DESC LIMIT -1 OFFSET 10000)`);
     this.lastPruned=now;
   }
-  /** Persist and publish observation before enqueueing slow safety/wallet research. */
+  /** Capture the whole page first so priority counting never waits behind the
+   * source history, vendor-performance ledger or research observer. */
   acceptPage(page:NormalizedAveSignals):void {
     if(this.closed||this.stopped)return;
     if(page.reason&&page.reason!=='AVE_SIGNAL_RECORDS_REJECTED'){this.lastError='AVE_SIGNAL_RESPONSE_INVALID';return;}
-    for(const observation of page.observations.slice(0,20).sort((a,b)=>a.signal.occurredAt.localeCompare(b.signal.occurredAt)||a.id.localeCompare(b.id))){
-      if(this.closed||this.stopped)break;
-      try {this.record(observation);}catch(error){
-        this.lastError=error instanceof Error&&'errcode' in error&&error.errcode===13?'AVE_SIGNAL_STORE_FULL':'AVE_SIGNAL_PERSIST_FAILED';
+    const sorted=page.observations.slice(0,20)
+      .sort((a,b)=>a.signal.occurredAt.localeCompare(b.signal.occurredAt)||a.id.localeCompare(b.id));
+    // Keep the legacy synchronous observer contract for callers that do not
+    // opt into the latency-critical callback.
+    if(!this.options.onPriorityObservation&&!this.options.onPriorityObservations){
+      for(const observation of sorted){
+        if(this.closed||this.stopped)break;
+        try {this.record(this.prepareObservation(observation));}
+        catch(error){this.lastError=this.persistReason(error);break;}
       }
+      try {this.prune();}catch {this.lastError='AVE_SIGNAL_PERSIST_FAILED';}
+      return;
     }
-    try {this.prune();}catch {this.lastError='AVE_SIGNAL_PERSIST_FAILED';}
+    // The bounded inbox absorbs ten complete source pages. Capture and forward
+    // the whole page before yielding; one slow history/research item drains per turn.
+    let captured:CapturedObservation[]=[];
+    try {captured=this.captureObservationPage(sorted);this.forwardPriorityPage(captured);}
+    catch(error){this.lastError=this.persistReason(error);return;}
+    for(const item of captured.filter(item=>item.state==='existing')){
+      this.duplicateUpdates.delete(item.signal.sourceEventId);this.duplicateUpdates.set(item.signal.sourceEventId,item);
+      if(this.duplicateUpdates.size>MAX_FAST_INBOX)this.duplicateUpdates.delete(this.duplicateUpdates.keys().next().value!);
+    }
+    this.scheduleObservationDrain();
   }
   acceptPush(payload:unknown):void {
     if(this.closed||this.stopped)return;
@@ -214,19 +246,153 @@ export class AveScanner {
     if(page.reason==='AVE_SIGNAL_PUSH_INVALID')return;
     this.acceptPage(page);
   }
-  private record(observation:AveSignalObservation){
+  private persistReason(error:unknown):string {
+    if(error instanceof Error&&['AVE_SIGNAL_PRIORITY_CALLBACK_FAILED','AVE_SIGNAL_OBSERVATION_CALLBACK_FAILED'].includes(error.message))return error.message;
+    return error instanceof Error&&(error.message==='AVE_SIGNAL_STORE_FULL'||'errcode' in error&&error.errcode===13)?
+      'AVE_SIGNAL_STORE_FULL':'AVE_SIGNAL_PERSIST_FAILED';
+  }
+  private prepareObservation(observation:AveSignalObservation):PreparedObservation {
     const signal=parseSignal(observation.signal),now=this.now().getTime();
     if(signal.source!=='ave'||!this.chains.includes(signal.token.chain)||!/^ave:signal:[a-f0-9]{64}$/.test(signal.sourceEventId)||
       !parseDate(observation.observedAt)||Date.parse(observation.observedAt)>now+30_000||
       Date.parse(signal.occurredAt)>now+30_000||!/^\d{1,16}$/.test(observation.id))throw new Error('AVE_SIGNAL_INPUT_INVALID');
-    const serialized=JSON.stringify(observation);if(Buffer.byteLength(serialized)>64_000)throw new Error('AVE_SIGNAL_INPUT_INVALID');
-    const existing=this.db.prepare('SELECT chain,address FROM ave_signals WHERE id=?').get(signal.sourceEventId);
-    if(existing&&(existing.chain!==signal.token.chain||existing.address!==signal.token.address))return;
-    // Display-only peak changes survive duplicate suppression without becoming
-    // another notification, price sample, callback or research task.
+    const payload=JSON.stringify(observation);if(Buffer.byteLength(payload)>64_000)throw new Error('AVE_SIGNAL_INPUT_INVALID');
+    return {observation,signal,payload};
+  }
+  private captureObservationPage(observations:AveSignalObservation[]):CapturedObservation[] {
+    const captured:CapturedObservation[]=[];if(!observations.length)return captured;
+    const pending=this.db.prepare('SELECT chain,address,payload,forwarded FROM ave_observation_inbox WHERE id=?'),
+      existing=this.db.prepare('SELECT chain,address FROM ave_signals WHERE id=?'),
+      insert=this.db.prepare(`INSERT OR IGNORE INTO ave_observation_inbox(id,chain,address,observed_at,payload,forwarded)
+        SELECT ?,?,?,?,?,0 WHERE NOT EXISTS (SELECT 1 FROM ave_signals WHERE id=?)`);
+    let remaining=Math.max(0,MAX_FAST_INBOX-this.inboxSize());
+    this.db.exec('SAVEPOINT ave_observation_page');
+    try {
+      for(const observation of observations){
+        let item:PreparedObservation;
+        try{item=this.prepareObservation(observation);}catch{this.lastError='AVE_SIGNAL_PERSIST_FAILED';continue;}
+        const inbox=pending.get(item.signal.sourceEventId);
+        if(inbox){
+          if(inbox.chain===item.signal.token.chain&&inbox.address===item.signal.token.address&&inbox.payload===item.payload)
+            captured.push({...item,state:Number(inbox.forwarded)===1?'forwarded':'new'});
+          continue;
+        }
+        const prior=existing.get(item.signal.sourceEventId);
+        if(prior){if(prior.chain===item.signal.token.chain&&prior.address===item.signal.token.address)
+          captured.push({...item,state:'existing'});continue;}
+        if(remaining<=0)throw new Error('AVE_SIGNAL_STORE_FULL');
+        const result=insert.run(item.signal.sourceEventId,item.signal.token.chain,item.signal.token.address,
+          item.observation.observedAt,item.payload,item.signal.sourceEventId);
+        if(Number(result.changes)>0){captured.push({...item,state:'new'});remaining--;}
+      }
+      this.db.exec('RELEASE ave_observation_page');return captured;
+    }catch(error){
+      try{this.db.exec('ROLLBACK TO ave_observation_page; RELEASE ave_observation_page');}catch{/* SQLITE_FULL may end the savepoint. */}
+      throw error;
+    }
+  }
+  private notifyPriority(observation:AveSignalObservation):boolean {
+    try {
+      if(this.options.onPriorityObservation)this.options.onPriorityObservation(structuredClone(observation));
+      else this.options.onPriorityObservations?.([structuredClone(observation)]);
+      return true;
+    }
+    catch {this.lastError='AVE_SIGNAL_PRIORITY_CALLBACK_FAILED';return false;}
+  }
+  private inboxSize():number {
+    return Number(this.db.prepare('SELECT count(*) AS n FROM ave_observation_inbox').get()!.n);
+  }
+  private forwardPriorityPage(captured:CapturedObservation[]):void {
+    const pending=captured.filter(item=>item.state==='new');if(!pending.length)return;
+    let delivered=pending;
+    if(this.options.onPriorityObservations)try {
+      this.options.onPriorityObservations(pending.map(item=>structuredClone(item.observation)));
+    }catch{this.lastError='AVE_SIGNAL_PRIORITY_CALLBACK_FAILED';delivered=[];}
+    else delivered=pending.filter(item=>this.notifyPriority(item.observation));
+    const ids=[...new Set(delivered.map(item=>item.signal.sourceEventId))];
+    if(!ids.length)return;
+    const placeholders=ids.map(()=>'?').join(',');
+    this.db.exec('SAVEPOINT ave_observation_forward');
+    try {
+      this.db.prepare(`UPDATE ave_observation_inbox SET forwarded=1 WHERE id IN (${placeholders})`).run(...ids);
+      this.db.exec('RELEASE ave_observation_forward');
+    }catch(error){
+      try{this.db.exec('ROLLBACK TO ave_observation_forward; RELEASE ave_observation_forward');}catch{/* Keep rows for recovery. */}
+      throw error;
+    }
+  }
+  private notifyObservationSync(observation:AveSignalObservation):boolean {
+    try {
+      const work=this.options.onObservation(structuredClone(observation));
+      if(work&&typeof (work as {then?:unknown}).then==='function')
+        void Promise.resolve(work).catch(()=>{this.lastError='AVE_SIGNAL_OBSERVATION_CALLBACK_FAILED';});
+      return true;
+    }catch {this.lastError='AVE_SIGNAL_OBSERVATION_CALLBACK_FAILED';return false;}
+  }
+  private async notifyObservation(observation:AveSignalObservation):Promise<boolean> {
+    try {await this.options.onObservation(structuredClone(observation));return true;}
+    catch {this.lastError='AVE_SIGNAL_OBSERVATION_CALLBACK_FAILED';return false;}
+  }
+  private scheduleObservationDrain(delay=0):void {
+    if(this.closed||this.stopped||this.slowDraining||this.slowDrainImmediate||this.slowDrainTimer)return;
+    const queue=()=>{
+      this.slowDrainTimer=undefined;
+      if(this.closed||this.stopped)return;
+      this.slowDrainImmediate=setImmediate(()=>{
+        this.slowDrainImmediate=undefined;
+        const work=this.drainObservationInboxOne().finally(()=>{if(this.slowDrainWork===work)this.slowDrainWork=undefined;});
+        this.slowDrainWork=work;
+      });
+      this.slowDrainImmediate.unref?.();
+    };
+    if(delay>0){this.slowDrainTimer=setTimeout(queue,delay);this.slowDrainTimer.unref?.();}
+    else queue();
+  }
+  private async drainObservationInboxOne():Promise<void> {
+    if(this.closed||this.stopped||this.slowDraining)return;
+    const row=this.db.prepare('SELECT id,chain,address,observed_at,payload,forwarded FROM ave_observation_inbox ORDER BY rowid LIMIT 1')
+      .get() as FastInboxRow|undefined;
+    if(!row){
+      const duplicate=this.duplicateUpdates.entries().next().value as [string,PreparedObservation]|undefined;
+      if(duplicate){
+        this.duplicateUpdates.delete(duplicate[0]);this.slowDraining=true;
+        try{await this.recordResearchUpdate(duplicate[1]);this.slowDrainFailures=0;}
+        catch(error){this.duplicateUpdates.set(duplicate[0],duplicate[1]);this.lastError=this.persistReason(error);this.slowDrainFailures++;}
+        finally{this.slowDraining=false;}
+        const delay=this.slowDrainFailures?Math.min(SLOW_DRAIN_RETRY_MAX_MS,SLOW_DRAIN_RETRY_MIN_MS*2**Math.min(this.slowDrainFailures-1,7)):0;
+        this.scheduleObservationDrain(delay);return;
+      }
+      this.slowDrainFailures=0;try{this.prune();}catch{this.lastError='AVE_SIGNAL_PERSIST_FAILED';}return;
+    }
+    this.slowDraining=true;let failed=false;
+    try {
+      let observation:AveSignalObservation;
+      try{observation=JSON.parse(row.payload) as AveSignalObservation;}catch{throw new Error('AVE_SIGNAL_PERSIST_FAILED');}
+      const item=this.prepareObservation(observation);
+      if(item.signal.sourceEventId!==row.id||item.signal.token.chain!==row.chain||item.signal.token.address!==row.address||
+        item.observation.observedAt!==row.observed_at||item.payload!==row.payload)throw new Error('AVE_SIGNAL_PERSIST_FAILED');
+      if(row.forwarded!==1){if(!this.notifyPriority(item.observation))throw new Error('AVE_SIGNAL_PRIORITY_CALLBACK_FAILED');
+        this.db.prepare('UPDATE ave_observation_inbox SET forwarded=1 WHERE id=?').run(row.id);}
+      await this.recordForwarded(item);this.slowDrainFailures=0;
+    }catch(error){failed=true;this.lastError=this.persistReason(error);this.slowDrainFailures++;}
+    finally{this.slowDraining=false;}
+    if(this.closed||this.stopped)return;
+    const delay=failed?Math.min(SLOW_DRAIN_RETRY_MAX_MS,SLOW_DRAIN_RETRY_MIN_MS*2**Math.min(this.slowDrainFailures-1,7)):0;
+    this.scheduleObservationDrain(delay);
+  }
+  private recordPerformance(observation:AveSignalObservation):void {
     if(observation.vendorPerformance)try {this.performance.record(observation);this.vendorPerformanceError=undefined;}
     catch {this.vendorPerformanceError='VENDOR_PERFORMANCE_PERSIST_FAILED';}
-    if(existing)return;
+  }
+  private persistRecord(item:PreparedObservation):boolean {
+    const {observation,signal,payload:serialized}=item,now=this.now().getTime();
+    const existing=this.db.prepare('SELECT chain,address FROM ave_signals WHERE id=?').get(signal.sourceEventId);
+    if(existing&&(existing.chain!==signal.token.chain||existing.address!==signal.token.address))return false;
+    // Display-only peak changes survive duplicate suppression without becoming
+    // another notification, price sample, callback or research task.
+    if(existing){
+      return false;
+    }
     const stale=now-Date.parse(signal.occurredAt)>MAX_AGE_MS;
     this.db.exec('SAVEPOINT ave_record');
     try {
@@ -243,7 +409,26 @@ export class AveScanner {
       this.db.exec('RELEASE ave_record');
     }catch(error){this.db.exec('ROLLBACK TO ave_record; RELEASE ave_record');throw error;}
     this.lastSignalAt=observation.observedAt;
-    try {this.options.onObservation(structuredClone(observation));}catch {this.lastError='AVE_SIGNAL_OBSERVATION_CALLBACK_FAILED';}
+    return true;
+  }
+  private record(item:PreparedObservation):void {
+    const created=this.persistRecord(item);
+    if(created){this.notifyPriority(item.observation);this.notifyObservationSync(item.observation);}
+    this.recordPerformance(item.observation);
+  }
+  private async recordForwarded(item:PreparedObservation):Promise<void> {
+    this.persistRecord(item);
+    if(!await this.notifyObservation(item.observation))throw new Error('AVE_SIGNAL_OBSERVATION_CALLBACK_FAILED');
+    this.db.prepare('DELETE FROM ave_observation_inbox WHERE id=?').run(item.signal.sourceEventId);
+    this.recordPerformance(item.observation);
+    // The durable inbox is the source-research ACK barrier. Only schedule
+    // analysis after it has been removed, and do so on the next turn so a
+    // prior dispatch promise can finish and release its single-flight slot.
+    if(this.running)setImmediate(()=>{if(this.running&&!this.closed&&!this.stopped)void this.dispatchOnce();}).unref?.();
+  }
+  private async recordResearchUpdate(item:PreparedObservation):Promise<void> {
+    this.persistRecord(item);
+    this.recordPerformance(item.observation);
   }
   runOnce():Promise<void>{
     if(this.collecting)return this.collecting;if(this.closed||this.stopped)return Promise.resolve();
@@ -265,13 +450,22 @@ export class AveScanner {
   dispatchOnce():Promise<void>{
     if(this.dispatching)return this.dispatching;if(this.closed||this.stopped)return Promise.resolve();
     const generation=this.generation,work=Promise.resolve().then(async()=>{
+      if(this.inboxSize()){
+        this.scheduleObservationDrain();
+        // An explicit dispatch may follow acceptPage in the same turn. Yield
+        // once so the first durable source row can become dispatchable without
+        // waiting for the rest of the slow page tail.
+        await new Promise<void>(resolve=>setImmediate(resolve));
+        if(!this.alive(generation))return;
+      }
       const now=this.now();
       this.db.prepare(`UPDATE ave_signals SET state='ignored',reason='AVE_SIGNAL_STALE' WHERE state='pending' AND occurred_at<?`)
         .run(new Date(now.getTime()-MAX_AGE_MS).toISOString());
       if(now.getTime()<this.nextDispatchAt)return;
       const defer=this.options.shouldDefer?.();this.deferredReason=defer&&/^[A-Z][A-Z0-9_]{0,99}$/.test(defer)?defer:defer?'AVE_RESEARCH_DEFERRED':undefined;
       if(defer)return;
-      const row=this.db.prepare(`SELECT a.* FROM ave_signals a WHERE a.state='pending' AND a.chain IN (${this.chains.map(()=>'?').join(',')}) AND NOT EXISTS
+      const row=this.db.prepare(`SELECT a.* FROM ave_signals a WHERE a.state='pending' AND a.chain IN (${this.chains.map(()=>'?').join(',')})
+        AND NOT EXISTS (SELECT 1 FROM ave_observation_inbox i WHERE i.id=a.id) AND NOT EXISTS
         (SELECT 1 FROM ave_signals b WHERE b.chain=a.chain AND b.address=a.address AND b.dispatched_at>?)
         ORDER BY a.occurred_at DESC,a.id DESC LIMIT 1`).get(...this.chains,new Date(now.getTime()-PER_TOKEN_MS).toISOString()) as Row|undefined;
       if(!row||!this.alive(generation))return;
@@ -405,7 +599,9 @@ export class AveScanner {
   }
   start(){
     if(this.running||this.closed)return;
-    this.running=true;this.stopped=false;this.controller=new AbortController();this.connect();
+    this.running=true;this.stopped=false;this.controller=new AbortController();
+    this.scheduleObservationDrain();
+    this.connect();
     const generation=this.generation;
     const poll=async()=>{if(!this.alive(generation)||!this.running)return;await this.runOnce();
       if(this.alive(generation)&&this.running){this.pollTimer=setTimeout(()=>void poll(),60_000);this.pollTimer.unref?.();}};
@@ -416,9 +612,13 @@ export class AveScanner {
   async stop(){
     if(this.closed)return;
     this.running=false;this.stopped=true;this.generation++;this.controller.abort();
-    clearTimeout(this.pollTimer);clearTimeout(this.dispatchTimer);clearTimeout(this.reconnectTimer);this.disconnect();this.connectionState='stopped';
+    clearTimeout(this.pollTimer);clearTimeout(this.dispatchTimer);clearTimeout(this.reconnectTimer);
+    clearTimeout(this.slowDrainTimer);clearImmediate(this.slowDrainImmediate);
+    this.slowDrainTimer=undefined;this.slowDrainImmediate=undefined;
+    this.duplicateUpdates.clear();
+    this.disconnect();this.connectionState='stopped';
     this.db.exec("UPDATE ave_signals SET state='interrupted',reason='AVE_SIGNAL_INTERRUPTED' WHERE state='dispatching'");
-    await Promise.allSettled([this.collecting,this.dispatching].filter((p):p is Promise<void>=>!!p));
+    await Promise.allSettled([this.collecting,this.dispatching,this.slowDrainWork].filter((p):p is Promise<void>=>!!p));
   }
   async close(){if(this.closed)return;await this.stop();this.closed=true;this.db.close();}
 }

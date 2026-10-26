@@ -9,6 +9,14 @@ import {createRuntime} from '../src/runtime.js';
 import {Store,PROCESSING_LEASE_MS} from '../src/store.js';
 import {unknown,type Signal} from '../src/types.js';
 
+async function waitFor(check:()=>boolean,label:string,timeoutMs=8_000){
+  const deadline=Date.now()+timeoutMs;
+  while(!check()){
+    if(Date.now()>=deadline)assert.fail(`${label} timed out`);
+    await new Promise(resolve=>setTimeout(resolve,10));
+  }
+}
+
 test('DeBot collection reaches existing research and dashboard with original receipt time, no wallet claim or order',async()=>{
   const directory=mkdtempSync(join(tmpdir(),'debot-runtime-'));
   const config=readConfig({DEBOT_SCANNER_ENABLED:'true',DEBOT_TRANSPORT:'anonymous_poll',DEBOT_SIGNALS_DATABASE_PATH:join(directory,'debot.sqlite'),
@@ -34,8 +42,9 @@ test('DeBot collection reaches existing research and dashboard with original rec
   try {
     useLocalProviders();await runtime.debotScanner!.runOnce();
     const db=new DatabaseSync(config.debotSignalsDatabase,{readOnly:true});
+    await waitFor(()=>Number(db.prepare('SELECT count(*) AS n FROM debot_signals').get()!.n)===1&&
+      Number(db.prepare('SELECT count(*) AS n FROM debot_observation_inbox').get()!.n)===0,'DeBot source observation ACK');
     const observed=String(db.prepare('SELECT observed_at FROM debot_signals').get()!.observed_at);db.close();
-    await new Promise(resolve=>setTimeout(resolve,15));
     await runtime.debotScanner!.dispatchOnce();
     assert.equal(requests,1);assert.equal(runtime.debotScanner!.getStatus().dispatched,1);
     const scan=runtime.archive!.list().items[0];

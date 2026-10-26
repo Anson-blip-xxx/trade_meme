@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {mkdtempSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
+import {DatabaseSync} from 'node:sqlite';
 import bs58 from 'bs58';
 import {WalletSetupLedger} from '../src/wallet-setup-ledger.js';
 import type {WalletScreeningReport,WalletSetup} from '../src/wallet-screening.js';
@@ -38,6 +39,26 @@ test('wallet opportunity pages use filtered totals and retain all records across
     assert.equal(f.ledger.list({chain:'robinhood'}).total,0);assert.equal(f.ledger.list({chain:'bsc',address:address(999)}).total,0);
     assert.equal(f.ledger.status().records,5);
   }finally{f.ledger.close();}
+});
+
+test('wallet opportunity pages use ordered indexes instead of sorting the retained evidence table',()=>{
+  const directory=mkdtempSync(join(tmpdir(),'meme-wallet-setup-page-')),database=join(directory,'setups.sqlite');
+  const ledger=new WalletSetupLedger(database,{now:()=>new Date(iso(100))});
+  try {
+    const db=new DatabaseSync(database);
+    try {
+      const plans=[
+        [`SELECT data FROM wsl_setups ORDER BY registered_at DESC,id LIMIT ? OFFSET ?`,[20,0],'wsl_page'],
+        [`SELECT data FROM wsl_setups WHERE chain=? ORDER BY registered_at DESC,id LIMIT ? OFFSET ?`,['bsc',20,0],'wsl_chain_page'],
+        [`SELECT data FROM wsl_setups WHERE chain=? AND address=? ORDER BY registered_at DESC,id LIMIT ? OFFSET ?`,['bsc',token.address,20,0],'wsl_token_page'],
+      ] as const;
+      for(const [sql,args,index] of plans){
+        const plan=db.prepare('EXPLAIN QUERY PLAN '+sql).all(...args).map(row=>String(row.detail));
+        assert.ok(plan.some(detail=>detail.includes(`INDEX ${index}`)),plan.join('\n'));
+        assert.ok(plan.every(detail=>!detail.includes('USE TEMP B-TREE')),plan.join('\n'));
+      }
+    } finally {db.close();}
+  } finally {ledger.close();rmSync(directory,{recursive:true,force:true});}
 });
 
 test('registration freezes the initial proof and real registration time across refreshes and renamed setup IDs',()=>{

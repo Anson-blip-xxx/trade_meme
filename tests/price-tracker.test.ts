@@ -328,3 +328,18 @@ test('priority errors fall back to the ordinary ring and legacy GMGN sampling do
   const legacy=await new PriceTracker({archive:archive.archive,client:client.client,priorityTokens}).runOnce();
   assert.equal(legacy.recorded,2);assert.equal(legacy.errors,0);
 });
+
+test('two router-backed trackers reserve one shared Dex response for the same token',async()=>{
+  const {MarketPriceRouter}=await import('../src/market-price-router.js');
+  const archive=memoryArchive([token()]),client=mockedClient(),gate=deferred<void>();let calls=0;
+  const router=new MarketPriceRouter({client:client.client,now:()=>new Date(instant),preferStreams:true,minHttpIntervalMs:30_000,
+    maxDebotPerBatch:0,maxGmgnPerBatch:0,fetcher:async()=>{calls++;await gate.promise;return new Response(JSON.stringify([
+      {chainId:'bsc',baseToken:{address:token().address},pairAddress:token(9).address,priceUsd:'2'},
+    ]));}});
+  const first=new PriceTracker({archive:archive.archive,client:client.client,router,now:()=>new Date(instant)}).runOnce();
+  await Promise.resolve();
+  const second=new PriceTracker({archive:archive.archive,client:client.client,router,now:()=>new Date(instant)}).runOnce();
+  await Promise.resolve();assert.equal(calls,1);
+  gate.resolve();await Promise.all([first,second]);
+  assert.equal(calls,1);assert.equal(archive.samples.length,1);
+});

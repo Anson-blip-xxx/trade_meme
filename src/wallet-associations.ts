@@ -103,6 +103,27 @@ const event=(row:Row):AssociationEvent=>{const data=JSON.parse(String(row.data))
 const coverage:WalletAssociationDetail['coverage']={sampleOnly:true,firstObservedBuy:true,leadWindowSeconds:86400,
   candidateEventLimit:400,candidateWalletLimit:40,episodeDisplayLimit:100,conflictingTimestampsExcluded:true,ownership:'unknown',exactRealizedPnl:false,
   prospectiveDefinition:'candidate_observed_before_leader_trade',forwardDefinition:'relation_known_before_candidate_trade_and_candidate_observed_before_leader_trade'};
+const associationSummary=(row:Row):WalletAssociationSummary=>({...JSON.parse(String(row.data)),status:Number(row.dirty)?'stale':'current'});
+
+/** Read-only association page for dashboard workers. */
+export function readWalletAssociationList(db:DatabaseSync,options:WalletAssociationListOptions={}):{items:WalletAssociationSummary[];total:number} {
+  const clauses=['r.token_count>0'],args:string[]=[];
+  if(options.chain) {clauses.push('r.chain=?');args.push(options.chain);}
+  if(options.search) {clauses.push('(instr(lower(r.leader),?)>0 OR instr(lower(r.candidate),?)>0)');const value=String(options.search).toLowerCase().slice(0,160);args.push(value,value);}
+  const where=clauses.join(' AND '),limit=Number.isSafeInteger(options.limit)?Math.max(1,Math.min(100,options.limit!)):25,
+    offset=Number.isSafeInteger(options.offset)?Math.max(0,options.offset!):0;
+  const index=options.chain?'wh_assoc_relation_chain_page':'wh_assoc_relation_page',indexed=` INDEXED BY ${index}`;
+  const total=Number(db.prepare(`SELECT COUNT(*) AS n FROM wh_assoc_relations r${indexed} WHERE ${where}`).get(...args)!.n);
+  const rows=db.prepare(`SELECT r.* FROM wh_assoc_relations r${indexed} WHERE ${where} ORDER BY r.token_count DESC,r.funding_count DESC,r.forward_count DESC,r.updated_at DESC,r.leader,r.candidate LIMIT ? OFFSET ?`).all(...args,limit,offset);
+  return {items:rows.map(associationSummary),total};
+}
+
+/** Read-only directed association detail for dashboard workers. */
+export function readWalletAssociationDetail(db:DatabaseSync,chain:Chain,leader:string,candidate:string):WalletAssociationDetail|undefined {
+  const row=db.prepare('SELECT * FROM wh_assoc_relations WHERE chain=? AND leader=? AND candidate=? AND token_count>0').get(chain,leader,candidate);if(!row)return;
+  return {association:associationSummary(row),episodes:db.prepare('SELECT data FROM wh_assoc_episodes WHERE chain=? AND leader=? AND candidate=? AND active=1 ORDER BY updated_at DESC LIMIT 100')
+    .all(chain,leader,candidate).map(item=>JSON.parse(String(item.data))),fundingEvidence:JSON.parse(String(row.funding_data)),coverage};
+}
 
 /** Derived, bounded research indexes. No identity assertion, PnL reconstruction or trading permission. */
 export class WalletAssociations {
@@ -118,6 +139,10 @@ export class WalletAssociations {
       CREATE INDEX IF NOT EXISTS wh_assoc_anchor_token ON wh_assoc_anchors(chain,token_address);
       CREATE INDEX IF NOT EXISTS wh_assoc_anchor_recent ON wh_assoc_anchors(chain,public_observed_at DESC,leader,token_address);
       CREATE INDEX IF NOT EXISTS wh_assoc_relation_rank ON wh_assoc_relations(token_count DESC,funding_count DESC,forward_count DESC);
+      CREATE INDEX IF NOT EXISTS wh_assoc_relation_page ON wh_assoc_relations(
+        token_count DESC,funding_count DESC,forward_count DESC,updated_at DESC,leader,candidate) WHERE token_count>0;
+      CREATE INDEX IF NOT EXISTS wh_assoc_relation_chain_page ON wh_assoc_relations(
+        chain,token_count DESC,funding_count DESC,forward_count DESC,updated_at DESC,leader,candidate) WHERE token_count>0;
       CREATE INDEX IF NOT EXISTS wh_assoc_relation_candidate ON wh_assoc_relations(chain,candidate);
       CREATE INDEX IF NOT EXISTS wh_assoc_relation_candidate_leader ON wh_assoc_relations(chain,candidate,leader);
       CREATE INDEX IF NOT EXISTS wh_assoc_episode_pair ON wh_assoc_episodes(chain,leader,candidate,active,updated_at DESC);
@@ -194,19 +219,10 @@ export class WalletAssociations {
   }
 
   list(options:WalletAssociationListOptions={}):{items:WalletAssociationSummary[];total:number} {
-    const clauses=['r.token_count>0'],args:string[]=[];
-    if(options.chain) {clauses.push('r.chain=?');args.push(options.chain);}
-    if(options.search) {clauses.push('(instr(lower(r.leader),?)>0 OR instr(lower(r.candidate),?)>0)');const value=String(options.search).toLowerCase().slice(0,160);args.push(value,value);}
-    const where=clauses.join(' AND '),limit=Number.isSafeInteger(options.limit)?Math.max(1,Math.min(100,options.limit!)):25,
-      offset=Number.isSafeInteger(options.offset)?Math.max(0,options.offset!):0;
-    const total=Number(this.db.prepare(`SELECT COUNT(*) AS n FROM wh_assoc_relations r WHERE ${where}`).get(...args)!.n);
-    const rows=this.db.prepare(`SELECT r.* FROM wh_assoc_relations r WHERE ${where} ORDER BY r.token_count DESC,r.funding_count DESC,r.forward_count DESC,r.updated_at DESC,r.leader,r.candidate LIMIT ? OFFSET ?`).all(...args,limit,offset);
-    return {items:rows.map(row=>this.summary(row)),total};
+    return readWalletAssociationList(this.db,options);
   }
   detail(chain:Chain,leader:string,candidate:string):WalletAssociationDetail|undefined {
-    const row=this.db.prepare('SELECT * FROM wh_assoc_relations WHERE chain=? AND leader=? AND candidate=? AND token_count>0').get(chain,leader,candidate);if(!row) return;
-    return {association:this.summary(row),episodes:this.db.prepare('SELECT data FROM wh_assoc_episodes WHERE chain=? AND leader=? AND candidate=? AND active=1 ORDER BY updated_at DESC LIMIT 100')
-      .all(chain,leader,candidate).map(item=>JSON.parse(String(item.data))),fundingEvidence:JSON.parse(String(row.funding_data)),coverage};
+    return readWalletAssociationDetail(this.db,chain,leader,candidate);
   }
   stats():WalletAssociationStats {
     const n=(sql:string)=>Number(this.db.prepare(sql).get()!.n),cursor=Number(this.db.prepare("SELECT value FROM wh_meta WHERE key='association_cursor'").get()?.value??0),
@@ -352,5 +368,4 @@ export class WalletAssociations {
     for(const change of changes) {const values=grouped.get(change.chain)??new Set<string>();values.add(change[key]);grouped.set(change.chain,values);}
     return new Map([...grouped].map(([chain,values])=>[chain,[...values]]));
   }
-  private summary(row:Row):WalletAssociationSummary {return {...JSON.parse(String(row.data)),status:Number(row.dirty)?'stale':'current'};}
 }

@@ -147,16 +147,25 @@ export class NativeExecutor {
       const stamp=this.now().toISOString(),reserved=this.journal.reserve({...request,onPlanReady:undefined,beforeBroadcast:undefined,reason:undefined,status:'prepared',createdAt:stamp,updatedAt:stamp,
         timing:createNativeTiming(stamp)} as NativeJournalRecord,owner,this.now().getTime());
       r=reserved.record;if(!reserved.created)return this.view(r);
-      const [,supplied]=await Promise.all([this.stage(r,'chainCheck',()=>this.ensureChain()),
-        this.stage(r,'plan',()=>this.options.plan({wallet:r!.wallet,mint:r!.mint,side:r!.side,amount:r!.amount,slippageBps:r!.slippageBps}))]);this.validatePlan(supplied,r);
+      // Stable preparation may run before the Jito pacing lane. Anything whose
+      // freshness authorizes the transaction (route quote and blockhash) is
+      // intentionally created only after this intent owns that lane. Otherwise
+      // a burst of exits can prebuild twenty plans and let the later ones expire
+      // while they wait behind the endpoint's one-request-per-second limit.
+      const [,tip]=await Promise.all([this.stage(r,'chainCheck',()=>this.ensureChain()),
+        this.stage(r,'tipAccount',()=>this.jito.tipAccount())]);
+      turn=await this.stage(r,'broadcastQueue',()=>this.jito.reserveBroadcast());
+      if(this.stopping)fail('NATIVE_EXECUTOR_STOPPED');
+      const [supplied,latest]=await Promise.all([
+        this.stage(r,'plan',()=>this.options.plan({wallet:r!.wallet,mint:r!.mint,side:r!.side,amount:r!.amount,slippageBps:r!.slippageBps})),
+        this.stage(r,'blockhash',()=>this.rpc('getLatestBlockhash',[{commitment:'confirmed'}])),
+      ]);this.validatePlan(supplied,r);
       const plan:NativeSwapPlan={...supplied,subscriptionAccounts:[...supplied.subscriptionAccounts],instructions:supplied.instructions.map(ix=>
         new TransactionInstruction({programId:new PublicKey(ix.programId.toBytes()),data:Buffer.from(ix.data),
           keys:ix.keys.map(key=>({...key,pubkey:new PublicKey(key.pubkey.toBytes())}))}))};
       r.venue=plan.venue;r.tokenDecimals=plan.tokenDecimals;r.subscriptionAccounts=[...plan.subscriptionAccounts];r.quotedAt=plan.quotedAt;
       r.expectedOutputAmount=plan.expectedOutputAmount;r.minimumOutputAmount=plan.minimumOutputAmount;
       request.onPlanReady?.(this.readonlyPlan(plan));
-      const [tip,latest]=await Promise.all([this.stage(r,'tipAccount',()=>this.jito.tipAccount()),
-        this.stage(r,'blockhash',()=>this.rpc('getLatestBlockhash',[{commitment:'confirmed'}]))]);
       if(!object(latest)||!object(latest.context)||!uint(latest.context.slot)||!object(latest.value)||!pub(latest.value.blockhash)||!uint(latest.value.lastValidBlockHeight))fail('NATIVE_BLOCKHASH_INVALID');
       const blockhash=latest.value.blockhash;
       const {message,tx,unsigned}=this.stageSync(r,'compile',()=>{
@@ -179,7 +188,6 @@ export class NativeExecutor {
         BigInt(balance.value)<(r.side==='buy'?BigInt(r.amount):0n)+BigInt(fee.value)+BigInt(this.options.tipLamports))fail('NATIVE_FEE_BALANCE_LOW');
       if(!object(simulation)||!object(simulation.context)||!uint(simulation.context.slot)||simulation.context.slot<latest.context.slot||!object(simulation.value)||simulation.value.err!==null)
         fail('NATIVE_SIMULATION_FAILED');
-      turn=await this.stage(r,'broadcastQueue',()=>this.jito.reserveBroadcast());
       if(this.stopping)fail('NATIVE_EXECUTOR_STOPPED');this.validatePlan(plan,r);
       // The final guard may inspect the executable quote without mutating its compiled plan.
       await this.stage(r,'finalGuard',async()=>{await request.beforeBroadcast?.(this.readonlyPlan(plan));});

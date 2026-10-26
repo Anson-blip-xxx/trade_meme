@@ -10,6 +10,8 @@ export interface TelegramPosition {
   quantityAtomic?:string;tokenDecimals?:number;
   priceUsd?:number;priceAt?:string;priceFresh?:boolean;gainPct?:number;
   gainBasis?:'fill'|'observation';protection?:string;canClose?:boolean;
+  /** Selects the sell service without creating an action for off-page rows. */
+  sellProvider?:'native'|'direct';
   /** Fresh opaque single-use action supplied by the sell service for this page. */
   sellActionRef?:string;
   /** Latest durable sale for this holding; never infer its outcome from a balance alone. */
@@ -75,7 +77,8 @@ export function positionReference(p:TelegramPosition):string {
 
 /** Cached registered real holdings only; pagination does not multiply upstream API requests. */
 export class TelegramPositions {
-  constructor(private readonly rows:()=>TelegramPosition[],private readonly options:{pending?:()=>number;now?:()=>number}={}){}
+  constructor(private readonly rows:()=>TelegramPosition[],private readonly options:{pending?:()=>number;now?:()=>number;
+    action?:(position:TelegramPosition)=>string|undefined}={}){}
   private list() {
     const unique=new Map<string,TelegramPosition>();
     for(const row of this.rows()){
@@ -86,7 +89,9 @@ export class TelegramPositions {
       // The isolated native/Jito runtime issues `np...` capabilities. If a
       // legacy observer exposes the same wallet/mint too, retain the native
       // capability so one holding never renders two competing sell paths.
-      if(!current||nativeSellRef.test(row.sellActionRef??'')&&!nativeSellRef.test(current.sellActionRef??''))unique.set(key,row);
+      const native=row.sellProvider==='native'||nativeSellRef.test(row.sellActionRef??'');
+      const currentNative=current&&(current.sellProvider==='native'||nativeSellRef.test(current.sellActionRef??''));
+      if(!current||native&&!currentNative)unique.set(key,row);
     }
     return [...unique.values()].sort((a,b)=>identity(a).localeCompare(identity(b)));
   }
@@ -97,14 +102,21 @@ export class TelegramPositions {
   /** Exact current holding for a token card; ambiguity or an in-flight sell is never actionable. */
   findSellableSolanaMint(mint:string):TelegramPosition|undefined {
     if(!solanaMint(mint))return;
-    const matches=this.list().filter(p=>p.chain==='solana'&&p.address===mint&&p.canClose===true&&validSellRef(p.sellActionRef)&&
+    const matches=this.list().filter(p=>p.chain==='solana'&&p.address===mint&&p.canClose===true&&
       !(p.sellStatus&&activeSellStates.has(p.sellStatus.state)));
-    return matches.length===1?structuredClone(matches[0]):undefined;
+    if(matches.length!==1)return;
+    const match=structuredClone(matches[0]);
+    if(!validSellRef(match.sellActionRef))try{match.sellActionRef=this.options.action?.(match);}catch{return;}
+    return validSellRef(match.sellActionRef)?match:undefined;
   }
   page(requested:number):{text:string;buttons:TelegramCallbackButtons} {
     if(!Number.isSafeInteger(requested)||requested<1||requested>MAX_PAGE)throw Error('TELEGRAM_POSITION_PAGE_INVALID');
     const rows=this.list(),total=rows.length,pages=Math.max(1,Math.ceil(total/PAGE_SIZE)),page=Math.min(requested,pages);
-    const items=rows.slice((page-1)*PAGE_SIZE,page*PAGE_SIZE);
+    const items=rows.slice((page-1)*PAGE_SIZE,page*PAGE_SIZE).map(row=>{
+      const item=structuredClone(row),active=!!item.sellStatus&&activeSellStates.has(item.sellStatus.state);
+      if(!active&&item.canClose&&!validSellRef(item.sellActionRef))try{item.sellActionRef=this.options.action?.(item);}catch{item.canClose=false;}
+      return item;
+    });
     const text=[`【持仓查询】`,`第 ${page} / ${pages} 页 · 共 ${total} 个持仓`,
       `更新时间：${stamp(new Date((this.options.now??Date.now)()).toISOString())}（北京时间）`];
     const buttons:TelegramCallbackButtons=[];

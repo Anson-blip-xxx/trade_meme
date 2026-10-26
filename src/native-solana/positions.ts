@@ -380,15 +380,20 @@ export class NativePositionSupervisor {
     const id=row.buy.orderId,existing=this.checks.get(id);if(existing)return existing;
     const sequence=this.dirtySequence.get(id)??0;
     this.checkSequences.set(id,sequence);
-    const work=this.check(row,generation).then(()=>this.flush()).finally(()=>{
+    const work=this.check(row,generation).finally(()=>{
       this.checks.delete(id);this.checkSequences.delete(id);
       if(this.options.eventDriven&&this.enabled(generation)&&(this.dirtySequence.get(id)??0)>sequence)
         queueMicrotask(()=>{void this.checkNow(id);});
+      // Delivery is durable and retried from native_position_events. A slow
+      // order/Telegram projection must never keep this position's protection
+      // check in flight or delay a newer account-stream observation.
+      void this.flush().catch(()=>{this.lastError='NATIVE_POSITION_CALLBACK_UNAVAILABLE';});
     });this.checks.set(id,work);return work;
   }
   private async runTick(generation:number){
     const now=this.clock();this.lastTickAt=iso(now);const due=this.takeDue(now);
-    await Promise.allSettled(due.map(row=>this.runCheck(row,generation)));await this.flush();
+    await Promise.allSettled(due.map(row=>this.runCheck(row,generation)));
+    void this.flush().catch(()=>{this.lastError='NATIVE_POSITION_CALLBACK_UNAVAILABLE';});
     if(this.lastError==='NATIVE_POSITION_TICK_FAILED')this.lastError=undefined;
   }
   private async call<T>(fn:(signal:AbortSignal)=>Promise<T>):Promise<T>{

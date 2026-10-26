@@ -140,6 +140,17 @@ test('durable reopen preserves original timestamps and immutable metadata while 
   }finally{f.close();}
 });
 
+test('a durable worker delivery key makes an ambiguous callback retry idempotent',()=>{
+  const f=fixture();try {
+    const ledger=f.create(),deliveryKey='a'.repeat(64);
+    assert.equal(ledger.record(signal(),at(),{deliveryKey}).duplicate,false);
+    f.advance(1);assert.equal(ledger.record(signal(),at(),{deliveryKey}).duplicate,true);
+    let row=ledger.history(token).items[0];assert.equal(row.deliveryCount,1);
+    assert.equal(ledger.record(signal(),at(1),{deliveryKey:'b'.repeat(64)}).duplicate,true);
+    row=ledger.history(token).items[0];assert.equal(row.deliveryCount,2);
+  }finally{f.close();}
+});
+
 test('legacy ledgers backfill status metadata once, then restart and status reads avoid notification scans',()=>{
   const f=fixture();try {
     let ledger=f.create();
@@ -240,7 +251,7 @@ test('100000-event limit retains existing dedup identities instead of evicting t
     try {
       db.exec(`WITH RECURSIVE sequence(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM sequence WHERE n<99999)
         INSERT INTO source_notifications SELECT 'ave','filled-'||n,chain,address,occurred_at,first_observed_at,
-          recorded_at,last_delivery_at,last_recorded_at,delivery_count,conflict_at,name,source_url,tx_refs
+          recorded_at,last_delivery_at,last_recorded_at,delivery_count,conflict_at,name,source_url,tx_refs,NULL
         FROM sequence CROSS JOIN source_notifications WHERE event_id='seed'`);
     }finally{db.close();}
     assert.equal(ledger.record(signal('debot')).reason,'SOURCE_LEDGER_CAPACITY_REACHED');

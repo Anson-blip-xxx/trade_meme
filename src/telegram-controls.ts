@@ -170,7 +170,10 @@ export class TelegramControls {
         scope TEXT NOT NULL,update_id INTEGER NOT NULL,action TEXT NOT NULL,state TEXT NOT NULL,
         created_at INTEGER NOT NULL,reply TEXT,queued INTEGER NOT NULL DEFAULT 0,reply_buttons TEXT,PRIMARY KEY(scope,update_id));
       CREATE TABLE IF NOT EXISTS telegram_control_pending_token_sell (
-        scope TEXT PRIMARY KEY,ref TEXT NOT NULL,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL);`);
+        scope TEXT PRIMARY KEY,ref TEXT NOT NULL,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL);
+      CREATE INDEX IF NOT EXISTS telegram_control_events_scope_state ON telegram_control_events(scope,state);
+      CREATE INDEX IF NOT EXISTS telegram_control_events_pending_reply ON telegram_control_events(scope,update_id)
+        WHERE queued=0 AND reply IS NOT NULL;`);
     if(!this.db.prepare('PRAGMA table_info(telegram_control_events)').all().some(row=>row.name==='reply_buttons'))
       this.db.exec('ALTER TABLE telegram_control_events ADD COLUMN reply_buttons TEXT');
     this.db.prepare('INSERT OR IGNORE INTO telegram_control_state(scope) VALUES(?)').run(this.scope);

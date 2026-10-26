@@ -53,6 +53,19 @@ test('first boot discards history, persists its watermark, and never executes th
   assert.equal(JSON.parse(String(f.requests[1].init.body)).timeout,20);
 });
 
+test('Telegram status and pending-reply reads stay on bounded covering indexes',t=>{
+  const f=fixture(t),db=new DatabaseSync(f.database);t.after(()=>db.close());
+  const states=db.prepare(`EXPLAIN QUERY PLAN SELECT state,count(*) FROM telegram_control_events
+    WHERE scope=? GROUP BY state`).all('scope').map(row=>String(row.detail));
+  assert.ok(states.some(detail=>detail.includes('COVERING INDEX telegram_control_events_scope_state')),states.join('\n'));
+  const pending=db.prepare(`EXPLAIN QUERY PLAN SELECT count(*) FROM telegram_control_events
+    WHERE scope=? AND queued=0 AND reply IS NOT NULL`).all('scope').map(row=>String(row.detail));
+  assert.ok(pending.some(detail=>detail.includes('INDEX telegram_control_events_pending_reply')),pending.join('\n'));
+  const flush=db.prepare(`EXPLAIN QUERY PLAN SELECT update_id,reply,reply_buttons FROM telegram_control_events
+    WHERE scope=? AND queued=0 AND reply IS NOT NULL ORDER BY update_id LIMIT 100`).all('scope').map(row=>String(row.detail));
+  assert.ok(flush.some(detail=>detail.includes('INDEX telegram_control_events_pending_reply')),flush.join('\n'));
+});
+
 test('only exact explicit commands and reply keyboard text are actions; /start only reports status',async t=>{
   const f=fixture(t);await f.poll();
   await f.poll(['/count_start','停止计数','计数状态','启动计数','/count_stop','/count_status','/start',

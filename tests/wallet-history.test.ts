@@ -158,6 +158,18 @@ test('批量报告对重复资金来源只做一次关联失效且完整保存�
   } finally {history.close();}
 });
 
+test('one invalidation batch can retire its full limit of zero-work wallet jobs',()=>{
+  const {history}=fixture(),db=(history as unknown as {db:DatabaseSync}).db;
+  try {
+    const insert=db.prepare(`INSERT INTO wh_association_invalidations(kind,chain,address,enqueued_at)
+      VALUES ('funding_wallet','bsc',?,?)`);
+    db.exec('BEGIN');for(let index=0;index<128;index++)insert.run(address(10_000+index),iso(1));db.exec('COMMIT');
+    const result=history.flushAssociationInvalidations(128);
+    assert.deepEqual(result,{touched:0,completed:128,remaining:false});
+    assert.equal(history.associationInvalidationStatus().pending,0);
+  } finally {history.close();}
+});
+
 test('200钱包报告在密集关联表上保持有界，不按钱包重复扫描全表',()=>{
   const {history}=fixture(),db=(history as unknown as {db:DatabaseSync}).db;
   try {

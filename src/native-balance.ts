@@ -80,7 +80,7 @@ function validWallet(chain: Chain, wallet: string): boolean {
 
 /** Read-only wallet balance. It is a chain snapshot, not a reservation of spendable funds. */
 export async function readNativeBalance(chain: Chain, wallet: string, config: Config,
-  fetcher: Fetcher = fetch): Promise<NativeBalance> {
+  fetcher: Fetcher = fetch, parentSignal?:AbortSignal): Promise<NativeBalance> {
   const readStartedAt = new Date().toISOString();
   const unknown = (reason: string): NativeBalance => ({status: 'unknown', readStartedAt,
     checkedAt: new Date().toISOString(), reasons: [reason]});
@@ -102,9 +102,9 @@ export async function readNativeBalance(chain: Chain, wallet: string, config: Co
       if (remaining <= 0) throw new DOMException('Balance read deadline exceeded', 'TimeoutError');
       const boundedFetcher: Fetcher = async (input, init) => {
         try {
+          const signals=[...(init?.signal ? [init.signal] : []),...(parentSignal ? [parentSignal] : [])];
           const response = await fetcher(input, {...init,
-          signal: AbortSignal.any([...(init?.signal ? [init.signal] : []),
-            AbortSignal.timeout(Math.min(BALANCE_RPC_TIMEOUT_MS, remaining))])});
+          signal: AbortSignal.any([...signals,AbortSignal.timeout(Math.min(BALANCE_RPC_TIMEOUT_MS, remaining))])});
           if (response.status === 429) {
             void response.body?.cancel().catch(() => {});
             throw new NativeRpcRateLimitError(retryAfterMs(response.headers.get('retry-after')));
@@ -123,7 +123,7 @@ export async function readNativeBalance(chain: Chain, wallet: string, config: Co
         if (!retryAvailable || !retryableReadError(error) || deadline - Date.now() <= waitMs)
           throw error;
         retryAvailable = false;
-        await delay(waitMs);
+        await delay(waitMs,undefined,parentSignal?{signal:parentSignal}:undefined);
       }
     }
   };
@@ -152,28 +152,36 @@ export async function readNativeBalance(chain: Chain, wallet: string, config: Co
 
 /** Caller must match the snapshot's chain, wallet and RPC to the order before calling. */
 export async function nativeBalanceCoversOrder(order: Pick<OpeningOrder, 'chain' | 'transactionHash'>,
-  balance: NativeBalance, config: Config, fetcher: Fetcher = fetch): Promise<boolean> {
+  balance: NativeBalance, config: Config, fetcher: Fetcher = fetch, signal?:AbortSignal): Promise<boolean> {
   const {chain, transactionHash} = order;
   if (!['bsc', 'solana', 'robinhood'].includes(chain) || balance.status !== 'verified' ||
       typeof balance.amount !== 'string' || !/^(?:0|[1-9]\d*)$/.test(balance.amount)) return false;
   const url = config.rpc[chain];
   if (!url) return false;
+  if(signal?.aborted)return false;
+  const boundedFetcher:Fetcher=async(input,init)=>{
+    const signals=[...(init?.signal?[init.signal]:[]),...(signal?[signal]:[])];
+    return fetcher(input,{...init,...(signals.length?{signal:AbortSignal.any(signals)}:{})});
+  };
   try {
     if (chain !== 'solana') {
       if (!evmHash(transactionHash) || !quantity(balance.blockNumber)) return false;
       const snapshotBlock = BigInt(balance.blockNumber);
-      const receipt: unknown = await rpc(url, 'eth_getTransactionReceipt', [transactionHash], fetcher);
+      const receipt: unknown = await rpc(url, 'eth_getTransactionReceipt', [transactionHash], boundedFetcher);
+      if(signal?.aborted)return false;
       if (!object(receipt) || receipt.status !== '0x1' || !evmHash(receipt.transactionHash) ||
           receipt.transactionHash.toLowerCase() !== transactionHash.toLowerCase() ||
           !quantity(receipt.blockNumber) || BigInt(receipt.blockNumber) + 12n > snapshotBlock || !evmHash(receipt.blockHash)) return false;
-      const block: unknown = await rpc(url, 'eth_getBlockByNumber', [receipt.blockNumber, false], fetcher);
+      const block: unknown = await rpc(url, 'eth_getBlockByNumber', [receipt.blockNumber, false], boundedFetcher);
+      if(signal?.aborted)return false;
       return object(block) && quantity(block.number) && BigInt(block.number) === BigInt(receipt.blockNumber) &&
         evmHash(block.hash) && block.hash.toLowerCase() === receipt.blockHash.toLowerCase();
     }
     if (!validSignature(transactionHash) || !safeUnsigned(balance.slot)) return false;
     const snapshotSlot = balance.slot;
     const statuses: unknown = await rpc(url, 'getSignatureStatuses',
-      [[transactionHash], {searchTransactionHistory: true}], fetcher);
+      [[transactionHash], {searchTransactionHistory: true}], boundedFetcher);
+    if(signal?.aborted)return false;
     if (!object(statuses) || !Array.isArray(statuses.value) || statuses.value.length !== 1 || !object(statuses.value[0])) return false;
     const transaction = statuses.value[0];
     if (transaction.err !== null || !safeUnsigned(transaction.slot) || transaction.slot > snapshotSlot ||

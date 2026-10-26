@@ -16,6 +16,8 @@ export class WalletProfileRunner {
   private watchdog?:ReturnType<typeof setInterval>;
   private running=false;
   private inFlight=false;
+  private livePriority=false;
+  private workerLivePriority?:boolean;
   private workingSince=0;
   private error?:string;
   private restarts=0;
@@ -29,6 +31,7 @@ export class WalletProfileRunner {
   }
   status() {
     return {...this.cached,enabled:true,running:this.running&&!!this.worker,inFlight:this.inFlight,
+      livePriority:this.livePriority,workerLivePriority:this.workerLivePriority,
       intervalSec:this.options.intervalSec,batchSize:this.options.batchSize,refreshAfterSec:this.options.refreshAfterSec??21600,restarts:this.restarts,
       ...(this.error?{error:this.error}:{}),sampleOnly:true,ownership:'unknown',tradingEnabled:false};
   }
@@ -40,6 +43,11 @@ export class WalletProfileRunner {
       }
     },10000);this.watchdog.unref();
   }
+  /** Pause research-only writes while live signal counting owns latency priority. */
+  setLivePriority(active:boolean) {
+    this.livePriority=active;
+    try{this.worker?.postMessage({type:'live-priority',active});}catch{}
+  }
   private launch() {
     if(!this.running)return;
     try {
@@ -48,18 +56,20 @@ export class WalletProfileRunner {
       // register tsx inside the worker before loading TypeScript imports.
       const url=source?new URL('data:text/javascript,'+encodeURIComponent(
         `import {register} from ${JSON.stringify(pathToFileURL(createRequire(import.meta.url).resolve('tsx/esm/api')).href)};register();await import(${JSON.stringify(entry.href)});`)):entry;
-      const worker=new Worker(url,{workerData:this.options,env:{},execArgv:[]});
+      const worker=new Worker(url,{workerData:{...this.options,livePriority:this.livePriority},env:{},execArgv:[]});
       this.worker=worker;
+      this.workerLivePriority=undefined;
       worker.on('message',message=>{
         if(this.worker!==worker)return;
-        if(message?.type==='working') {this.inFlight=true;this.workingSince=Date.now();}
+        if(message?.type==='priority'&&typeof message.livePriority==='boolean')this.workerLivePriority=message.livePriority;
+        else if(message?.type==='working') {this.inFlight=true;this.workingSince=Date.now();}
         else if(message?.type==='status') {this.cached=message.status;this.reader.replaceProfitCohorts(message.profitCohorts);this.inFlight=false;this.error=undefined;}
         else if(message?.type==='failed') {this.inFlight=false;this.error='WALLET_PROFILE_REFRESH_FAILED';}
       });
       worker.on('error',()=>{if(this.worker===worker)this.error='WALLET_PROFILE_WORKER_FAILED';});
       worker.on('exit',()=>{
         if(this.worker!==worker)return;
-        this.worker=undefined;this.inFlight=false;
+        this.worker=undefined;this.inFlight=false;this.workerLivePriority=undefined;
         if(this.running) {this.error??='WALLET_PROFILE_WORKER_EXITED';this.scheduleRestart();}
       });
     } catch {this.error='WALLET_PROFILE_WORKER_START_FAILED';this.scheduleRestart();}
@@ -76,6 +86,6 @@ export class WalletProfileRunner {
       const timeout=setTimeout(()=>{void worker.terminate();},3000);
       worker.once('exit',()=>{clearTimeout(timeout);done();});worker.postMessage('stop');
     });
-    this.worker=undefined;this.inFlight=false;this.reader.close();
+    this.worker=undefined;this.inFlight=false;this.workerLivePriority=undefined;this.reader.close();
   }
 }

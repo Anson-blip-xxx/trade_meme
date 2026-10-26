@@ -12,6 +12,7 @@ import {assessEntryHolderRiskValues,unavailableEntryHolderRisk,normalizeStoredEn
   ENTRY_HOLDER_RISK_MAX_AGE_MS,type EntryHolderRiskValues,type EntryHolderRiskAssessment} from './entry-holder-risk.js';
 
 const SOL=NATIVE_INPUT_TOKENS.solana, MAX_AGE_MS=120_000, QUOTE_MAX_AGE_MS=15_000;
+const FUNDING_COVERAGE_BUDGET_MS=6_000,FUNDING_REFRESH_BUDGET_MS=4_000,FUNDING_COVERAGE_CONCURRENCY=4;
 const object=(v:unknown):v is Record<string,unknown>=>v!==null&&typeof v==='object'&&!Array.isArray(v);
 const identifier=(v:unknown):v is string=>typeof v==='string'&&/^[A-Za-z0-9_-]{1,200}$/.test(v);
 const atomic=(v:unknown):v is string=>typeof v==='string'&&/^[1-9]\d{0,19}$/.test(v)&&BigInt(v)<=(1n<<64n)-1n;
@@ -42,6 +43,7 @@ interface Submission {
   candidate:Readonly<ThirdSignalCandidate>;orderId:string;clientId:string;bodyText:string;quotedAt:number;
   attempted:boolean;failureReason?:string;
   holderRisk:EntryHolderRiskAssessment;
+  funding:FundingSnapshot;
 }
 
 /** Internal owner-started third-notification route. It does not create or bypass research Reports. */
@@ -150,7 +152,7 @@ export class ThirdSignalEntryController {
               this.active(submission.candidate);
               const order=this.orders.get(submission.orderId);if(!order||order.status!=='prepared')fail('ENTRY_ALREADY_HANDLED');
               this.requireHolderRisk(this.orders.get(order.id)??order,submission.holderRisk);
-              const latest=await this.fundingSnapshot(order.wallet);
+              const latest=await this.refreshFundingSnapshot(order.wallet,submission.funding);
               this.active(submission.candidate);
               if(init?.signal?.aborted)fail('THIRD_ENTRY_REQUEST_ABORTED');
               if(this.now().getTime()-submission.quotedAt>QUOTE_MAX_AGE_MS)fail('THIRD_ENTRY_QUOTE_EXPIRED');
@@ -171,24 +173,39 @@ export class ThirdSignalEntryController {
     return this.client;
   }
   private async fundingSnapshot(wallet:string):Promise<FundingSnapshot> {
-    const balance=await readNativeBalance('solana',wallet,this.config,this.fetcher);
+    const deadline=AbortSignal.timeout(FUNDING_COVERAGE_BUDGET_MS);
+    const balance=await readNativeBalance('solana',wallet,this.config,this.fetcher,deadline);
     if(balance.status!=='verified'||balance.amount===undefined)fail('ENTRY_BALANCE_UNAVAILABLE');
     const coveredOrderIds:string[]=[];
-    for(const previous of this.orders.fundingOrders({chain:'solana',mode:'live',wallet,inputToken:SOL})) {
+    const pending:OpeningOrder[]=[];
+    for(const previous of this.orders.fundingOrders({chain:'solana',mode:'live',wallet,inputToken:SOL},balance)) {
       if(!previous.transactionHash)continue;
       const cache=previous.details.nativeDebitCoverage;
       const cached=object(cache)&&cache.transactionHash===previous.transactionHash&&Number.isSafeInteger(cache.slot)&&
         Number(cache.slot)>=0&&typeof balance.slot==='number'&&balance.slot>=Number(cache.slot);
       if(cached){coveredOrderIds.push(previous.id);continue;}
-      if(await nativeBalanceCoversOrder(previous,balance,this.config,this.fetcher)){
-        coveredOrderIds.push(previous.id);
-        const current=this.orders.get(previous.id);
-        if(current?.status==='confirmed')this.orders.update(previous.id,['confirmed'],{details:{...current.details,
-          nativeDebitCoverage:{transactionHash:current.transactionHash,slot:balance.slot,checkedAt:balance.checkedAt}}},this.now());
-      }
-      if(this.now().getTime()-Date.parse(balance.readStartedAt)>25_000)break;
+      pending.push(previous);
     }
+    let cursor=0;
+    const worker=async()=>{for(;;){
+      const previous=pending[cursor++];if(!previous||deadline.aborted)return;
+      if(!await nativeBalanceCoversOrder(previous,balance,this.config,this.fetcher,deadline))continue;
+      coveredOrderIds.push(previous.id);
+      const current=this.orders.get(previous.id);
+      if(current?.status==='confirmed')this.orders.update(previous.id,['confirmed'],{details:{...current.details,
+        nativeDebitCoverage:{transactionHash:current.transactionHash,slot:balance.slot,checkedAt:balance.checkedAt}}},this.now());
+    }};
+    await Promise.all(Array.from({length:Math.min(FUNDING_COVERAGE_CONCURRENCY,pending.length)},worker));
     return {...balance,balance:balance.amount,feeReserve:this.config.entryFeeReserves.solana,coveredOrderIds};
+  }
+  private async refreshFundingSnapshot(wallet:string,verified:FundingSnapshot):Promise<FundingSnapshot>{
+    // The native process gives its final host callback five seconds. Leave a
+    // full second for the local funding CAS/readiness checks after this read.
+    const balance=await readNativeBalance('solana',wallet,this.config,this.fetcher,AbortSignal.timeout(FUNDING_REFRESH_BUDGET_MS));
+    if(balance.status!=='verified'||balance.amount===undefined||typeof balance.slot!=='number'||
+      typeof verified.slot!=='number'||balance.slot<verified.slot)fail('ENTRY_BALANCE_UNAVAILABLE');
+    return {...balance,balance:balance.amount,feeReserve:this.config.entryFeeReserves.solana,
+      coveredOrderIds:[...verified.coveredOrderIds]};
   }
   private requireHolderRisk(order:OpeningOrder,expected:EntryHolderRiskAssessment):void {
     const saved=normalizeStoredEntryHolderRisk(order.details.entryHolderRisk,{chain:order.chain,address:order.tokenAddress});
@@ -208,9 +225,9 @@ export class ThirdSignalEntryController {
   }
   private async considerInternal(candidate:Readonly<ThirdSignalCandidate>,wallet:string,exit:ExitTracking,
     releaseAdmission:()=>void):Promise<EntryResult> {
-    let reservation:ReturnType<OrderStore['reserve']>;
+    let reservation:ReturnType<OrderStore['reserve']>,funding:FundingSnapshot;
     try {
-      this.active(candidate);const funding:FundingSnapshot=await this.fundingSnapshot(wallet);this.active(candidate);
+      this.active(candidate);funding=await this.fundingSnapshot(wallet);this.active(candidate);
       const eventKey=createHash('sha256').update(JSON.stringify(['third_signal_v1',candidate.runId,candidate.id])).digest('hex');
       reservation=this.orders.reserve({eventKey,chain:'solana',tokenAddress:candidate.address,mode:'live',wallet,inputToken:SOL,inputAmount:'0',
         slippagePct:this.config.entrySlippagePct,exit,details:{executionStrategy:'third_signal_v1',policyVersion:'third_signal_v1',candidate,
@@ -237,7 +254,7 @@ export class ThirdSignalEntryController {
           const next=await this.options.native.execute(order,async()=>{
             this.active(candidate);
             this.requireHolderRisk(this.orders.get(order.id)??order,holderRisk);
-            const fresh=await this.fundingSnapshot(wallet);this.active(candidate);
+            const fresh=await this.refreshFundingSnapshot(wallet,funding);this.active(candidate);
             const fundingCheck=this.orders.checkFunding(order.id,fresh,this.now());if(!fundingCheck.ok)fail(fundingCheck.reason);
             this.requireHolderRisk(this.orders.get(order.id)??order,holderRisk);
             const readiness=this.options.native!.readiness();if(!readiness.ready)fail(readiness.reason??'NATIVE_EXECUTOR_UNAVAILABLE');
@@ -267,7 +284,7 @@ export class ThirdSignalEntryController {
       const saved=this.orders.update(order.id,['prepared'],{details:{...order.details,quote:{...quote,quotedAt:new Date(quotedAt).toISOString()},
         submission:{clientId,bodyHash:createHash('sha256').update(bodyText).digest('hex'),body,createdAt:this.now().toISOString()}}},this.now());
       if(!saved)return {status:'existing',order:this.orders.get(order.id)};order=saved;
-      submission={candidate,orderId:order.id,clientId,bodyText,quotedAt,attempted:false,holderRisk};this.submissions.set(clientId,submission);
+      submission={candidate,orderId:order.id,clientId,bodyText,quotedAt,attempted:false,holderRisk,funding};this.submissions.set(clientId,submission);
       const result=await this.transport().swap(body,clientId);
       if(!submission.attempted)fail('THIRD_ENTRY_SUBMISSION_DENIED');
       return {status:'created',order:this.applyExecution(order,result)};

@@ -5,7 +5,7 @@ import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {DatabaseSync} from 'node:sqlite';
 import {Keypair} from '@solana/web3.js';
-import {TOKEN_PROGRAM_ID} from '@solana/spl-token';
+import {TOKEN_PROGRAM_ID,TOKEN_2022_PROGRAM_ID} from '@solana/spl-token';
 import bs58 from 'bs58';
 import {readConfig} from '../src/config.js';
 import {OrderStore} from '../src/orders.js';
@@ -353,6 +353,26 @@ test('inventory bootstrap RPC failure fails readiness without substituting marke
   const f=fixture(t);f.activate();f.internal.executor.readiness=()=>({ready:true});f.internal.inventory.status=()=>({ready:false});
   await f.internal.refreshInventory();assert.equal(f.runtime.readiness().reason,'NATIVE_INVENTORY_RPC_UNAVAILABLE');
   assert.equal(f.runtime.status().inventory.error,'NATIVE_INVENTORY_RPC_UNAVAILABLE');assert.equal(f.httpQuote.mock.callCount(),0);
+});
+
+test('inventory refresh fetches both programs concurrently and retries only the failed program',async t=>{
+  const f=fixture(t);f.activate();f.internal.ownerVerified=true;
+  const standard=TOKEN_PROGRAM_ID.toBase58(),token2022=TOKEN_2022_PROGRAM_ID.toBase58(),calls:string[]=[];
+  let pending=0,peak=0,fail2022=true;
+  f.internal.ownerConnection.getTokenAccountsByOwner=async(_wallet:unknown,filter:{programId:{toBase58():string}})=>{
+    const program=filter.programId.toBase58();calls.push(program);pending++;peak=Math.max(peak,pending);
+    await new Promise(resolve=>setImmediate(resolve));pending--;
+    if(program===token2022&&fail2022)throw Error('TRANSIENT_RPC_FAILURE');
+    return {context:{slot:102},value:[]};
+  };
+  await f.internal.refreshInventory();
+  assert.equal(peak,2);assert.equal(f.internal.inventoryError,'NATIVE_INVENTORY_RPC_UNAVAILABLE');
+  assert.deepEqual(f.internal.inventory.programsNeedingRefresh(),[token2022]);
+  assert.equal(calls.filter(program=>program===standard).length,1);
+  fail2022=false;f.internal.inventoryRetryAt=0;await f.internal.refreshInventory();
+  assert.deepEqual(f.internal.inventory.programsNeedingRefresh(),[]);assert.equal(f.internal.inventoryError,undefined);
+  assert.equal(calls.filter(program=>program===standard).length,1);
+  assert.equal(calls.filter(program=>program===token2022).length,2);
 });
 
 test('slow finalized-zero reconciliation never blocks another holding from receiving a stream-cache quote',async t=>{

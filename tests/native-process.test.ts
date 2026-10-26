@@ -165,6 +165,23 @@ test('process notice replay scans only its partial pending index',t=>{
   assert.match(plan.map(row=>String(row.detail)).join('\n'),/process_notices_pending/);
 });
 
+test('native sell capabilities are reused until consumed and expired cleanup is bounded',t=>{
+  const dir=mkdtempSync(join(tmpdir(),'native-process-actions-')),path=join(dir,'bridge.sqlite');
+  const store=new NativeProcessStore(path);t.after(()=>{store.close();rmSync(dir,{recursive:true,force:true});});
+  const first=store.createAction('order-1',0);
+  assert.equal(store.createAction('order-1',1),first,'refresh reuses the unconsumed capability');
+  store.mapAction(first,'worker-action');
+  assert.notEqual(store.createAction('order-1',2),first,'a consumed capability is never reused for a new sell');
+  for(let i=0;i<140;i++)store.createAction(`expired-${i}`,0);
+  store.createAction('fresh',86_400_001);
+  const db=new DatabaseSync(path,{readOnly:true});
+  const plan=db.prepare(`EXPLAIN QUERY PLAN DELETE FROM process_actions WHERE rowid IN
+    (SELECT rowid FROM process_actions WHERE expires<=? LIMIT 128)`).all(86_400_001);
+  assert.match(plan.map(row=>String(row.detail)).join('\n'),/process_actions_expired/);
+  const remaining=Number((db.prepare('SELECT count(*) AS n FROM process_actions WHERE expires<=?').get(86_400_001) as {n:number}).n);
+  db.close();assert.equal(remaining,13,'one call deletes at most 128 expired rows');
+});
+
 test('duplicate execute IPC while a guard is pending invokes only one runtime execution',async t=>{
   const dir=mkdtempSync(join(tmpdir(),'native-worker-duplicate-'));t.after(()=>rmSync(dir,{recursive:true,force:true}));
   let incoming!:(message:unknown)=>void;const sent:NativeWorkerMessage[]=[];let invoked=0,executed=0;

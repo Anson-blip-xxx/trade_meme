@@ -121,6 +121,154 @@ const labels=(v:unknown):string[]=>Array.isArray(v)?[...new Set(v.filter((x):x i
 const twitter=(v:unknown):string|undefined=>typeof v==='string'&&/^@?[A-Za-z0-9_]{1,100}$/.test(v)?v.replace(/^@/,''):undefined;
 const code=(v:unknown):string|undefined=>typeof v==='string'&&/^[A-Z][A-Z0-9_]{0,99}$/.test(v)?v:undefined;
 const CAPACITY='WALLET_HISTORY_CAPACITY_REACHED';
+
+function walletCoordinationSummary(evidence:WalletHistoryDetail['coordinationEvidence'],status:WalletHistorySummary['coordination']['status'],
+  checkedAt?:string):WalletHistorySummary['coordination'] {
+  const shared=new Set(evidence.sharedFunding.map(item=>item.wallet)).size,
+    synced=new Set(evidence.synchronized.map(item=>item.wallet)).size;
+  return {score:Math.min(100,shared*10+synced*20),sharedFundingPeers:shared,synchronizedPeers:synced,
+    evidenceCount:evidence.sharedFunding.length+evidence.synchronized.length,ownership:'unknown',scope:'heuristic',status,checkedAt};
+}
+
+function readWalletCoordination(db:DatabaseSync,chain:Chain,wallet:string):WalletHistoryDetail['coordinationEvidence'] {
+  // Keep the target wallet as the outer loop. An ordinary JOIN can start with
+  // every funding snapshot on the chain before applying the wallet constraint.
+  const sharedFunding=db.prepare(`SELECT DISTINCT b.wallet,a.funding_address,MAX(a.observed_at,b.observed_at) AS observed
+    FROM wh_funding a INDEXED BY wh_funding_coord_wallet CROSS JOIN wh_funding b INDEXED BY wh_funding_coord_address ON a.chain=b.chain AND a.funding_address=b.funding_address AND a.wallet<>b.wallet
+    WHERE a.chain=? AND a.wallet=? AND a.shared=0 AND b.shared=0 AND a.conflict=0 AND b.conflict=0
+      AND NOT EXISTS(SELECT 1 FROM wh_funding s INDEXED BY wh_funding_coord_address WHERE s.chain=a.chain AND s.funding_address=a.funding_address AND s.shared=1)
+      AND NOT EXISTS(SELECT 1 FROM wh_funding x INDEXED BY wh_funding_coord_wallet WHERE x.chain=a.chain AND x.wallet=a.wallet AND x.funding_address=a.funding_address
+        AND (x.snapshot_at>a.snapshot_at OR (x.snapshot_at=a.snapshot_at AND (x.observed_at>a.observed_at OR x.conflict=1))))
+      AND NOT EXISTS(SELECT 1 FROM wh_funding x INDEXED BY wh_funding_coord_wallet WHERE x.chain=b.chain AND x.wallet=b.wallet AND x.funding_address=b.funding_address
+        AND (x.snapshot_at>b.snapshot_at OR (x.snapshot_at=b.snapshot_at AND (x.observed_at>b.observed_at OR x.conflict=1))))
+    LIMIT 50`).all(chain,wallet).map(row=>({address:String(row.funding_address),wallet:String(row.wallet),observedAt:String(row.observed)}));
+  const synchronized=db.prepare(`WITH seeds AS (SELECT * FROM wh_events WHERE chain=? AND wallet=? AND side IN ('buy','sell') ORDER BY event_at DESC LIMIT 200)
+    SELECT b.wallet,a.token_address,COUNT(DISTINCT a.tx_hash) AS n FROM seeds a JOIN wh_events b ON b.id IN (
+      SELECT x.id FROM wh_events x WHERE x.chain=a.chain AND x.token_address=a.token_address AND x.side=a.side
+        AND x.wallet<>a.wallet AND x.tx_hash<>a.tx_hash
+        AND x.event_at BETWEEN strftime('%Y-%m-%dT%H:%M:%fZ',a.event_at,'-120 seconds') AND strftime('%Y-%m-%dT%H:%M:%fZ',a.event_at,'+120 seconds')
+      ORDER BY x.event_at DESC LIMIT 200) GROUP BY b.wallet,a.token_address
+    HAVING COUNT(DISTINCT a.tx_hash)>=2 AND COUNT(DISTINCT b.tx_hash)>=2 LIMIT 50`).all(chain,wallet)
+    .map(row=>({wallet:String(row.wallet),tokenAddress:String(row.token_address),distinctTransactions:Number(row.n),windowSeconds:120 as const}));
+  return {sharedFunding,synchronized};
+}
+
+export function readWalletResearchSeedHints(db:DatabaseSync,chain:Chain,address:string):WalletResearchSeedHint[] {
+  if(!['bsc','robinhood'].includes(chain)||!/^0x[0-9a-fA-F]{40}$/.test(address))return [];
+  return db.prepare(`SELECT s.data AS source,e.data AS entry FROM wh_research_seeds e JOIN wh_research_seed_sources s ON s.source_id=e.source_id
+    WHERE e.address=? LIMIT 10`).all(address.toLowerCase()).map(row=>{
+    const source=JSON.parse(String(row.source)),entry=JSON.parse(String(row.entry));
+    return {sourceId:source.sourceId,sourceUrl:source.sourceUrl,commit:source.commit,sha256:source.sha256,labels:entry.labels,groups:entry.groups,
+      verification:'unverified_external_list',scope:'research_hint_only',ownershipProven:false,qualifiesAsSmart:false};
+  });
+}
+
+/** Read-only wallet page shared by the live store and the dashboard query worker. */
+export function readWalletHistoryList(db:DatabaseSync,options:WalletHistoryListOptions={}):{items:WalletHistorySummary[];total:number} {
+  const chain=options.chain,search=options.search?String(options.search).toLowerCase().slice(0,200):undefined;
+  const offset=Number.isSafeInteger(options.offset)?Math.max(0,options.offset!):0,limit=Number.isSafeInteger(options.limit)?Math.max(1,Math.min(200,options.limit!)):50;
+  const metric=options.sort==='profit'?'profit_usd':options.sort==='gain'?'gain_pct':options.sort==='coordination'?'coordination_score':undefined;
+  const nulls=metric&&metric!=='coordination_score'?' NULLS LAST':'',sort=metric?`m.${metric} DESC${nulls},m.last_at DESC,m.address,m.chain`:
+    'w.last_at DESC,w.address,w.chain';
+  const fts=!!search&&![...search].includes('\u0000')&&[...search].length>=3,
+    phrase=fts?`"${search!.replaceAll('"','""')}"`:undefined;
+  let total:number,rows:Record<string,any>[];
+  if(search) {
+    const exact='(instr(lower(w.address),?)>0 OR instr(lower(w.profile),?)>0)',chainClause=chain?' AND w.chain=?':'';
+    if(fts) {
+      const values:SQLInputValue[]=[phrase!,search,search,...(chain?[chain]:[])];
+      total=Number(db.prepare(`SELECT count(*) AS n FROM wh_wallet_search s CROSS JOIN wh_wallets w ON w.rowid=s.rowid
+        WHERE wh_wallet_search MATCH ? AND ${exact}${chainClause}`).get(...values)!.n);
+      rows=db.prepare(`SELECT w.*,m.* FROM wh_wallet_search s CROSS JOIN wh_wallets w ON w.rowid=s.rowid
+        CROSS JOIN wh_metrics m INDEXED BY sqlite_autoindex_wh_metrics_1 ON m.chain=w.chain AND m.address=w.address
+        WHERE wh_wallet_search MATCH ? AND ${exact}${chainClause} ORDER BY ${sort} LIMIT ? OFFSET ?`)
+        .all(...values,limit,offset);
+    } else {
+      const values:SQLInputValue[]=[...(chain?[chain]:[]),search,search],where=`WHERE ${chain?'w.chain=? AND ':''}${exact}`;
+      total=Number(db.prepare(`SELECT count(*) AS n FROM wh_wallets w ${where}`).get(...values)!.n);
+      const driver=metric?`wh_metrics m INDEXED BY wh_metrics_${options.sort}_page
+        JOIN wh_wallets w INDEXED BY sqlite_autoindex_wh_wallets_1 ON w.chain=m.chain AND w.address=m.address`:
+        `wh_wallets w INDEXED BY ${chain?'wh_stream_recent_wallets':'wh_wallets_recent_page'}
+        JOIN wh_metrics m INDEXED BY sqlite_autoindex_wh_metrics_1 ON m.chain=w.chain AND m.address=w.address`;
+      rows=db.prepare(`SELECT w.*,m.* FROM ${driver} ${where} ORDER BY ${sort} LIMIT ? OFFSET ?`).all(...values,limit,offset);
+    }
+  } else {
+    const totalWhere=chain?'WHERE w.chain=?':'',values:SQLInputValue[]=chain?[chain]:[];
+    total=Number(db.prepare(`SELECT count(*) AS n FROM wh_wallets w ${totalWhere}`).get(...values)!.n);
+    if(metric) {
+      const index=`wh_metrics_${options.sort}_page`,where=chain?'WHERE chain=?':'';
+      rows=db.prepare(`WITH page AS MATERIALIZED (
+          SELECT chain,address FROM wh_metrics INDEXED BY ${index} ${where}
+          ORDER BY ${metric} DESC${nulls},last_at DESC,address,chain LIMIT ? OFFSET ?)
+        SELECT w.*,m.* FROM page p
+        JOIN wh_metrics m INDEXED BY sqlite_autoindex_wh_metrics_1 ON m.chain=p.chain AND m.address=p.address
+        JOIN wh_wallets w INDEXED BY sqlite_autoindex_wh_wallets_1 ON w.chain=p.chain AND w.address=p.address
+        ORDER BY ${sort}`).all(...values,limit,offset);
+    } else {
+      const index=chain?'wh_stream_recent_wallets':'wh_wallets_recent_page',where=chain?'WHERE chain=?':'';
+      rows=db.prepare(`WITH page AS MATERIALIZED (
+          SELECT chain,address FROM wh_wallets INDEXED BY ${index} ${where}
+          ORDER BY last_at DESC,address,chain LIMIT ? OFFSET ?)
+        SELECT w.*,m.* FROM page p
+        JOIN wh_wallets w INDEXED BY sqlite_autoindex_wh_wallets_1 ON w.chain=p.chain AND w.address=p.address
+        JOIN wh_metrics m INDEXED BY sqlite_autoindex_wh_metrics_1 ON m.chain=p.chain AND m.address=p.address
+        ORDER BY ${sort}`).all(...values,limit,offset);
+    }
+  }
+  return {items:rows.map(row=>readWalletSummary(db,row)),total};
+}
+
+function readWalletSummary(db:DatabaseSync,row:Record<string,any>):WalletHistorySummary {
+  const chain=row.chain as Chain,wallet=String(row.address),profile=JSON.parse(String(row.profile));
+  const profit=row.profit_data?JSON.parse(String(row.profit_data)) as WalletVendorStats:undefined;
+  const evidence=row.coordination_data?JSON.parse(String(row.coordination_data)) as WalletHistoryDetail['coordinationEvidence']:{sharedFunding:[],synchronized:[]};
+  const checkedAt=row.coordination_checked_at?String(row.coordination_checked_at):undefined;
+  return {chain,address:wallet,firstObservedAt:String(row.first_at),lastObservedAt:String(row.last_at),labels:profile.labels,
+    name:profile.name,twitter:profile.twitter,vendorVerification:'vendor_claim',observedEventCount:Number(row.event_count??0),buyEvents:Number(row.buy_count??0),
+    sellEvents:Number(row.sell_count??0),tokenCount:Number(row.token_count??0),profit,gain:row.gain_data?JSON.parse(String(row.gain_data)):undefined,
+    researchSeeds:readWalletResearchSeedHints(db,chain,wallet),
+    coordination:walletCoordinationSummary(evidence,!checkedAt?'pending':Number(row.coordination_dirty)?'stale':'current',checkedAt)};
+}
+
+/** Exact wallet detail reader shared by the live store and the dashboard's read-only worker. */
+export function readWalletHistoryDetail(db:DatabaseSync,chain:Chain,address:string,now=new Date()):WalletHistoryDetail|undefined {
+  if(!chainValid(chain))return;
+  const wallet=addr(address,chain);if(!wallet)return;
+  const row=db.prepare('SELECT w.*,m.* FROM wh_wallets w JOIN wh_metrics m ON m.chain=w.chain AND m.address=w.address WHERE w.chain=? AND w.address=?').get(chain,wallet);if(!row)return;
+  const summary=readWalletSummary(db,row),coordinationEvidence=readWalletCoordination(db,chain,wallet);
+  summary.coordination=walletCoordinationSummary(coordinationEvidence,'current',now.toISOString());
+  const events=db.prepare('SELECT * FROM wh_events WHERE chain=? AND wallet=? ORDER BY event_at DESC LIMIT 100').all(chain,wallet),
+    evidenceByEvent=new Map<string,WalletTradeObservation[]>();
+  if(events.length){
+    const eventIds=events.map(event=>String(event.id)),placeholders=eventIds.map(()=>'?').join(',');
+    const rows=db.prepare(`SELECT event_id,data FROM (
+      SELECT event_id,data,row_number() OVER (PARTITION BY event_id ORDER BY observed_at) AS position
+      FROM wh_observations INDEXED BY wh_observations_event WHERE event_id IN (${placeholders}) AND kind='trade')
+      WHERE position<=20 ORDER BY event_id,position`).all(...eventIds);
+    for(const row of rows){const id=String(row.event_id),list=evidenceByEvent.get(id)??[];
+      list.push(JSON.parse(String(row.data)) as WalletTradeObservation);evidenceByEvent.set(id,list);}
+  }
+  const timeline=events.map(event=>{
+    const evidence=evidenceByEvent.get(String(event.id))??[];
+    const first=JSON.parse(String(event.data)) as WalletTradeObservation;
+    const contents=new Set(evidence.map(e=>JSON.stringify([e.eventAt,e.amount,e.amountUnit,e.usd,e.priceUsd])));
+    return {...first,id:String(event.id),scope:first.eventIndex===undefined?'transaction_wallet_token_side' as const:'indexed_event' as const,
+      ambiguous:first.eventIndex===undefined||contents.size>1,evidence};
+  });
+  const observations=(kind:string,limit=100)=>db.prepare('SELECT data FROM wh_observations WHERE chain=? AND wallet=? AND kind=? ORDER BY observed_at DESC LIMIT ?')
+    .all(chain,wallet,kind,limit).map(r=>JSON.parse(String(r.data)));
+  const observationCount=Number(db.prepare('SELECT count(*) AS n FROM wh_observations WHERE chain=? AND wallet=?').get(chain,wallet)!.n);
+  const nominationCount=Number(db.prepare("SELECT count(*) AS n FROM wh_observations WHERE chain=? AND wallet=? AND kind='vendor_nomination'").get(chain,wallet)!.n);
+  const gains=db.prepare('SELECT data FROM wh_gains WHERE chain=? AND wallet=?').all(chain,wallet).map(row=>JSON.parse(String(row.data)) as WalletGainEvidence)
+    .sort((a,b)=>b.maxGainPct-a.maxGainPct).slice(0,100);
+  return {wallet:summary,timeline,holdings:observations('holding'),vendorStats:observations('stats'),tokenTraderSnapshots:observations('token_trader'),
+    vendorNominations:observations('vendor_nomination'),
+    fundingEdges:db.prepare('SELECT data FROM wh_funding WHERE chain=? AND wallet=? ORDER BY observed_at DESC LIMIT 100').all(chain,wallet).map(r=>JSON.parse(String(r.data))),
+    gains,coordinationEvidence,
+    coverage:{sampleOnly:true,exactRealizedPnl:false,eventCount:summary.observedEventCount,observationCount,nominationCount,
+      firstObservedAt:summary.firstObservedAt,lastObservedAt:summary.lastObservedAt}};
+}
+
 interface AssociationChanges {
   fundingWallets:Map<Chain,Set<string>>;
   fundingAddresses:Map<Chain,Set<string>>;
@@ -535,7 +683,10 @@ export class WalletHistory {
    * the work for a retry or commits it completely.
    */
   flushAssociationInvalidations(limit=64):{touched:number;completed:number;remaining:boolean} {
-    const take=Number.isSafeInteger(limit)?Math.max(1,Math.min(128,limit)):64,jobLimit=32;
+    // A job can legitimately touch no derived row. Keep both touched rows and
+    // completed zero-work jobs within the caller's batch ceiling so a queue of
+    // new wallets cannot grow behind an unrelated fixed 32-job limit.
+    const take=Number.isSafeInteger(limit)?Math.max(1,Math.min(128,limit)):64,jobLimit=take;
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const rows=this.db.prepare(`SELECT kind,chain,address,stage,cursor FROM wh_association_invalidations
@@ -681,85 +832,11 @@ export class WalletHistory {
   }
 
   listWallets(options:WalletHistoryListOptions={}):{items:WalletHistorySummary[];total:number} {
-    const chain=options.chain,search=options.search?String(options.search).toLowerCase().slice(0,200):undefined;
-    const offset=Number.isSafeInteger(options.offset)?Math.max(0,options.offset!):0,limit=Number.isSafeInteger(options.limit)?Math.max(1,Math.min(200,options.limit!)):50;
-    const metric=options.sort==='profit'?'profit_usd':options.sort==='gain'?'gain_pct':options.sort==='coordination'?'coordination_score':undefined;
-    const nulls=metric&&metric!=='coordination_score'?' NULLS LAST':'',sort=metric?`m.${metric} DESC${nulls},m.last_at DESC,m.address,m.chain`:
-      'w.last_at DESC,w.address,w.chain';
-    const fts=!!search&&![...search].includes('\u0000')&&[...search].length>=3,
-      phrase=fts?`"${search!.replaceAll('"','""')}"`:undefined;
-    let total:number,rows:Record<string,any>[];
-    if(search) {
-      const exact='(instr(lower(w.address),?)>0 OR instr(lower(w.profile),?)>0)',chainClause=chain?' AND w.chain=?':'';
-      if(fts) {
-        const values:SQLInputValue[]=[phrase!,search,search,...(chain?[chain]:[])];
-        total=Number(this.db.prepare(`SELECT count(*) AS n FROM wh_wallet_search s CROSS JOIN wh_wallets w ON w.rowid=s.rowid
-          WHERE wh_wallet_search MATCH ? AND ${exact}${chainClause}`).get(...values)!.n);
-        rows=this.db.prepare(`SELECT w.*,m.* FROM wh_wallet_search s CROSS JOIN wh_wallets w ON w.rowid=s.rowid
-          CROSS JOIN wh_metrics m INDEXED BY sqlite_autoindex_wh_metrics_1 ON m.chain=w.chain AND m.address=w.address
-          WHERE wh_wallet_search MATCH ? AND ${exact}${chainClause} ORDER BY ${sort} LIMIT ? OFFSET ?`)
-          .all(...values,limit,offset);
-      } else {
-        const values:SQLInputValue[]=[...(chain?[chain]:[]),search,search],where=`WHERE ${chain?'w.chain=? AND ':''}${exact}`;
-        total=Number(this.db.prepare(`SELECT count(*) AS n FROM wh_wallets w ${where}`).get(...values)!.n);
-        const driver=metric?`wh_metrics m INDEXED BY wh_metrics_${options.sort}_page
-          JOIN wh_wallets w INDEXED BY sqlite_autoindex_wh_wallets_1 ON w.chain=m.chain AND w.address=m.address`:
-          `wh_wallets w INDEXED BY ${chain?'wh_stream_recent_wallets':'wh_wallets_recent_page'}
-          JOIN wh_metrics m INDEXED BY sqlite_autoindex_wh_metrics_1 ON m.chain=w.chain AND m.address=w.address`;
-        rows=this.db.prepare(`SELECT w.*,m.* FROM ${driver} ${where} ORDER BY ${sort} LIMIT ? OFFSET ?`).all(...values,limit,offset);
-      }
-    } else {
-      const totalWhere=chain?'WHERE w.chain=?':'',values:SQLInputValue[]=chain?[chain]:[];
-      total=Number(this.db.prepare(`SELECT count(*) AS n FROM wh_wallets w ${totalWhere}`).get(...values)!.n);
-      // Materialize only the requested keys from a covering index before the
-      // JSON-bearing wallet/metric rows are joined.  OFFSET 100k therefore
-      // walks compact index entries rather than deserializing 100k joined rows.
-      if(metric) {
-        const index=`wh_metrics_${options.sort}_page`,where=chain?'WHERE chain=?':'';
-        rows=this.db.prepare(`WITH page AS MATERIALIZED (
-            SELECT chain,address FROM wh_metrics INDEXED BY ${index} ${where}
-            ORDER BY ${metric} DESC${nulls},last_at DESC,address,chain LIMIT ? OFFSET ?)
-          SELECT w.*,m.* FROM page p
-          JOIN wh_metrics m INDEXED BY sqlite_autoindex_wh_metrics_1 ON m.chain=p.chain AND m.address=p.address
-          JOIN wh_wallets w INDEXED BY sqlite_autoindex_wh_wallets_1 ON w.chain=p.chain AND w.address=p.address
-          ORDER BY ${sort}`).all(...values,limit,offset);
-      } else {
-        const index=chain?'wh_stream_recent_wallets':'wh_wallets_recent_page',where=chain?'WHERE chain=?':'';
-        rows=this.db.prepare(`WITH page AS MATERIALIZED (
-            SELECT chain,address FROM wh_wallets INDEXED BY ${index} ${where}
-            ORDER BY last_at DESC,address,chain LIMIT ? OFFSET ?)
-          SELECT w.*,m.* FROM page p
-          JOIN wh_wallets w INDEXED BY sqlite_autoindex_wh_wallets_1 ON w.chain=p.chain AND w.address=p.address
-          JOIN wh_metrics m INDEXED BY sqlite_autoindex_wh_metrics_1 ON m.chain=p.chain AND m.address=p.address
-          ORDER BY ${sort}`).all(...values,limit,offset);
-      }
-    }
-    return {items:rows.map(row=>this.summary(row)),total};
+    return readWalletHistoryList(this.db,options);
   }
 
   getWallet(chain:Chain,address:string):WalletHistoryDetail|undefined {
-    const wallet=addr(address,chain);if(!chainValid(chain)||!wallet) return;
-    const row=this.db.prepare('SELECT w.*,m.* FROM wh_wallets w JOIN wh_metrics m ON m.chain=w.chain AND m.address=w.address WHERE w.chain=? AND w.address=?').get(chain,wallet);if(!row) return;
-    const summary=this.summary(row);
-    const coordinationEvidence=this.coordination(chain,wallet);
-    summary.coordination=this.coordinationSummary(coordinationEvidence,'current',this.now().toISOString());
-    const timeline=this.db.prepare('SELECT * FROM wh_events WHERE chain=? AND wallet=? ORDER BY event_at DESC LIMIT 100').all(chain,wallet).map(event=>{
-      const evidence=this.db.prepare("SELECT data FROM wh_observations INDEXED BY wh_observations_event WHERE event_id=? AND kind='trade' ORDER BY observed_at LIMIT 20").all(event.id!).map(r=>JSON.parse(String(r.data)) as WalletTradeObservation);
-      const first=JSON.parse(String(event.data)) as WalletTradeObservation;
-      const contents=new Set(evidence.map(e=>JSON.stringify([e.eventAt,e.amount,e.amountUnit,e.usd,e.priceUsd])));
-      return {...first,id:String(event.id),scope:first.eventIndex===undefined?'transaction_wallet_token_side' as const:'indexed_event' as const,
-        ambiguous:first.eventIndex===undefined||contents.size>1,evidence};
-    });
-    const observations=(kind:string,limit=100)=>this.db.prepare('SELECT data FROM wh_observations WHERE chain=? AND wallet=? AND kind=? ORDER BY observed_at DESC LIMIT ?')
-      .all(chain,wallet,kind,limit).map(r=>JSON.parse(String(r.data)));
-    const observationCount=Number(this.db.prepare('SELECT count(*) AS n FROM wh_observations WHERE chain=? AND wallet=?').get(chain,wallet)!.n);
-    const nominationCount=Number(this.db.prepare("SELECT count(*) AS n FROM wh_observations WHERE chain=? AND wallet=? AND kind='vendor_nomination'").get(chain,wallet)!.n);
-    return {wallet:summary,timeline,holdings:observations('holding'),vendorStats:observations('stats'),tokenTraderSnapshots:observations('token_trader'),
-      vendorNominations:observations('vendor_nomination'),
-      fundingEdges:this.db.prepare('SELECT data FROM wh_funding WHERE chain=? AND wallet=? ORDER BY observed_at DESC LIMIT 100').all(chain,wallet).map(r=>JSON.parse(String(r.data))),
-      gains:this.gains(chain,wallet),coordinationEvidence,
-      coverage:{sampleOnly:true,exactRealizedPnl:false,eventCount:summary.observedEventCount,observationCount,nominationCount,
-        firstObservedAt:summary.firstObservedAt,lastObservedAt:summary.lastObservedAt}};
+    return readWalletHistoryDetail(this.db,chain,address,this.now());
   }
 
   stats():WalletHistoryStats {
@@ -916,48 +993,11 @@ export class WalletHistory {
       amount:event.amount,amountUnit:'vendor_quantity',usd:event.usd})??[]);
     return {holding,stats,funding,events};
   }
-  private gains(chain:Chain,wallet:string):WalletGainEvidence[] {
-    return this.db.prepare('SELECT data FROM wh_gains WHERE chain=? AND wallet=?').all(chain,wallet).map(row=>JSON.parse(String(row.data)) as WalletGainEvidence)
-      .sort((a,b)=>b.maxGainPct-a.maxGainPct).slice(0,100);
-  }
   private summary(row:Record<string,any>):WalletHistorySummary {
-    const chain=row.chain as Chain,wallet=String(row.address),profile=JSON.parse(String(row.profile));
-    const profit=row.profit_data?JSON.parse(String(row.profit_data)) as WalletVendorStats:undefined;
-    const evidence=row.coordination_data?JSON.parse(String(row.coordination_data)) as WalletHistoryDetail['coordinationEvidence']:{sharedFunding:[],synchronized:[]};
-    const checkedAt=row.coordination_checked_at?String(row.coordination_checked_at):undefined;
-    return {chain,address:wallet,firstObservedAt:String(row.first_at),lastObservedAt:String(row.last_at),labels:profile.labels,
-      name:profile.name,twitter:profile.twitter,vendorVerification:'vendor_claim',observedEventCount:Number(row.event_count??0),buyEvents:Number(row.buy_count??0),
-      sellEvents:Number(row.sell_count??0),tokenCount:Number(row.token_count??0),profit,gain:row.gain_data?JSON.parse(String(row.gain_data)):undefined,
-      researchSeeds:this.researchSeeds.hints(chain,wallet),
-      coordination:this.coordinationSummary(evidence,!checkedAt?'pending':Number(row.coordination_dirty)?'stale':'current',checkedAt)};
-  }
-  private coordinationSummary(evidence:WalletHistoryDetail['coordinationEvidence'],status:WalletHistorySummary['coordination']['status'],checkedAt?:string):WalletHistorySummary['coordination'] {
-    const shared=new Set(evidence.sharedFunding.map(item=>item.wallet)).size,
-      synced=new Set(evidence.synchronized.map(item=>item.wallet)).size;
-    return {score:Math.min(100,shared*10+synced*20),sharedFundingPeers:shared,synchronizedPeers:synced,
-      evidenceCount:evidence.sharedFunding.length+evidence.synchronized.length,ownership:'unknown',scope:'heuristic',status,checkedAt};
+    return readWalletSummary(this.db,row);
   }
   private coordination(chain:Chain,wallet:string):WalletHistoryDetail['coordinationEvidence'] {
-    // Keep the target wallet as the outer loop. An ordinary JOIN can start with
-    // every funding snapshot on the chain before applying the wallet constraint.
-    const sharedFunding=this.db.prepare(`SELECT DISTINCT b.wallet,a.funding_address,MAX(a.observed_at,b.observed_at) AS observed
-      FROM wh_funding a INDEXED BY wh_funding_coord_wallet CROSS JOIN wh_funding b INDEXED BY wh_funding_coord_address ON a.chain=b.chain AND a.funding_address=b.funding_address AND a.wallet<>b.wallet
-      WHERE a.chain=? AND a.wallet=? AND a.shared=0 AND b.shared=0 AND a.conflict=0 AND b.conflict=0
-        AND NOT EXISTS(SELECT 1 FROM wh_funding s INDEXED BY wh_funding_coord_address WHERE s.chain=a.chain AND s.funding_address=a.funding_address AND s.shared=1)
-        AND NOT EXISTS(SELECT 1 FROM wh_funding x INDEXED BY wh_funding_coord_wallet WHERE x.chain=a.chain AND x.wallet=a.wallet AND x.funding_address=a.funding_address
-          AND (x.snapshot_at>a.snapshot_at OR (x.snapshot_at=a.snapshot_at AND (x.observed_at>a.observed_at OR x.conflict=1))))
-        AND NOT EXISTS(SELECT 1 FROM wh_funding x INDEXED BY wh_funding_coord_wallet WHERE x.chain=b.chain AND x.wallet=b.wallet AND x.funding_address=b.funding_address
-          AND (x.snapshot_at>b.snapshot_at OR (x.snapshot_at=b.snapshot_at AND (x.observed_at>b.observed_at OR x.conflict=1))))
-      LIMIT 50`).all(chain,wallet).map(row=>({address:String(row.funding_address),wallet:String(row.wallet),observedAt:String(row.observed)}));
-    const synchronized=this.db.prepare(`WITH seeds AS (SELECT * FROM wh_events WHERE chain=? AND wallet=? AND side IN ('buy','sell') ORDER BY event_at DESC LIMIT 200)
-      SELECT b.wallet,a.token_address,COUNT(DISTINCT a.tx_hash) AS n FROM seeds a JOIN wh_events b ON b.id IN (
-        SELECT x.id FROM wh_events x WHERE x.chain=a.chain AND x.token_address=a.token_address AND x.side=a.side
-          AND x.wallet<>a.wallet AND x.tx_hash<>a.tx_hash
-          AND x.event_at BETWEEN strftime('%Y-%m-%dT%H:%M:%fZ',a.event_at,'-120 seconds') AND strftime('%Y-%m-%dT%H:%M:%fZ',a.event_at,'+120 seconds')
-        ORDER BY x.event_at DESC LIMIT 200) GROUP BY b.wallet,a.token_address
-      HAVING COUNT(DISTINCT a.tx_hash)>=2 AND COUNT(DISTINCT b.tx_hash)>=2 LIMIT 50`).all(chain,wallet)
-      .map(row=>({wallet:String(row.wallet),tokenAddress:String(row.token_address),distinctTransactions:Number(row.n),windowSeconds:120 as const}));
-    return {sharedFunding,synchronized};
+    return readWalletCoordination(this.db,chain,wallet);
   }
   private bytes():number {
     if(this.path===':memory:') return Number(this.db.prepare('PRAGMA page_count').get()!.page_count)*Number(this.db.prepare('PRAGMA page_size').get()!.page_size);

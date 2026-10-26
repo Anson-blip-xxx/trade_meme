@@ -69,6 +69,10 @@ export class NativeInventoryCache {
     this.mintAccounts.delete(mint);this.aggregates.delete(mint);
   }
   invalidate(){this.snapshots.clear();this.invalid.clear();}
+  /** Only snapshots missing from the current complete-owner generation need an
+   * RPC refresh. A successful program snapshot survives a sibling RPC failure,
+   * while readiness remains false until both programs are complete. */
+  programsNeedingRefresh():string[]{return [...programs].filter(program=>!this.snapshots.has(program)||this.invalid.has(program));}
   private decode(address:string,info:AccountInfo<Buffer>,slot:number,receivedAtMs:number):Holding {
     if(!Number.isSafeInteger(slot)||slot<0||!Number.isFinite(receivedAtMs)||receivedAtMs<0||info.executable||!programs.has(info.owner.toBase58()))throw Error('NATIVE_INVENTORY_ACCOUNT_INVALID');
     const a=unpackAccount(new PublicKey(address),info,info.owner);
@@ -123,6 +127,7 @@ export class NativeInventoryCache {
   }
   /** Direct watches also observe closures that no longer match programSubscribe owner filters. */
   addresses(mint:string):string[]{return [...(this.aggregates.get(mint)?.addresses??[])];}
-  status(){return {ready:!this.invalid.size&&[...programs].every(p=>this.snapshots.has(p)),accounts:this.accounts.size,
-    trackedMints:this.tracked.size,retiredMints:this.retired.size,error:[...this.invalid.values()][0]?.reason,snapshotSlots:[...this.snapshots.values()].map(v=>v.slot)};}
+  status(){const missingPrograms=this.programsNeedingRefresh();return {ready:missingPrograms.length===0,accounts:this.accounts.size,
+    trackedMints:this.tracked.size,retiredMints:this.retired.size,error:[...this.invalid.values()][0]?.reason,
+    missingPrograms,snapshotSlots:[...this.snapshots.values()].map(v=>v.slot)};}
 }

@@ -288,3 +288,42 @@ test('Robinhood Ave current-price stream accepts verified live schema without tr
   assert.equal(samples[0].market?.poolAddress,undefined);assert.equal(JSON.stringify(samples[0]).includes(poolId),false);
   assert.equal(router.latest({chain:'bsc',address}).status,'unavailable');
 });
+
+test('maximum Dex response is indexed once and yields before it can stall the event loop',async()=>{
+  const targets=Array.from({length:30},(_,index)=>token(index+1));
+  const rows=Array.from({length:10_000},(_,index)=>({chainId:'bsc',baseToken:{address:targets[index%targets.length].address},
+    pairAddress:token(100+index%targets.length).address,priceUsd:'1'}));
+  const body=JSON.stringify(rows);assert.ok(Buffer.byteLength(body)<2_000_000);
+  let time=epoch;
+  const router=new MarketPriceRouter({now:()=>new Date(time),maxDebotPerBatch:0,maxGmgnPerBatch:0,minHttpIntervalMs:0,
+    fetcher:fetcher(async()=>new Response(body))});
+  // Warm parsing/JIT independently from the event-loop assertion.
+  assert.equal((await router.read(targets)).samples.length,30);time+=31_000;
+  assert.equal((await router.read(targets)).samples.length,30);time+=31_000;
+  let stopped=false,ticks=0;
+  const pulse=()=>setImmediate(()=>{ticks++;if(!stopped)pulse();});pulse();
+  const cpuStart=process.cpuUsage(),result=await router.read(targets),cpu=process.cpuUsage(cpuStart);
+  stopped=true;await new Promise<void>(resolve=>setImmediate(resolve));
+  assert.equal(result.samples.length,30);assert.equal(result.gaps.length,0);
+  assert.ok(ticks>=10,`Dex routing yielded only ${ticks} times`);
+  const cpuMs=(cpu.user+cpu.system)/1000;assert.ok(cpuMs<100,`warm bounded Dex routing used ${cpuMs.toFixed(1)}ms CPU`);
+});
+
+test('pathological matching Sol pools fail closed within the bounded response without blocking',async()=>{
+  const solAddress=(index:number)=>{const bytes=new Uint8Array(32);new DataView(bytes.buffer).setUint32(28,index);return bs58.encode(bytes);};
+  const target:ScanToken={chain:'solana',address:solAddress(1)};
+  const rows=Array.from({length:10_000},(_,index)=>({chainId:'solana',baseToken:{address:target.address},
+    pairAddress:solAddress(index+2),priceUsd:'1'}));
+  const body=JSON.stringify(rows);assert.ok(Buffer.byteLength(body)<2_000_000);
+  const router=new MarketPriceRouter({now:()=>new Date(epoch),maxDebotPerBatch:0,maxGmgnPerBatch:0,
+    fetcher:fetcher(async()=>new Response(body))});
+  let stopped=false,ticks=0;
+  const pulse=()=>setImmediate(()=>{ticks++;if(!stopped)pulse();});pulse();
+  const cpuStart=process.cpuUsage(),result=await router.read([target]),cpu=process.cpuUsage(cpuStart);
+  stopped=true;await new Promise<void>(resolve=>setImmediate(resolve));
+  assert.equal(result.samples.length,0);assert.equal(result.gaps[0].reason,'PRICE_NO_FRESH_SOURCE');
+  assert.equal(result.sourceErrors.dexscreener,'DEX_PRICE_TOKEN_POOL_LIMIT_EXCEEDED');
+  assert.equal(router.latest(target).status,'unavailable');
+  assert.ok(ticks>=1,'bounded Sol response did not yield to the event loop');
+  const cpuMs=(cpu.user+cpu.system)/1000;assert.ok(cpuMs<100,`bounded Sol response used ${cpuMs.toFixed(1)}ms CPU`);
+});

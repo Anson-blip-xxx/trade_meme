@@ -58,11 +58,18 @@ test('confirmed SOL opening synchronously subscribes its price as a holding prio
     const subscriptions=t.mock.method(runtime.aveScanner,'setPriceTokens');
     const hasSubscription=t.mock.method(runtime.aveScanner,'hasPriceSubscription',()=>true);
     const prepared=reserve(runtime,31);
-    assert.deepEqual(subscriptions.mock.calls.at(-1)?.arguments,[[],[]]);
     const before=subscriptions.mock.callCount();
     const order=confirm(runtime,prepared.id,31);
     assert.ok(subscriptions.mock.callCount()>before,'the committed fill must refresh subscriptions immediately');
     assert.deepEqual(subscriptions.mock.calls.at(-1)?.arguments,[[token(31)],[token(31)]]);
+    const subscribed=subscriptions.mock.callCount();
+    for(const healthProbe of ['one','two','three'])assert.ok(runtime.orders.update(order.id,['confirmed'],
+      {details:{...order.details,healthProbe}}));
+    assert.equal(subscriptions.mock.callCount(),subscribed,
+      'native protection heartbeats must not synchronously rescan unchanged holding subscriptions');
+    await new Promise<void>(resolve=>setImmediate(resolve));
+    assert.equal(subscriptions.mock.callCount(),subscribed+1,
+      'one event-loop turn coalesces a heartbeat burst into one health/subscription refresh');
     assert.ok(hasSubscription.mock.calls.some(call=>call.arguments[0]?.address===order.tokenAddress));
     const overview=runtime.dashboardOverview();
     assert.equal(overview.positionPriceStream.error,undefined);assert.equal(overview.positionPriceStream.health?.monitored,1);
@@ -161,6 +168,7 @@ test('a fresh Dex backup keeps an open holding healthy when Ave has no new frame
       const batch=await runtime.priceRouter.read([mint]);
       assert.equal(batch.samples[0]?.source,'dexscreener_token_pairs_sample');
       runtime.orders.update(opening.id,['confirmed'],{details:{...opening.details,healthProbe:elapsed}});
+      await new Promise<void>(resolve=>setImmediate(resolve));
       const health=runtime.dashboardOverview().positionPriceStream.health;
       assert.equal(health?.monitored,1);assert.equal(health?.degraded,0);
       assert.equal(health?.positions[0].priceSource,'dexscreener_token_pairs_sample');

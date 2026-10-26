@@ -34,7 +34,7 @@ function fixture(t:{after:(fn:()=>void)=>void},options:{store?:OrderStore;config
   maxConcurrent?:number;
   native?:ThirdSignalEntryOptions['native'];
   holderRisk?:(address:string)=>EntryHolderRiskValues|Promise<EntryHolderRiskValues>}={}) {
-  const clock={now:Date.now()+1000},state={active:true,balance:1000000000,balanceReads:0,posts:0,quotes:0,riskReads:0},swaps:Record<string,unknown>[]=[];
+  const clock={now:Date.now()+1000},state={active:true,balance:1000000000,balanceReads:0,coverageReads:0,posts:0,quotes:0,riskReads:0},swaps:Record<string,unknown>[]=[];
   const config:Config={...readConfig({}),gmgnApiKey:`test-${randomUUID()}`,gmgnPrivateKey:pem,entryMode:'off',
     scannerChains:['solana'],rpc:{solana:'https://rpc.test'},entryWallets:{solana:wallet},entryInputTokens:{solana:SOL},
     entryBalanceBps:{solana:300},entryFeeReserves:{bsc:'1',solana:'10000000',robinhood:'1'},exitPolicy:policy,...options.config};
@@ -45,7 +45,7 @@ function fixture(t:{after:(fn:()=>void)=>void},options:{store?:OrderStore;config
       const rpc=JSON.parse(String(init?.body));
       if(rpc.method==='getGenesisHash')return Response.json({jsonrpc:'2.0',id:rpc.id,result:'5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d'});
       if(rpc.method==='getBalance'){state.balanceReads++;options.onBalance?.(state.balanceReads);return Response.json({jsonrpc:'2.0',id:rpc.id,result:{context:{slot:100},value:state.balance}});}
-      if(rpc.method==='getSignatureStatuses')return Response.json({jsonrpc:'2.0',id:rpc.id,result:{value:[{slot:90,err:null,confirmationStatus:'finalized'}]}});
+      if(rpc.method==='getSignatureStatuses'){state.coverageReads++;return Response.json({jsonrpc:'2.0',id:rpc.id,result:{value:[{slot:90,err:null,confirmationStatus:'finalized'}]}});}
       throw new Error('UNEXPECTED_RPC');
     }
     assert.equal(url.origin,'https://openapi.gmgn.ai');
@@ -277,6 +277,23 @@ test('native entry preserves 3 percent and holder checks without a GMGN quote or
   assert.equal(f.state.riskReads,1);assert.equal(f.state.quotes,0);assert.equal(f.state.posts,0);
   assert.equal(f.store.hasAttemptedOpening('solana',mint),true);
   assert.notEqual((await f.controller.consider(f.candidate())).status,'created');assert.equal(calls,1);
+});
+
+test('one entry attempt proves an uncovered active debit once and reuses it at the broadcast balance refresh',async t=>{
+  let f:ReturnType<typeof fixture>;
+  f=fixture(t,{config:{solanaExecutionProvider:'pump_native',entryMaxOpen:3},native:{readiness:()=>({ready:true}),execute:async(order,guard)=>{
+    await guard();return f.store.update(order.id,['submitting'],{status:'submitted',transactionHash:signature},new Date(f.clock.now))!;
+  }}});
+  const priorMint=bs58.encode(new Uint8Array(32).fill(19)),priorSignature=bs58.encode(new Uint8Array(64).fill(20));
+  const prior=f.store.reserve({eventKey:'prior-covered-buy',chain:'solana',tokenAddress:priorMint,mode:'live',wallet,inputToken:SOL,
+    inputAmount:'10000000',slippagePct:5,exit:{policy,state:'awaiting_swap',reasons:[],checkedAt:new Date(f.clock.now).toISOString(),positionClosed:false},
+    details:{executionProvider:'pump_native',nativeFill:{signature:priorSignature,slot:90},token:{chain:'solana',address:priorMint}}},3,new Date(f.clock.now)).order!;
+  f.store.update(prior.id,['prepared'],{status:'confirmed',transactionHash:priorSignature,actualInputAmount:'10000000',outputAmount:'1'},new Date(f.clock.now));
+  f.store.updateNativeProtection(prior.id,{provider:'pump_native',healthy:true,checkedAt:new Date(f.clock.now).toISOString(),
+    buySignature:priorSignature,buySlot:90,balanceSlot:100,balanceAmount:'1',closed:false},new Date(f.clock.now));
+  const result=await f.controller.consider(f.candidate());
+  assert.equal(result.status,'created');assert.equal(f.state.balanceReads,2);assert.equal(f.state.coverageReads,1);
+  assert.equal((f.store.get(prior.id)?.details.nativeDebitCoverage as {transactionHash:string}).transactionHash,priorSignature);
 });
 test('native readiness failure cannot silently fall back to GMGN',async t=>{
   const f=fixture(t,{config:{solanaExecutionProvider:'pump_native'},native:{readiness:()=>({ready:false,reason:'NATIVE_SIGNER_UNAVAILABLE'}),

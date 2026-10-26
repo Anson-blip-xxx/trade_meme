@@ -238,3 +238,15 @@ test('unavailable storage or disabled configuration cannot throw into the caller
   const disabled=ctx.open({enabled:false});disabled.enqueue(input());assert.equal(disabled.list().total,0);
   const conflict=ctx.open({startupError:'JEV_PATH_CONFLICT'});assert.equal(conflict.status().lastError,'JEV_STORAGE_UNAVAILABLE');
 });
+
+test('production status can use a worker snapshot without scanning historical comparison JSON',async t=>{
+  const ctx=setup(t),internal=ctx.runner as unknown as {db?:{prepare:(sql:string)=>unknown}};
+  const db=internal.db!,prepare=db.prepare.bind(db),queries:string[]=[];
+  db.prepare=((sql:string)=>{queries.push(sql);return prepare(sql);}) as typeof db.prepare;
+  try{
+    const status=ctx.runner.status({counts:{total:9,available:7,unavailable:1,pending:1},
+      comparison:{eligible:4,selected:2,rejected:1,excluded:1,priced:3,horizons:[]},usedBytes:123,computedAt:iso(start)});
+    assert.equal(status.counts.total,9);assert.equal(status.comparison.selected,2);assert.equal(status.storage.usedBytes,123);
+    assert.equal(queries.some(sql=>sql.includes('FROM jev_results')),false);
+  }finally{db.prepare=prepare as typeof db.prepare;}
+});

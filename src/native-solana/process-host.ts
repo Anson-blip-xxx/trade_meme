@@ -13,7 +13,7 @@ interface Pending {resolve:(value:any)=>void;reject:(error:Error)=>void;timer:Re
 export interface NativeProcessOptions {
   /** Main-process observers read the authoritative shared order ledger after this callback. */
   onOrderUpdate?:(order:OpeningOrder)=>void|Promise<void>;
-  snapshotStaleMs?:number;guardTimeoutMs?:number;requestTimeoutMs?:number;restartDelayMs?:number;
+  snapshotStaleMs?:number;guardTimeoutMs?:number;requestTimeoutMs?:number;restartDelayMs?:number;maxPendingRequests?:number;
   /** Test seam; production always starts the pinned local worker under an exclusive kernel lock. */
   spawnWorker?:(lockPath:string)=>ChildProcess;
 }
@@ -24,11 +24,14 @@ export class ProcessNativeTradingRuntime {
   private snapshot?:NativeWorkerSnapshot;private snapshots=new Map<string,NativePositionState>();
   private pending=new Map<string,Pending>();private error?:string;private retry?:ReturnType<typeof setTimeout>;
   private readonly storePath:string;private readonly staleMs:number;private readonly guardMs:number;private readonly requestMs:number;
+  private readonly pendingLimit:number;
   constructor(private config:Config,private orders:OrderStore,private enqueue:(event:TradeNotificationEvent)=>boolean,
     private options:NativeProcessOptions={}){
     if(!config.nativeSolana?.positionsPath||config.ordersDatabase===':memory:')throw Error('NATIVE_PROCESS_REQUIRES_DURABLE_DATABASE');
     this.staleMs=options.snapshotStaleMs??1500;this.guardMs=options.guardTimeoutMs??5000;this.requestMs=options.requestTimeoutMs??120000;
+    this.pendingLimit=options.maxPendingRequests??64;
     if([this.staleMs,this.guardMs,this.requestMs].some(v=>!Number.isSafeInteger(v)||v<50)||this.guardMs>30000||
+      !Number.isSafeInteger(this.pendingLimit)||this.pendingLimit<1||this.pendingLimit>1000||
       options.restartDelayMs!==undefined&&(!Number.isSafeInteger(options.restartDelayMs)||options.restartDelayMs<10||options.restartDelayMs>60000))throw Error('NATIVE_PROCESS_OPTIONS_INVALID');
     this.storePath=config.nativeSolana.positionsPath+'.process.sqlite';this.store=new NativeProcessStore(this.storePath);
   }
@@ -119,6 +122,7 @@ export class ProcessNativeTradingRuntime {
     return this.store.createAction(orderId);
   }
   private request(message:Extract<NativeParentMessage,{kind:'call'}>,guard?:()=>Promise<void>):Promise<any>{
+    if(this.pending.size>=this.pendingLimit)return Promise.reject(Error('NATIVE_WORKER_REQUEST_BACKLOG'));
     return new Promise((resolve,reject)=>{
       const timer=setTimeout(()=>{this.pending.delete(message.id);reject(Error('NATIVE_WORKER_RESPONSE_TIMEOUT'));},this.requestMs);timer.unref();
       this.pending.set(message.id,{resolve,reject,timer,guard});
@@ -135,6 +139,7 @@ export class ProcessNativeTradingRuntime {
     catch(error){
       const reason=safeProcessError(error);
       if(reason==='NATIVE_SELL_BUTTON_EXPIRED')return {text:'卖出未提交：按钮已过期，请刷新持仓。'};
+      if(reason==='NATIVE_WORKER_REQUEST_BACKLOG')return {text:'卖出未提交：原生交易请求繁忙，请稍后刷新持仓再试。'};
       // Losing an IPC reply cannot prove that the child did not durably accept or send the sell.
       return {text:'⏳ 卖出请求的回执暂未返回，成交状态待确认。请刷新持仓；重复点击原按钮不会重复提交卖单。'};
     }

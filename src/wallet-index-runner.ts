@@ -1,6 +1,7 @@
 import {Worker} from 'node:worker_threads';
 import {createRequire} from 'node:module';
 import {pathToFileURL} from 'node:url';
+import type {WalletAssociationStats} from './wallet-associations.js';
 
 export interface WalletIndexRunnerOptions {
   database:string;
@@ -13,8 +14,15 @@ export interface WalletIndexRunnerOptions {
 export interface WalletIndexSnapshot {
   running:boolean;
   inFlight:boolean;
+  invalidationMs:number;
+  invalidationProcessed:number;
+  invalidationPending:number;
+  invalidationError?:string;
   coordinationMs:number;
   associationMs:number;
+  associationStats?:WalletAssociationStats;
+  associationStatsMs:number;
+  associationStatsRefreshedAt?:string;
   coordinationError?:string;
   associationError?:string;
   workerError?:string;
@@ -35,10 +43,17 @@ export class WalletIndexRunner {
   private inFlight=false;
   private workingSince=0;
   private restarts=0;
+  private invalidationMs=0;
+  private invalidationProcessed=0;
+  private invalidationPending=0;
+  private invalidationError?:string;
   private coordinationMs=0;
   private associationMs=0;
   private coordinationError?:string;
   private associationError?:string;
+  private associationStats?:WalletAssociationStats;
+  private associationStatsMs=0;
+  private associationStatsRefreshedAt?:string;
   private workerError?:string;
   private lastAttemptAt?:string;
   private completedAt?:string;
@@ -56,7 +71,11 @@ export class WalletIndexRunner {
 
   snapshot():WalletIndexSnapshot {
     return {running:this.running&&!!this.worker,inFlight:this.inFlight,
-      coordinationMs:this.coordinationMs,associationMs:this.associationMs,
+      invalidationMs:this.invalidationMs,invalidationProcessed:this.invalidationProcessed,
+      invalidationPending:this.invalidationPending,
+      ...(this.invalidationError?{invalidationError:this.invalidationError}:{}),
+      coordinationMs:this.coordinationMs,associationMs:this.associationMs,associationStats:this.associationStats,
+      associationStatsMs:this.associationStatsMs,associationStatsRefreshedAt:this.associationStatsRefreshedAt,
       ...(this.coordinationError?{coordinationError:this.coordinationError}:{}),
       ...(this.associationError?{associationError:this.associationError}:{}),
       ...(this.workerError?{workerError:this.workerError}:{}),
@@ -89,8 +108,15 @@ export class WalletIndexRunner {
           this.lastAttemptAt=typeof message.at==='string'?message.at:new Date().toISOString();
         } else if(message?.type==='status'&&message.status) {
           const status=message.status as Partial<WalletIndexSnapshot>;
+          this.invalidationMs=Number.isSafeInteger(status.invalidationMs)&&status.invalidationMs!>=0?status.invalidationMs!:0;
+          this.invalidationProcessed=Number.isSafeInteger(status.invalidationProcessed)&&status.invalidationProcessed!>=0?status.invalidationProcessed!:0;
+          this.invalidationPending=Number.isSafeInteger(status.invalidationPending)&&status.invalidationPending!>=0?status.invalidationPending!:0;
+          this.invalidationError=status.invalidationError==='WALLET_ASSOCIATION_INVALIDATION_FAILED'?status.invalidationError:undefined;
           this.coordinationMs=Number.isSafeInteger(status.coordinationMs)&&status.coordinationMs!>=0?status.coordinationMs!:0;
           this.associationMs=Number.isSafeInteger(status.associationMs)&&status.associationMs!>=0?status.associationMs!:0;
+          if(status.associationStats)this.associationStats=status.associationStats;
+          this.associationStatsMs=Number.isSafeInteger(status.associationStatsMs)&&status.associationStatsMs!>=0?status.associationStatsMs!:0;
+          if(typeof status.associationStatsRefreshedAt==='string')this.associationStatsRefreshedAt=status.associationStatsRefreshedAt;
           this.coordinationError=status.coordinationError==='WALLET_COORDINATION_REFRESH_FAILED'?status.coordinationError:undefined;
           this.associationError=status.associationError==='WALLET_ASSOCIATION_REFRESH_FAILED'?status.associationError:undefined;
           this.completedAt=typeof status.completedAt==='string'?status.completedAt:new Date().toISOString();

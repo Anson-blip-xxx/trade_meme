@@ -9,7 +9,7 @@ export interface NativeStreamReset {
   generation:number;reason:'connect'|'disconnect'|'head_stale'|'accounts_removed';accounts?:string[];
 }
 export interface NativeAccountStreamOptions {
-  maxHeadAgeMs?:number;reconnectHeadAgeMs?:number;watchdogIntervalMs?:number;now?:()=>number;
+  maxHeadAgeMs?:number;reconnectHeadAgeMs?:number;watchdogIntervalMs?:number;maxAccounts?:number;now?:()=>number;
 }
 const tokenPrograms=['TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA','TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb'];
 type RequestInput={kind:'subscribe';label:string}|{kind:'unsubscribe';label:string;subscription:number};
@@ -42,7 +42,7 @@ export class NativeAccountStream {
   private acknowledged=new Set<string>();private lastSlotAt?:number;private lastHeadSlot?:number;private retryAt=0;private openedAt=0;
   private accountSlots=new Map<string,number>();private knownWalletAccounts=new Map<string,string>();private generation=0;private staleReset=false;
   private published='';private readonly now:()=>number;private readonly maxHeadAgeMs:number;private readonly reconnectHeadAgeMs:number;
-  private readonly watchdogIntervalMs:number;private readonly walletBytes:Buffer;
+  private readonly watchdogIntervalMs:number;private readonly maxAccounts:number;private readonly walletBytes:Buffer;
   constructor(private url:string,private wallet:string,private callbacks:{
     dirty:(account:string)=>void;state:(value:{connected:boolean;subscribedAccounts:string[]})=>void;
     account?:(value:NativeStreamAccountUpdate)=>void;head?:(value:NativeStreamHead)=>void;reset?:(value:NativeStreamReset)=>void;
@@ -50,13 +50,14 @@ export class NativeAccountStream {
     const u=new URL(url);if(u.protocol!=='wss:'||u.username||u.password||u.hash)throw Error('NATIVE_WS_URL_INVALID');
     this.walletBytes=publicKey(wallet).toBuffer();this.now=options.now??Date.now;
     this.maxHeadAgeMs=options.maxHeadAgeMs??1500;this.reconnectHeadAgeMs=options.reconnectHeadAgeMs??20_000;
-    this.watchdogIntervalMs=options.watchdogIntervalMs??200;
+    this.watchdogIntervalMs=options.watchdogIntervalMs??200;this.maxAccounts=options.maxAccounts??120;
     if(!Number.isFinite(this.maxHeadAgeMs)||this.maxHeadAgeMs<100||!Number.isFinite(this.reconnectHeadAgeMs)||
       this.reconnectHeadAgeMs<=this.maxHeadAgeMs||!Number.isFinite(this.watchdogIntervalMs)||this.watchdogIntervalMs<10||
-      this.watchdogIntervalMs>this.maxHeadAgeMs)throw Error('NATIVE_STREAM_TIMING_INVALID');
+      this.watchdogIntervalMs>this.maxHeadAgeMs||!Number.isSafeInteger(this.maxAccounts)||this.maxAccounts<1||this.maxAccounts>1000)
+      throw Error('NATIVE_STREAM_TIMING_INVALID');
   }
   setAccounts(accounts:string[]){
-    const next=new Set(accounts);if(next.size>120)throw Error('NATIVE_SUBSCRIPTION_LIMIT');for(const a of next)publicKey(a);
+    const next=new Set(accounts);if(next.size>this.maxAccounts)throw Error('NATIVE_SUBSCRIPTION_LIMIT');for(const a of next)publicKey(a);
     const removed=[...this.wanted].filter(a=>!next.has(a)),added=[...next].filter(a=>!this.wanted.has(a));
     if(!removed.length&&!added.length)return;this.wanted=next;
     for(const a of removed){this.acknowledged.delete(a);this.accountSlots.delete(a);this.attempts.delete(a);
@@ -67,9 +68,13 @@ export class NativeAccountStream {
     this.publish();
   }
   start(){if(!this.stopped)return;this.stopped=false;this.connect();this.timer=setInterval(()=>this.watchdog(),this.watchdogIntervalMs);this.timer.unref();}
+  /** Allocation-free health check for the per-account valuation path. */
+  transportReady():boolean {const age=this.lastSlotAt===undefined?undefined:Math.max(0,this.now()-this.lastSlotAt);
+    return this.socket?.readyState===1&&this.acknowledged.has('@slots')&&
+      tokenPrograms.every(p=>this.acknowledged.has('@wallet:'+p))&&age!==undefined&&age<=this.maxHeadAgeMs;}
+  headSlot():number|undefined {return this.lastHeadSlot;}
   status(){const age=this.lastSlotAt===undefined?undefined:Math.max(0,this.now()-this.lastSlotAt);
-    const transportHealthy=this.socket?.readyState===1&&this.acknowledged.has('@slots')&&
-      tokenPrograms.every(p=>this.acknowledged.has('@wallet:'+p))&&age!==undefined&&age<=this.maxHeadAgeMs;
+    const transportHealthy=this.transportReady();
     const pending=[...this.wanted].filter(a=>!this.acknowledged.has(a)),labels=this.requiredLabels().filter(a=>!this.acknowledged.has(a));
     const failedAccounts=pending.filter(a=>this.attempts.get(a)?.failed).length,failedSubscriptions=labels.filter(a=>this.attempts.get(a)?.failed).length;
     return {transportHealthy,connected:transportHealthy&&[...this.wanted].every(a=>this.acknowledged.has(a)),
@@ -77,7 +82,7 @@ export class NativeAccountStream {
       pendingAccounts:pending.length-failedAccounts,failedAccounts,pendingSubscriptions:labels.length-failedSubscriptions,failedSubscriptions,
       generation:this.generation,lastHeadSlot:this.lastHeadSlot,headAgeMs:age};}
   /** A new position's pending ACK must not suspend already subscribed positions. */
-  isSubscribed(accounts:string[]):boolean {return this.status().transportHealthy&&accounts.every(address=>this.wanted.has(address)&&this.acknowledged.has(address));}
+  isSubscribed(accounts:string[]):boolean {return this.transportReady()&&accounts.every(address=>this.wanted.has(address)&&this.acknowledged.has(address));}
   private publish(){const s=this.status(),signature=JSON.stringify([s.connected,s.transportHealthy,s.pendingSubscriptions,s.failedSubscriptions,[...s.subscribedAccounts].sort()]);
     if(signature===this.published)return;this.published=signature;this.callbacks.state({connected:s.connected,subscribedAccounts:s.subscribedAccounts});}
   private reset(reason:NativeStreamReset['reason']){this.generation++;

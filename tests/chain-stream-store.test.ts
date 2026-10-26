@@ -31,6 +31,10 @@ test('EVM transfer evidence is exact, targeted and distinct per watched particip
   assert.equal(evmTransfers('bsc',log(),new Set([token]),'live',at).length,0);
   const replacement=evmTransfers('bsc',log({blockHash:'0x'+'1'.repeat(64)}),new Set([from]),'live',at)[0];
   assert.notEqual(events[0].id,replacement.id);assert.ok(store.record(events[0]));assert.ok(store.record(replacement));
+  const db=(store as any).db,prepare=db.prepare.bind(db);db.prepare=(sql:string)=>{
+    assert.equal(/count\(\*\).*chain_events/i.test(sql),false,'stats must use the append count cache');return prepare(sql);
+  };
+  assert.equal(store.stats().events,2);
   const self=evmTransfers('bsc',log({topics:[TRANSFER_TOPIC,'0x'+'0'.repeat(24)+from.slice(2),'0x'+'0'.repeat(24)+from.slice(2)]}),new Set([from]),'live',at);
   assert.equal(self.length,1);
 });

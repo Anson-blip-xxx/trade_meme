@@ -148,7 +148,7 @@ export function normalizeWalletActivity(raw: unknown, chain: Chain, wallet: stri
 
 export interface WalletObserverOptions {
   history: Pick<WalletHistory, 'recordTrades' | 'captureAnalysis' | 'captureLeaders' | 'captureTokenRanks' |
-    'captureTokenTraders' | 'recordCollection' | 'watchTargets' | 'markTargetChecked' | 'recordPrice' | 'refreshCoordination'> &
+    'captureTokenTraders' | 'recordCollection' | 'watchTargets' | 'markTargetChecked' | 'recordPrice'> &
     Partial<Pick<WalletHistory, 'associationTargets' | 'markAssociationTargetChecked' | 'captureFunding' |
       'getWalletObserverCursor' | 'setWalletObserverCursor' | 'researchSeedTarget' | 'markResearchSeedChecked'>>;
   client: Pick<GmgnClient, 'get' | 'cooldownUntil'> & Partial<Pick<GmgnClient, 'recordRateLimit'>>;
@@ -638,8 +638,9 @@ export class WalletObserver {
     report.completedAt = this.now().toISOString();
     if (generation !== this.generation) report.status = 'stopped';
     else if (report.status === 'ok' && report.reasons.length) report.status = 'partial';
-    try {this.history.refreshCoordination(10);}
-    catch {if (!report.reasons.includes('WALLET_COORDINATION_REFRESH_FAILED')) report.reasons.push('WALLET_COORDINATION_REFRESH_FAILED'); if (report.status === 'ok') report.status = 'partial';}
+    // Coordination contains graph joins over the growing wallet corpus. The
+    // dedicated WalletIndexRunner owns that work in a worker thread; doing it
+    // here after a vendor response stalls the HTTP, signal and Telegram loop.
     try {this.history.recordCollection({...report, source: 'gmgn_wallet_observer', reason: report.reasons[0]});}
     catch {if (!report.reasons.includes('WALLET_HISTORY_WRITE_FAILED')) report.reasons.push('WALLET_HISTORY_WRITE_FAILED'); if (report.status === 'ok') report.status = 'partial';}
     return report;

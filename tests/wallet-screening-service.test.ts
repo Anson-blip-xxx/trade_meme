@@ -48,16 +48,32 @@ function fixture(){
   const root=mkdtempSync(join(tmpdir(),'wallet-screening-service-')),historyPath=join(root,'history.sqlite'),profilePath=join(root,'profiles.sqlite'),ledgerPath=join(root,'setups.sqlite');
   let seconds=1000;const now=()=>new Date(iso(seconds));
   const history=new WalletHistory(historyPath,{now}),engine=new WalletProfiles({database:profilePath,historyDatabase:historyPath,now});engine.close();
-  const db=new DatabaseSync(profilePath),reader=new WalletProfileReader(profilePath,now);
+  const db=new DatabaseSync(profilePath),reader=new WalletProfileReader(profilePath,now),written=new Map<string,WalletProfile>();
+  const syncCohorts=()=>{
+    const asOf=now().toISOString(),validUntil=new Date(now().getTime()+300_000).toISOString(),result:any={};
+    for(const chain of ['bsc','solana','robinhood'] as const)result[chain]={asOf,validUntil,values:[...written.values()]
+      .filter(p=>p.chain===chain&&p.groups.some(g=>g.id==='public_kol')).sort((a,b)=>b.computedAt.localeCompare(a.computedAt)).slice(0,2000).flatMap(p=>{
+        const v=p.metrics.vendorProfit,n=Number(v?.realizedProfitUsd);return v?.verification==='vendor_claim'&&v.period==='7d'&&Number.isFinite(n)&&n>0&&
+          v.snapshotAt<=v.observedAt&&Date.parse(v.observedAt)<=now().getTime()&&now().getTime()-Date.parse(v.snapshotAt)<=86_400_000?[n]:[];})};
+    reader.replaceProfitCohorts(result);
+  };
   const put=(p:WalletProfile)=>{
     db.prepare('INSERT OR REPLACE INTO wp_profiles(chain,address,computed_at,fresh_until,data) VALUES (?,?,?,?,?)').run(p.chain,p.address,p.computedAt,p.freshUntil,JSON.stringify(p));
     db.prepare('DELETE FROM wp_groups WHERE chain=? AND address=?').run(p.chain,p.address);
     for(const group of p.groups)db.prepare('INSERT INTO wp_groups VALUES (?,?,?,?)').run(p.chain,p.address,group.id,group.firstObservedAt);
+    written.set(p.chain+':'+p.address,structuredClone(p));syncCohorts();
   };
   put(profile(2));for(let i=1;i<=9;i++)put(profile(10+i,i*1000));
-  const service=new WalletScreeningService(history,reader,{database:ledgerPath,maxBytes:4*1024*1024,sourcePaths:[historyPath,profilePath]},now);
+  const service=new WalletScreeningService(history,reader,{database:ledgerPath,historyDatabase:historyPath,maxBytes:4*1024*1024,sourcePaths:[historyPath,profilePath]},now);
   return {root,historyPath,profilePath,ledgerPath,history,reader,service,put,now,advance:(n:number)=>{seconds=n;},
     close:async()=>{await service.close();reader.close();db.close();history.close();rmSync(root,{recursive:true,force:true});}};
+}
+async function waitFor(check:()=>boolean,timeoutMs=5000):Promise<void> {
+  const deadline=Date.now()+timeoutMs;
+  while(!check()){
+    if(Date.now()>=deadline)throw new Error('WAIT_FOR_TIMEOUT');
+    await new Promise<void>(resolve=>setTimeout(resolve,5));
+  }
 }
 function entryReport(f:ReturnType<typeof fixture>,input=research(),profileSupport=true):Report {
   const checked={status:'pass' as const,checkedAt:f.now().toISOString(),facts:{},reasons:['TEST_CHECK_PASSED']};
@@ -183,9 +199,31 @@ test('background observation advances registered opportunities and close stops i
     f.history.recordTrades([trade(2,900),trade(3,910),trade(4,920)]);f.service.assess(signal,research());
     f.service.start();f.service.start();assert.equal(f.service.status().running,true);
     f.advance(1020);f.history.recordTrade(trade(2,1010,{side:'sell'}));t.mock.timers.tick(10000);
-    await new Promise<void>(resolve=>setImmediate(resolve));await new Promise<void>(resolve=>setImmediate(resolve));
+    await waitFor(()=>f.service.ledger.list().items[0].state==='reduced');
     assert.equal(f.service.ledger.list().items[0].state,'reduced');assert.equal(f.service.ledger.list().items[0].reduction?.eventAt,iso(1010));
     await f.close();closed=true;t.mock.timers.tick(30000);
+  }finally{if(!closed)await f.close();t.mock.timers.reset();}
+});
+
+test('write-heavy opportunity refresh stays off the main loop and remains fairly retryable',async t=>{
+  t.mock.timers.enable({apis:['setInterval']});const f=fixture();let closed=false;
+  try{
+    f.history.recordTrades([trade(2,900),trade(3,910),trade(4,920)]);const screened=f.service.assess(signal,research());
+    for(let i=1;i<110;i++){
+      const copy=structuredClone(screened);copy.setups=[structuredClone(screened.setups[0])];copy.setups[0].trigger.txHash=hash(8_000_000+i);
+      f.service.ledger.record(copy);
+    }
+    assert.equal(f.service.status().records,110);
+    f.advance(1020);f.history.recordTrade(trade(2,1010,{side:'sell'}));
+    t.mock.method(f.service.ledger,'observe',()=>{throw new Error('MAIN_THREAD_OBSERVE_CALLED');});
+    f.service.start();const started=performance.now();t.mock.timers.tick(10000);const synchronousMs=performance.now()-started;
+    assert.ok(synchronousMs<10,`timer callback blocked for ${synchronousMs.toFixed(1)}ms`);
+    await waitFor(()=>Number(f.service.status().stateCounts.reduced??0)===100);
+    await waitFor(()=>!f.service.status().observationWorker.inFlight);
+    assert.equal(f.service.status().observationWorker.processedTokens,1);
+    t.mock.timers.tick(10000);await waitFor(()=>Number(f.service.status().stateCounts.reduced??0)===110);
+    assert.equal(f.service.status().error,undefined);
+    await f.close();closed=true;
   }finally{if(!closed)await f.close();t.mock.timers.reset();}
 });
 
@@ -195,9 +233,9 @@ test('a slow dispatched analysis does not block later observation ticks, and clo
   const flush=async()=>{await new Promise<void>(resolve=>setImmediate(resolve));await new Promise<void>(resolve=>setImmediate(resolve));};
   try{
     f.history.recordTrades([trade(2,900),trade(3,910),trade(4,920)]);f.service.assess(signal,research());
-    f.service.start(async()=>{dispatched++;await deferred;});t.mock.timers.tick(10000);await flush();assert.equal(dispatched,1);
+    f.service.start(async()=>{dispatched++;await deferred;});t.mock.timers.tick(10000);await waitFor(()=>dispatched===1);assert.equal(dispatched,1);
     f.advance(1020);f.history.recordTrade(trade(2,1010,{side:'sell'}));t.mock.timers.tick(10000);await flush();
-    assert.equal(f.service.ledger.list().items[0].state,'reduced');assert.equal(dispatched,1);assert.equal(f.service.status().error,undefined);
+    await waitFor(()=>f.service.ledger.list().items[0].state==='reduced');assert.equal(dispatched,1);assert.equal(f.service.status().error,undefined);
     const closing=f.close().then(()=>{closed=true;});await flush();assert.equal(closed,false,'close must wait for the admitted analysis');
     release();await closing;t.mock.timers.tick(30000);await flush();assert.equal(dispatched,1);
   }finally{release();if(!closed)await f.close();t.mock.timers.reset();}
@@ -209,9 +247,9 @@ test('a deferred false dispatch is not recorded as an error or admitted signal a
   t.mock.method(f.history,'screeningWalletCandidates',(_now?:Date,offset=0)=>{offsets.push(offset);return [trade(2,900)];});
   const flush=async()=>{await new Promise<void>(resolve=>setImmediate(resolve));await new Promise<void>(resolve=>setImmediate(resolve));};
   try{
-    f.service.start(async()=>{calls++;return false;});t.mock.timers.tick(10000);await flush();
+    f.service.start(async()=>{calls++;return false;});t.mock.timers.tick(10000);await waitFor(()=>calls===1);
     assert.equal(calls,1);assert.equal(f.service.status().error,undefined);
-    f.advance(1001);t.mock.timers.tick(10000);await flush();
+    f.advance(1001);t.mock.timers.tick(10000);await waitFor(()=>calls===2);
     assert.equal(calls,2);assert.equal(f.service.status().error,undefined);assert.deepEqual(offsets,[0,40]);assert.equal(f.service.status().records,0);
   }finally{await f.close();t.mock.timers.reset();}
 });
@@ -222,8 +260,8 @@ test('empty candidate pages still advance the discovery cursor',async t=>{
   t.mock.method(f.history,'screeningWalletCandidates',(_now?:Date,offset=0)=>{offsets.push(offset);return offset===0?[]:[trade(2,900)];});
   const flush=async()=>{await new Promise<void>(resolve=>setImmediate(resolve));await new Promise<void>(resolve=>setImmediate(resolve));};
   try{
-    f.service.start(async()=>{calls++;return true;});t.mock.timers.tick(10000);await flush();assert.equal(calls,0);
-    t.mock.timers.tick(10000);await flush();assert.equal(calls,1);assert.deepEqual(offsets,[0,40]);
+    f.service.start(async()=>{calls++;return true;});t.mock.timers.tick(10000);await waitFor(()=>offsets.length===1);assert.equal(calls,0);
+    t.mock.timers.tick(10000);await waitFor(()=>calls===1);assert.equal(calls,1);assert.deepEqual(offsets,[0,40]);
   }finally{await f.close();t.mock.timers.reset();}
 });
 
@@ -240,7 +278,7 @@ test('ledger source path collisions including symlink aliases are rejected befor
   const f=fixture();try{
     const alias=join(f.root,'history-alias.sqlite');symlinkSync(f.historyPath,alias);
     for(const path of [f.historyPath,join(f.root,'unused','..','history.sqlite'),alias])
-      assert.throws(()=>new WalletScreeningService(f.history,f.reader,{database:path,maxBytes:1024*1024,sourcePaths:[f.historyPath,f.profilePath]},f.now),/MUST_BE_SEPARATE/);
+      assert.throws(()=>new WalletScreeningService(f.history,f.reader,{database:path,historyDatabase:f.historyPath,maxBytes:1024*1024,sourcePaths:[f.historyPath,f.profilePath]},f.now),/MUST_BE_SEPARATE/);
     const raw=new DatabaseSync(f.historyPath,{readOnly:true});try{assert.equal(raw.prepare("SELECT 1 FROM sqlite_master WHERE name='wsl_setups'").get(),undefined);}finally{raw.close();}
   }finally{await f.close();}
 });

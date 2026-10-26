@@ -35,6 +35,8 @@ export interface ThirdSignalEntryOptions {
   /** Native executor owns durable signed transactions; this guard is called immediately before broadcasting. */
   native?:{readiness:()=>{ready:boolean;reason?:string};
     execute:(order:OpeningOrder,beforeBroadcast:()=>Promise<void>)=>Promise<OpeningOrder>};
+  /** Defense in depth around all pre-reservation and submitted entry work. */
+  maxConcurrent?:number;
 }
 interface Submission {
   candidate:Readonly<ThirdSignalCandidate>;orderId:string;clientId:string;bodyText:string;quotedAt:number;
@@ -49,9 +51,13 @@ export class ThirdSignalEntryController {
   private client?:GmgnTestClient;
   private readonly submissions=new Map<string,Submission>();
   private readonly jobs=new Set<Promise<EntryResult>>();
+  private readonly maxJobs:number;
+  private admissions=0;
   private stopping=false;
   constructor(private readonly config:Config,private readonly orders:OrderStore,private readonly options:ThirdSignalEntryOptions) {
     this.now=options.now??(()=>new Date());this.fetcher=options.fetcher??fetch;
+    this.maxJobs=options.maxConcurrent??config.entryMaxOpen;
+    if(!Number.isSafeInteger(this.maxJobs)||this.maxJobs<1||this.maxJobs>100)throw Error('THIRD_ENTRY_CONCURRENCY_INVALID');
   }
   readiness():{ready:boolean;reason?:string} {
     try {
@@ -65,7 +71,22 @@ export class ThirdSignalEntryController {
     }catch(error){return {ready:false,reason:reason(error)};}
   }
   consider(input:ThirdSignalCandidate):Promise<EntryResult> {
-    const job=this.considerInternal(input);this.jobs.add(job);
+    let candidate:Readonly<ThirdSignalCandidate>,wallet:string,exit:ExitTracking;
+    try{candidate=Object.freeze(structuredClone(input));this.active(candidate);({wallet,exit}=this.configuration());
+      const readiness=this.readiness();if(!readiness.ready)fail(readiness.reason??'THIRD_ENTRY_DISABLED');}
+    catch(error){return Promise.resolve({status:'blocked',reason:reason(error)});}
+    if(this.jobs.size>=this.maxJobs)return Promise.resolve({status:'blocked',reason:'THIRD_ENTRY_BUSY'});
+    let capacity:ReturnType<OrderStore['openingCapacity']>;
+    try {capacity=this.orders.openingCapacity('live',this.config.entryMaxOpen,this.now(),true,
+      {chain:'solana',address:candidate.address,preventReentry:true});}
+    catch(error){return Promise.resolve({status:'blocked',reason:reason(error)});}
+    if(capacity.reason)return Promise.resolve({status:'blocked',reason:capacity.reason});
+    // An admitted task has not written its prepared row yet. Counting it beside
+    // durable occupied rows prevents bursts from all doing remote RPC work first.
+    if(this.admissions>=capacity.available)return Promise.resolve({status:'blocked',reason:'OPENING_LIMIT_REACHED'});
+    this.admissions++;let released=false;
+    const releaseAdmission=()=>{if(!released){released=true;this.admissions--;}};
+    const job=this.considerInternal(candidate,wallet,exit,releaseAdmission);this.jobs.add(job);
     void job.finally(()=>this.jobs.delete(job)).catch(()=>{});return job;
   }
   /** Shutdown prevents new submissions, then waits for any already-sent response to be journaled. */
@@ -185,21 +206,20 @@ export class ThirdSignalEntryController {
       return normalizeStoredEntryHolderRisk(assessed,{chain:'solana',address})??unavailable('ENTRY_HOLDER_RISK_RESPONSE_INVALID');
     }catch {return unavailable('ENTRY_HOLDER_RISK_READ_FAILED');}
   }
-  private async considerInternal(input:ThirdSignalCandidate):Promise<EntryResult> {
-    let candidate:Readonly<ThirdSignalCandidate>,wallet:string,exit:ExitTracking;
-    try{candidate=Object.freeze(structuredClone(input));this.active(candidate);({wallet,exit}=this.configuration());
-      const readiness=this.readiness();if(!readiness.ready)fail(readiness.reason??'THIRD_ENTRY_DISABLED');}
-    catch(error){return {status:'blocked',reason:reason(error)};}
-    let funding:FundingSnapshot;
-    try {this.active(candidate);funding=await this.fundingSnapshot(wallet);this.active(candidate);}
-    catch(error){return {status:'blocked',reason:reason(error)};}
-    const eventKey=createHash('sha256').update(JSON.stringify(['third_signal_v1',candidate.runId,candidate.id])).digest('hex');
-    const reservation=this.orders.reserve({eventKey,chain:'solana',tokenAddress:candidate.address,mode:'live',wallet,inputToken:SOL,inputAmount:'0',
-      slippagePct:this.config.entrySlippagePct,exit,details:{executionStrategy:'third_signal_v1',policyVersion:'third_signal_v1',candidate,
-        ...(this.config.solanaExecutionProvider==='pump_native'?{executionProvider:'pump_native'}:{}),
-        signal:{source:candidate.source,eventId:candidate.eventId,occurredAt:candidate.occurredAt},
-        token:{chain:'solana',address:candidate.address,name:candidate.name,symbol:candidate.symbol}}},this.config.entryMaxOpen,this.now(),funding,
-      {preventReentry:true,balanceBps:300,balanceBasis:'total'});
+  private async considerInternal(candidate:Readonly<ThirdSignalCandidate>,wallet:string,exit:ExitTracking,
+    releaseAdmission:()=>void):Promise<EntryResult> {
+    let reservation:ReturnType<OrderStore['reserve']>;
+    try {
+      this.active(candidate);const funding:FundingSnapshot=await this.fundingSnapshot(wallet);this.active(candidate);
+      const eventKey=createHash('sha256').update(JSON.stringify(['third_signal_v1',candidate.runId,candidate.id])).digest('hex');
+      reservation=this.orders.reserve({eventKey,chain:'solana',tokenAddress:candidate.address,mode:'live',wallet,inputToken:SOL,inputAmount:'0',
+        slippagePct:this.config.entrySlippagePct,exit,details:{executionStrategy:'third_signal_v1',policyVersion:'third_signal_v1',candidate,
+          ...(this.config.solanaExecutionProvider==='pump_native'?{executionProvider:'pump_native'}:{}),
+          signal:{source:candidate.source,eventId:candidate.eventId,occurredAt:candidate.occurredAt},
+          token:{chain:'solana',address:candidate.address,name:candidate.name,symbol:candidate.symbol}}},this.config.entryMaxOpen,this.now(),funding,
+        {preventReentry:true,balanceBps:300,balanceBasis:'total'});
+    }catch(error){return {status:'blocked',reason:reason(error)};}
+    finally{releaseAdmission();}
     if(!reservation.created)return reservation.order?{status:'existing',order:reservation.order}:{status:'blocked',reason:reservation.reason};
     let order=reservation.order!,submission:Submission|undefined;
     try {

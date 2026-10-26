@@ -25,10 +25,11 @@ export interface WalletSetupLedgerStatus {
   records:number;pending:number;stateCounts:Partial<Record<WalletSetupLedgerState,number>>;withdrawn:number;
   bytes:number;maxBytes:number;capacityReached:boolean;sampleOnly:true;
 }
-export interface WalletSetupLedgerOptions {now?:()=>Date;maxBytes?:number;windowSec?:number;}
+export interface WalletSetupLedgerOptions {now?:()=>Date;maxBytes?:number;windowSec?:number;synchronous?:'full'|'normal';}
 type Token={chain:Chain;address:string};
 type StoredEvidence={key:string;event:WalletTradeObservation;conflict:boolean};
 const EVENT_LIMIT=16,RECORD_BUDGET=32768,BASE_BUDGET=32768;
+const OBSERVATION_WRITE_BATCH=4;
 const stamp=(value:unknown):string|undefined=>{
   if(typeof value!=='string'||value.length>32||!/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,3})?Z$/.test(value)||!Number.isFinite(Date.parse(value)))return;
   const normalized=new Date(value).toISOString();return normalized.slice(0,19)===value.slice(0,19)?normalized:undefined;
@@ -87,6 +88,7 @@ export class WalletSetupLedger {
       CREATE INDEX IF NOT EXISTS wsl_status_counts ON wsl_setups(closed_at,review_withdrawn);
       CREATE INDEX IF NOT EXISTS wsl_status_state ON wsl_setups(state);
       CREATE TABLE IF NOT EXISTS wsl_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);`);
+    this.db.exec(`PRAGMA synchronous=${options.synchronous==='normal'?'NORMAL':'FULL'}`);
     if(!this.db.prepare('PRAGMA table_info(wsl_setups)').all().some(row=>row.name==='check_seq'))this.db.exec('ALTER TABLE wsl_setups ADD COLUMN check_seq INTEGER NOT NULL DEFAULT 0');
     const pageSize=Number(this.db.prepare('PRAGMA page_size').get()!.page_size);
     this.db.exec(`PRAGMA max_page_count=${Math.floor(this.maxBytes/pageSize)}`);
@@ -113,10 +115,16 @@ export class WalletSetupLedger {
         setup.route==='precursor'&&wallet===leader||setup.route==='public_entry'&&wallet!==leader)continue;
       const id=identity(token,{...setup,wallet,leader},trigger),old=this.db.prepare('SELECT data FROM wsl_setups WHERE id=?').get(id);
       if(old){
-        const item=JSON.parse(String(old.data)) as WalletSetupLedgerItem;
-        if(setup.status==='withdrawn'&&checkedAt>=item.review.checkedAt){
+        // Observation refreshes run on a worker connection.  Preserve any
+        // outcome written between this read and the review update instead of
+        // replacing it with a stale JSON copy.
+        if(setup.status==='withdrawn')for(let attempt=0;attempt<3;attempt++){
+          const current=this.db.prepare('SELECT data FROM wsl_setups WHERE id=?').get(id);if(!current)break;
+          const item=JSON.parse(String(current.data)) as WalletSetupLedgerItem;if(checkedAt<item.review.checkedAt)break;
           item.review={status:'withdrawn',checkedAt,reasons:strings(setup.reasons)};
-          this.db.prepare('UPDATE wsl_setups SET data=?,review_withdrawn=1 WHERE id=?').run(JSON.stringify(item),id);
+          const saved=this.db.prepare('UPDATE wsl_setups SET data=?,review_withdrawn=1 WHERE id=? AND data=?')
+            .run(JSON.stringify(item),id,String(current.data));
+          if(Number(saved.changes))break;
         }
         continue;
       }
@@ -160,7 +168,8 @@ export class WalletSetupLedger {
     const rows=this.db.prepare(`SELECT * FROM wsl_setups WHERE chain=? AND address=?
       ORDER BY closed_at IS NOT NULL,check_seq,registered_at,id LIMIT 100`).all(token.chain,token.address);
     const sequence=Number(this.db.prepare("SELECT value FROM wsl_meta WHERE key='check_seq'").get()?.value??0)+1;
-    if(rows.length)this.db.prepare("INSERT INTO wsl_meta VALUES ('check_seq',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(String(sequence));
+    const updates:{now:string;state:WalletSetupLedgerState;closedAt:string|null;data:string;evidence:string;withdrawn:number;id:string;
+      oldData:string;oldEvidence:string;oldCheckedAt:string;oldSequence:number}[]=[];
     for(const row of rows){
       const item=JSON.parse(String(row.data)) as WalletSetupLedgerItem;if(now<item.registeredAt||now<item.lastCheckedAt)continue;
       if(options.truncated||trades.length>1000)item.observationsTruncated=true;
@@ -204,8 +213,25 @@ export class WalletSetupLedger {
       const expired=now>=item.expiresAt;
       item.state=item.reduction?'reduced':item.leaderEntry?'leader_entered':item.route==='public_entry'?'direct_entry':expired?'expired_unconfirmed':'awaiting_leader';
       item.lastCheckedAt=now;if(expired&&!item.closedAt)item.closedAt=now;
-      this.db.prepare('UPDATE wsl_setups SET last_checked_at=?,state=?,closed_at=?,data=?,evidence=?,check_seq=?,review_withdrawn=? WHERE id=?')
-        .run(now,item.state,item.closedAt??null,JSON.stringify(item),JSON.stringify(evidence),sequence,item.review.status==='withdrawn'?1:0,item.id);
+      // A concurrent assessment may retract support while this worker is
+      // computing the forward outcome.  Compare the source columns so a stale
+      // observation can never restore the older review; the unchanged row is
+      // naturally retried by the durable pending query on the next cycle.
+      updates.push({now,state:item.state,closedAt:item.closedAt??null,data:JSON.stringify(item),evidence:JSON.stringify(evidence),
+        withdrawn:item.review.status==='withdrawn'?1:0,id:item.id,oldData:String(row.data),oldEvidence:String(row.evidence),
+        oldCheckedAt:String(row.last_checked_at),oldSequence:Number(row.check_seq)});
+    }
+    const save=this.db.prepare(`UPDATE wsl_setups SET last_checked_at=?,state=?,closed_at=?,data=?,evidence=?,check_seq=?,review_withdrawn=?
+      WHERE id=? AND data=? AND evidence=? AND last_checked_at=? AND check_seq=?`),
+      saveSequence=this.db.prepare("INSERT INTO wsl_meta VALUES ('check_seq',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value");
+    for(let offset=0;offset<updates.length;offset+=OBSERVATION_WRITE_BATCH){
+      this.db.exec('BEGIN IMMEDIATE');
+      try {
+        if(offset===0)saveSequence.run(String(sequence));
+        for(const update of updates.slice(offset,offset+OBSERVATION_WRITE_BATCH))save.run(update.now,update.state,update.closedAt,update.data,update.evidence,
+          sequence,update.withdrawn,update.id,update.oldData,update.oldEvidence,update.oldCheckedAt,update.oldSequence);
+        this.db.exec('COMMIT');
+      }catch(error){this.db.exec('ROLLBACK');throw error;}
     }
   }
   list(options:{chain?:Chain;address?:string;limit?:number;offset?:number}={}):{

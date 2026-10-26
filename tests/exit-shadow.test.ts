@@ -40,6 +40,15 @@ test('shadow validates capacity settings and marks its persistent database priva
   assert.equal(summary.status.liveBlockReason,'ENTRY_UNATTENDED_PROTECTION_UNVERIFIED');
 });
 
+test('tracks admits only a current nonclosed shadow episode',t=>{
+  const ctx=setup(t),store=ctx.store;
+  assert.equal(store.tracks(token,new Date(start)),false);
+  store.recordPrice(price(start),seed());assert.equal(store.tracks(token,new Date(start)),true);
+  assert.equal(store.tracks(other,new Date(start)),false);
+  ctx.clock.time=start+60_000;store.recordPrice(price(ctx.clock.time,0.1),undefined);
+  assert.equal(store.tracks(token,new Date(ctx.clock.time)),false);
+});
+
 test('baseline is a fresh post-enable observation; pre-enable, stale, future and invalid prices cannot backfill it',t=>{
   const ctx=setup(t),store=ctx.store;
   store.recordPrice(price(start-1,999),seed());

@@ -61,7 +61,7 @@ function cursorKey(key:unknown):boolean {
 }
 /** Durable observations and independent per-wallet cursors. Capacity stops collection; it never silently deletes evidence. */
 export class ChainStreamStore {
-  private db:DatabaseSync;
+  private db:DatabaseSync;private eventCount=0;
   constructor(private path:string,private maxBytes=256*1024*1024) {
     if(!Number.isSafeInteger(maxBytes)||maxBytes<=0)throw new Error('CHAIN_STORE_LIMIT_INVALID');
     if(path!==':memory:')mkdirSync(dirname(path),{recursive:true,mode:0o700});
@@ -73,6 +73,7 @@ export class ChainStreamStore {
       CREATE TABLE IF NOT EXISTS chain_cursors(key TEXT PRIMARY KEY,value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS chain_sol_replays(key TEXT PRIMARY KEY,data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS chain_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);`);
+    this.eventCount=Number(this.db.prepare('SELECT count(*) AS n FROM chain_events').get()!.n);
   }
   record(input:ChainEvent):boolean {
     const event=validatedEvent(input);if(!event)return false;
@@ -86,7 +87,7 @@ export class ChainStreamStore {
       return false;
     }
     if(this.bytes()+JSON.stringify(event).length*3+16384>this.maxBytes){this.markIncomplete('CHAIN_STORE_CAPACITY');throw new Error('CHAIN_STORE_CAPACITY');}
-    this.db.prepare('INSERT INTO chain_events VALUES (?,?,?,?,?)').run(event.id,event.chain,event.wallet,event.observedAt,JSON.stringify(event));return true;
+    this.db.prepare('INSERT INTO chain_events VALUES (?,?,?,?,?)').run(event.id,event.chain,event.wallet,event.observedAt,JSON.stringify(event));this.eventCount++;return true;
   }
   cursor(key:string):string|undefined {if(!cursorKey(key))throw new Error('CHAIN_CURSOR_INVALID');return this.db.prepare('SELECT value FROM chain_cursors WHERE key=?').get(key)?.value as string|undefined;}
   checkpoint(key:string,value:string):void {
@@ -118,7 +119,7 @@ export class ChainStreamStore {
     if(!Number.isSafeInteger(limit)||limit<1||limit>100)throw new Error('CHAIN_STORE_QUERY_INVALID');
     return this.db.prepare('SELECT data FROM chain_events ORDER BY observed_at DESC,id LIMIT ?').all(limit).map(r=>JSON.parse(String(r.data)));
   }
-  stats(){return {events:Number(this.db.prepare('SELECT count(*) AS n FROM chain_events').get()!.n),bytes:this.bytes(),maxBytes:this.maxBytes,
+  stats(){return {events:this.eventCount,bytes:this.bytes(),maxBytes:this.maxBytes,
     incomplete:!!this.db.prepare("SELECT value FROM chain_meta WHERE key='incomplete'").get()};}
   close(){this.db.close();}
   private bytes(){return this.path===':memory:'?Number(this.db.prepare('PRAGMA page_count').get()!.page_count)*Number(this.db.prepare('PRAGMA page_size').get()!.page_size):

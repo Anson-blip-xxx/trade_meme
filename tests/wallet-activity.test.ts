@@ -218,6 +218,10 @@ test('classifier archive strips arbitrary payloads, keeps transfer evidence, and
     assert.equal(JSON.stringify(store.status()).includes('secret'),false);assert.equal(store.status().recent[0].transfers?.length,2);
     assert.equal(store.record({...r,classification:'retracted',trades:[],reasons:['CHAIN_EVENT_RETRACTED']}),true);
     assert.equal(store.record(r),false);assert.equal(store.status().counts.retracted,1);assert.equal(store.status().counts.buy,undefined);
+    const db=(store as any).db,prepare=db.prepare.bind(db);db.prepare=(sql:string)=>{
+      assert.equal(/GROUP BY kind/i.test(sql),false,'status must use the write-through count cache');return prepare(sql);
+    };
+    assert.equal(store.status().counts.retracted,1);
   }finally{store.close();}
 });
 test('RPC verifier checks chain identity, requests confirmed parsed Solana and coalesces transaction fetches',async()=>{

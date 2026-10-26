@@ -39,7 +39,11 @@ interface Options {
   onCandidate?:(candidate:ThirdSignalCandidate)=>Promise<void>|void;
   executionReady?:()=>{ready:boolean;reason?:string};
   enqueue?:(message:{key:string;text:string})=>boolean;
+  /** Total active plus queued candidate callbacks. Production defaults to one worker and a bounded burst. */
+  dispatchConcurrency?:number;
+  dispatchCapacity?:number;
 }
+interface QueuedDispatch {candidate:ThirdSignalCandidate;complete:()=>void;}
 /** Counts fresh source events; only new live candidates invoke the configured execution callback. */
 export class SignalCounting {
   readonly strategy:ThirdSignalStrategy;
@@ -48,10 +52,19 @@ export class SignalCounting {
   private readonly imported=new Set<string>();
   private sentCandidateKeys=new Set<string>();
   private readonly dispatches=new Set<Promise<void>>();
+  private readonly dispatchQueue:QueuedDispatch[]=[];
+  private readonly dispatchConcurrency:number;
+  private readonly dispatchCapacity:number;
+  private activeDispatches=0;
   private controlledDb?:DatabaseSync;
   private controlledDataVersion=-1;
   private closed=false;
   constructor(private readonly options:Options) {
+    this.dispatchConcurrency=options.dispatchConcurrency??1;
+    this.dispatchCapacity=options.dispatchCapacity??32;
+    if(!Number.isSafeInteger(this.dispatchConcurrency)||this.dispatchConcurrency<1||this.dispatchConcurrency>16||
+      !Number.isSafeInteger(this.dispatchCapacity)||this.dispatchCapacity<this.dispatchConcurrency||this.dispatchCapacity>1000)
+      throw Error('SIGNAL_COUNTING_DISPATCH_OPTIONS_INVALID');
     this.strategy=new ThirdSignalStrategy(options.database);
     try{this.importHistory();}catch{this.historyError='SIGNAL_COUNTING_OPENING_HISTORY_UNAVAILABLE';}
   }
@@ -174,21 +187,62 @@ export class SignalCounting {
   }
   private dispatchCandidate(candidate:ThirdSignalCandidate):void {
     if(!this.options.onCandidate||!this.strategy.claimDispatch(candidate))return;
-    const operation=Promise.resolve().then(async()=>{
-      if(!this.isActive(candidate))throw Error('THIRD_SIGNAL_RUN_STOPPED');
-      await this.options.onCandidate!(candidate);
-      if(!this.closed)this.strategy.finishDispatch(candidate);
-    }).catch(error=>{
-      const reason=error instanceof Error&&/^[A-Z][A-Z0-9_]{1,100}$/.test(error.message)?error.message:'THIRD_SIGNAL_ENTRY_CALLBACK_FAILED';
-      if(!this.closed){
-        try{this.strategy.finishDispatch(candidate,reason);}catch{this.captureError='SIGNAL_COUNTING_CAPTURE_FAILED';}
-        try{this.options.enqueue?.({key:`third-signal:dispatch-failed:${candidate.id}`,text:
-          `【开仓未完成】\n${candidate.name??candidate.symbol??'未命名'} · ${candidate.chain==='solana'?'SOL':candidate.chain}\nCA：${candidate.address}\n原因：${reason}\n本次不自动重复提交；如已有提交记录，以订单查询结果为准。`});}catch{}
-      }
-    }).finally(()=>this.dispatches.delete(operation));
-    this.dispatches.add(operation);
+    if(this.activeDispatches+this.dispatchQueue.length>=this.dispatchCapacity){
+      this.failDispatch(candidate,'THIRD_SIGNAL_DISPATCH_QUEUE_FULL');return;
+    }
+    let resolve!:()=>void;
+    const completion=new Promise<void>(done=>{resolve=done;});
+    const complete=()=>{this.dispatches.delete(completion);resolve();};
+    this.dispatches.add(completion);this.dispatchQueue.push({candidate,complete});
+    // Deliberately synchronous: the first free handler reaches its first await
+    // before the source callback continues into slower research observers.
+    this.drainDispatches();
+  }
+  private failDispatch(candidate:ThirdSignalCandidate,why:unknown):void {
+    const reason=why instanceof Error&&/^[A-Z][A-Z0-9_]{1,100}$/.test(why.message)?why.message:
+      typeof why==='string'&&/^[A-Z][A-Z0-9_]{1,100}$/.test(why)?why:'THIRD_SIGNAL_ENTRY_CALLBACK_FAILED';
+    if(this.closed)return;
+    try{this.strategy.finishDispatch(candidate,reason);}catch{this.captureError='SIGNAL_COUNTING_CAPTURE_FAILED';}
+    try{this.options.enqueue?.({key:`third-signal:dispatch-failed:${candidate.id}`,text:
+      `【开仓未完成】\n${candidate.name??candidate.symbol??'未命名'} · ${candidate.chain==='solana'?'SOL':candidate.chain}\nCA：${candidate.address}\n原因：${reason}\n本次不自动重复提交；如已有提交记录，以订单查询结果为准。`});}catch{}
+  }
+  private drainDispatches():void {
+    while(!this.closed&&this.activeDispatches<this.dispatchConcurrency&&this.dispatchQueue.length){
+      const item=this.dispatchQueue.shift()!;this.activeDispatches++;
+      let operation:Promise<void>;
+      try {
+        if(!this.isActive(item.candidate))throw Error('THIRD_SIGNAL_RUN_STOPPED');
+        // Calling before Promise.resolve is intentional: async handlers execute
+        // synchronously through their first await in this same source-event stack.
+        operation=Promise.resolve(this.options.onCandidate!(item.candidate)).then(()=>{
+          if(!this.closed)this.strategy.finishDispatch(item.candidate);
+        });
+      }catch(error){operation=Promise.reject(error);}
+      void operation.catch(error=>this.failDispatch(item.candidate,error)).finally(()=>{
+        this.activeDispatches--;item.complete();this.drainDispatches();
+      });
+    }
   }
   recordExecution(candidate:ThirdSignalCandidate,execution:ThirdSignalExecution):void {this.strategy.recordExecution(candidate,execution);}
-  async waitForDispatches():Promise<void> {await Promise.all([...this.dispatches]);}
-  close(){this.closed=true;this.controlledDb?.close();this.strategy.close();}
+  async waitForDispatches():Promise<void> {
+    // Work can be enqueued while an active callback is settling. A one-time
+    // snapshot can therefore return while the newly started callback is still
+    // running. Keep observing the live set until both workers and queue drain.
+    for(;;){
+      const pending=[...this.dispatches];
+      if(!pending.length&&this.activeDispatches===0&&!this.dispatchQueue.length)return;
+      if(pending.length)await Promise.allSettled(pending);
+      else await new Promise<void>(resolve=>setImmediate(resolve));
+    }
+  }
+  close(){
+    if(this.closed)return;
+    // Normal runtime shutdown waits before close. Direct callers still get a
+    // durable terminal outcome for queued callbacks and no unresolved promise.
+    while(this.dispatchQueue.length){
+      const item=this.dispatchQueue.shift()!;
+      this.failDispatch(item.candidate,'THIRD_SIGNAL_SERVICE_CLOSED');item.complete();
+    }
+    this.closed=true;this.controlledDb?.close();this.strategy.close();
+  }
 }

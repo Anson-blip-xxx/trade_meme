@@ -150,6 +150,8 @@ export class GmgnEntryHolderReader {
     const result: EntryHolderRiskValues = {provider: 'gmgn', chain: 'solana', address: tokenAddress, checkedAt,
       values: {top10: unknownMetric(TOP10_FIELD), bundler: unknownMetric(sourceField('bundler')),
         ratTrader: unknownMetric(sourceField('rat_trader'))}, evidence};
+    // Keep the start timestamp as the freshness boundary. A slow or queued
+    // multi-endpoint assessment is not safe to present as newly sampled.
     const complete = () => {result.completedAt = this.now().toISOString(); return result;};
     if (!address(tokenAddress)) {
       evidence.identity = {status: 'invalid', reasons: ['ENTRY_HOLDER_RISK_TOKEN_INVALID']};

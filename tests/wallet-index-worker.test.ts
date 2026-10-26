@@ -23,6 +23,8 @@ test('wallet-index worker completes the coordination and association quotas on a
   let history=new WalletHistory(database);
   history.recordTrade(base);
   history.recordTrade({...base,wallet:leader,txHash:hash(2),eventAt:iso(-20_000),observedAt:iso(-10_000),source:'gmgn_kol_feed'});
+  history.captureFunding({chain:'bsc',address:token},candidate,{address:address(500),timestamp:iso(-70_000),txHash:hash(500)},
+    {source:'gmgn_funding',observedAt:iso(-5_000),snapshotAt:iso(-5_000)});
   assert.ok(history.stats().coordinationPending>0);assert.ok(history.associationStats().pending>0);history.close();
 
   const runner=new WalletIndexRunner({database,maxBytes:512*1024*1024,intervalMs:1_000});
@@ -31,11 +33,16 @@ test('wallet-index worker completes the coordination and association quotas on a
     const status=runner.snapshot();
     assert.equal(status.coordinationError,undefined);assert.equal(status.associationError,undefined);
     assert.ok(status.coordinationMs>=0);assert.ok(status.associationMs>=0);
+    assert.equal(status.associationStats?.pending,0);assert.equal(status.associationStats?.relations,1);
+    const firstCompleted=status.completedAt,firstStatsAt=status.associationStatsRefreshedAt;
+    assert.ok(firstStatsAt);await waitFor(()=>runner.snapshot().completedAt!==firstCompleted);
+    assert.equal(runner.snapshot().associationStatsRefreshedAt,firstStatsAt);
   } finally {await runner.stop();}
 
   history=new WalletHistory(database);
   try {
     assert.equal(history.stats().coordinationPending,0);
+    assert.equal(history.associationInvalidationStatus().pending,0);
     assert.equal(history.associationStats().pending,0);
     assert.equal(history.listAssociations().total,1);
   } finally {history.close();rmSync(directory,{recursive:true,force:true});}

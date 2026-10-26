@@ -38,6 +38,10 @@ export interface JevShadowStatus {
   storage:{usedBytes:number;maxBytes:number;prunedRecords:number;retentionDays:number;maxRecords:number};
   limits:{timeoutMs:number;minIntervalMs:number;perTokenIntervalMs:number;queueLimit:number;queueExpiryMs:number;baselineWaitMs:number;horizonLateToleranceMs:number};
 }
+/** Expensive historical totals are produced by a read-only worker in production. */
+export interface JevStatusAggregate {
+  counts:JevShadowStatus['counts'];comparison:JevShadowStatus['comparison'];usedBytes:number;computedAt:string;
+}
 type Row=Record<string,any>;
 interface Pending {id:string;input:JevInput;request:unknown;receivedAt:number;hash:string;}
 const QUEUE_LIMIT=32,QUEUE_EXPIRY_MS=30_000,BASELINE_WAIT_MS=120_000,LATE_MS=120_000,MAX_RECORDS=20_000,RETENTION_MS=14*86_400_000;
@@ -343,12 +347,15 @@ export class JevShadow {
       }
     }catch {this.storageFailure();}
   }
-  status():JevShadowStatus {
+  status(aggregate?:JevStatusAggregate|null):JevShadowStatus {
     let usedBytes=0;const counts={total:0,available:0,unavailable:0,pending:0};
     const comparison:JevShadowStatus['comparison']={eligible:0,selected:0,rejected:0,excluded:0,priced:0,horizons:[]};
     try {
       this.refreshBudget();
-      if(this.db){
+      if(aggregate){
+        usedBytes=aggregate.usedBytes;Object.assign(counts,aggregate.counts);Object.assign(comparison,aggregate.comparison);
+        comparison.horizons=aggregate.comparison.horizons.map(row=>({...row}));
+      } else if(this.db&&aggregate===undefined){
         usedBytes=Number(this.db.prepare('PRAGMA page_count').get()!.page_count)*Number(this.db.prepare('PRAGMA page_size').get()!.page_size);
         for(const row of this.db.prepare('SELECT status,count(*) AS n FROM jev_results GROUP BY status').all()){
           counts.total+=Number(row.n);if(row.status==='available'||row.status==='unavailable'||row.status==='pending')counts[row.status]+=Number(row.n);

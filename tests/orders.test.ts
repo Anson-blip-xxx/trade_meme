@@ -94,6 +94,26 @@ test('旧账本中的未知、缺失退出及未保护已确认仓位，跨资�
   }
 });
 
+test('openingCapacity accounts for every in-flight live state before remote admission work',()=>{
+ const now=new Date('2026-10-11T00:00:00Z');
+ for(const status of ['prepared','submitting','submitted','confirmed','unknown'] as const){
+   const store=new OrderStore(':memory:');
+   try {
+     const order=store.reserve({...input(`capacity-${status}`),mode:'live'},3,now).order!;
+     if(status!=='prepared')assert.equal(store.update(order.id,['prepared'],{status},now)?.status,status);
+     const capacity=store.openingCapacity('live',3,now);
+     assert.equal(capacity.occupied,1,status);assert.equal(capacity.available,0,status);
+     assert.equal(capacity.reason,'EXIT_PROTECTION_UNVERIFIED',status);
+   }finally{store.close();}
+ }
+ const terminal=new OrderStore(':memory:');
+ try {
+   const order=terminal.reserve({...input('capacity-failed'),mode:'live'},3,now).order!;
+   terminal.update(order.id,['prepared'],{status:'failed'},now);
+   assert.deepEqual(terminal.openingCapacity('live',3,now),{available:3,occupied:0});
+ }finally{terminal.close();}
+});
+
 test('发送前事务再次核验其他仓位，阻止报价后新增的未知风险',()=>{
   const now=new Date('2026-10-11T00:00:00Z');
   const store=new OrderStore(':memory:');

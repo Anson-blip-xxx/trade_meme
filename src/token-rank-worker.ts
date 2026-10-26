@@ -8,7 +8,9 @@ const engine=new TokenRankResearch(options);
 let stopping=false,timer:ReturnType<typeof setTimeout>|undefined;
 const run=()=>{
   if(stopping)return;parentPort!.postMessage({type:'working'});
-  try{engine.runBatch(batchSize);parentPort!.postMessage({type:'status',status:engine.status()});}
+  // runBatch already returns the status captured after the committed batch. Reusing it
+  // avoids immediately repeating aggregate reads against the multi-gigabyte database.
+  try{const status=engine.runBatch(batchSize);parentPort!.postMessage({type:'status',status});}
   catch{parentPort!.postMessage({type:'failed'});}
   if(!stopping)timer=setTimeout(run,intervalSec*1000);
 };

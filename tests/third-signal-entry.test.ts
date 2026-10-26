@@ -31,6 +31,7 @@ function candidate(at:number,overrides:Record<string,unknown>={}):ThirdSignalCan
 function fixture(t:{after:(fn:()=>void)=>void},options:{store?:OrderStore;config?:Partial<Config>;enabled?:boolean;
   quote?:(body:Record<string,string>)=>unknown|Promise<unknown>;onBalance?:(n:number)=>void;swap?:(body:Record<string,unknown>)=>unknown|Promise<unknown>;
   scheduleRequest?:ThirdSignalEntryOptions['scheduleRequest'];noHolderRisk?:boolean;
+  maxConcurrent?:number;
   native?:ThirdSignalEntryOptions['native'];
   holderRisk?:(address:string)=>EntryHolderRiskValues|Promise<EntryHolderRiskValues>}={}) {
   const clock={now:Date.now()+1000},state={active:true,balance:1000000000,balanceReads:0,posts:0,quotes:0,riskReads:0},swaps:Record<string,unknown>[]=[];
@@ -64,7 +65,7 @@ function fixture(t:{after:(fn:()=>void)=>void},options:{store?:OrderStore;config
   };
   const controller=new ThirdSignalEntryController(config,store,{enabled:options.enabled??true,isActive:()=>state.active,
     now:()=>new Date(clock.now),fetcher,scheduleRequest:options.scheduleRequest,
-    native:options.native,
+    native:options.native,maxConcurrent:options.maxConcurrent,
     readHolderRisk:options.noHolderRisk?undefined:async address=>{state.riskReads++;return options.holderRisk?options.holderRisk(address):holdingRisk(clock.now,address);}});
   return {controller,store,config,state,clock,swaps,fetcher,candidate:()=>candidate(clock.now)};
 }
@@ -88,6 +89,22 @@ test('disabled, stopped, simulated, wrong chain/source/count/cap and stale candi
   const disabled=fixture(t,{enabled:false});assert.equal((await disabled.controller.consider(disabled.candidate())).reason,'THIRD_ENTRY_DISABLED');
   const stopped=fixture(t);stopped.state.active=false;assert.equal((await stopped.controller.consider(stopped.candidate())).reason,'THIRD_ENTRY_RUN_STOPPED');
   const stale=fixture(t);assert.equal((await stale.controller.consider(candidate(stale.clock.now-120001))).reason,'THIRD_ENTRY_CANDIDATE_EXPIRED');
+});
+
+test('pre-reservation admission bounds remote work by local opening slots and the internal job limit',async t=>{
+  const slots=fixture(t,{config:{entryMaxOpen:2},maxConcurrent:3});
+  const first=slots.controller.consider(candidate(slots.clock.now,{address:bs58.encode(new Uint8Array(32).fill(11))}));
+  const second=slots.controller.consider(candidate(slots.clock.now,{address:bs58.encode(new Uint8Array(32).fill(12))}));
+  const overflow=await slots.controller.consider(candidate(slots.clock.now,{address:bs58.encode(new Uint8Array(32).fill(13))}));
+  assert.equal(overflow.reason,'OPENING_LIMIT_REACHED');
+  slots.state.active=false;await Promise.all([first,second]);
+  assert.equal(slots.state.balanceReads,2);assert.equal(slots.state.riskReads,0);
+
+  const jobs=fixture(t,{config:{entryMaxOpen:3},maxConcurrent:1});
+  const running=jobs.controller.consider(candidate(jobs.clock.now,{address:bs58.encode(new Uint8Array(32).fill(14))}));
+  const busy=await jobs.controller.consider(candidate(jobs.clock.now,{address:bs58.encode(new Uint8Array(32).fill(15))}));
+  assert.equal(busy.reason,'THIRD_ENTRY_BUSY');jobs.state.active=false;await running;
+  assert.equal(jobs.state.balanceReads,1);assert.equal(jobs.state.riskReads,0);
 });
 
 test('wrong sizing and missing or legacy exits cannot silently trade the new strategy',async t=>{

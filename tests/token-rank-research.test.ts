@@ -116,10 +116,15 @@ test('wallet page index migrates from append-only versions and keeps current ord
     const pages=new DatabaseSync(`${f.out}.wallet-pages.sqlite`,{readOnly:true});
     try {
       assert.equal(Number(pages.prepare('SELECT count(*) AS n FROM tr_wallet_latest').get()!.n),3);
+      assert.equal(Number(pages.prepare('SELECT count(*) AS n FROM tr_token_latest').get()!.n),1);
       assert.equal(pages.prepare("SELECT value FROM tr_wallet_page_meta WHERE key='published_at'").get()!.value,published);
       const plan=pages.prepare(`EXPLAIN QUERY PLAN SELECT version_id FROM tr_wallet_latest INDEXED BY tr_wallet_latest_realized
         ORDER BY realized DESC NULLS LAST,early_count DESC,chain,address LIMIT 20`).all().map(row=>String(row.detail));
       assert.ok(plan.some(line=>line.includes('tr_wallet_latest_realized')));assert.ok(plan.every(line=>!line.includes('TEMP B-TREE')));
+      const tokenPlan=pages.prepare(`EXPLAIN QUERY PLAN SELECT version_id FROM tr_token_latest
+        WHERE registered_at<=? ORDER BY registered_at DESC,chain,address LIMIT 20 OFFSET 1000`).all(published).map(row=>String(row.detail));
+      assert.ok(tokenPlan.some(line=>line.includes('tr_token_latest_registered')));
+      assert.ok(tokenPlan.every(line=>!line.includes('TEMP B-TREE')));
     }finally{pages.close();}
     const evidence=new DatabaseSync(f.out,{readOnly:true});
     try {
@@ -129,6 +134,13 @@ test('wallet page index migrates from append-only versions and keeps current ord
         SELECT v.data FROM selected s JOIN tr_wallet_versions v ON v.id=s.version_id
         ORDER BY s.realized DESC NULLS LAST,s.early_count DESC,s.chain,s.address`).all().map(row=>String(row.detail));
       assert.ok(plan.some(line=>line.includes('tr_wallet_latest_realized')));assert.ok(plan.some(line=>line.includes('INTEGER PRIMARY KEY')));
+      const tokenPlan=evidence.prepare(`EXPLAIN QUERY PLAN WITH selected AS MATERIALIZED (
+          SELECT l.* FROM wallet_pages.tr_token_latest l WHERE l.registered_at<=?
+          ORDER BY l.registered_at DESC,l.chain,l.address LIMIT 20 OFFSET 1000)
+        SELECT v.data FROM selected s JOIN tr_token_versions v ON v.id=s.version_id
+        ORDER BY s.registered_at DESC,s.chain,s.address`).all(published).map(row=>String(row.detail));
+      assert.ok(tokenPlan.some(line=>line.includes('tr_token_latest_registered')));
+      assert.ok(tokenPlan.some(line=>line.includes('INTEGER PRIMARY KEY')));
     }finally{evidence.close();}
     f.advance(130);f.profit(1,'100',null,'100',125);migrated.runBatch();
     assert.equal(r.wallets({sort:'realized'}).items[0].address,address(1),'incremental publication updates ordering atomically');

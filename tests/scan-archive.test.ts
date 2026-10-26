@@ -137,6 +137,18 @@ test('price writes do not run retention maintenance; explicit prune still remove
   }finally{db.close();archive.close();rmSync(dir,{recursive:true,force:true});}
 });
 
+test('hot readers and the scheduled sweep share one minute-gated retention pass',()=>{
+  let elapsed=1_000;const archive=new ScanArchive(':memory:',{now:()=>new Date(start+elapsed)}),
+    internal=archive as unknown as {comparison:{prune:(now:Date)=>boolean}};
+  const prune=internal.comparison.prune.bind(internal.comparison);let calls=0;
+  internal.comparison.prune=now=>{calls++;return prune(now);};
+  try {
+    archive.capture(stored());elapsed+=60_000;archive.pendingTokens();assert.equal(calls,1);
+    archive.get('scan-1');archive.list();archive.watchStatus();archive.maintenance();assert.equal(calls,1);
+    archive.prune();assert.equal(calls,2,'an explicit operator prune remains forceful');
+  }finally{archive.close();}
+});
+
 test('detailed stats rebuild from persisted scalar columns after restart',()=>{
   const dir=mkdtempSync(join(tmpdir(),'meme-scan-stats-restart-')),path=join(dir,'scans.sqlite');
   let archive:ScanArchive|undefined=new ScanArchive(path,{now:()=>new Date(start+1_000)});

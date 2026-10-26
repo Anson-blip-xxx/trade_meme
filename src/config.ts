@@ -51,7 +51,7 @@ export interface Config extends z.infer<typeof schema> {
   exitPolicy?:ExitPolicy;
   dashboard:{enabled:boolean;host:string;port:number;token?:string;origin?:string;archivePath:string;retentionDays:number;trackingHours:number;sampleIntervalSec:number};
   walletResearch:{enabled:boolean;database:string;maxBytes:number;intervalSec:number;maxRequestsPerCycle:number};
-  walletProfiles:{enabled:boolean;database:string;maxBytes:number;intervalSec:number;batchSize:number};
+  walletProfiles:{enabled:boolean;database:string;maxBytes:number;intervalSec:number;batchSize:number;refreshAfterSec:number};
   walletScreening:{enabled:boolean;database:string;maxBytes:number};
   meme?:{enabled:boolean;database:string;maxBytes:number;maxActive:number;activeWindowSec:number};
   jev?:{enabled:boolean;database:string;maxBytes:number;timeoutMs:number;minIntervalMs:number;perTokenIntervalMs:number;
@@ -222,14 +222,15 @@ export function readConfig(env:NodeJS.ProcessEnv=process.env): Config {
       maxRequestsPerCycle:z.coerce.number().int().min(1).max(10).parse(env.WALLET_OBSERVER_MAX_REQUESTS??9)},
     tokenRankResearch:{enabled:z.enum(['true','false']).parse(env.TOKEN_RANK_RESEARCH_ENABLED??env.WALLET_RESEARCH_ENABLED??'false')==='true',
       database:z.string().trim().refine(isPersistentOrderPath).parse(env.TOKEN_RANK_RESEARCH_DATABASE_PATH??`${env.WALLET_HISTORY_DATABASE_PATH??'data/wallet-history.sqlite'}.rank-research.sqlite`),
-      maxBytes:z.coerce.number().int().min(16).max(4096).parse(env.TOKEN_RANK_RESEARCH_MAX_MB??512)*1024*1024,
+      maxBytes:z.coerce.number().int().min(16).max(16384).parse(env.TOKEN_RANK_RESEARCH_MAX_MB??512)*1024*1024,
       intervalSec:z.coerce.number().int().min(1).max(300).parse(env.TOKEN_RANK_RESEARCH_INTERVAL_SEC??15),
       batchSize:z.coerce.number().int().min(1).max(2000).parse(env.TOKEN_RANK_RESEARCH_BATCH_SIZE??500)},
     walletProfiles:{enabled:z.enum(['true','false']).parse(env.WALLET_PROFILES_ENABLED??env.WALLET_RESEARCH_ENABLED??'false')==='true',
       database:z.string().trim().refine(isPersistentOrderPath).parse(env.WALLET_PROFILES_DATABASE_PATH??'data/wallet-profiles.sqlite'),
       maxBytes:z.coerce.number().int().min(16).max(4096).parse(env.WALLET_PROFILES_MAX_MB??512)*1024*1024,
       intervalSec:z.coerce.number().int().min(1).max(300).parse(env.WALLET_PROFILES_INTERVAL_SEC??2),
-      batchSize:z.coerce.number().int().min(1).max(500).parse(env.WALLET_PROFILES_BATCH_SIZE??100)},
+      batchSize:z.coerce.number().int().min(1).max(500).parse(env.WALLET_PROFILES_BATCH_SIZE??100),
+      refreshAfterSec:z.coerce.number().int().min(300).max(604800).parse(env.WALLET_PROFILES_REFRESH_AFTER_SEC??21600)},
     exitShadow:{enabled:z.enum(['true','false']).default('false').parse(env.EXIT_SHADOW_ENABLED)==='true',
       database:z.string().trim().refine(isPersistentOrderPath).parse(env.EXIT_SHADOW_DATABASE_PATH??'data/exit-shadow.sqlite'),
       maxBytes:z.coerce.number().int().min(16).max(4096).parse(env.EXIT_SHADOW_MAX_MB??128)*1024*1024,

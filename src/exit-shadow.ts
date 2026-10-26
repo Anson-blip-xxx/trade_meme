@@ -260,6 +260,14 @@ export class ExitShadow {
     return rows.map(row=>({chain:row.chain as Chain,address:String(row.address)}));
   }
 
+  /** Exact indexed admission check for optional wallet-pressure research. */
+  tracks(value:ScanToken,now=this.now()):boolean {
+    const target=identity(value);if(!target||!Number.isFinite(now.getTime()))return false;
+    const row=this.current(target);if(!row||!['tracking','exit_pending'].includes(row.phase))return false;
+    const state=JSON.parse(row.state) as AdaptiveExitState;
+    return !state.shadowClosed&&(continuousPolicy(state.policyVersion)||Date.parse(row.ends_at)>now.getTime());
+  }
+
   private activeIntent(id:string):ShadowExitIntent|undefined {
     const intent=this.intent(id);return intent?.cancelledAt?undefined:intent;
   }

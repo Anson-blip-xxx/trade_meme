@@ -188,6 +188,71 @@ test('explicit live start dispatches exactly one fresh third event and retains p
  }finally{s.close();f.close();}
 });
 
+test('live dispatch starts in the source stack, bounds bursts, and durably rejects overflow without replay',async()=>{
+ const f=fixture(),addresses=[mint,bs58.encode(Buffer.alloc(32,3)),bs58.encode(Buffer.alloc(32,4))];
+ let release!:()=>void,calls=0;const gate=new Promise<void>(resolve=>{release=resolve;});
+ let s=new SignalCounting({...f.options,executionMode:'live',allowedChains:['solana'],dispatchConcurrency:1,dispatchCapacity:2,
+   onCandidate:async()=>{calls++;if(calls===1)await gate;}});
+ try {
+   s.control('start','tg');
+   for(const [index,address] of addresses.entries()){
+     for(let n=0;n<3;n++)s.observe(observation('debot',address,'solana'));
+     assert.equal(calls,index===0?1:1,'only the first callback starts while its worker is occupied');
+   }
+   const overflow=s.page({limit:20}).items.find(item=>item.address===addresses[2]);
+   assert.equal(overflow?.dispatchState,'failed');assert.equal(overflow?.dispatchReason,'THIRD_SIGNAL_DISPATCH_QUEUE_FULL');
+   release();await s.waitForDispatches();assert.equal(calls,2);
+   assert.equal(s.page({limit:20}).items.find(item=>item.address===addresses[1])?.dispatchState,'handled');
+   s.close();s=new SignalCounting({...f.options,executionMode:'live',allowedChains:['solana'],onCandidate:()=>{calls++;}});
+   s.tick();await s.waitForDispatches();assert.equal(calls,2,'a durably failed overflow candidate is never replayed');
+ }finally{s.close();f.close();}
+});
+
+test('waitForDispatches follows callbacks enqueued while an active callback is settling',async()=>{
+ const f=fixture(),next=bs58.encode(Buffer.alloc(32,9));
+ let releaseFirst!:()=>void,releaseSecond!:()=>void,secondStarted!:()=>void,calls=0;
+ const firstGate=new Promise<void>(resolve=>{releaseFirst=resolve;});
+ const secondGate=new Promise<void>(resolve=>{releaseSecond=resolve;});
+ const started=new Promise<void>(resolve=>{secondStarted=resolve;});
+ const s:SignalCounting=new SignalCounting({...f.options,executionMode:'live',allowedChains:['solana'],
+   dispatchConcurrency:1,dispatchCapacity:4,onCandidate:async()=>{
+     calls++;
+     if(calls===1){await firstGate;for(let n=0;n<3;n++)s.observe(observation('debot',next,'solana'));return;}
+     secondStarted();await secondGate;
+   }});
+ try {
+   s.control('start','tg');for(let n=0;n<3;n++)s.observe(observation('debot',mint,'solana'));
+   let settled=false;const waiting=s.waitForDispatches().then(()=>{settled=true;});
+   releaseFirst();await started;await Promise.resolve();
+   assert.equal(calls,2);assert.equal(settled,false,'wait must include work admitted while its original snapshot settles');
+   releaseSecond();await waiting;assert.equal(settled,true);
+   assert.ok(s.page({limit:20}).items.every(item=>item.dispatchState==='handled'));
+ }finally{s.close();f.close();}
+});
+
+test('queued stop, synchronous throw, and ordinary callback return all settle without leaking dispatches',async()=>{
+ const f=fixture(),queued=bs58.encode(Buffer.alloc(32,10)),thrown=bs58.encode(Buffer.alloc(32,11)),plain=bs58.encode(Buffer.alloc(32,12));
+ let release!:()=>void,queuedCalls=0,plainCalls=0;const gate=new Promise<void>(resolve=>{release=resolve;});
+ const s=new SignalCounting({...f.options,executionMode:'live',allowedChains:['solana'],dispatchConcurrency:1,dispatchCapacity:4,
+   onCandidate:candidate=>{
+     if(candidate.address===mint)return gate;
+     if(candidate.address===queued){queuedCalls++;return;}
+     if(candidate.address===thrown)throw Error('THIRD_SIGNAL_SYNC_FAILURE');
+     if(candidate.address===plain){plainCalls++;return;}
+   }});
+ const emit=(address:string)=>{for(let n=0;n<3;n++)s.observe(observation('debot',address,'solana'));};
+ try {
+   s.control('start','tg');emit(mint);emit(queued);s.control('stop','web');release();await s.waitForDispatches();
+   assert.equal(queuedCalls,0);
+   assert.equal(s.page({limit:20}).items.find(item=>item.address===queued)?.dispatchReason,'THIRD_SIGNAL_RUN_STOPPED');
+   s.control('start','tg');emit(thrown);emit(plain);await s.waitForDispatches();
+   const page=s.page({limit:20}).items;
+   assert.equal(page.find(item=>item.address===thrown)?.dispatchReason,'THIRD_SIGNAL_SYNC_FAILURE');
+   assert.equal(page.find(item=>item.address===plain)?.dispatchState,'handled');assert.equal(plainCalls,1);
+   await s.waitForDispatches();
+ }finally{s.close();f.close();}
+});
+
 test('deployment with live configuration neither upgrades a simulation run nor replays historical candidates',async()=>{
  const f=fixture();let s=new SignalCounting(f.options),calls=0;
  try {
@@ -204,7 +269,7 @@ test('deployment with live configuration neither upgrades a simulation run nor r
  }finally{s.close();f.close();}
 });
 
-test('stop before dispatch and stop during asynchronous preparation fence new submissions',async()=>{
+test('stop after immediate dispatch start and during asynchronous preparation fences new submissions',async()=>{
  for(const stopBeforeCallback of [true,false]) {
    const f=fixture();let submitted=0,prepared=0,release!:()=>void;
    const gate=new Promise<void>(resolve=>{release=resolve;});
@@ -215,7 +280,7 @@ test('stop before dispatch and stop during asynchronous preparation fence new su
      s.control('start','tg');for(let i=0;i<3;i++)s.observe(observation('debot',mint,'solana'));
      if(!stopBeforeCallback)await new Promise(resolve=>setImmediate(resolve));
      s.control('stop','web');release();await s.waitForDispatches();
-     assert.equal(submitted,0);assert.equal(prepared,stopBeforeCallback?0:1);
+     assert.equal(submitted,0);assert.equal(prepared,1);
      assert.equal(s.page().items[0].dispatchState,'failed');assert.equal(s.page().items[0].dispatchReason,'THIRD_SIGNAL_RUN_STOPPED');
      s.control('start','tg');for(let i=0;i<3;i++)s.observe(observation('debot',mint,'solana'));
      await s.waitForDispatches();assert.equal(submitted,0);assert.equal(s.status().candidates,0);

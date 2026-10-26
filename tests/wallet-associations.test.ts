@@ -38,12 +38,24 @@ test('existing histories gain the token invalidation covering index without chan
     try {
       assert.deepEqual(reader.prepare('PRAGMA index_info(wh_assoc_episode_token)').all().map(row=>row.name),
         ['chain','token_address','active','leader','candidate']);
+      assert.deepEqual(reader.prepare('PRAGMA index_info(wh_assoc_anchor_recent)').all().map(row=>row.name),
+        ['chain','public_observed_at','leader','token_address']);
       const lookup='SELECT leader,candidate FROM wh_assoc_episodes WHERE chain=? AND token_address=? AND active=1';
       const plan=reader.prepare(`EXPLAIN QUERY PLAN ${lookup}`).all(chain,token).map(row=>String(row.detail));
       assert.ok(plan.some(detail=>detail.includes('COVERING INDEX wh_assoc_episode_token')&&detail.includes('chain=? AND token_address=? AND active=?')));
       const updatePlan=reader.prepare(`EXPLAIN QUERY PLAN UPDATE wh_assoc_relations SET dirty=1 WHERE chain=? AND (leader,candidate) IN (${lookup})`)
         .all(chain,chain,token).map(row=>String(row.detail));
       assert.ok(updatePlan.some(detail=>detail.includes('COVERING INDEX wh_assoc_episode_token')));
+      const recentPlan=reader.prepare(`EXPLAIN QUERY PLAN SELECT chain,leader,token_address,public_observed_at,collection_checked_at
+        FROM wh_assoc_anchors INDEXED BY wh_assoc_anchor_recent WHERE chain=? AND public_observed_at>=? AND public_observed_at<=?
+        ORDER BY COALESCE(collection_checked_at,''),public_observed_at DESC,leader,token_address LIMIT 20`)
+        .all(chain,iso(0),iso(100)).map(row=>String(row.detail));
+      assert.ok(recentPlan.some(detail=>detail.includes('INDEX wh_assoc_anchor_recent')&&detail.includes('chain=? AND public_observed_at>?')));
+      const knownPlan=reader.prepare(`EXPLAIN QUERY PLAN SELECT chain,leader,candidate,collection_checked_at,token_count,funding_count
+        FROM wh_assoc_relations INDEXED BY wh_assoc_relation_targets WHERE chain=? AND token_count>0
+        ORDER BY COALESCE(collection_checked_at,''),token_count DESC,funding_count DESC,leader,candidate LIMIT 20`)
+        .all(chain).map(row=>String(row.detail));
+      assert.ok(knownPlan.some(detail=>detail.includes('INDEX wh_assoc_relation_targets')&&detail.includes('chain=?')));
     } finally {reader.close();}
     history.recordTrade(trade({wallet:address(8),eventAt:iso(40),observedAt:iso(80),txHash:hash(800)}));
     assert.equal(history.getAssociation(chain,leader,candidate)!.association.status,'stale');
@@ -160,6 +172,7 @@ test('candidate funds leader is direct vendor evidence and public funder reclass
     assert.equal(detail.fundingEvidence[0].edges[0].wallet,leader);assert.equal(detail.fundingEvidence[0].edges[0].fundingAddress,candidate);
     assert.equal(detail.fundingEvidence[0].observedAt,iso(80)); // Funding learned after leader trade is never backdated.
     setNow(200);history.captureLeaders(chain,[{address:candidate,period:'7d',labels:['exchange_or_pool']}],{source:'gmgn_stats',observedAt:iso(150)});
+    for(let batch=0;batch<4&&history.associationInvalidationStatus().pending;batch++)history.flushAssociationInvalidations(64);
     assert.equal(history.getAssociation(chain,leader,candidate)!.association.status,'stale');history.refreshAssociations();
     detail=history.getAssociation(chain,leader,candidate)!;assert.equal(detail.fundingEvidence.length,0);assert.equal(detail.association.status,'current');
     assert.equal(detail.association.forwardValidatedTokens,0);

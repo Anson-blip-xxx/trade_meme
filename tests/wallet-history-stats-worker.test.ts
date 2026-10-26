@@ -32,3 +32,18 @@ test('wallet-history stats run off-thread and a failed refresh retains the last 
     assert.equal(failed.computedAt,first.computedAt);assert.deepEqual(failed.store,first.store);
   } finally {await runner.stop();rmSync(directory,{recursive:true,force:true});}
 });
+
+test('wallet-history stats advance exact append-only counts without a historical recount',async()=>{
+  const directory=mkdtempSync(join(tmpdir(),'wallet-history-stats-incremental-')),database=join(directory,'history.sqlite'),
+    history=new WalletHistory(database),maxBytes=history.stats().maxBytes;
+  const runner=new WalletHistoryStatsRunner({database,maxBytes,intervalMs:100,staleAfterMs:2_000});
+  try {
+    runner.start();await waitFor(()=>runner.snapshot().state==='fresh');const first=runner.snapshot();
+    history.recordTrade({chain:'bsc',wallet:'0x'+'1'.repeat(40),tokenAddress:'0x'+'2'.repeat(40),txHash:'0x'+'3'.repeat(64),
+      side:'buy',eventAt:new Date(Date.now()-1000).toISOString(),observedAt:new Date().toISOString(),source:'gmgn_wallet_activity'});
+    await waitFor(()=>runner.snapshot().computedAt!==first.computedAt&&runner.snapshot().store?.events===1);
+    const next=runner.snapshot().store!;
+    assert.equal(next.wallets,1);assert.equal(next.events,1);assert.equal(next.observations,1);assert.equal(next.tokens,1);
+    assert.equal(next.firstObservedAt,next.lastObservedAt);assert.equal(next.snapshots,0);
+  } finally {await runner.stop();history.close();rmSync(directory,{recursive:true,force:true});}
+});

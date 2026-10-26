@@ -65,6 +65,8 @@ export interface DashboardServices {
   walletResearchStatus?:()=>unknown;
   walletResearchHints?:WalletHistory['researchSeedHints'];
   walletAssociations?:Pick<WalletHistory,'listAssociations'|'getAssociation'|'associationStats'>;
+  /** Worker-produced aggregate; avoids scanning the 9 GB graph on an HTTP request. */
+  walletAssociationsStatus?:()=>unknown;
   walletProfiles?:Pick<WalletProfileReader,'list'|'get'>;
   walletProfilesStatus?:()=>unknown;
   walletScreening?:Pick<WalletSetupLedger,'list'|'status'>;
@@ -339,7 +341,7 @@ export function buildDashboard(config:Config,services:DashboardServices,assetDir
         send(res,profile?200:404,profile?withResearchHints(profile):{error:'NOT_FOUND'});return;
       }
       if(url.pathname==='/dashboard/api/wallet-associations/status') {
-        send(res,200,services.walletAssociations?{enabled:true,...services.walletAssociations.associationStats()}:{enabled:false});return;
+        send(res,200,services.walletAssociations?{enabled:true,...(services.walletAssociationsStatus?.()??services.walletAssociations.associationStats())}:{enabled:false});return;
       }
       if(url.pathname==='/dashboard/api/wallet-associations') {
         const chain=url.searchParams.get('chain')||undefined,search=url.searchParams.get('search')??'';

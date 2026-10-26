@@ -34,6 +34,7 @@ export interface TelegramControlStatus {
   interrupted?:number;
   pendingReplies?:number;
   pendingTokenCards?:number;
+  pendingTradeActions?:number;
 }
 export interface TelegramControlsOptions {
   token:string;
@@ -75,7 +76,10 @@ type Command=({action:TelegramCountAction;help?:boolean}|{action:'positions';pag
 type AckOnly={action:'ack_only';callbackId:string;text:string};
 type TokenCardCommand=Extract<Command,{action:'token_card'}>;
 type TokenCardJob={updateId:number;command:TokenCardCommand};
+type TradeCommand=Extract<Command,{action:'sell'}>;
+type TradeJob={updateId:number;command:TradeCommand};
 const TOKEN_CARD_QUEUE_CAPACITY=16;
+const TRADE_QUEUE_CAPACITY=32;
 const object=(value:unknown):value is Row=>typeof value==='object'&&value!==null&&!Array.isArray(value);
 const positiveId=(value:unknown):value is number=>typeof value==='number'&&Number.isSafeInteger(value)&&value>0;
 const updateId=(value:unknown):value is number=>typeof value==='number'&&Number.isSafeInteger(value)&&value>=0&&value<Number.MAX_SAFE_INTEGER;
@@ -136,6 +140,9 @@ export class TelegramControls {
   private tokenCardWorker?:Promise<void>;
   private tokenCardKick?:ReturnType<typeof setImmediate>;
   private tokenCardActive=0;
+  private readonly tradeQueue:TradeJob[]=[];
+  private tradeWorker?:Promise<void>;
+  private tradeActive=0;
 
   constructor(private readonly options:TelegramControlsOptions) {
     this.token=options.token?.trim();this.chatId=options.chatId?.trim();
@@ -178,13 +185,19 @@ export class TelegramControls {
 
   start():void {
     if(this.closed||this.closing||this.running||this.stopping)return;
-    this.running=true;this.blocked=false;this.schedule();this.scheduleTokenCardWorker();
+    this.running=true;this.blocked=false;this.schedule();this.scheduleTokenCardWorker();this.scheduleTradeWorker();
   }
   async stop():Promise<void> {
     this.running=false;this.stopping=true;if(this.timer)clearTimeout(this.timer);this.timer=undefined;
     if(this.tokenCardKick)clearImmediate(this.tokenCardKick);this.tokenCardKick=undefined;
     for(const controller of this.controllers)controller.abort();
-    await this.inFlight;await this.tokenCardWorker;await Promise.allSettled([...this.acknowledgements]);this.stopping=false;
+    await this.inFlight;await this.tokenCardWorker;await this.tradeWorker;
+    // Claimed sales that did not start before shutdown must not execute later or
+    // disappear as a silent button failure. The position action itself remains
+    // unused, so a fresh holdings card can safely provide another button.
+    for(const job of this.tradeQueue.splice(0))this.persistReply(job.updateId,'interrupted',
+      '【持仓卖出】\n服务停止前未能提交该卖出，请刷新持仓后重试。');
+    await Promise.allSettled([...this.acknowledgements]);this.stopping=false;
   }
   close():Promise<void> {
     if(this.closing)return this.closing;if(this.closed)return Promise.resolve();
@@ -207,7 +220,8 @@ export class TelegramControls {
       processed:counts.reduce((n,row)=>n+Number(row.n),0),
       interrupted:counts.filter(row=>row.state==='interrupted').reduce((n,row)=>n+Number(row.n),0),
       pendingReplies:Number(this.db.prepare('SELECT count(*) n FROM telegram_control_events WHERE scope=? AND queued=0 AND reply IS NOT NULL').get(this.scope)?.n??0),
-      pendingTokenCards:this.tokenCardQueue.length+this.tokenCardActive};
+      pendingTokenCards:this.tokenCardQueue.length+this.tokenCardActive,
+      pendingTradeActions:this.tradeQueue.length+this.tradeActive};
   }
   /** Wait for bounded read-only lookups without coupling them to the update consumer. */
   async waitForTokenCards():Promise<void> {
@@ -217,6 +231,15 @@ export class TelegramControls {
       if(this.tokenCardKick&&!this.tokenCardWorker)await new Promise<void>(resolve=>setImmediate(resolve));
       const worker=this.tokenCardWorker;if(worker)await worker;
       else this.scheduleTokenCardWorker();
+    }
+  }
+  /** Wait for already claimed owner sell actions; used by graceful shutdown and tests. */
+  async waitForTradeActions():Promise<void> {
+    if(this.closed)return;
+    this.scheduleTradeWorker();
+    while(this.tradeWorker||this.tradeQueue.length) {
+      const worker=this.tradeWorker;if(worker)await worker;
+      else this.scheduleTradeWorker();
     }
   }
   /** One bounded poll, also useful for deterministic local tests; concurrent calls share one request. */
@@ -230,7 +253,7 @@ export class TelegramControls {
       if(this.blocked)this.running=false;
       try {this.db.prepare('UPDATE telegram_control_state SET last_error=?,next_poll_at=? WHERE scope=?')
         .run(safe.code,this.now()+safe.delay,this.scope);}catch {this.memoryError='TELEGRAM_CONTROLS_STORAGE_ERROR';this.running=false;this.blocked=true;}
-    }).finally(()=>{this.inFlight=undefined;this.schedule();this.scheduleTokenCardWorker();});
+    }).finally(()=>{this.inFlight=undefined;this.schedule();this.scheduleTokenCardWorker();this.scheduleTradeWorker();});
     return this.inFlight;
   }
   private state():Row {return this.db.prepare('SELECT * FROM telegram_control_state WHERE scope=?').get(this.scope)!;}
@@ -291,7 +314,36 @@ export class TelegramControls {
         else this.tokenCardQueue.push({updateId:id,command});
         continue;
       }
+      // A native worker reply can legitimately take much longer than Telegram's
+      // next control update. Keep the sell exactly-once claim, acknowledgement,
+      // and reply durable, while allowing stop/status/holdings polls to continue.
+      if(command.action==='sell') {
+        if(this.tradeQueue.length+this.tradeActive>=TRADE_QUEUE_CAPACITY)
+          this.persistReply(id,'failed','【持仓卖出】\n卖出处理队列已满，本次未提交。请刷新持仓后重试。');
+        else {this.tradeQueue.push({updateId:id,command});this.scheduleTradeWorker();}
+        continue;
+      }
       await this.executeAndPersist(id,command);
+    }
+  }
+  private scheduleTradeWorker():void {
+    if(this.closed||this.closing||this.stopping||this.tradeWorker||!this.tradeQueue.length)return;
+    const worker=this.drainTradeQueue();this.tradeWorker=worker;
+    void worker.then(()=>{
+      if(this.tradeWorker===worker)this.tradeWorker=undefined;
+      this.scheduleTradeWorker();
+    },()=>{
+      if(this.tradeWorker===worker)this.tradeWorker=undefined;
+      this.memoryError='TELEGRAM_CONTROLS_STORAGE_ERROR';this.blocked=true;this.running=false;
+    });
+  }
+  private async drainTradeQueue():Promise<void> {
+    while(!this.closed&&!this.closing&&!this.stopping) {
+      const job=this.tradeQueue.shift();if(!job)return;
+      this.tradeActive=1;
+      try {await this.executeAndPersist(job.updateId,job.command);}
+      finally {this.tradeActive=0;}
+      await new Promise<void>(resolve=>setImmediate(resolve));
     }
   }
   private scheduleTokenCardWorker():void {

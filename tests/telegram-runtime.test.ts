@@ -122,6 +122,7 @@ async function pollTelegram(runtime:ReturnType<typeof createRuntime>,path:string
     // Reset only this temporary test database's pacing clocks; production defaults stay unchanged.
     db.exec('UPDATE telegram_control_state SET next_poll_at=0');await runtime.telegramControls.pollOnce();
     await runtime.telegramControls.waitForTokenCards();
+    await runtime.telegramControls.waitForTradeActions();
     for(let sent=0;runtime.telegram.status().pending>0&&sent<100;sent++){
       db.exec("DELETE FROM telegram_meta WHERE key='next_attempt_at'; UPDATE telegram_outbox SET next_at=0 WHERE state='pending'");
       await runtime.telegram.flush();

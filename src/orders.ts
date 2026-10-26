@@ -176,6 +176,25 @@ export class OrderStore {
       catch { /* A broken notification sink must not roll back an already committed order. */ }
     }
   }
+  /** Fast advisory admission before remote balance/risk reads. reserve() remains the atomic authority. */
+  openingCapacity(mode:'paper'|'live',maxOpen:number,now=new Date(),allowObservedProtection=false,
+    asset?:{chain:Chain;address:string;preventReentry?:boolean}):
+    {available:number;occupied:number;reason?:'ASSET_ALREADY_OPEN'|'ASSET_REENTRY_BLOCKED'|'DEBOT_REENTRY_BLOCKED'|'EXIT_PROTECTION_UNVERIFIED'|'OPENING_LIMIT_REACHED'} {
+    if(!Number.isSafeInteger(maxOpen)||maxOpen<1) return {available:0,occupied:0,reason:'OPENING_LIMIT_REACHED'};
+    const occupied=Number(this.db.prepare(`SELECT count(*) AS n FROM opening_orders WHERE mode=? AND ${occupies}`).get(mode)!.n);
+    const available=Math.max(0,maxOpen-occupied);
+    if(asset){
+      const duplicate=this.db.prepare(`SELECT 1 FROM opening_orders WHERE chain=? AND token_address=? ${asset.chain==='solana'?'':'COLLATE NOCASE'} AND mode=? AND ${occupies} LIMIT 1`)
+        .get(asset.chain,asset.address,mode);
+      if(duplicate)return {available:0,occupied,reason:'ASSET_ALREADY_OPEN'};
+      if(this.identityClaim(asset.chain,asset.address,mode))return {available:0,occupied,reason:'ASSET_REENTRY_BLOCKED'};
+      if(asset.preventReentry&&this.hasOpeningHistory(asset.chain,asset.address,mode))
+        return {available:0,occupied,reason:'DEBOT_REENTRY_BLOCKED'};
+    }
+    if(mode==='live'&&this.hasUnprotectedOpening(now,'',allowObservedProtection))
+      return {available:0,occupied,reason:'EXIT_PROTECTION_UNVERIFIED'};
+    return {available,occupied,...(available?{}:{reason:'OPENING_LIMIT_REACHED' as const})};
+  }
   reserve(input:NewOpening,maxOpen:number,now=new Date(),funding?:FundingSnapshot,
     options:{preventReentry?:boolean;balanceBps?:number;balanceBasis?:'available'|'total'}={}):{created:boolean;order?:OpeningOrder;reason?:string} {
     this.db.exec('BEGIN IMMEDIATE');

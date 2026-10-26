@@ -40,6 +40,10 @@ function fixture(t:TestContext){
   positions.options.autoSchedule=false;positions.options.eventDriven=false;
   t.mock.method(internal.stream,'setAccounts',(accounts:string[])=>{subscriptions.push([...accounts]);});
   t.mock.method(internal.stream,'status',()=>({connected:true,subscribedAccounts:[],lastHeadSlot:110}));
+  t.mock.method(internal.stream,'transportReady',()=>{const s=internal.stream.status();return s.transportHealthy??s.connected;});
+  t.mock.method(internal.stream,'headSlot',()=>internal.stream.status().lastHeadSlot);
+  t.mock.method(internal.stream,'isSubscribed',(accounts:string[])=>{const s=internal.stream.status();return s.transportHealthy===undefined?s.connected:
+    s.transportHealthy&&accounts.every(address=>s.subscribedAccounts.includes(address));});
   const balances=new Map<string,{amount:string;slot:number}>(),tracked:{mint:string;decimals:number;program:string}[]=[];
   t.mock.method(internal.inventory,'status',()=>({ready:true,accounts:balances.size,trackedMints:tracked.length,snapshotSlots:[102,102]}));
   t.mock.method(internal.inventory,'track',(tokenMint:string,decimals:number,program:string)=>{tracked.push({mint:tokenMint,decimals,program});});

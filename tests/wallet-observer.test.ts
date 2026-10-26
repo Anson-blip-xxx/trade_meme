@@ -30,7 +30,6 @@ function fixture() {
     watchTargets: () => targets,
     markTargetChecked: (token, at) => {marked.push({token, at});},
     recordPrice: (token, priceUsd, observedAt, source) => {prices.push({token, priceUsd, observedAt, source});},
-    refreshCoordination: () => {},
   };
   return {history, targets, trades, ranks, traders, analyses, leaders, collections, prices, marked};
 }
@@ -211,12 +210,12 @@ test('invalid credentials stop the whole cycle without leaking upstream error te
   assert.deepEqual(cycle.reasons, ['GMGN_AUTH_FAILED']);
 });
 
-test('coordination cache refresh is bounded and failure still leaves a collection gap record', async () => {
-  const f = fixture(), p = provider(); let limit: number | undefined;
-  f.history.refreshCoordination = count => {limit = count; throw new Error('SECRET sqlite detail');};
-  const report = await new WalletObserver({history: f.history, client: p.client, now}).runOnce();
-  assert.equal(limit, 10); assert.equal(report.status, 'partial');
-  assert.equal(f.collections.at(-1).reason, 'WALLET_COORDINATION_REFRESH_FAILED');
+test('coordination cache refresh stays off the observer/main loop', async () => {
+  const f = fixture(), p = provider(); let called = false;
+  const history = {...f.history, refreshCoordination: () => {called = true; throw new Error('SECRET sqlite detail');}};
+  const report = await new WalletObserver({history, client: p.client, now}).runOnce();
+  assert.equal(called, false, 'coordination refresh belongs to the worker');
+  assert.notEqual(f.collections.at(-1)?.reason, 'WALLET_COORDINATION_REFRESH_FAILED');
   assert.equal(JSON.stringify(report).includes('SECRET'), false);
 });
 

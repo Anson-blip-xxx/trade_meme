@@ -12,6 +12,7 @@ import type {MemeCatalystSnapshot} from './meme-catalyst.js';
 import type {GmgnTokenSnapshot} from './providers/gmgn-safety.js';
 import type {SourceCorroborationAssessment} from './source-corroboration.js';
 import {ReviewSamplingPlanReader,type ReviewSamplingPlan,type ReviewSamplingSource} from './review-sampling.js';
+import {MemeMaintenanceRunner} from './meme-maintenance.js';
 
 type Token=Signal['token'];
 type Row=Record<string,any>;
@@ -58,6 +59,7 @@ export class MemeObserver {
   private lastCycleAt?:string;private error?:string;private catalystError?:string;private nextPrune=0;private dexCooldown=0;
   private marketSampleCallbackError?:string;
   private storagePressure=false;private usedBytes=0;private storageCheckedAt?:string;private reclaimedSnapshots=0;
+  private readonly maintenance?:MemeMaintenanceRunner;
   constructor(private readonly options:MemeObserverOptions){
     this.now=options.now??(()=>new Date());this.maxActive=options.maxActive??180;this.windowMs=(options.activeWindowSec??7200)*1000;
     this.samplingReader=new ReviewSamplingPlanReader(options.samplingPlanPath,{now:this.now});
@@ -71,10 +73,11 @@ export class MemeObserver {
     if(options.database!==':memory:')mkdirSync(dirname(options.database),{recursive:true,mode:0o700});
     this.db=new DatabaseSync(options.database);
     const pageSize=Number(this.db.prepare('PRAGMA page_size').get()!.page_size);
-    this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=1500; PRAGMA max_page_count=${Math.floor(maxBytes/pageSize)}`);
+    this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=1500; PRAGMA wal_autocheckpoint=16; PRAGMA journal_size_limit=4194304;
+      PRAGMA max_page_count=${Math.floor(maxBytes/pageSize)}`);
     // Recover space before a new index/schema migration needs additional pages.
     if(this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meme_snapshots'").get())this.reclaimSpace();
-    this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=1500;
+    this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=1500; PRAGMA wal_autocheckpoint=16; PRAGMA journal_size_limit=4194304;
       CREATE TABLE IF NOT EXISTS meme_tokens(chain TEXT,address TEXT,first_seen_at TEXT NOT NULL,last_signal_at TEXT NOT NULL,
         signal TEXT NOT NULL,name TEXT,symbol TEXT,market_attempt_at TEXT,fallback_attempt_at TEXT,catalyst_attempt_at TEXT,last_sample_at TEXT,
         sample_count INTEGER NOT NULL DEFAULT 0,market TEXT,assessment TEXT,catalyst TEXT,social_context TEXT,wallet_context TEXT,gate TEXT,error TEXT,
@@ -94,6 +97,7 @@ export class MemeObserver {
       CREATE TABLE IF NOT EXISTS meme_catalysts(id INTEGER PRIMARY KEY,chain TEXT,address TEXT,observed_at TEXT NOT NULL,
         data TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS meme_catalysts_token ON meme_catalysts(chain,address,observed_at DESC);
+      CREATE INDEX IF NOT EXISTS meme_catalysts_time ON meme_catalysts(observed_at);
       CREATE TABLE IF NOT EXISTS meme_sampling_plans(plan_id TEXT PRIMARY KEY,first_applied_at TEXT NOT NULL,record TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS meme_sampling_selections(plan_id TEXT NOT NULL,channel TEXT NOT NULL,chain TEXT NOT NULL,address TEXT NOT NULL,
         source TEXT NOT NULL,reason TEXT NOT NULL,first_selected_at TEXT NOT NULL,last_selected_at TEXT NOT NULL,
@@ -104,6 +108,13 @@ export class MemeObserver {
     if(!this.db.prepare('PRAGMA table_info(meme_snapshots)').all().some(row=>row.name==='corroboration'))
       this.db.exec('ALTER TABLE meme_snapshots ADD COLUMN corroboration TEXT');
     if(options.database!==':memory:')chmodSync(options.database,0o600);
+    // Large retained research stores run retention and WAL checkpoints in a
+    // worker. Small/test stores keep deterministic inline maintenance.
+    if(options.database!==':memory:'&&this.usedBytes>=64*1024*1024){
+      this.db.exec('PRAGMA wal_autocheckpoint=0');
+      this.maintenance=new MemeMaintenanceRunner({database:options.database,maxBytes:this.maxBytes,reclaimedSnapshots:this.reclaimedSnapshots});
+      this.maintenance.start();
+    }
   }
   register(signal:Signal,receivedAt=this.now().toISOString(),display:{name?:string;symbol?:string}={}):boolean {
     if(this.closed)return false;
@@ -194,13 +205,15 @@ export class MemeObserver {
       this.db.exec('RELEASE meme_sampling');
     }catch(error){this.db.exec('ROLLBACK TO meme_sampling; RELEASE meme_sampling');throw error;}
   }
-  recordMarket(sample:MemeMarketSample):boolean {
-    if(this.closed||this.storagePressure)return false;
+  /** Persist one validated sample inside its own savepoint. Callers may wrap
+   * several samples in an outer savepoint to pay for one WAL commit. */
+  private storeMarket(sample:MemeMarketSample):MemeMarketSample|undefined {
+    if(this.closed||this.storagePressure)return;
     const token=validToken(sample.token),at=time(sample.observedAt),now=this.now().getTime();
-    if(!token||!Number.isFinite(at)||at>now||now-at>120000||!Number.isFinite(sample.priceUsd)||(sample.priceUsd??0)<=0)return false;
-    const validated=sanitizeMemeMarketSample(sample,token,now);if(!validated?.priceUsd)return false;sample=validated;
-    const row=this.row(token);if(!row||row.last_sample_at&&row.last_sample_at>=sample.observedAt)return false;
-    if(row.last_sample_at&&at-time(row.last_sample_at)<5000)return false;
+    if(!token||!Number.isFinite(at)||at>now||now-at>120000||!Number.isFinite(sample.priceUsd)||(sample.priceUsd??0)<=0)return;
+    const validated=sanitizeMemeMarketSample(sample,token,now);if(!validated?.priceUsd)return;sample=validated;
+    const row=this.row(token);if(!row||row.last_sample_at&&row.last_sample_at>=sample.observedAt)return;
+    if(row.last_sample_at&&at-time(row.last_sample_at)<5000)return;
     const samples=this.db.prepare('SELECT market FROM meme_snapshots WHERE chain=? AND address=? AND observed_at>=? AND observed_at<=? AND market IS NOT NULL ORDER BY observed_at DESC,id DESC LIMIT 120')
       .all(token.chain,token.address,iso(now-1800000),sample.observedAt).map(r=>parse<MemeMarketSample>(r.market)).filter((s):s is MemeMarketSample=>!!s).reverse();
     let evidence:ReturnType<NonNullable<MemeObserverOptions['walletEvidence']>>={};
@@ -219,11 +232,17 @@ export class MemeObserver {
         .run(JSON.stringify(sample),JSON.stringify(assessment),sample.observedAt,token.chain,token.address);
       this.db.exec('RELEASE meme_market');
     }catch(error){this.db.exec('ROLLBACK TO meme_market; RELEASE meme_market');throw error;}
-    // The subscriber runs after commit and cannot roll back or poison the
-    // observer. Clone so subscriber mutation cannot alter the accepted sample.
+    return sample;
+  }
+  private publishMarket(sample:MemeMarketSample):void {
     try {this.options.onMarketSample?.(structuredClone(sample));this.marketSampleCallbackError=undefined;}
     catch {this.marketSampleCallbackError='MEME_MARKET_SAMPLE_CALLBACK_FAILED';}
-    return true;
+  }
+  recordMarket(sample:MemeMarketSample):boolean {
+    const stored=this.storeMarket(sample);if(!stored)return false;
+    // The subscriber runs only after this sample's outermost transaction has
+    // committed, and cannot roll it back or mutate retained evidence.
+    this.publishMarket(stored);return true;
   }
   recordCatalyst(snapshot:MemeCatalystSnapshot):void {
     if(this.closed||this.storagePressure)return;
@@ -326,7 +345,8 @@ export class MemeObserver {
       maxActive:this.maxActive,activeWindowSec:this.windowMs/1000,intervalSec:5,targetSampleIntervalSec:30,
       lastCycleAt:this.lastCycleAt,error:this.catalystError??this.error,marketInFlight:!!this.marketWork,catalystInFlight:!!this.catalystWork,
       marketSampleCallbackError:this.marketSampleCallbackError,
-      storage:{maxBytes:this.maxBytes,usedBytes:this.usedBytes,checkedAt:this.storageCheckedAt,pressure:this.storagePressure,reclaimedSnapshots:this.reclaimedSnapshots},
+      storage:{maxBytes:this.maxBytes,usedBytes:this.usedBytes,checkedAt:this.storageCheckedAt,pressure:this.storagePressure,reclaimedSnapshots:this.reclaimedSnapshots,
+        ...(this.maintenance?{maintenance:this.maintenance.snapshot()}:{})},
       experimental:true,tradingEnabled:false,retentionDays:30,maxSnapshots:250000,learningScope:'frozen_features_and_subsequent_sampled_returns'};
   }
   runOnce():Promise<void>{
@@ -345,18 +365,32 @@ export class MemeObserver {
     // active set's evidence merely to choose its next thirty observations.
     const pools=new Map(this.db.prepare(`SELECT chain,address,json_extract(market,'$.poolAddress') pool FROM meme_tokens WHERE (chain,address) IN (VALUES ${rows.map(()=>'(?,?)').join(',')})`)
       .all(...rows.flatMap(row=>[row.chain,row.address])).map(row=>[tokenKey({chain:row.chain as Token['chain'],address:String(row.address)}),row.pool]));
-    this.auditSampling(rows,'market',iso(now));
-    for(const row of rows)this.db.prepare('UPDATE meme_tokens SET market_attempt_at=? WHERE chain=? AND address=?').run(iso(now),row.chain,row.address);
+    const attemptedAt=iso(now),markAttempt=this.db.prepare('UPDATE meme_tokens SET market_attempt_at=? WHERE chain=? AND address=?');
+    // Scheduling thirty tokens used to perform thirty autocommits on the main
+    // event loop. One outer savepoint keeps the same row-level state atomic and
+    // bounds WAL/fsync work for each five-second observer cycle.
+    this.db.exec('SAVEPOINT meme_market_schedule');
+    try {
+      this.auditSampling(rows,'market',attemptedAt);
+      for(const row of rows)markAttempt.run(attemptedAt,row.chain,row.address);
+      this.db.exec('RELEASE meme_market_schedule');
+    }catch(error){this.db.exec('ROLLBACK TO meme_market_schedule; RELEASE meme_market_schedule');throw error;}
     let samples:MemeMarketSample[]=[];
     try {samples=await this.options.marketBatch(rows.map(row=>{const pool=pools.get(tokenKey({chain:row.chain,address:row.address}));
       return {chain:row.chain,address:row.address,poolAddress:typeof pool==='string'?pool:undefined};}),signal);}
     catch(error){if(error instanceof Error&&error.message==='MEME_MARKET_RATE_LIMITED')this.dexCooldown=now+60000;this.error='MEME_MARKET_BATCH_UNAVAILABLE';}
     if(signal.aborted||this.closed)return;
     const requested=new Set(rows.map(row=>tokenKey({chain:row.chain,address:row.address}))),received=new Set<string>();
-    for(const sample of samples){
-      if(requested.has(tokenKey(sample.token))){if(this.recordMarket(sample))received.add(tokenKey(sample.token));}
+    let storeError:unknown;
+    // Commit and publish one sample at a time, then yield. A bad later sample
+    // cannot discard earlier evidence, and no transaction spans the yield.
+    const candidates=samples.filter(sample=>requested.has(tokenKey(sample.token)));
+    for(const sample of candidates){
+      try {if(this.recordMarket(sample))received.add(tokenKey(sample.token));}
+      catch(error){storeError=error;break;}
       await new Promise<void>(resolve=>setImmediate(resolve));if(signal.aborted||this.closed)return;
     }
+    if(storeError)throw storeError;
     const missing=rows.filter(row=>!received.has(tokenKey({chain:row.chain,address:row.address})));
     if(missing.length&&this.options.marketFallback&&(this.options.cooldownUntil?.()??0)<=this.now().getTime()){
       const row=missing.sort((a,b)=>String(a.fallback_attempt_at??'').localeCompare(String(b.fallback_attempt_at??'')))[0];
@@ -365,8 +399,13 @@ export class MemeObserver {
       catch {/* Shared GMGN budget or unsupported assets remain explicitly uncovered. */}
     }
     if(signal.aborted||this.closed)return;
-    for(const row of rows)if(!received.has(tokenKey({chain:row.chain,address:row.address})))
-      this.db.prepare("UPDATE meme_tokens SET error='MEME_MARKET_UNAVAILABLE' WHERE chain=? AND address=?").run(row.chain,row.address);
+    const unavailable=rows.filter(row=>!received.has(tokenKey({chain:row.chain,address:row.address})));
+    if(unavailable.length){
+      const markUnavailable=this.db.prepare("UPDATE meme_tokens SET error='MEME_MARKET_UNAVAILABLE' WHERE chain=? AND address=?");
+      this.db.exec('SAVEPOINT meme_market_unavailable');
+      try {for(const row of unavailable)markUnavailable.run(row.chain,row.address);this.db.exec('RELEASE meme_market_unavailable');}
+      catch(error){this.db.exec('ROLLBACK TO meme_market_unavailable; RELEASE meme_market_unavailable');throw error;}
+    }
     if(received.size)this.error=undefined;
     this.lastCycleAt=this.now().toISOString();this.prune();
   }
@@ -383,8 +422,13 @@ export class MemeObserver {
       .sort((a,b)=>String(a.catalyst_attempt_at??'').localeCompare(String(b.catalyst_attempt_at??''))||String(b.last_signal_at).localeCompare(String(a.last_signal_at)))[0];
     if(!row)return;
     const context=this.db.prepare('SELECT signal,social_context FROM meme_tokens WHERE chain=? AND address=?').get(row.chain,row.address);if(!context)return;
-    this.auditSampling([row],'catalyst',iso(now));
-    this.db.prepare('UPDATE meme_tokens SET catalyst_attempt_at=? WHERE chain=? AND address=?').run(iso(now),row.chain,row.address);
+    const attemptedAt=iso(now);
+    this.db.exec('SAVEPOINT meme_catalyst_schedule');
+    try {
+      this.auditSampling([row],'catalyst',attemptedAt);
+      this.db.prepare('UPDATE meme_tokens SET catalyst_attempt_at=? WHERE chain=? AND address=?').run(attemptedAt,row.chain,row.address);
+      this.db.exec('RELEASE meme_catalyst_schedule');
+    }catch(error){this.db.exec('ROLLBACK TO meme_catalyst_schedule; RELEASE meme_catalyst_schedule');throw error;}
     const snapshot=await this.options.catalyst!(JSON.parse(String(context.signal)),abort,parse<GmgnTokenSnapshot>(context.social_context));
     if(!abort.aborted&&!this.closed&&snapshot.token.chain===row.chain&&snapshot.token.address===row.address){
       this.recordCatalyst(snapshot);this.catalystError=undefined;
@@ -411,16 +455,29 @@ export class MemeObserver {
     if(this.storagePressure)this.error='MEME_OBSERVATION_STORAGE_PRESSURE';
     else if(this.error==='MEME_OBSERVATION_STORAGE_PRESSURE')this.error=undefined;
   }
-  private prune(){
+  private prune():void {
+    if(this.maintenance){
+      const snapshot=this.maintenance.snapshot();
+      if(snapshot.value){this.usedBytes=snapshot.value.usedBytes;this.storageCheckedAt=snapshot.value.checkedAt;
+        this.storagePressure=snapshot.value.pressure;this.reclaimedSnapshots=snapshot.value.reclaimedSnapshots;
+        if(snapshot.value.error)this.error=snapshot.value.error;
+        else if(this.error==='MEME_OBSERVATION_STORAGE_PRESSURE'||this.error?.startsWith('MEME_MAINTENANCE_'))this.error=undefined;}
+      if(snapshot.error)this.error=snapshot.error;
+      return;
+    }
     const now=this.now().getTime();if(now<this.nextPrune)return;this.nextPrune=now+60000;
-    this.db.prepare('DELETE FROM meme_snapshots WHERE observed_at<?').run(iso(now-30*86400000));
+    const cutoff=iso(now-30*86400000);
+    // Production-sized stores use the worker above. Inline maintenance remains
+    // deterministic for small/test stores, where these bounded scans stay
+    // below the real-time latency budget.
+    this.db.prepare('DELETE FROM meme_snapshots WHERE observed_at<?').run(cutoff);
     this.trimRows('meme_snapshots',250000);
-    this.db.prepare('DELETE FROM meme_catalysts WHERE observed_at<?').run(iso(now-30*86400000));
+    this.db.prepare('DELETE FROM meme_catalysts WHERE observed_at<?').run(cutoff);
     this.trimRows('meme_catalysts',20000);
-    this.db.prepare('DELETE FROM meme_signals WHERE observed_at<?').run(iso(now-30*86400000));
-    this.db.prepare('DELETE FROM meme_tokens WHERE last_signal_at<?').run(iso(now-30*86400000));
-    this.db.prepare('DELETE FROM meme_sampling_selections WHERE last_selected_at<?').run(iso(now-30*86400000));
-    this.db.prepare('DELETE FROM meme_sampling_plans WHERE first_applied_at<? AND plan_id NOT IN (SELECT plan_id FROM meme_sampling_selections)').run(iso(now-30*86400000));
+    this.db.prepare('DELETE FROM meme_signals WHERE observed_at<?').run(cutoff);
+    this.db.prepare('DELETE FROM meme_tokens WHERE last_signal_at<?').run(cutoff);
+    this.db.prepare('DELETE FROM meme_sampling_selections WHERE last_selected_at<?').run(cutoff);
+    this.db.prepare('DELETE FROM meme_sampling_plans WHERE first_applied_at<? AND plan_id NOT IN (SELECT plan_id FROM meme_sampling_selections)').run(cutoff);
     this.reclaimSpace();if(this.storagePressure)this.nextPrune=now+1000;
   }
   private trimRows(table:'meme_snapshots'|'meme_catalysts',limit:number):void {
@@ -436,5 +493,5 @@ export class MemeObserver {
     tick();social();
   }
   async close(){if(this.closed)return;this.running=false;clearTimeout(this.timer);clearTimeout(this.socialTimer);
-    this.marketAbort?.abort();this.socialAbort?.abort();await Promise.all([this.marketWork,this.catalystWork]);this.closed=true;this.db.close();}
+    this.marketAbort?.abort();this.socialAbort?.abort();await Promise.all([this.marketWork,this.catalystWork]);await this.maintenance?.stop();this.closed=true;this.db.close();}
 }

@@ -17,8 +17,9 @@ async function fixture(enabled=true) {
   const cfg=config();cfg.dashboard.token=token;
   const archive=new ScanArchive(':memory:');const calls:{method:string;input?:unknown}[]=[];
   const services:DashboardServices={archive,overview:()=>({entryMode:'off'}),orders:()=>({items:[]}),
+    ...(enabled?{walletAssociationsStatus:()=>{calls.push({method:'cached-status'});return {relations:1,sampleOnly:true,tradingEnabled:false,state:'fresh'};}}:{}),
     ...(enabled?{walletAssociations:{
-      associationStats:()=>{calls.push({method:'stats'});return {relations:1,sampleOnly:true,tradingEnabled:false};},
+      associationStats:()=>{throw new Error('historical aggregate must not run in the HTTP loop');},
       listAssociations:(input:unknown)=>{calls.push({method:'list',input});return {items:[],total:0};},
       getAssociation:(chain:unknown,l:unknown,c:unknown)=>{calls.push({method:'get',input:{chain,leader:l,candidate:c}});return c===candidate?{association:{chain,leader:l,candidate:c,ownership:'unknown'}}:undefined;},
     } as unknown as DashboardServices['walletAssociations']}:{}),
@@ -36,6 +37,7 @@ test('association research endpoints require authentication and cannot submit or
     assert.equal(f.calls.length,0);
     const status=await(await fetch(f.base+'/status',{headers})).json();
     assert.equal(status.enabled,true);assert.equal(status.sampleOnly,true);assert.equal(status.tradingEnabled,false);
+    assert.deepEqual(f.calls,[{method:'cached-status'}]);
   }finally{await f.close();}
 });
 test('association filters bound work and exact wallet identities stay chain scoped',async()=>{

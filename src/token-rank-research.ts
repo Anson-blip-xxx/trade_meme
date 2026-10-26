@@ -154,6 +154,10 @@ export class TokenRankResearch {
     if(!columns.some(c=>c.name==='live_at'))this.db.exec('ALTER TABLE tr_tokens ADD COLUMN live_at TEXT');
     this.db.exec('CREATE INDEX IF NOT EXISTS tr_tokens_live ON tr_tokens(dirty_live,live_at)');
     const oldMax=Number(this.meta('max_bytes'));this.setMeta('max_bytes',String(this.maxBytes));
+    // These tables only append. Seed exact durable counters once when upgrading an
+    // existing database; subsequent batches update them in the same transaction as
+    // the inserted rows. status() therefore never scans the large evidence tables.
+    this.initializeCount('token_count','tr_tokens');this.initializeCount('wallet_count','tr_wallets');
     if(this.meta('error')===CAPACITY&&this.maxBytes>oldMax&&bytes(this.db)+65536<this.maxBytes)this.setMeta('error','');
     this.error=this.meta('error')||undefined;
     for(const kind of KINDS)if(!this.meta(`${kind}_ceiling`)){
@@ -171,6 +175,11 @@ export class TokenRankResearch {
   }
   private meta(key:string){return String(this.db.prepare('SELECT value FROM tr_meta WHERE key=?').get(key)?.value??'');}
   private setMeta(key:string,value:string){this.db.prepare('INSERT INTO tr_meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key,value);}
+  private initializeCount(key:'token_count'|'wallet_count',table:'tr_tokens'|'tr_wallets'){
+    const stored=this.meta(key),value=Number(stored);
+    if(!/^(0|[1-9]\d*)$/.test(stored)||!Number.isSafeInteger(value))
+      this.setMeta(key,String(this.db.prepare(`SELECT count(*) AS n FROM ${table}`).get()!.n));
+  }
   private pageMeta(key:string){return String(this.walletPages?.prepare('SELECT value FROM tr_wallet_page_meta WHERE key=?').get(key)?.value??'');}
   private setPageMeta(key:string,value:string){this.walletPages!.prepare('INSERT INTO tr_wallet_page_meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key,value);}
   private sourceFingerprint(){
@@ -190,7 +199,12 @@ export class TokenRankResearch {
       CREATE INDEX IF NOT EXISTS tr_wallet_latest_chain_early ON tr_wallet_latest(chain,early_count DESC,realized DESC,address);
       CREATE INDEX IF NOT EXISTS tr_wallet_latest_chain_realized ON tr_wallet_latest(chain,realized DESC,early_count DESC,address);
       CREATE INDEX IF NOT EXISTS tr_wallet_latest_changed ON tr_wallet_latest(computed_at,chain,address);
-      CREATE INDEX IF NOT EXISTS tr_wallet_latest_chain_changed ON tr_wallet_latest(chain,computed_at,address);`);
+      CREATE INDEX IF NOT EXISTS tr_wallet_latest_chain_changed ON tr_wallet_latest(chain,computed_at,address);
+      CREATE TABLE IF NOT EXISTS tr_token_latest(chain TEXT NOT NULL,address TEXT NOT NULL,version_id INTEGER NOT NULL,
+        computed_at TEXT NOT NULL,registered_at TEXT NOT NULL,PRIMARY KEY(chain,address));
+      CREATE UNIQUE INDEX IF NOT EXISTS tr_token_latest_version ON tr_token_latest(version_id);
+      CREATE INDEX IF NOT EXISTS tr_token_latest_registered ON tr_token_latest(registered_at DESC,chain,address);
+      CREATE INDEX IF NOT EXISTS tr_token_latest_chain_registered ON tr_token_latest(chain,registered_at DESC,address);`);
     this.syncWalletPages();
   }
   /**
@@ -201,10 +215,16 @@ export class TokenRankResearch {
   private syncWalletPages(){
     const pages=this.walletPages;if(!pages)return;
     const sourcePath=canonical(this.options.database),sourceFingerprint=this.sourceFingerprint(),
-      sourceMax=Number(this.db.prepare('SELECT max(id) AS n FROM tr_wallet_versions').get()!.n??0),published=this.meta('last_run_at');
+      sourceMax=Number(this.db.prepare('SELECT max(id) AS n FROM tr_wallet_versions').get()!.n??0),
+      tokenSourceMax=Number(this.db.prepare('SELECT max(id) AS n FROM tr_token_versions').get()!.n??0),
+      tokenFirst=this.db.prepare('SELECT id,chain,address,computed_at FROM tr_token_versions ORDER BY id LIMIT 1').get(),
+      tokenFingerprint=tokenFirst?hash([tokenFirst.id,tokenFirst.chain,tokenFirst.address,tokenFirst.computed_at]):'',
+      published=this.meta('last_run_at');
     const schema=this.pageMeta('schema_version'),indexed=Number(this.pageMeta('source_version_id')||0),
       valid=schema===WALLET_PAGE_SCHEMA&&this.pageMeta('source_path')===sourcePath&&
-        this.pageMeta('source_fingerprint')===sourceFingerprint&&Number.isSafeInteger(indexed)&&indexed>=0&&indexed<=sourceMax;
+        this.pageMeta('source_fingerprint')===sourceFingerprint&&Number.isSafeInteger(indexed)&&indexed>=0&&indexed<=sourceMax,
+      tokenIndexed=Number(this.pageMeta('token_source_version_id')||0),tokenValid=this.pageMeta('source_path')===sourcePath&&
+        this.pageMeta('token_source_fingerprint')===tokenFingerprint&&Number.isSafeInteger(tokenIndexed)&&tokenIndexed>=0&&tokenIndexed<=tokenSourceMax;
     pages.exec('BEGIN IMMEDIATE');
     try {
       if(!valid){
@@ -233,8 +253,32 @@ export class TokenRankResearch {
               (excluded.computed_at=tr_wallet_latest.computed_at AND excluded.version_id>tr_wallet_latest.version_id)`);
         for(const row of rows)upsert.run(row.chain,row.address,row.version_id,row.computed_at,row.registered_at,row.early_count,row.realized);
       }
+      if(!tokenValid){
+        pages.exec('DELETE FROM tr_token_latest');
+        const refs=this.db.prepare(`SELECT t.chain,t.address,t.registered_at,(SELECT x.id FROM tr_token_versions x
+            WHERE x.chain=t.chain AND x.address=t.address ORDER BY x.computed_at DESC,x.id DESC LIMIT 1) AS version_id
+          FROM tr_tokens t ORDER BY t.chain,t.address`).all().filter(row=>Number.isSafeInteger(Number(row.version_id)))
+          .sort((a,b)=>Number(a.version_id)-Number(b.version_id)),
+          insert=pages.prepare('INSERT INTO tr_token_latest VALUES(?,?,?,?,?)');
+        for(let offset=0;offset<refs.length;offset+=500){
+          const batch=refs.slice(offset,offset+500),byId=new Map(batch.map(row=>[Number(row.version_id),row])),
+            rows=this.db.prepare(`SELECT id,computed_at FROM tr_token_versions
+              WHERE id IN (${batch.map(()=>'?').join(',')}) ORDER BY id`).all(...batch.map(row=>row.version_id));
+          for(const row of rows){const ref=byId.get(Number(row.id))!;
+            insert.run(ref.chain,ref.address,row.id,row.computed_at,ref.registered_at);}
+        }
+      }else if(tokenIndexed<tokenSourceMax){
+        const rows=this.db.prepare(`SELECT v.chain,v.address,v.id AS version_id,v.computed_at,t.registered_at
+          FROM tr_token_versions v JOIN tr_tokens t ON t.chain=v.chain AND t.address=v.address WHERE v.id>? ORDER BY v.id`).all(tokenIndexed),
+          upsert=pages.prepare(`INSERT INTO tr_token_latest VALUES(?,?,?,?,?) ON CONFLICT(chain,address) DO UPDATE SET
+            version_id=excluded.version_id,computed_at=excluded.computed_at,registered_at=excluded.registered_at
+            WHERE excluded.computed_at>tr_token_latest.computed_at OR
+              (excluded.computed_at=tr_token_latest.computed_at AND excluded.version_id>tr_token_latest.version_id)`);
+        for(const row of rows)upsert.run(row.chain,row.address,row.version_id,row.computed_at,row.registered_at);
+      }
       this.setPageMeta('schema_version',WALLET_PAGE_SCHEMA);this.setPageMeta('source_path',sourcePath);
       this.setPageMeta('source_fingerprint',sourceFingerprint);this.setPageMeta('source_version_id',String(sourceMax));
+      this.setPageMeta('token_source_fingerprint',tokenFingerprint);this.setPageMeta('token_source_version_id',String(tokenSourceMax));
       this.setPageMeta('published_at',stamp(published)?published:'');pages.exec('COMMIT');
     }catch(error){pages.exec('ROLLBACK');throw error;}
   }
@@ -272,9 +316,17 @@ export class TokenRankResearch {
       const candidates=new Map<string,Row>(),add=(rows:Row[])=>{for(const row of rows)if(candidates.size<MAX_TOKEN_BATCH)candidates.set(`${row.chain}:${row.address}`,row);};
       // Reserve independent work slots for new evidence, rank bootstrap and post/signal revisits.
       add(this.db.prepare('SELECT * FROM tr_tokens WHERE dirty_live=1 ORDER BY live_at,chain,address LIMIT 3').all());
-      add(this.db.prepare("SELECT * FROM tr_tokens WHERE dirty=1 AND dirty_live=0 ORDER BY COALESCE(refreshed_at,''),registered_at,chain,address LIMIT 3").all());
+      // SQLite otherwise prefers tr_tokens_live(dirty_live) on the production
+      // database. Almost every row is non-live, so that plan reads the 4 GB
+      // table before discovering there is no dirty work. dirty=1 is selective.
+      add(this.db.prepare("SELECT * FROM tr_tokens INDEXED BY tr_tokens_dirty WHERE dirty=1 AND dirty_live=0 ORDER BY COALESCE(refreshed_at,''),registered_at,chain,address LIMIT 3").all());
       add(this.db.prepare('SELECT * FROM tr_tokens WHERE dirty=0 AND refreshed_at<=? ORDER BY refreshed_at,chain,address LIMIT 2').all(due));
-      add(this.db.prepare("SELECT * FROM tr_tokens WHERE dirty=1 OR refreshed_at IS NULL OR refreshed_at<=? ORDER BY COALESCE(refreshed_at,''),chain,address LIMIT 24").all(due));
+      // Fill unused reserved slots with the same selective lanes. The former
+      // OR fallback discarded all three indexes and sorted the 4 GB table even
+      // when the candidate map was already full.
+      if(candidates.size<MAX_TOKEN_BATCH)add(this.db.prepare('SELECT * FROM tr_tokens WHERE dirty_live=1 ORDER BY live_at,chain,address LIMIT ?').all(MAX_TOKEN_BATCH));
+      if(candidates.size<MAX_TOKEN_BATCH)add(this.db.prepare("SELECT * FROM tr_tokens INDEXED BY tr_tokens_dirty WHERE dirty=1 AND dirty_live=0 ORDER BY COALESCE(refreshed_at,''),registered_at,chain,address LIMIT ?").all(MAX_TOKEN_BATCH));
+      if(candidates.size<MAX_TOKEN_BATCH)add(this.db.prepare('SELECT * FROM tr_tokens WHERE dirty=0 AND refreshed_at<=? ORDER BY refreshed_at,chain,address LIMIT ?').all(due,MAX_TOKEN_BATCH));
       const targets=[...candidates.values()];
       const touched=new Set<string>();let changed=0;
       for(const row of targets){
@@ -322,6 +374,10 @@ export class TokenRankResearch {
       this.db.prepare('UPDATE tr_wallet_tokens SET registered_at=? WHERE rowid>?').run(committedAt,previousWalletToken);
       this.db.prepare("UPDATE tr_token_versions SET data=json_set(data,'$.registeredAt',?) WHERE id>? AND EXISTS(SELECT 1 FROM tr_tokens t WHERE t.chain=tr_token_versions.chain AND t.address=tr_token_versions.address AND t.rowid>?)")
         .run(committedAt,previousTokenVersion,previousToken);
+      const addedTokens=Number(this.db.prepare('SELECT count(*) AS n FROM tr_tokens WHERE rowid>?').get(previousToken)!.n),
+        addedWallets=Number(this.db.prepare('SELECT count(*) AS n FROM tr_wallets WHERE rowid>?').get(previousWallet)!.n);
+      this.setMeta('token_count',String(Number(this.meta('token_count'))+addedTokens));
+      this.setMeta('wallet_count',String(Number(this.meta('wallet_count'))+addedWallets));
       this.setMeta('last_run_at',committedAt);this.setMeta('processed',String(Number(this.meta('processed')||0)+targets.length));
       this.setMeta('changed',String(Number(this.meta('changed')||0)+changed));this.setMeta('error','');
       this.db.exec('COMMIT');writing=false;this.syncWalletPages();this.error=undefined;
@@ -515,7 +571,9 @@ function outputStatus(db:DatabaseSync|undefined,error?:string,maxBytes?:number){
     watermarks:Object.fromEntries(KINDS.map(k=>[k,{initial:0,live:0}])),maxTokensPerBatch:MAX_TOKEN_BATCH,
     scope:'retained_ranked_tokens_and_sampled_vendor_transactions' as const};
   const meta=(k:string)=>String(db.prepare('SELECT value FROM tr_meta WHERE key=?').get(k)?.value??'');
-  return {...base,tokens:Number(db.prepare('SELECT count(*) AS n FROM tr_tokens').get()!.n),wallets:Number(db.prepare('SELECT count(*) AS n FROM tr_wallets').get()!.n),
+  const durableCount=(key:string,table:'tr_tokens'|'tr_wallets')=>{const raw=meta(key),value=Number(raw);
+    return /^(0|[1-9]\d*)$/.test(raw)&&Number.isSafeInteger(value)?value:Number(db.prepare(`SELECT count(*) AS n FROM ${table}`).get()!.n);};
+  return {...base,tokens:durableCount('token_count','tr_tokens'),wallets:durableCount('wallet_count','tr_wallets'),
     pending:Number(db.prepare('SELECT count(*) AS n FROM tr_tokens WHERE dirty=1').get()!.n),
     initialComplete:KINDS.every(k=>meta(`${k}_complete`)==='1'),processed:Number(meta('processed')||0),changed:Number(meta('changed')||0),
     bootstrap:{rankRowsTotal:Number(meta('rank_history_total')||0),rankRowsProcessed:Number(meta('rank_history_processed')||0),
@@ -559,6 +617,23 @@ export class TokenRankResearchReader {
       SELECT 1 FROM tr_token_versions v WHERE v.chain=t.chain AND v.address=t.address AND v.computed_at<=?)`,
       args=[page.asOf,...(options.chain?[options.chain]:[]),page.asOf];
     if(!db)return {...page,ready:false,total:0,hasMore:false,items:[] as TokenRankToken[]};
+    if(this.attachWalletPages(db)&&db.prepare("SELECT 1 FROM wallet_pages.sqlite_master WHERE type='table' AND name='tr_token_latest'").get()){
+      db.exec('BEGIN');
+      try {
+        const indexedPublished=String(db.prepare("SELECT value FROM wallet_pages.tr_wallet_page_meta WHERE key='published_at'").get()?.value??'');
+        if(page.asOf===indexedPublished){
+          const filter=`l.registered_at<=?${options.chain?' AND l.chain=?':''}`,pageArgs=[page.asOf,...(options.chain?[options.chain]:[])],
+            total=Number(db.prepare(`SELECT count(*) AS n FROM wallet_pages.tr_token_latest l WHERE ${filter}`).get(...pageArgs)!.n),
+            rows=db.prepare(`WITH selected AS MATERIALIZED (SELECT l.* FROM wallet_pages.tr_token_latest l WHERE ${filter}
+                ORDER BY l.registered_at DESC,l.chain,l.address LIMIT ? OFFSET ?)
+              SELECT v.data FROM selected s JOIN tr_token_versions v ON v.id=s.version_id
+              ORDER BY s.registered_at DESC,s.chain,s.address`).all(...pageArgs,page.limit,page.offset);
+          db.exec('COMMIT');
+          return {...page,ready:true,total,hasMore:page.offset+rows.length<total,items:rows.map(row=>parse(row.data) as TokenRankToken)};
+        }
+        db.exec('COMMIT');
+      }catch(error){try{db.exec('ROLLBACK');}catch{}throw error;}
+    }
     const total=Number(db.prepare(`SELECT count(*) AS n FROM tr_tokens t WHERE ${where}`).get(...args)!.n);
     const rows=db.prepare(`SELECT (SELECT v.data FROM tr_token_versions v WHERE v.chain=t.chain AND v.address=t.address AND v.computed_at<=?
       ORDER BY v.computed_at DESC,v.id DESC LIMIT 1) AS data FROM tr_tokens t WHERE ${where}

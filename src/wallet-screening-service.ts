@@ -8,11 +8,13 @@ import {WalletHistory,type WalletTradeObservation} from './wallet-history.js';
 import {WalletProfileReader} from './wallet-profiles.js';
 import {analyzeWalletScreening,qualifiedWalletWithdrawal,type WalletScreeningReport} from './wallet-screening.js';
 import {WalletSetupLedger} from './wallet-setup-ledger.js';
+import {WalletScreeningObservationRunner} from './wallet-screening-observation-runner.js';
 import {selectWalletResearchTargets,type WalletResearchTargets} from './research/wallet-targets.js';
 
 /** No vendor requests: combines already collected current evidence with bounded local profiles. */
 export class WalletScreeningService {
   readonly ledger:WalletSetupLedger;
+  private readonly observations:WalletScreeningObservationRunner;
   private timer?:ReturnType<typeof setInterval>;
   private work?:Promise<void>;
   private dispatchWork?:Promise<void>;
@@ -22,15 +24,16 @@ export class WalletScreeningService {
   private dispatch?: (signal:Signal)=>Promise<void|boolean>;
   private emitted=new Map<string,number>();private discoveryOffset=0;private lastDispatch=0;
   constructor(private readonly history:WalletHistory,private readonly profiles:WalletProfileReader,
-    options:{database:string;maxBytes:number;sourcePaths:string[]},private readonly now:()=>Date=()=>new Date()) {
+    options:{database:string;historyDatabase:string;maxBytes:number;sourcePaths:string[]},private readonly now:()=>Date=()=>new Date()) {
     const sameFile=(a:string,b:string)=>{
       if(resolve(a)===resolve(b))return true;
       if(!existsSync(a)||!existsSync(b))return false;
       const sa=statSync(a),sb=statSync(b);
       return realpathSync(a)===realpathSync(b)||sa.dev===sb.dev&&sa.ino===sb.ino;
     };
-    if(options.sourcePaths.some(p=>sameFile(p,options.database)))throw new Error('WALLET_SCREENING_DATABASE_MUST_BE_SEPARATE');
+    if([options.historyDatabase,...options.sourcePaths].some(p=>sameFile(p,options.database)))throw new Error('WALLET_SCREENING_DATABASE_MUST_BE_SEPARATE');
     this.ledger=new WalletSetupLedger(options.database,{maxBytes:options.maxBytes,now});
+    this.observations=new WalletScreeningObservationRunner({database:options.database,historyDatabase:options.historyDatabase,maxBytes:options.maxBytes});
   }
   /** Local-only nomination, supplied before collection so current holding evidence can be requested within its existing budget. */
   researchTargets(signal:Signal,now=this.now()):WalletResearchTargets {
@@ -82,16 +85,13 @@ export class WalletScreeningService {
     }
     return check('pass','WALLET_LOCAL_COUNTEREVIDENCE_RECHECKED');
   }
-  start(dispatch?:(signal:Signal)=>Promise<void|boolean>):void {if(this.timer||this.stopped)return;this.dispatch=dispatch;this.timer=setInterval(()=>this.tick(),10000);this.timer.unref();}
+  start(dispatch?:(signal:Signal)=>Promise<void|boolean>):void {
+    if(this.timer||this.stopped)return;this.dispatch=dispatch;this.observations.start();this.timer=setInterval(()=>this.tick(),10000);this.timer.unref();
+  }
   private tick():void {
     if(this.work||this.stopped)return;
     this.work=(async()=>{
-      for(const token of this.ledger.pending(10)) {
-        if(this.stopped)break;
-        const now=this.now(),evidence=this.history.screeningEvidence(token,now);
-        this.ledger.observe(token,evidence.trades,now,{truncated:evidence.truncated});
-        await new Promise<void>(r=>setImmediate(r));
-      }
+      await this.observations.run(this.now());
       if(!this.stopped&&this.dispatch&&!this.dispatchWork&&this.now().getTime()-this.lastDispatch>=60000){
         const now=this.now(),trades=this.history.screeningWalletCandidates(now,this.discoveryOffset);
         // Empty trade pages can still contain recently updated holding-only wallets.
@@ -112,6 +112,9 @@ export class WalletScreeningService {
       this.error=undefined;
     })().catch(()=>{this.error='WALLET_SETUP_OBSERVATION_FAILED';}).finally(()=>{this.work=undefined;});
   }
-  status(){return {enabled:true,running:!!this.timer,error:this.error,...this.ledger.status()};}
-  async close():Promise<void>{this.stopped=true;clearInterval(this.timer);this.timer=undefined;await this.work;await this.dispatchWork;this.ledger.close();}
+  status(){return {enabled:true,running:!!this.timer,error:this.error,observationWorker:this.observations.status(),...this.ledger.status()};}
+  async close():Promise<void>{
+    this.stopped=true;clearInterval(this.timer);this.timer=undefined;const work=this.work;
+    await this.observations.stop();await work;await this.dispatchWork;this.ledger.close();
+  }
 }

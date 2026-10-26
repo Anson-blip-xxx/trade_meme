@@ -42,8 +42,10 @@ export class HeldPositionMonitor {
   private readonly db:DatabaseSync;
   private readonly now:()=>number;
   private states=new Map<string,State>();
+  private stateIdsByToken=new Map<string,Set<string>>();
   private timer?:ReturnType<typeof setInterval>;
   private inFlight?:Promise<void>;
+  private cycleCursor=0;
   private running=false;
   private isClosed=false;
   private lastError?:string;
@@ -51,12 +53,15 @@ export class HeldPositionMonitor {
     this.now=options.now??Date.now;
     if(path!==':memory:')mkdirSync(dirname(path),{recursive:true,mode:0o700});
     this.db=new DatabaseSync(path);if(path!==':memory:')chmodSync(path,0o600);
-    this.db.exec(`PRAGMA journal_mode=WAL;PRAGMA busy_timeout=1500;
+    // All rows are reconstructable from confirmed fills and chain reads. Avoid
+    // an fsync per websocket tick while retaining WAL crash consistency.
+    this.db.exec(`PRAGMA journal_mode=WAL;PRAGMA synchronous=NORMAL;PRAGMA busy_timeout=1500;
       CREATE TABLE IF NOT EXISTS held_positions(id TEXT PRIMARY KEY,state TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS held_events(key TEXT PRIMARY KEY,text TEXT NOT NULL,queued INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL);
       CREATE INDEX IF NOT EXISTS held_pending ON held_events(queued,created_at);`);
-    for(const row of this.db.prepare('SELECT id,state FROM held_positions').all())
-      this.states.set(String(row.id),JSON.parse(String(row.state)) as State);
+    for(const row of this.db.prepare('SELECT id,state FROM held_positions').all()) {
+      const state=JSON.parse(String(row.state)) as State;this.states.set(String(row.id),state);this.index(state);
+    }
     this.refreshSeeds();
   }
   private refreshSeeds():void {
@@ -64,15 +69,19 @@ export class HeldPositionMonitor {
       const seeds=this.options.seeds();
       const valid=new Set(seeds.map(s=>s.id));
       // Reconfiguration cannot keep observing/notifying for a previous wallet.
-      for(const [id,state] of this.states)if(!valid.has(id)&&!retired(state))this.states.delete(id);
+      for(const [id,state] of this.states)if(!valid.has(id)&&!retired(state)){this.unindex(state);this.states.delete(id);}
       for(const seed of seeds) {
         if(this.states.has(seed.id))continue;
         const state:State={seed,registeredAt:this.now(),milestones:[],errors:{},alerts:{},episodes:{}};
-        this.states.set(seed.id,state);this.save(state);
+        this.states.set(seed.id,state);this.index(state);this.save(state);
       }
       this.lastError=undefined;
     }catch {this.lastError='HELD_SEEDS_UNAVAILABLE';}
   }
+  private tokenKey(state:State):string {return `${state.seed.chain}:${state.seed.tokenAddress}`;}
+  private index(state:State):void {const key=this.tokenKey(state),ids=this.stateIdsByToken.get(key)??new Set<string>();
+    ids.add(state.seed.id);this.stateIdsByToken.set(key,ids);}
+  private unindex(state:State):void {const key=this.tokenKey(state),ids=this.stateIdsByToken.get(key);ids?.delete(state.seed.id);if(!ids?.size)this.stateIdsByToken.delete(key);}
   private save(state:State):void {
     this.db.prepare('INSERT INTO held_positions VALUES (?,?) ON CONFLICT(id) DO UPDATE SET state=excluded.state')
       .run(state.seed.id,JSON.stringify(state));
@@ -108,8 +117,9 @@ export class HeldPositionMonitor {
     const extra=price as ScanPrice&{conflict?:boolean;status?:string};
     if(!SOURCES.has(price.source)||!Number.isFinite(price.priceUsd)||price.priceUsd<=0||!Number.isFinite(t)||
       t>now||now-t>90_000||extra.conflict||extra.status==='conflict'||price.source==='chain_pool_sample'&&!priceEvidence(price))return false;
-    let accepted=false;
-    for(const s of this.states.values()) {
+    let accepted=false,notify=false;
+    for(const id of this.stateIdsByToken.get(`${price.chain}:${price.address}`)??[]) {
+      const s=this.states.get(id);if(!s)continue;
       if(retired(s)||s.seed.chain!==price.chain||s.seed.tokenAddress!==price.address||t<Date.parse(s.seed.confirmedAt)||
         s.latest&&t<=Date.parse(s.latest.at))continue;
       this.db.exec('BEGIN IMMEDIATE');
@@ -124,13 +134,14 @@ export class HeldPositionMonitor {
             s.milestones.push(...crossed);
             const key=crossed.join(',');
             this.event(s,`milestone:${key.length<=160?key:digest(crossed)}`,`价格越过 ${crossedMilestoneLabel(crossed)}\n\n${this.priceText(s)}`);
+            notify=true;
           }
         }
         if(now-t<=60_000)this.recover(s,'price','持仓报价已恢复。');
         this.save(s);this.db.exec('COMMIT');accepted=true;
       }catch(error){this.db.exec('ROLLBACK');throw error;}
     }
-    this.flush();return accepted;
+    if(notify)this.flush();return accepted;
   }
   recordPriceError(token:ScanToken,_reason:string):void {
     if(this.isClosed)return;
@@ -197,7 +208,11 @@ export class HeldPositionMonitor {
   }
   private async cycle():Promise<void> {
     this.refreshSeeds();
-    await Promise.all([...this.states.values()].filter(s=>!retired(s)).slice(0,20).map(async s=>{
+    const active=[...this.states.values()].filter(s=>!retired(s));
+    const size=Math.min(20,active.length),start=active.length?this.cycleCursor%active.length:0;
+    const batch=Array.from({length:size},(_,index)=>active[(start+index)%active.length]);
+    this.cycleCursor=active.length?(start+size)%active.length:0;
+    await Promise.all(batch.map(async s=>{
       const now=this.now();
       const tasks:Promise<void>[]=[];
       if(s.balanceAttempt===undefined||now-s.balanceAttempt>=30_000)tasks.push(this.checkBalance(s));

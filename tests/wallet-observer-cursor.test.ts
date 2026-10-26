@@ -27,7 +27,7 @@ function rig(history?: WalletHistory) {
     captureTokenTraders: (token, rows, context) => {observed.push({token, rows, context}); history?.captureTokenTraders(token, rows, context);},
     recordCollection: item => history?.recordCollection(item), watchTargets: () => [{chain: 'bsc', address: addr(2)}],
     markTargetChecked: (token, at) => {marked.push(token); history?.markTargetChecked(token, at);},
-    recordPrice: (token, price, at, source) => history?.recordPrice(token, price, at, source), refreshCoordination: () => {},
+    recordPrice: (token, price, at, source) => history?.recordPrice(token, price, at, source),
     getWalletObserverCursor: () => history ? history.getWalletObserverCursor() : structuredClone(checkpoint),
     setWalletObserverCursor: value => history ? history.setWalletObserverCursor(value) : (checkpoint = structuredClone(value), true),
   };

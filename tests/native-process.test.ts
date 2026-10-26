@@ -122,6 +122,15 @@ test('manual sell IPC timeout reports unknown outcome and preserves the original
   await pause(300);assert.equal(readFileSync(join(f.dir,'actions'),'utf8').trim().split('\n').length,1);
 });
 
+test('parent IPC request backlog is bounded and rejects overflow before it reaches the worker',async t=>{
+  const f=fixture(t,{maxPendingRequests:1},()=>true,{submitDelayMs:250});f.host.start();await until(()=>f.host.readiness().ready);
+  const order=f.reserve();await f.host.execute(order,async()=>{});await until(()=>!!f.host.get(order.id));
+  const ref=f.host.createAction(order.id),first=f.host.submit(ref,25);
+  const overflow=await f.host.submit(ref,50);assert.match(overflow.text,/请求繁忙/);assert.match(overflow.text,/未提交/);
+  assert.match((await first).text,/accepted:/);
+  assert.equal(readFileSync(join(f.dir,'actions'),'utf8').trim().split('\n').length,1,'overflow never reaches the child');
+});
+
 test('manual action mapping survives worker restart and retries keep the same native action',async t=>{
   const f=fixture(t);f.host.start();await until(()=>f.host.readiness().ready);
   const order=f.reserve();await f.host.execute(order,async()=>{});await until(()=>!!f.host.get(order.id));

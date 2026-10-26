@@ -186,6 +186,27 @@ test('capacity pruning keeps 10000 versions and exposes omissions without discar
   }finally{f.db.close();}
 });
 
+test('capacity overflow deletes only exact oldest versions and skips unrelated retention sweeps',()=>{
+  const f=fixture(),originalPrepare=f.db.prepare.bind(f.db),deletes:string[]=[];try {
+    const first=f.ledger.record(observation());
+    const insert=f.db.prepare(`INSERT INTO debot_notification_versions(key,chain,address,event_id,vendor_event_id,occurred_at,
+      observed_at,last_observed_at,kind,notification_count,delivery_count,delta,reasons)
+      SELECT ?,chain,address,event_id,vendor_event_id,occurred_at,?,?,kind,notification_count,delivery_count,delta,reasons
+      FROM debot_notification_versions WHERE key=?`);
+    f.db.exec('BEGIN');
+    for(let i=1;i<10_000;i++)insert.run(i.toString(16).padStart(64,'0'),iso(i),iso(i),first.key);
+    f.db.prepare('UPDATE debot_notification_groups SET version_count=10000').run();f.db.exec('COMMIT');
+    (f.ledger as unknown as {retainedVersions:number}).retainedVersions=10_000;
+    f.db.prepare=((sql:string)=>{if(/^DELETE FROM debot_notification_/.test(sql))deletes.push(sql);return originalPrepare(sql);}) as typeof f.db.prepare;
+    f.advance(1);f.ledger.record({...observation(1,1),alertPriceUsd:2});f.db.prepare=originalPrepare;
+    assert.equal(Number(f.db.prepare('SELECT count(*) AS n FROM debot_notification_versions').get()!.n),10_000);
+    assert.equal(deletes.length,1);assert.match(deletes[0],/^DELETE FROM debot_notification_versions/);
+    const plan=f.db.prepare('EXPLAIN QUERY PLAN '+deletes[0]).all(1).map(row=>String(row.detail));
+    assert.ok(plan.some(detail=>detail.includes('USING COVERING INDEX debot_notification_versions_prune')));
+    assert.ok(plan.every(detail=>!detail.includes('TEMP B-TREE')));
+  }finally{f.db.prepare=originalPrepare;f.db.close();}
+});
+
 test('migration does not count already-linked rows or internal analysis revision jobs as vendor notifications',()=>{
   const db=new DatabaseSync(':memory:');try {
     db.exec('CREATE TABLE debot_signals(id TEXT PRIMARY KEY,chain TEXT,address TEXT,occurred_at TEXT,observed_at TEXT,payload TEXT,notification_key TEXT)');

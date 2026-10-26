@@ -226,6 +226,7 @@ export class ScanArchive {
   private watch?:WatchOptions;
   private cachedOverview?:{at:number;value:{total:number;eligible:number;tracking:number;maxGainPct?:number;computedAt:string}};
   private cachedStats?:{at:number;value:ScanArchiveStats};
+  private nextRetentionAt=0;
   constructor(path:string,options:ScanArchiveOptions={}) {
     this.retentionDays=options.retentionDays??30;this.maxEntries=options.maxEntries??10_000;
     const hours=options.trackingHours??24;
@@ -370,7 +371,7 @@ export class ScanArchive {
   }
 
   watchStatus(now=this.now()):WatchQueueStatus {
-    this.prune(now);
+    this.maybeMaintain(now);
     const result:WatchQueueStatus={scheduled:0,processing:0,ended:0,due:0};
     for(const row of this.db.prepare('SELECT state,count(*) AS n FROM watch_jobs GROUP BY state').all())
       result[row.state as 'scheduled'|'processing'|'ended']=Number(row.n);
@@ -441,7 +442,7 @@ export class ScanArchive {
   }
 
   list(options:ScanListOptions={}):{items:ScanRecord[];total:number} {
-    this.prune();
+    this.maybeMaintain(this.now());
     const {rows,total}=this.listRows(options,'record');
     return {items:rows.map(row=>this.withObservation(JSON.parse(String(row.record)) as ScanRecord)),total};
   }
@@ -483,7 +484,7 @@ export class ScanArchive {
     return {rows,total};
   }
 
-  get(id:string):ScanRecord|undefined {this.prune();const record=this.read(id);return record&&this.withObservation(record);}
+  get(id:string):ScanRecord|undefined {this.maybeMaintain(this.now());const record=this.read(id);return record&&this.withObservation(record);}
 
   /** Narrow local lookup for token labels; no charts, research payloads or network calls. */
   tokenDisplay(id:string):{chain:Chain;address:string;name?:string;symbol?:string}|undefined {
@@ -526,7 +527,7 @@ export class ScanArchive {
   }
 
   pendingTokens(limit=20,now=this.now()):ScanToken[] {
-    this.prune(now);
+    this.maybeMaintain(now);
     const take=Number.isSafeInteger(limit)?Math.max(1,Math.min(200,limit)):20;
     return this.db.prepare(`SELECT chain,address,MIN(COALESCE(last_price_attempt_at,'')) AS attempted FROM scan_summaries
       WHERE eligible_at>? AND eligible_at<=? GROUP BY chain,address ORDER BY attempted ASC,MIN(eligible_at) ASC,chain,address LIMIT ?`)
@@ -662,6 +663,12 @@ export class ScanArchive {
   prune(now=this.now()):void {
     if(!Number.isFinite(now.getTime())) return;
     this.db.exec('BEGIN IMMEDIATE');
+    try {this.pruneInside(now,true);this.db.exec('COMMIT');} catch(error) {this.db.exec('ROLLBACK');throw error;}
+  }
+  /** Periodic runtime maintenance; retention is automatically minute-gated. */
+  maintenance(now=this.now()):void {
+    if(!Number.isFinite(now.getTime()))return;
+    this.db.exec('BEGIN IMMEDIATE');
     try {this.pruneInside(now);this.db.exec('COMMIT');} catch(error) {this.db.exec('ROLLBACK');throw error;}
   }
   close():void {this.db.close();}
@@ -753,15 +760,25 @@ export class ScanArchive {
         record.performance?.maxGainPct??null,JSON.stringify(record));
     this.cachedStats=undefined;
   }
-  private pruneInside(now:Date):void {
-    if(this.comparison.prune(now))this.cachedStats=undefined;
-    this.followup?.prune(now);
-    const cutoff=new Date(now.getTime()-this.retentionDays*86_400_000).toISOString();
-    if(Number(this.db.prepare('DELETE FROM scan_summaries WHERE received_at<?').run(cutoff).changes))this.cachedStats=undefined;
-    if(Number(this.db.prepare('SELECT count(*) AS n FROM scan_summaries').get()!.n)>this.maxEntries)
-      if(Number(this.db.prepare('DELETE FROM scan_summaries WHERE id NOT IN (SELECT id FROM scan_summaries ORDER BY received_at DESC,rowid DESC LIMIT ?)').run(this.maxEntries).changes))
+  private maybeMaintain(now:Date):void {
+    if(Number.isFinite(now.getTime())&&now.getTime()>=this.nextRetentionAt)this.maintenance(now);
+  }
+  private pruneInside(now:Date,force=false):void {
+    // Capacity is checked with a compact covering index. Retention and orphan
+    // reconciliation scan several indexes and need run at most once a minute,
+    // rather than on every price-target read and signal state transition.
+    const count=Number(this.db.prepare('SELECT count(*) AS n FROM scan_summaries').get()!.n),
+      full=force||now.getTime()>=this.nextRetentionAt||count>this.maxEntries;
+    if(full){
+      if(this.comparison.prune(now))this.cachedStats=undefined;
+      this.followup?.prune(now);
+      const cutoff=new Date(now.getTime()-this.retentionDays*86_400_000).toISOString();
+      if(Number(this.db.prepare('DELETE FROM scan_summaries WHERE received_at<?').run(cutoff).changes))this.cachedStats=undefined;
+      if(count>this.maxEntries&&Number(this.db.prepare('DELETE FROM scan_summaries WHERE id NOT IN (SELECT id FROM scan_summaries ORDER BY received_at DESC,rowid DESC LIMIT ?)').run(this.maxEntries).changes))
         this.cachedStats=undefined;
-    this.db.exec('DELETE FROM watch_jobs WHERE id NOT IN (SELECT id FROM scan_summaries); DELETE FROM watch_heads WHERE id NOT IN (SELECT id FROM scan_summaries)');
+      this.db.exec('DELETE FROM watch_jobs WHERE id NOT IN (SELECT id FROM scan_summaries); DELETE FROM watch_heads WHERE id NOT IN (SELECT id FROM scan_summaries)');
+      this.nextRetentionAt=now.getTime()+60_000;
+    }
     this.db.prepare("UPDATE watch_jobs SET state='ended',end_reason=expiry_reason,next_check_at=NULL,lease_until=NULL,claim_id=NULL WHERE state<>'ended' AND ends_at<=?")
       .run(now.toISOString());
     this.db.prepare("UPDATE watch_jobs SET state='scheduled',next_check_at=?,lease_until=NULL,claim_id=NULL WHERE state='processing' AND lease_until<=?")

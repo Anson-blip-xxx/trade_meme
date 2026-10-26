@@ -131,6 +131,8 @@ function safeEvidence(value:unknown):Record<string,unknown>|undefined {
 
 /** Bounded, local notification history; this class never submits or replays analysis. */
 export class DebotNotificationLedger {
+  private nextPruneAt=0;
+  private retainedVersions=-1;
   constructor(private readonly db:DatabaseSync,private readonly now:()=>Date=()=>new Date()) {
     db.exec(`CREATE TABLE IF NOT EXISTS debot_notification_groups (
       chain TEXT NOT NULL,address TEXT NOT NULL,first_seen_at TEXT NOT NULL,last_seen_at TEXT NOT NULL,
@@ -149,16 +151,25 @@ export class DebotNotificationLedger {
         classification TEXT,reasons TEXT NOT NULL,evidence TEXT);
       CREATE INDEX IF NOT EXISTS debot_notification_versions_history ON debot_notification_versions(chain,address,observed_at DESC,key DESC);
       CREATE INDEX IF NOT EXISTS debot_notification_versions_seen ON debot_notification_versions(observed_at);
+      CREATE INDEX IF NOT EXISTS debot_notification_versions_prune ON debot_notification_versions(observed_at,key);
       CREATE TABLE IF NOT EXISTS debot_notification_meta (key TEXT PRIMARY KEY,value TEXT NOT NULL);`);
-    this.migrate();this.prune();
+    this.migrate();this.prune(true);
   }
 
   record(observation:DebotSignalObservation):DebotNotificationResult {
     this.db.exec('SAVEPOINT debot_notification_record');
-    try {const result=this.write(observation);this.prune();this.db.exec('RELEASE debot_notification_record');return result;}
+    try {
+      const result=this.write(observation);
+      // At the hard cap, remove only the exact overflow through the oldest-row
+      // index. Running all three retention sweeps for every incoming card made
+      // the live signal callback pause for hundreds of milliseconds.
+      if(this.retainedVersions>MAX_VERSIONS)this.trimVersions(this.retainedVersions-MAX_VERSIONS);
+      this.prune();this.db.exec('RELEASE debot_notification_record');return result;
+    }
     catch(error){
       // SQLITE_FULL can roll back the outer inbox transaction as well as this savepoint.
       try{this.db.exec('ROLLBACK TO debot_notification_record; RELEASE debot_notification_record');}catch{/* Already rolled back. */}
+      this.retainedVersions=-1;this.nextPruneAt=0;
       throw error;
     }
   }
@@ -223,6 +234,7 @@ export class DebotNotificationLedger {
     this.db.prepare(`INSERT INTO debot_notification_versions(key,chain,address,event_id,vendor_event_id,occurred_at,observed_at,last_observed_at,
       kind,notification_count,delivery_count,delta,reasons) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`)
       .run(key,token.chain,token.address,eventId,observation.id,occurredAt,observedAt,observedAt,change.kind,notificationCount,1,JSON.stringify(change.delta),JSON.stringify(change.reasons));
+    if(this.retainedVersions>=0)this.retainedVersions++;
     this.db.prepare(`INSERT INTO debot_notification_groups(chain,address,first_seen_at,last_seen_at,notification_count,delivery_count,version_count,
       latest_key,last_change_at,last_change_kind,snapshot,delta,reasons) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
       ON CONFLICT(chain,address) DO UPDATE SET last_seen_at=excluded.last_seen_at,notification_count=excluded.notification_count,
@@ -232,16 +244,34 @@ export class DebotNotificationLedger {
         key,observedAt,change.kind,JSON.stringify(next),JSON.stringify(change.delta),JSON.stringify(change.reasons));
     return {key,kind:change.kind,firstSeenAt,lastSeenAt,notificationCount,deliveryCount,newEvent:!event};
   }
-  private prune():void {
-    const cutoff=new Date(this.now().getTime()-RETENTION_DAYS*86400_000).toISOString();
+  private prune(force=false):void {
+    const now=this.now().getTime();
+    if(!Number.isFinite(now))throw new Error('DEBOT_NOTIFICATION_TIME_INVALID');
+    // Retention cannot change between notifications within the same minute.
+    // Capacity remains strict: the in-memory exact version count forces an
+    // immediate sweep on the first row beyond MAX_VERSIONS.
+    if(!force&&now<this.nextPruneAt)return;
+    const cutoff=new Date(now-RETENTION_DAYS*86400_000).toISOString();
     this.db.prepare('DELETE FROM debot_notification_versions WHERE observed_at<?').run(cutoff);
-    this.db.prepare('DELETE FROM debot_notification_versions WHERE key IN (SELECT key FROM debot_notification_versions ORDER BY observed_at DESC,key DESC LIMIT -1 OFFSET ?)').run(MAX_VERSIONS);
+    this.retainedVersions=Number(this.db.prepare('SELECT count(*) AS n FROM debot_notification_versions').get()!.n);
+    if(this.retainedVersions>MAX_VERSIONS)this.trimVersions(this.retainedVersions-MAX_VERSIONS);
     // Identity tombstones survive version pruning while they remain inside the
     // bounded deduplication horizon. Aggregates preserve the number omitted.
     this.db.prepare('DELETE FROM debot_notification_events WHERE observed_at<?').run(cutoff);
-    this.db.prepare('DELETE FROM debot_notification_events WHERE rowid IN (SELECT rowid FROM debot_notification_events ORDER BY observed_at DESC,rowid DESC LIMIT -1 OFFSET ?)').run(MAX_VERSIONS);
+    const events=Number(this.db.prepare('SELECT count(*) AS n FROM debot_notification_events').get()!.n);
+    if(events>MAX_VERSIONS)this.db.prepare(`DELETE FROM debot_notification_events WHERE rowid IN
+      (SELECT rowid FROM debot_notification_events INDEXED BY debot_notification_events_seen ORDER BY observed_at,rowid LIMIT ?)`).run(events-MAX_VERSIONS);
     this.db.prepare('DELETE FROM debot_notification_groups WHERE last_seen_at<?').run(cutoff);
-    this.db.prepare('DELETE FROM debot_notification_groups WHERE rowid IN (SELECT rowid FROM debot_notification_groups ORDER BY last_seen_at DESC,rowid DESC LIMIT -1 OFFSET ?)').run(MAX_VERSIONS);
+    const groups=Number(this.db.prepare('SELECT count(*) AS n FROM debot_notification_groups').get()!.n);
+    if(groups>MAX_VERSIONS)this.db.prepare(`DELETE FROM debot_notification_groups WHERE rowid IN
+      (SELECT rowid FROM debot_notification_groups INDEXED BY debot_notification_groups_seen ORDER BY last_seen_at,rowid LIMIT ?)`).run(groups-MAX_VERSIONS);
+    this.nextPruneAt=now+60_000;
+  }
+  private trimVersions(limit:number):void {
+    if(!Number.isSafeInteger(limit)||limit<=0)return;
+    const removed=this.db.prepare(`DELETE FROM debot_notification_versions WHERE key IN
+      (SELECT key FROM debot_notification_versions INDEXED BY debot_notification_versions_prune ORDER BY observed_at,key LIMIT ?)`).run(limit);
+    if(this.retainedVersions>=0)this.retainedVersions=Math.max(0,this.retainedVersions-Number(removed.changes));
   }
   private migrate():void {
     if(this.db.prepare("SELECT 1 FROM debot_notification_meta WHERE key='inbox_migration_v1'").get())return;

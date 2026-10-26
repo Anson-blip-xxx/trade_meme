@@ -112,7 +112,9 @@ export class TradeNotifications {
       throw new Error('TRADE_NOTIFICATION_INTERVAL_INVALID');
     if(path!==':memory:')mkdirSync(dirname(path),{recursive:true,mode:0o700});
     this.db=new DatabaseSync(path);if(path!==':memory:')chmodSync(path,0o600);
-    this.db.exec(`PRAGMA journal_mode=WAL;PRAGMA busy_timeout=5000;
+    // This database is a derived notification projection. WAL/NORMAL keeps app
+    // crash durability without forcing one fsync for every websocket price.
+    this.db.exec(`PRAGMA journal_mode=WAL;PRAGMA synchronous=NORMAL;PRAGMA busy_timeout=5000;
       CREATE TABLE IF NOT EXISTS trade_notification_positions (
         order_id TEXT PRIMARY KEY, state TEXT NOT NULL
       );
@@ -122,11 +124,15 @@ export class TradeNotifications {
       );`);
     // A small indexed active set keeps per-price work independent of historical order count.
     const columns=new Set(this.db.prepare('PRAGMA table_info(trade_notification_positions)').all().map(row=>String(row.name)));
-    const migrate=!columns.has('active')||!columns.has('latest_at_ms');
+    const migrate=!columns.has('active')||!columns.has('latest_at_ms')||!columns.has('token_key')||!columns.has('native_managed');
     if(!columns.has('active'))this.db.exec('ALTER TABLE trade_notification_positions ADD COLUMN active INTEGER NOT NULL DEFAULT 0');
     if(!columns.has('latest_at_ms'))this.db.exec('ALTER TABLE trade_notification_positions ADD COLUMN latest_at_ms INTEGER');
+    if(!columns.has('token_key'))this.db.exec('ALTER TABLE trade_notification_positions ADD COLUMN token_key TEXT');
+    if(!columns.has('native_managed'))this.db.exec('ALTER TABLE trade_notification_positions ADD COLUMN native_managed INTEGER NOT NULL DEFAULT 0');
     if(migrate)for(const state of this.states())this.save(state);
     this.db.exec(`CREATE INDEX IF NOT EXISTS trade_notification_active ON trade_notification_positions(active,latest_at_ms);
+      CREATE INDEX IF NOT EXISTS trade_notification_price_target ON trade_notification_positions(token_key)
+        WHERE active=1 AND native_managed=0;
       CREATE INDEX IF NOT EXISTS trade_notification_pending ON trade_notification_events(queued,created_at,event_key);`);
   }
   private states(activeOnly=false):Tracking[] {
@@ -167,9 +173,12 @@ export class TradeNotifications {
       entryPriceUsd:state.baselineKind==='fill'?state.baseline?.usd:undefined}));
   }
   private save(state:Tracking):void {
-    this.db.prepare(`INSERT INTO trade_notification_positions (order_id,state,active,latest_at_ms) VALUES (?,?,?,?)
-      ON CONFLICT(order_id) DO UPDATE SET state=excluded.state,active=excluded.active,latest_at_ms=excluded.latest_at_ms`)
-      .run(state.order.id,JSON.stringify(state),active(state)?1:0,state.latest?at(state.latest.at):null);
+    const token=normalizePriceToken({chain:state.order.chain,address:state.order.tokenAddress});
+    this.db.prepare(`INSERT INTO trade_notification_positions (order_id,state,active,latest_at_ms,token_key,native_managed) VALUES (?,?,?,?,?,?)
+      ON CONFLICT(order_id) DO UPDATE SET state=excluded.state,active=excluded.active,latest_at_ms=excluded.latest_at_ms,
+      token_key=excluded.token_key,native_managed=excluded.native_managed`)
+      .run(state.order.id,JSON.stringify(state),active(state)?1:0,state.latest?at(state.latest.at):null,
+        token?`${token.chain}:${token.address}`:null,state.nativeManaged?1:0);
   }
   private event(state:Tracking,suffix:string,body:string):void {
     const eventKey=`trade:${state.order.id}:${suffix}`;
@@ -213,8 +222,8 @@ export class TradeNotifications {
     const actualLabel=nativeManaged?'链上核验成交输入':'GMGN 记录成交输入';
     return `${actual?actualLabel:'委托输入'}：${exact} ${currency.symbol}${actual?'（未核算总费用）':'（不代表已成交）'}`;
   }
-  private flush():void {
-    this.states(true);
+  private flush(checkClosures=true):void {
+    if(checkClosures)this.states(true);
     for(const row of this.db.prepare('SELECT event_key,text FROM trade_notification_events WHERE queued=0 ORDER BY created_at,event_key LIMIT 100').all()) {
       try {
         this.options.enqueue({key:String(row.event_key),text:String(row.text)});
@@ -289,14 +298,15 @@ export class TradeNotifications {
     // that already-observed fresh price immediately without treating it as new.
     if(state.latest&&this.now()-at(state.latest.at)<=QUOTE_ALERT_AFTER&&at(state.latest.at)>=at(fill.confirmedAt))this.emitMilestones(state);
   }
-  private emitMilestones(state:Tracking):void {
-    if(!state.latest||!state.baseline)return;
+  private emitMilestones(state:Tracking):boolean {
+    if(!state.latest||!state.baseline)return false;
     const gain=(state.latest.usd/state.baseline.usd-1)*100,crossed=crossedPriceMilestones(gain,state.milestones);
-    if(!crossed.length)return;
+    if(!crossed.length)return false;
     state.milestones.push(...crossed);
     const key=crossed.join(',');
     this.event(state,`milestone:${key.length<=160?key:createHash('sha256').update(key).digest('hex')}`,
       `${state.baselineKind==='fill'?'持仓价格涨幅':'价格涨跌观察'}：越过 ${crossedMilestoneLabel(crossed)}\n\n${this.priceSummary(state)}`);
+    return true;
   }
   private observeExit(state:Tracking):void {
     const order=state.order,exit=order.exit;
@@ -328,15 +338,16 @@ export class TradeNotifications {
     if(!token||!Number.isFinite(input.priceUsd)||input.priceUsd<=0||!Number.isFinite(time)||time>now||now-time>MAX_PRICE_AGE||
       !PRICE_SOURCES.has(input.source)||extra.conflict||extra.status==='conflict'||
       input.source==='chain_pool_sample'&&!priceEvidence(input))return false;
-    let accepted=false;
-    for(const target of this.states(true)) {
-      if(target.nativeManaged)continue;
-      if(!same(token,{chain:target.order.chain,address:target.order.tokenAddress}))continue;
+    let accepted=false,notify=false;
+    const targets=this.db.prepare(`SELECT state FROM trade_notification_positions
+      WHERE active=1 AND native_managed=0 AND token_key=?`).all(`${token.chain}:${token.address}`)
+      .map(row=>JSON.parse(String(row.state)) as Tracking);
+    for(const target of targets) {
+      if(this.authoritativelyClosed(target)||!same(token,{chain:target.order.chain,address:target.order.tokenAddress}))continue;
       this.db.exec('BEGIN IMMEDIATE');
       try {
-      const row=this.db.prepare('SELECT state FROM trade_notification_positions WHERE order_id=?').get(target.order.id);
-      const state=row?JSON.parse(String(row.state)) as Tracking:undefined;
-      if(!state||!active(state)||!state.confirmedAt||time<at(state.confirmedAt)||state.latest&&time<=at(state.latest.at)){
+      const state=target;
+      if(!active(state)||!state.confirmedAt||time<at(state.confirmedAt)||state.latest&&time<=at(state.latest.at)){
         this.db.exec('COMMIT');continue;
       }
       const point={at:new Date(time).toISOString(),usd:input.priceUsd,source:input.source};
@@ -345,11 +356,14 @@ export class TradeNotifications {
       }
       state.latest=point;
       if(!state.peak||point.usd>state.peak.usd)state.peak=point;
-      this.emitMilestones(state);
+      notify=this.emitMilestones(state)||notify;
       this.save(state);this.db.exec('COMMIT');accepted=true;
       }catch(error){this.db.exec('ROLLBACK');throw error;}
     }
-    this.flush();return accepted;
+    // The 5-second state tick performs the global closure sweep. A price frame
+    // only needs the exact token row above, otherwise N prices x N holdings
+    // blocks the websocket/main loop even for native-managed positions.
+    if(notify)this.flush(false);return accepted;
   }
   recordPriceError(token:ScanToken,_reason:string):void {if(this.closed||!normalizePriceToken(token))return;}
   private priceSummary(state:Tracking):string {

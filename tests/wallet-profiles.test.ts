@@ -77,6 +77,39 @@ test('fresh whole-wallet vendor profit and locally observed upside stay separate
   }finally{f.close();}
 });
 
+test('worker materializes a bounded durable profit cohort and expires it without a main-thread profile scan',()=>{
+  const f=fixture({refreshAfterSec:3600});try{
+    f.trade(1,{source:'gmgn_kol_feed'});f.history.captureLeaders('bsc',[{address:address(1),period:'7d',realizedProfitUsd:'123'}],{source:'gmgn_stats',observedAt:iso(30)});
+    f.batch();assert.deepEqual(f.reader.profitCohort('bsc',f.now()),[123]);
+    f.reader.close();assert.deepEqual(f.reader.profitCohort('bsc',f.now()),[123],'compact snapshot survives reader restart');
+    f.setNow(86_430);f.batch();f.reader.close();assert.deepEqual(f.reader.profitCohort('bsc',f.now()),[123],'the original +24h boundary remains inclusive');
+    f.setNow(86_430.001);assert.deepEqual(f.reader.profitCohort('bsc',f.now()),[],'one more millisecond expires the snapshot');
+    f.setNow(86_431);f.batch();assert.deepEqual(f.reader.profitCohort('bsc',f.now()),[]);
+  }finally{f.close();}
+});
+
+test('reader refresh cadence never extends expiring vendor evidence',()=>{
+  const f=fixture({refreshAfterSec:3600});try{
+    f.trade();f.history.captureLeaders('bsc',[{address:address(1),period:'7d',realizedProfitUsd:'123'}],
+      {source:'gmgn_stats',observedAt:iso(30)});
+    f.setNow(86_000);f.batch();
+    let profile=f.reader.get('bsc',address(1))!;
+    assert.equal(profile.freshUntil,new Date(base+(30+86_400)*1000+1).toISOString());
+    assert.equal(profile.status,'current');
+    f.setNow(86_430.001);profile=f.reader.get('bsc',address(1))!;
+    assert.equal(profile.status,'stale','a six-hour recomputation window cannot extend 24-hour vendor evidence');
+  }finally{f.close();}
+});
+
+test('profile status counters stay exact between bounded worker-side reconciliations',()=>{
+  const f=fixture({refreshAfterSec:3600});try{
+    f.trade(1);f.batch();const first=f.reader.status();assert.equal(first.profiles,1);assert.equal(first.aggregatedAt,iso(100));
+    f.setNow(101);f.trade(2,{txHash:hash(2)});f.batch();const incremental=f.reader.status();
+    assert.equal(incremental.profiles,2);assert.equal(incremental.profiledSourceWallets,2);assert.equal(incremental.aggregatedAt,first.aggregatedAt);
+    f.setNow(701);f.batch();assert.equal(f.reader.status().aggregatedAt,iso(701));
+  }finally{f.close();}
+});
+
 test('future observations, stale caches and token-level profit cannot grant a group',()=>{
   const f=fixture();try{f.trade();relation(f,[100],true);f.raw.prepare('UPDATE wh_assoc_relations SET updated_at=?').run(iso(101));
     const future={chain:'bsc',wallet:address(1),scope:'entire_wallet',period:'7d',verification:'vendor_claim',realizedProfitUsd:'9999',observedAt:iso(101)};
@@ -118,6 +151,18 @@ test('initial rowid ingestion, changed wallets and expiry progress across bounde
     f.setNow(102);f.trade(31,{observedAt:iso(102),eventAt:iso(101)});f.batch(5);assert.ok(f.reader.get('bsc',address(31)));
     assert.equal(f.reader.list({search:address(31)}).total,1);assert.equal(f.reader.list({group:'insufficient_evidence',chain:'bsc',limit:2}).items.length,2);
     f.setNow(200);assert.equal(f.reader.get('bsc',address(1))!.status,'stale');assert.ok(f.reader.status().staleProfiles>0);
+  }finally{f.close();}
+});
+
+test('periodic reconciliation uses the configured window while source changes remain immediate',()=>{
+  const f=fixture({refreshAfterSec:3600});try{
+    f.trade();f.batch();f.setNow(3699);
+    assert.equal(f.reader.get('bsc',address(1))!.status,'current');
+    assert.equal(f.reader.status().staleProfiles,0);
+    f.setNow(3700);assert.equal(f.reader.get('bsc',address(1))!.status,'stale');
+    assert.equal(f.reader.status().staleProfiles,1);
+    f.history.captureLeaders('bsc',[{address:address(1),period:'7d',realizedProfitUsd:'5'}],{source:'gmgn_stats',observedAt:iso(3700)});
+    f.batch();assert.equal(f.reader.get('bsc',address(1))!.status,'current');
   }finally{f.close();}
 });
 
@@ -300,6 +345,7 @@ test('old profiles acquire role analysis without new trades and common high-degr
     f.trade();f.batch();
     const output=new DatabaseSync(f.database);
     output.prepare('UPDATE wp_profiles SET role_computed_at=NULL,role_input_key=NULL,data=json_remove(data,?)').run('$.roleAnalysis');output.close();
+    f.restart();
     assert.equal(f.reader.status().rolePending,1);f.batch(5);assert.ok(f.reader.get('bsc',address(1))!.roleAnalysis);
     assert.equal(f.reader.status().rolePending,0);
     for(let i=1;i<=21;i++)f.raw.prepare('INSERT INTO wh_funding(id,chain,wallet,funding_address,observed_at,shared,conflict,snapshot_at,data) VALUES (?,?,?,?,?,?,?,?,?)')

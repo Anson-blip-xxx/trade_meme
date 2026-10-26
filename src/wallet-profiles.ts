@@ -22,11 +22,14 @@ export interface WalletProfile {
 }
 export interface WalletProfileStatus {ready:boolean;profiles:number;sourceWallets:number;profiledSourceWallets:number;initialComplete:boolean;processed:number;lastRunAt?:string;
   roleProfiles:number;rolePending:number;roleLastRunAt?:string;
-  groupCounts:Partial<Record<WalletProfileGroupId,number>>;bytes:number;maxBytes:number;capacityReached:boolean;error?:string;sampleOnly:true;staleProfiles:number;}
+  groupCounts:Partial<Record<WalletProfileGroupId,number>>;bytes:number;maxBytes:number;capacityReached:boolean;error?:string;sampleOnly:true;staleProfiles:number;aggregatedAt?:string;}
 export interface WalletProfileListOptions {chain?:Chain;group?:string;search?:string;limit?:number;offset?:number;}
-export interface WalletProfilesOptions {database:string;historyDatabase:string;chainDatabase?:string;maxBytes?:number;now?:()=>Date;refreshAfterSec?:number;}
+export interface WalletProfitCohortSnapshot {asOf:string;validUntil:string;values:number[];}
+export type WalletProfitCohorts=Partial<Record<Chain,WalletProfitCohortSnapshot>>;
+export interface WalletProfilesOptions {database:string;historyDatabase:string;chainDatabase?:string;maxBytes?:number;now?:()=>Date;refreshAfterSec?:number;cohortMaxAgeSec?:number;}
 type Row=Record<string,any>;
-const DAY=86_400_000,CAPACITY='WALLET_PROFILES_CAPACITY_REACHED',SERVICES=new Set(['exchange_or_pool','exchange','pool','router','bridge','cex']);
+const DAY=86_400_000,CAPACITY='WALLET_PROFILES_CAPACITY_REACHED',CHAINS:Chain[]=['bsc','solana','robinhood'];
+const SERVICES=new Set(['exchange_or_pool','exchange','pool','router','bridge','cex']);
 const parse=(value:unknown):any=>{try{return typeof value==='string'?JSON.parse(value):undefined;}catch{return undefined;}};
 const stamp=(value:unknown):value is string=>typeof value==='string'&&/^\d{4}-\d\d-\d\dT/.test(value)&&Number.isFinite(Date.parse(value));
 const validTime=(value:unknown,now:string):value is string=>stamp(value)&&value<=now;
@@ -46,8 +49,10 @@ export class WalletProfiles {
   private readonly roleKeys=new Map<string,string>();
   private readonly funderCache=new Map<string,boolean>();
   private readonly newQualifications=new Map<string,{profile:WalletProfile;peers:Set<string>}>();
+  private cachedStatus?:WalletProfileStatus;private statusAt=0;
+  private cachedProfitCohorts:WalletProfitCohorts={};private cohortsAt=0;
   constructor(private readonly options:WalletProfilesOptions) {
-    this.now=options.now??(()=>new Date());this.maxBytes=options.maxBytes??256*1024*1024;this.refreshMs=(options.refreshAfterSec??1800)*1000;
+    this.now=options.now??(()=>new Date());this.maxBytes=options.maxBytes??256*1024*1024;this.refreshMs=(options.refreshAfterSec??21600)*1000;
     if(!Number.isSafeInteger(this.maxBytes)||this.maxBytes<16_384||!Number.isFinite(this.refreshMs)||this.refreshMs<1000||canonicalPath(options.database)===canonicalPath(options.historyDatabase)||
       options.chainDatabase&&canonicalPath(options.database)===canonicalPath(options.chainDatabase))throw new Error('WALLET_PROFILES_CONFIG_INVALID');
     this.history=new DatabaseSync(options.historyDatabase,{readOnly:true});this.history.exec('PRAGMA busy_timeout=1000; PRAGMA query_only=ON');
@@ -63,22 +68,34 @@ export class WalletProfiles {
       CREATE TABLE IF NOT EXISTS wp_group_first(chain TEXT,address TEXT,group_id TEXT,first_at TEXT NOT NULL,PRIMARY KEY(chain,address,group_id));
       CREATE TABLE IF NOT EXISTS wp_changes(id INTEGER PRIMARY KEY,chain TEXT,address TEXT,observed_at TEXT NOT NULL,data TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS wp_changes_wallet ON wp_changes(chain,address,id DESC);
+      CREATE TABLE IF NOT EXISTS wp_snapshots(key TEXT PRIMARY KEY,updated_at TEXT NOT NULL,data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS wp_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);`);
     if(!this.db.prepare('PRAGMA table_info(wp_profiles)').all().some(column=>column.name==='source_wallet'))this.db.exec('ALTER TABLE wp_profiles ADD COLUMN source_wallet INTEGER NOT NULL DEFAULT 0');
     for(const column of ['role_computed_at','role_input_key'])if(!this.db.prepare('PRAGMA table_info(wp_profiles)').all().some(row=>row.name===column))this.db.exec(`ALTER TABLE wp_profiles ADD COLUMN ${column} TEXT`);
     this.db.exec('CREATE INDEX IF NOT EXISTS wp_profiles_source ON wp_profiles(source_wallet)');
     this.db.exec('CREATE INDEX IF NOT EXISTS wp_profiles_roles ON wp_profiles(role_computed_at)');
+    this.setMeta('refresh_after_sec',String(this.refreshMs/1000));
     const oldLimit=Number(this.meta('max_bytes'));this.setMeta('max_bytes',String(this.maxBytes));
     if(this.meta('error')===CAPACITY&&this.maxBytes>oldLimit&&filesBytes(options.database,this.db)+32768<this.maxBytes)this.setMeta('error','');
     // Historical coverage belongs to the rowid pass. Start update watermarks at
     // worker creation so live changes never queue behind the entire old corpus.
     if(!this.meta('changed_at'))this.setMeta('changed_at',this.now().toISOString());
     if(!this.meta('coordination_at'))this.setMeta('coordination_at',this.now().toISOString());
+    const now=this.now().toISOString(),cohorts=this.snapshot('profit_cohorts');
+    // One worker-side reconciliation at startup repairs a snapshot left behind
+    // by a crash. Subsequent batches update these counters incrementally.
+    this.cachedStatus=aggregateStatus(this.db,this.options.database,now,this.refreshMs/1000);this.statusAt=Date.parse(now);
+    this.saveSnapshot('profile_status',now,this.cachedStatus);
+    if(validProfitCohorts(cohorts?.data)){this.cachedProfitCohorts=cohorts.data;this.cohortsAt=Date.parse(cohorts.updatedAt);}
   }
   private hs(sql:string):StatementSync {let statement=this.sourceStatements.get(sql);if(!statement){statement=this.history.prepare(sql);this.sourceStatements.set(sql,statement);}return statement;}
   private os(sql:string):StatementSync {let statement=this.outputStatements.get(sql);if(!statement){statement=this.db.prepare(sql);this.outputStatements.set(sql,statement);}return statement;}
   private meta(key:string):string{return String(this.os('SELECT value FROM wp_meta WHERE key=?').get(key)?.value??'');}
   private setMeta(key:string,value:string):void {this.os('INSERT INTO wp_meta VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key,value);}
+  private snapshot(key:string):{updatedAt:string;data:unknown}|undefined {const row=this.os('SELECT updated_at,data FROM wp_snapshots WHERE key=?').get(key);if(!row)return;
+    return {updatedAt:String(row.updated_at),data:parse(row.data)};}
+  private saveSnapshot(key:string,updatedAt:string,data:unknown):void {this.os(`INSERT INTO wp_snapshots VALUES (?,?,?) ON CONFLICT(key)
+    DO UPDATE SET updated_at=excluded.updated_at,data=excluded.data`).run(key,updatedAt,JSON.stringify(data));}
   runBatch(limit=100):WalletProfileStatus {
     if(this.meta('error')===CAPACITY)return this.status();
     if(!this.chain&&this.options.chainDatabase&&existsSync(this.options.chainDatabase)){this.chain=new DatabaseSync(this.options.chainDatabase,{readOnly:true});this.chain.exec('PRAGMA busy_timeout=1000; PRAGMA query_only=ON');}
@@ -113,11 +130,16 @@ export class WalletProfiles {
     // Existing profiles also receive the new model, independent of new events
     // or the original history cursor. The NULL index makes this bounded.
     this.os('SELECT chain,address FROM wp_profiles WHERE role_computed_at IS NULL LIMIT ?').all(Math.max(1,Math.ceil(n*0.2))).forEach(add);
-    const due=this.os('SELECT chain,address FROM wp_profiles WHERE fresh_until<=? ORDER BY fresh_until LIMIT ?').all(now,Math.max(1,n-targets.size));due.forEach(add);
+    // Source cursors refresh changed wallets immediately. The periodic pass is
+    // only reconciliation, so key it by computed_at and the configured window
+    // instead of perpetually rewriting the whole corpus every 30 minutes.
+    const dueAt=new Date(Date.parse(now)-this.refreshMs).toISOString();
+    const due=this.os('SELECT chain,address FROM wp_profiles INDEXED BY wp_profiles_recent WHERE computed_at<=? ORDER BY computed_at,chain,address LIMIT ?')
+      .all(dueAt,Math.max(1,n-targets.size));due.forEach(add);
     const chainCursor=Number(this.meta('chain_cursor')||0);
     const chainRows=this.chain?.prepare('SELECT rowid AS cursor,chain,wallet FROM chain_events WHERE rowid>? ORDER BY rowid LIMIT ?').all(chainCursor,Math.max(1,Math.min(200,Math.floor(n*0.2))))??[];
     chainRows.forEach(add);
-    this.db.exec('BEGIN');
+    const statusBefore=this.cachedStatus&&structuredClone(this.cachedStatus);this.db.exec('BEGIN');
     let processed=0,full=false;
     try {
       for(const target of targets.values()){
@@ -144,10 +166,13 @@ export class WalletProfiles {
         this.os('UPDATE wp_profiles SET computed_at=?,role_computed_at=?,data=? WHERE chain=? AND address=?')
           .run(registeredAt,registeredAt,JSON.stringify(profile),profile.chain,profile.address);
       }
+      if(this.newQualifications.size&&this.cachedStatus&&(!this.cachedStatus.roleLastRunAt||registeredAt>this.cachedStatus.roleLastRunAt))
+        this.cachedStatus.roleLastRunAt=registeredAt;
       this.setMeta('processed',String(Number(this.meta('processed')||0)+processed));this.setMeta('last_run_at',registeredAt);
       if(full)this.setMeta('error',CAPACITY);this.db.exec('COMMIT');
-    }catch(error){this.db.exec('ROLLBACK');throw error;}
+    }catch(error){this.db.exec('ROLLBACK');this.cachedStatus=statusBefore;throw error;}
     if(!this.countedAt||this.now().getTime()-this.countedAt>=60_000){this.sourceCount=Number(this.hs('SELECT count(*) AS n FROM wh_wallets').get()!.n);this.countedAt=this.now().getTime();this.setMeta('source_wallets',String(this.sourceCount));}
+    this.refreshProfitCohorts(now,processed>0);
     return this.status();
   }
   private compute(chain:Chain,address:string,now:string):WalletProfile|undefined {
@@ -334,7 +359,8 @@ export class WalletProfiles {
     this.funderCache.set(key,usable);return usable;
   }
   private save(profile:WalletProfile):void {
-    const old=parse(this.os('SELECT data FROM wp_profiles WHERE chain=? AND address=?').get(profile.chain,profile.address)?.data) as WalletProfile|undefined;
+    const oldRow=this.os('SELECT data,source_wallet,role_computed_at FROM wp_profiles WHERE chain=? AND address=?').get(profile.chain,profile.address);
+    const old=parse(oldRow?.data) as WalletProfile|undefined;
     const peers=new Set((profile.roleAnalysis?.peers??[]).filter(peer=>peer.qualification&&
       JSON.stringify(peer.qualification)!==JSON.stringify(old?.roleAnalysis?.peers.find(previous=>previous.address===peer.address)?.qualification)).map(peer=>peer.address));
     if(peers.size)this.newQualifications.set(profile.chain+':'+profile.address,{profile,peers});
@@ -350,44 +376,110 @@ export class WalletProfiles {
         profile.roleAnalysis?.computedAt??null,this.roleKeys.get(profile.chain+':'+profile.address)??null);
     this.os('DELETE FROM wp_groups WHERE chain=? AND address=?').run(profile.chain,profile.address);
     for(const group of profile.groups)this.os('INSERT INTO wp_groups VALUES (?,?,?,?)').run(profile.chain,profile.address,group.id,group.firstObservedAt);
+    const status=this.cachedStatus;if(!status)return;
+    const wasSource=Number(oldRow?.source_wallet)===1,isSource=profile.source==='wallet_history',hadRole=!!oldRow?.role_computed_at,hasRole=!!profile.roleAnalysis?.computedAt;
+    if(!oldRow){status.profiles++;if(hasRole)status.roleProfiles++;else status.rolePending++;}
+    else if(hadRole!==hasRole){status.roleProfiles+=hasRole?1:-1;status.rolePending+=hasRole?-1:1;}
+    if(wasSource!==isSource)status.profiledSourceWallets+=isSource?1:-1;
+    if(hasRole&&(!status.roleLastRunAt||profile.roleAnalysis!.computedAt>status.roleLastRunAt))status.roleLastRunAt=profile.roleAnalysis!.computedAt;
+    for(const id of previous)if(!current.has(id))status.groupCounts[id]=Math.max(0,(status.groupCounts[id]??0)-1);
+    for(const id of current)if(!previous.has(id))status.groupCounts[id]=(status.groupCounts[id]??0)+1;
   }
-  status():WalletProfileStatus{return readStatus(this.db,this.options.database,this.now().toISOString());}
+  private refreshProfitCohorts(now:string,dirty:boolean):void {
+    const nowMs=Date.parse(now),complete=CHAINS.every(chain=>!!this.cachedProfitCohorts[chain]);
+    const expired=Object.values(this.cachedProfitCohorts).some(snapshot=>Date.parse(snapshot!.validUntil)<=nowMs);
+    if(complete&&nowMs>=this.cohortsAt&&!expired&&nowMs-this.cohortsAt<60_000&&(!dirty||nowMs-this.cohortsAt<10_000))return;
+    const configured=Number(this.options.cohortMaxAgeSec),maxAgeMs=(Number.isFinite(configured)?Math.max(120,Math.min(1800,configured)):300)*1000;
+    const cohorts:WalletProfitCohorts={};
+    for(const chain of CHAINS){
+      let validUntil=nowMs+maxAgeMs;
+      const values=this.os(`SELECT json_extract(p.data,'$.chain') AS chain,json_extract(p.data,'$.metrics.vendorProfit') AS profit
+        FROM wp_groups g INDEXED BY wp_groups_filter CROSS JOIN wp_profiles p ON p.chain=g.chain AND p.address=g.address
+        WHERE g.group_id='public_kol' AND g.chain=? ORDER BY p.computed_at DESC LIMIT 2000`).all(chain).flatMap(row=>{
+        const v=parse(row.profit) as WalletProfile['metrics']['vendorProfit'],n=Number(v?.realizedProfitUsd);
+        if(row.chain!==chain||v?.verification!=='vendor_claim'||v.period!=='7d'||!Number.isFinite(n)||n<=0||n>1e12||
+          !stamp(v.snapshotAt)||!stamp(v.observedAt)||v.snapshotAt>v.observedAt)return [];
+        const observedAt=Date.parse(v.observedAt),expiresAt=Date.parse(v.snapshotAt)+DAY+1;
+        if(observedAt>nowMs){validUntil=Math.min(validUntil,observedAt);return [];}
+        if(expiresAt<=nowMs)return [];
+        validUntil=Math.min(validUntil,expiresAt);return [n];
+      });
+      cohorts[chain]={asOf:now,validUntil:new Date(validUntil).toISOString(),values};
+    }
+    this.cachedProfitCohorts=cohorts;this.cohortsAt=nowMs;this.saveSnapshot('profit_cohorts',now,cohorts);
+  }
+  profitCohorts():WalletProfitCohorts {return structuredClone(this.cachedProfitCohorts);}
+  status():WalletProfileStatus {
+    const now=this.now().toISOString(),nowMs=Date.parse(now);
+    if(!this.cachedStatus||nowMs<this.statusAt||nowMs-this.statusAt>=600_000){
+      this.cachedStatus=aggregateStatus(this.db,this.options.database,now,this.refreshMs/1000);this.statusAt=nowMs;
+    }else this.cachedStatus=updateStatus(this.cachedStatus,this.db,this.options.database,now,this.refreshMs/1000);
+    this.saveSnapshot('profile_status',now,this.cachedStatus);return structuredClone(this.cachedStatus);
+  }
   close():void {this.chain?.close();this.history.close();this.db.close();}
 }
-function readStatus(db:DatabaseSync,path:string,now:string):WalletProfileStatus {
+function aggregateStatus(db:DatabaseSync,path:string,now:string,refreshAfterSec?:number):WalletProfileStatus {
   const meta=Object.fromEntries(db.prepare('SELECT key,value FROM wp_meta').all().map(r=>[String(r.key),String(r.value)]));
   const groupCounts:WalletProfileStatus['groupCounts']={};for(const row of db.prepare('SELECT group_id,count(*) AS n FROM wp_groups GROUP BY group_id').all())groupCounts[row.group_id as WalletProfileGroupId]=Number(row.n);
   const roles=db.prepare('SELECT COUNT(role_computed_at) AS n,MAX(role_computed_at) AS latest,COUNT(*)-COUNT(role_computed_at) AS pending FROM wp_profiles').get()!;
   return {ready:true,profiles:Number(db.prepare('SELECT count(*) AS n FROM wp_profiles').get()!.n),sourceWallets:Number(meta.source_wallets||0),
     roleProfiles:Number(roles.n),rolePending:Number(roles.pending),roleLastRunAt:roles.latest?String(roles.latest):undefined,
     profiledSourceWallets:Number(db.prepare('SELECT count(*) AS n FROM wp_profiles WHERE source_wallet=1').get()!.n),initialComplete:meta.initial_complete==='1',processed:Number(meta.processed||0),
-    lastRunAt:meta.last_run_at||undefined,groupCounts,bytes:filesBytes(path,db),maxBytes:Number(meta.max_bytes||0),capacityReached:meta.error===CAPACITY,error:meta.error||undefined,sampleOnly:true,
-    staleProfiles:Number(db.prepare('SELECT count(*) AS n FROM wp_profiles WHERE fresh_until<=?').get(now)!.n)};
+    lastRunAt:meta.last_run_at||undefined,groupCounts,bytes:filesBytes(path,db),maxBytes:Number(meta.max_bytes||0),capacityReached:meta.error===CAPACITY,error:meta.error||undefined,sampleOnly:true,aggregatedAt:now,
+    staleProfiles:Number(db.prepare('SELECT count(*) AS n FROM wp_profiles WHERE computed_at<=?').get(
+      new Date(Date.parse(now)-Math.max(1,refreshAfterSec??Number(meta.refresh_after_sec||21600))*1000).toISOString())!.n)};
 }
+function updateStatus(base:WalletProfileStatus,db:DatabaseSync,path:string,now:string,refreshAfterSec?:number):WalletProfileStatus {
+  const meta=Object.fromEntries(db.prepare('SELECT key,value FROM wp_meta').all().map(r=>[String(r.key),String(r.value)]));
+  return {...base,sourceWallets:Number(meta.source_wallets||0),initialComplete:meta.initial_complete==='1',processed:Number(meta.processed||0),
+    lastRunAt:meta.last_run_at||undefined,bytes:filesBytes(path,db),maxBytes:Number(meta.max_bytes||0),capacityReached:meta.error===CAPACITY,
+    error:meta.error||undefined,staleProfiles:Number(db.prepare('SELECT count(*) AS n FROM wp_profiles WHERE computed_at<=?').get(
+      new Date(Date.parse(now)-Math.max(1,refreshAfterSec??Number(meta.refresh_after_sec||21600))*1000).toISOString())!.n)};
+}
+function validStatus(value:unknown):value is WalletProfileStatus {if(!value||typeof value!=='object')return false;const status=value as Partial<WalletProfileStatus>;
+  return status.ready===true&&Number.isSafeInteger(status.profiles)&&status.profiles!>=0&&Number.isSafeInteger(status.profiledSourceWallets)&&status.profiledSourceWallets!>=0&&
+    Number.isSafeInteger(status.roleProfiles)&&status.roleProfiles!>=0&&Number.isSafeInteger(status.rolePending)&&status.rolePending!>=0&&!!status.groupCounts&&typeof status.groupCounts==='object';}
+function validProfitCohorts(value:unknown):value is WalletProfitCohorts {if(!value||typeof value!=='object')return false;
+  return CHAINS.every(chain=>{const item=(value as WalletProfitCohorts)[chain];return !!item&&stamp(item.asOf)&&stamp(item.validUntil)&&item.asOf<=item.validUntil&&
+    Array.isArray(item.values)&&item.values.length<=2000&&item.values.every(n=>typeof n==='number'&&Number.isFinite(n)&&n>0&&n<=1e12);});}
 /** The web process reads only this compact derived database, never the full research graph. */
 export class WalletProfileReader {
   private db?:DatabaseSync;
-  constructor(private readonly database:string,private readonly now:()=>Date=()=>new Date()){}
+  private refreshMs:number;
+  private profitCohorts?:WalletProfitCohorts;
+  constructor(private readonly database:string,private readonly now:()=>Date=()=>new Date(),private readonly refreshAfterSec?:number){
+    this.refreshMs=Math.max(1,refreshAfterSec??21600)*1000;
+  }
   private open():DatabaseSync|undefined {
     if(this.db)return this.db;if(!existsSync(this.database))return;
     try {const db=new DatabaseSync(this.database,{readOnly:true});db.exec('PRAGMA busy_timeout=500; PRAGMA query_only=ON');
-      if(!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='wp_profiles'").get()){db.close();return;}this.db=db;return db;
+      if(!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='wp_profiles'").get()){db.close();return;}
+      if(this.refreshAfterSec===undefined)
+        this.refreshMs=Math.max(1,Number(db.prepare("SELECT value FROM wp_meta WHERE key='refresh_after_sec'").get()?.value??21600))*1000;
+      this.db=db;this.loadProfitCohorts(db);return db;
     }catch{return;}
   }
-  status():WalletProfileStatus {const db=this.open();return db?readStatus(db,this.database,this.now().toISOString()):emptyStatus();}
+  private loadProfitCohorts(db:DatabaseSync):void {try {const row=db.prepare("SELECT data FROM wp_snapshots WHERE key='profit_cohorts'").get(),value=parse(row?.data);
+    if(validProfitCohorts(value))this.profitCohorts=value;}catch{/* The worker may still be creating the snapshot table. */}}
+  replaceProfitCohorts(value:unknown):void {if(validProfitCohorts(value))this.profitCohorts=structuredClone(value);}
+  status():WalletProfileStatus {const db=this.open();if(!db)return emptyStatus();try {const row=db.prepare("SELECT data FROM wp_snapshots WHERE key='profile_status'").get(),value=parse(row?.data);
+    return validStatus(value)?updateStatus(value,db,this.database,this.now().toISOString(),this.refreshMs/1000):{...emptyStatus(),ready:true};
+    }catch{return {...emptyStatus(),ready:true};}}
   /** The cohort is local sampled public wallets, never a global profit leaderboard. */
   profitCohort(chain:Chain,now=new Date()):number[] {
-    const db=this.open();if(!db)return [];
-    return db.prepare(`SELECT json_extract(p.data,'$.chain') AS chain,json_extract(p.data,'$.metrics.vendorProfit') AS profit
-      FROM wp_groups g INDEXED BY wp_groups_filter CROSS JOIN wp_profiles p ON p.chain=g.chain AND p.address=g.address
-      WHERE g.group_id='public_kol' AND g.chain=? ORDER BY p.computed_at DESC LIMIT 2000`).all(chain).flatMap(row=>{
-      const v=parse(row.profit) as WalletProfile['metrics']['vendorProfit'],n=Number(v?.realizedProfitUsd);
-      return row.chain===chain&&v?.verification==='vendor_claim'&&v.period==='7d'&&Number.isFinite(n)&&n>0&&
-        stamp(v.snapshotAt)&&stamp(v.observedAt)&&v.snapshotAt<=v.observedAt&&Date.parse(v.observedAt)<=now.getTime()&&
-        now.getTime()-Date.parse(v.snapshotAt)<=86_400_000?[n]:[];
-    });
+    this.open();const snapshot=this.profitCohorts?.[chain],at=now.toISOString();
+    return snapshot&&snapshot.asOf<=at&&at<snapshot.validUntil?snapshot.values.slice():[];
   }
-  private profile(data:unknown):WalletProfile {const profile=parse(data) as WalletProfile;if(profile.freshUntil<=this.now().toISOString())profile.status='stale';return profile;}
+  private profile(data:unknown):WalletProfile {const profile=parse(data) as WalletProfile;
+    // The configured recomputation window may extend legacy rows that were
+    // written with the old 30-minute cadence, but it must never extend time
+    // bounded evidence such as a vendor-profit snapshot past its own 24-hour
+    // validity boundary.
+    let untilMs=Date.parse(profile.computedAt)+this.refreshMs;
+    const profit=profile.metrics?.vendorProfit;
+    if(profit&&stamp(profit.snapshotAt))untilMs=Math.min(untilMs,Date.parse(profit.snapshotAt)+DAY+1);
+    const until=new Date(untilMs).toISOString();profile.freshUntil=until;
+    if(until<=this.now().toISOString())profile.status='stale';return profile;}
   list(options:WalletProfileListOptions={}):{ready:boolean;items:WalletProfile[];total:number} {
     const db=this.open();if(!db)return {ready:false,items:[],total:0};const where:string[]=[],args:(string|number)[]=[];
     if(options.chain){where.push('p.chain=?');args.push(options.chain);}if(options.group){where.push('EXISTS(SELECT 1 FROM wp_groups g WHERE g.chain=p.chain AND g.address=p.address AND g.group_id=?)');args.push(options.group);}
@@ -405,10 +497,11 @@ export class WalletProfileReader {
     const db=this.open();if(!db)return [];const cap=Math.max(1,Math.min(30,Math.trunc(limit))),quota=Math.max(1,Math.floor(cap/3)),result=new Map<string,WalletProfile>();
     for(const group of ['forward_validated','repeated_early','public_kol']){
       const rows=db.prepare(`SELECT p.data FROM wp_groups g INDEXED BY wp_groups_filter CROSS JOIN wp_profiles p ON p.chain=g.chain AND p.address=g.address
-        WHERE g.group_id=? AND g.chain=? AND p.fresh_until>? ORDER BY p.computed_at DESC,p.address LIMIT ?`).all(group,chain,this.now().toISOString(),quota);
+        WHERE g.group_id=? AND g.chain=? AND p.computed_at>? ORDER BY p.computed_at DESC,p.address LIMIT ?`)
+        .all(group,chain,new Date(this.now().getTime()-this.refreshMs).toISOString(),quota);
       for(const row of rows){const profile=this.profile(row.data);result.set(profile.address,profile);}
     }
     return [...result.values()].slice(0,cap);
   }
-  close():void {this.db?.close();this.db=undefined;}
+  close():void {this.db?.close();this.db=undefined;this.profitCohorts=undefined;this.refreshMs=Math.max(1,this.refreshAfterSec??21600)*1000;}
 }

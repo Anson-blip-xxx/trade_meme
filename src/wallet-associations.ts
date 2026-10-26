@@ -116,8 +116,10 @@ export class WalletAssociations {
         first_at TEXT,updated_at TEXT,active INTEGER,prospective INTEGER,forward_validated INTEGER,exited INTEGER,lead_seconds REAL,data TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS wh_assoc_anchor_dirty ON wh_assoc_anchors(dirty,checked_at);
       CREATE INDEX IF NOT EXISTS wh_assoc_anchor_token ON wh_assoc_anchors(chain,token_address);
+      CREATE INDEX IF NOT EXISTS wh_assoc_anchor_recent ON wh_assoc_anchors(chain,public_observed_at DESC,leader,token_address);
       CREATE INDEX IF NOT EXISTS wh_assoc_relation_rank ON wh_assoc_relations(token_count DESC,funding_count DESC,forward_count DESC);
       CREATE INDEX IF NOT EXISTS wh_assoc_relation_candidate ON wh_assoc_relations(chain,candidate);
+      CREATE INDEX IF NOT EXISTS wh_assoc_relation_candidate_leader ON wh_assoc_relations(chain,candidate,leader);
       CREATE INDEX IF NOT EXISTS wh_assoc_episode_pair ON wh_assoc_episodes(chain,leader,candidate,active,updated_at DESC);
       CREATE INDEX IF NOT EXISTS wh_assoc_episode_anchor ON wh_assoc_episodes(chain,leader,token_address,active);
       CREATE INDEX IF NOT EXISTS wh_assoc_episode_token ON wh_assoc_episodes(chain,token_address,active,leader,candidate);
@@ -132,7 +134,9 @@ export class WalletAssociations {
       db.exec('ALTER TABLE wh_assoc_relations ADD COLUMN active_since TEXT; UPDATE wh_assoc_relations SET active_since=first_at WHERE token_count>0');
     if(!db.prepare('PRAGMA table_info(wh_assoc_relations)').all().some(row=>row.name==='collection_checked_at'))
       db.exec('ALTER TABLE wh_assoc_relations ADD COLUMN collection_checked_at TEXT');
-    db.exec('CREATE INDEX IF NOT EXISTS wh_assoc_relation_collection ON wh_assoc_relations(chain,collection_checked_at)');
+    db.exec(`CREATE INDEX IF NOT EXISTS wh_assoc_relation_collection ON wh_assoc_relations(chain,collection_checked_at);
+      CREATE INDEX IF NOT EXISTS wh_assoc_relation_targets ON wh_assoc_relations(
+        chain,COALESCE(collection_checked_at,''),token_count DESC,funding_count DESC,leader,candidate) WHERE token_count>0`);
   }
 
   recordTrade(value:WalletTradeObservation):void {
@@ -214,19 +218,35 @@ export class WalletAssociations {
   targets(chain:Chain,limit=5,mode:'recent'|'known'='recent'):WalletAssociationTarget[] {
     const n=Number.isSafeInteger(limit)?Math.max(1,Math.min(20,limit)):5;
     if(mode==='known') return this.knownTargets(chain,n);
-    const rows=this.db.prepare(`SELECT a.*,e.event_at,e.observed_at FROM wh_assoc_anchors a JOIN wh_events e ON e.id=(SELECT id FROM wh_events
+    const end=this.now().toISOString(),start=new Date(Date.parse(end)-LEAD_SECONDS*1000).toISOString(),candidateLimit=Math.min(400,n*20);
+    // public_observed_at cannot precede the retained leader event. Restricting
+    // anchors by that indexed clock prevents a correlated first-buy lookup for
+    // every historical anchor on the chain. Materialization bounds the lookups
+    // even when a provider imports a large late batch at once.
+    const rows=this.db.prepare(`WITH targets AS MATERIALIZED (
+        SELECT chain,leader,token_address,public_observed_at,collection_checked_at
+        FROM wh_assoc_anchors INDEXED BY wh_assoc_anchor_recent
+        WHERE chain=? AND public_observed_at>=? AND public_observed_at<=?
+        ORDER BY COALESCE(collection_checked_at,''),public_observed_at DESC,leader,token_address LIMIT ?)
+      SELECT a.*,e.event_at,e.observed_at FROM targets a JOIN wh_events e ON e.id=(SELECT id FROM wh_events
         WHERE chain=a.chain AND wallet=a.leader AND token_address=a.token_address AND side='buy' ORDER BY event_at,id LIMIT 1)
-      WHERE a.chain=? AND e.event_at>=? AND e.event_at<=? ORDER BY COALESCE(a.collection_checked_at,''),a.public_observed_at DESC,a.leader,a.token_address LIMIT ?`).all(chain,new Date(this.now().getTime()-LEAD_SECONDS*1000).toISOString(),this.now().toISOString(),n).map(row=>{
+      WHERE e.event_at>=? AND e.event_at<=? ORDER BY COALESCE(a.collection_checked_at,''),a.public_observed_at DESC,a.leader,a.token_address LIMIT ?`)
+      .all(chain,start,end,candidateLimit,start,end,n).map(row=>{
         const candidate=this.db.prepare(`SELECT candidate FROM wh_assoc_episodes WHERE chain=? AND leader=? AND token_address=? AND active=1 ORDER BY first_at DESC LIMIT 1`).get(chain,row.leader!,row.token_address!);
         return {chain,address:String(row.token_address),anchorWallet:String(row.leader),anchorEventAt:String(row.event_at),anchorObservedAt:String(row.observed_at),candidateWallet:candidate?String(candidate.candidate):undefined};
       });
     return rows.length?rows:this.knownTargets(chain,n);
   }
   private knownTargets(chain:Chain,limit:number):WalletAssociationTarget[] {
-    return this.db.prepare(`SELECT r.*,e.token_address,e.data AS episode FROM wh_assoc_relations r JOIN wh_assoc_episodes e ON e.id=(
+    const candidateLimit=Math.min(80,limit*4);
+    return this.db.prepare(`WITH targets AS MATERIALIZED (
+      SELECT chain,leader,candidate,collection_checked_at,token_count,funding_count
+      FROM wh_assoc_relations INDEXED BY wh_assoc_relation_targets WHERE chain=? AND token_count>0
+      ORDER BY COALESCE(collection_checked_at,''),token_count DESC,funding_count DESC,leader,candidate LIMIT ?)
+      SELECT r.*,e.token_address,e.data AS episode FROM targets r JOIN wh_assoc_episodes e ON e.id=(
       SELECT id FROM wh_assoc_episodes WHERE chain=r.chain AND leader=r.leader AND candidate=r.candidate AND active=1 ORDER BY updated_at DESC,id LIMIT 1)
-      WHERE r.chain=? AND r.token_count>0 ORDER BY COALESCE(r.collection_checked_at,''),r.token_count DESC,r.funding_count DESC,r.leader,r.candidate LIMIT ?`)
-      .all(chain,limit).map(row=>{const episode=JSON.parse(String(row.episode)) as AssociationEpisode;return {chain,address:String(row.token_address),
+      ORDER BY COALESCE(r.collection_checked_at,''),r.token_count DESC,r.funding_count DESC,r.leader,r.candidate LIMIT ?`)
+      .all(chain,candidateLimit,limit).map(row=>{const episode=JSON.parse(String(row.episode)) as AssociationEpisode;return {chain,address:String(row.token_address),
         anchorWallet:String(row.leader),candidateWallet:String(row.candidate),anchorEventAt:episode.leaderBuy.eventAt,anchorObservedAt:episode.leaderBuy.observedAt,historicalRelationship:true};});
   }
   markTarget(target:Pick<WalletAssociationTarget,'chain'|'address'|'anchorWallet'|'candidateWallet'|'historicalRelationship'>,observedAt:string):void {

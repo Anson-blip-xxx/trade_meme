@@ -6,7 +6,7 @@ import {WalletProfileReader,type WalletProfileStatus} from './wallet-profiles.js
 
 export interface WalletProfileRunnerOptions {
   database:string;historyDatabase:string;chainDatabase?:string;
-  maxBytes:number;intervalSec:number;batchSize:number;
+  maxBytes:number;intervalSec:number;batchSize:number;refreshAfterSec?:number;
 }
 /** Own the worker lifecycle independently of HTTP requests and vendor limits. */
 export class WalletProfileRunner {
@@ -23,11 +23,13 @@ export class WalletProfileRunner {
   constructor(private readonly options:WalletProfileRunnerOptions) {
     if([options.historyDatabase,options.chainDatabase].some(path=>path&&resolve(path)===resolve(options.database)))
       throw new Error('WALLET_PROFILE_DATABASE_MUST_BE_SEPARATE');
-    this.reader=new WalletProfileReader(options.database);
+    // Use the configured window immediately. The reader can be opened by the
+    // screening service before the worker has persisted the same value.
+    this.reader=new WalletProfileReader(options.database,()=>new Date(),options.refreshAfterSec??21600);
   }
   status() {
     return {...this.cached,enabled:true,running:this.running&&!!this.worker,inFlight:this.inFlight,
-      intervalSec:this.options.intervalSec,batchSize:this.options.batchSize,restarts:this.restarts,
+      intervalSec:this.options.intervalSec,batchSize:this.options.batchSize,refreshAfterSec:this.options.refreshAfterSec??21600,restarts:this.restarts,
       ...(this.error?{error:this.error}:{}),sampleOnly:true,ownership:'unknown',tradingEnabled:false};
   }
   start() {
@@ -51,7 +53,7 @@ export class WalletProfileRunner {
       worker.on('message',message=>{
         if(this.worker!==worker)return;
         if(message?.type==='working') {this.inFlight=true;this.workingSince=Date.now();}
-        else if(message?.type==='status') {this.cached=message.status;this.inFlight=false;this.error=undefined;}
+        else if(message?.type==='status') {this.cached=message.status;this.reader.replaceProfitCohorts(message.profitCohorts);this.inFlight=false;this.error=undefined;}
         else if(message?.type==='failed') {this.inFlight=false;this.error='WALLET_PROFILE_REFRESH_FAILED';}
       });
       worker.on('error',()=>{if(this.worker===worker)this.error='WALLET_PROFILE_WORKER_FAILED';});

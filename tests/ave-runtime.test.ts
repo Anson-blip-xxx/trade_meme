@@ -78,6 +78,7 @@ test('collector storage budgets keep bounded defaults and reject invalid configu
     for(const value of ['0','-1','Infinity','NaN','1.5','1000001'])
       assert.throws(()=>readConfig({[key]:value}));
   assert.equal(readConfig({TOKEN_RANK_RESEARCH_MAX_MB:'4096'}).tokenRankResearch?.maxBytes,4*1024**3);
+  assert.equal(readConfig({TOKEN_RANK_RESEARCH_MAX_MB:'8192'}).tokenRankResearch?.maxBytes,8*1024**3);
 });
 
 test('Ave wallet nominations survive safety rejection independently of research limits and never fabricate trades',async()=>{

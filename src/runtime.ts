@@ -27,6 +27,7 @@ import {DashboardBalances,dashboardOrders,dashboardSettings} from './dashboard-d
 import {WalletHistory} from './wallet-history.js';
 import {WalletHistoryStatsRunner} from './wallet-history-stats.js';
 import {WalletIndexRunner} from './wallet-index-runner.js';
+import {WalletExitPressureRunner} from './wallet-exit-pressure-runner.js';
 import {FollowupReviewRunner} from './followup-review-runner.js';
 import {loadBundledWalletResearchSeeds} from './wallet-research-seeds.js';
 import {WalletObserver} from './wallet-observer.js';
@@ -56,6 +57,7 @@ import {WalletActivityVerifier} from './wallet-activity.js';
 import {WalletActivityStore} from './wallet-activity-store.js';
 import {WalletFastTargets,mergePinnedWallets,type FastWalletSnapshot,type FastWalletTarget,type FastTokenCheck} from './wallet-fast.js';
 import {JevShadow,type JevShadowOptions} from './jev-shadow.js';
+import {JevStatusRunner} from './jev-status.js';
 import {buildJevInput} from './jev-input.js';
 import {TelegramNotifier} from './telegram-notifier.js';
 import {TradeNotifications} from './trade-notifications.js';
@@ -133,6 +135,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       jevStartupError='JEV_DATABASE_CONFLICT';
   }catch {jevStartupError='JEV_STORAGE_UNAVAILABLE';}
   const jevShadow=config.jev?.enabled?new JevShadow({...config.jev,startupError:jevStartupError,invoke:dependencies.jevInvoke}):undefined;
+  const jevStatusRunner=config.jev?.enabled&&!jevStartupError?new JevStatusRunner({database:config.jev.database}):undefined;
   let jevCaptureError:string|undefined;
   const jevPending=new Set<ReturnType<typeof setImmediate>>();
   const providers=liveProviders(config,client);
@@ -153,7 +156,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
     ...(config.chainStream.enabled?{chainDatabase:config.chainStream.database}:{})}):undefined;
   const walletProfilesStatus=()=>walletProfiles?.status()??{enabled:false,running:false,ready:false};
   const walletScreening=walletHistory&&walletProfiles&&config.walletScreening.enabled?new WalletScreeningService(walletHistory,walletProfiles.reader,
-    {...config.walletScreening,sourcePaths:[config.walletResearch.database,config.walletProfiles.database,config.ordersDatabase,config.dashboard.archivePath,
+    {...config.walletScreening,historyDatabase:config.walletResearch.database,sourcePaths:[config.walletResearch.database,config.walletProfiles.database,config.ordersDatabase,config.dashboard.archivePath,
       config.chainStream.database,config.exitShadow.database]}):undefined;
   if(walletScreening){
     providers.walletScreening=(s,r,now)=>walletScreening.assess(s,r,now);
@@ -162,6 +165,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
   const dailyReview=config.dashboard.enabled?new DailyReviewStore(reviewDatabasePath(config.dashboard.archivePath)):undefined;
   let entryAuditError:string|undefined;
   const exitShadow=config.exitShadow.enabled?new ExitShadow(config.exitShadow.database,config.exitShadow):undefined;
+  const walletExitPressure=exitShadow&&walletHistory?new WalletExitPressureRunner({database:config.walletResearch.database}):undefined;
   const walletObserver=walletHistory&&backgroundGmgnEnabled?new WalletObserver({history:walletHistory,client,config,chains:config.scannerChains,
     intervalMs:config.walletResearch.intervalSec*1000,maxRequestsPerCycle:config.walletResearch.maxRequestsPerCycle}):undefined;
   let archiveCaptureError:string|undefined,walletCaptureError:string|undefined;
@@ -295,6 +299,9 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
   let thirdEntry:ThirdSignalEntryController|undefined;
   const signalCounting=new SignalCounting({database:signalCountingPath,controlledJournal,orders,allowedChains:config.scannerChains,
     executionMode:config.thirdSignalExecutionMode,
+    // Let each available live position slot begin its asynchronous preflight.
+    // ThirdSignalEntry still performs the durable capacity and re-entry checks.
+    dispatchConcurrency:Math.max(1,Math.min(3,config.entryMaxOpen)),dispatchCapacity:32,
     executionReady:()=>thirdEntry?.readiness()??{ready:false,reason:'THIRD_SIGNAL_EXECUTION_UNAVAILABLE'},
     onCandidate:async candidate=>{
       if(!thirdEntry)throw Error('THIRD_SIGNAL_EXECUTION_UNAVAILABLE');
@@ -693,9 +700,11 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
         // Reuse only newly returned prices. Old archive peaks cannot initialize a shadow position.
         let seed;
         try {seed=archive?.exitObservationSeed(price);}catch {archiveFailed=true;}
-        let pressure;
-        try {pressure=walletHistory?.recentExitPressure(price,price.observedAt);}
-        catch {walletCaptureError='WALLET_EXIT_PRESSURE_READ_FAILED';}
+        // Optional wallet flow research never blocks a real-time quote. The
+        // worker is admitted only for a new or already-open shadow position;
+        // this callback consumes a strictly historical, five-minute cache.
+        const pressure=walletExitPressure?.read(price,price.observedAt);
+        if(seed||exitShadow.tracks(price))walletExitPressure?.request(price,price.observedAt);
         exitShadow.recordPrice(price,seed,pressure);exitCaptureError=undefined;
       }catch {exitCaptureError='EXIT_SHADOW_CAPTURE_FAILED';}
       if(archiveFailed)throw new Error('PRICE_ARCHIVE_WRITE_FAILED');
@@ -910,7 +919,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
   }):undefined;
   const sweep=setInterval(()=>{
     store.prune(config.researchCacheTtlSec,config.researchCacheMax);orders.recover();
-    try {archive?.prune();archiveMaintenanceError=undefined;}
+    try {archive?.maintenance();archiveMaintenanceError=undefined;}
     catch {archiveMaintenanceError='SCAN_ARCHIVE_MAINTENANCE_FAILED';}
   },60000);sweep.unref();
   let reconcileTimer:ReturnType<typeof setInterval>|undefined;
@@ -925,14 +934,19 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
         statsStale:stats?.stale??false,statsState:stats?.state??'disabled',statsError:stats?.error,statsWorker:stats?.worker,
         observer:walletObserver?.getStatus()??{enabled:false,running:false,pausedReason:backgroundGmgnPausedReason},
         profiles:walletProfilesStatus(),screening:walletScreening?{...walletScreening.status(),discoveryEnabled:backgroundGmgnEnabled}:undefined,
-        localIndex:index??{running:false,inFlight:false,coordinationMs:0,associationMs:0,restarts:0},
-        captureError:walletCaptureError??index?.workerError??index?.coordinationError??index?.associationError,
+        localIndex:index??{running:false,inFlight:false,invalidationMs:0,invalidationProcessed:0,invalidationPending:0,coordinationMs:0,associationMs:0,restarts:0},
+        captureError:walletCaptureError??index?.workerError??index?.invalidationError??index?.coordinationError??index?.associationError,
         settings:{intervalSec:config.walletResearch.intervalSec,maxRequestsPerCycle:config.walletResearch.maxRequestsPerCycle,
           maxBytes:config.walletResearch.maxBytes,retention:'persistent_no_expiry',scope:'vendor_pages_and_observed_wallet_snapshots'}};
     };
+  const walletAssociationsStatus=()=>{
+    const snapshot=walletIndexRunner?.snapshot(),stats=snapshot?.associationStats;
+    return stats?{...stats,state:'fresh',computedAt:snapshot?.completedAt}:{sampleOnly:true,ownership:'unknown',tradingEnabled:false,
+      state:'loading',computedAt:snapshot?.completedAt,error:snapshot?.associationError??snapshot?.workerError};
+  };
   const protectionSummary=()=>{
     if(!exitShadow)return {enabled:false,mode:'shadow',liveReady:false};
-    try {return {...exitShadow.summary(),captureError:exitCaptureError};}
+    try {return {...exitShadow.summary(),walletPressure:walletExitPressure?.status(),captureError:exitCaptureError};}
     catch {return {enabled:true,mode:'shadow',liveReady:false,captureError:'EXIT_SHADOW_READ_FAILED'};}
   };
   let exitMaintenanceTimer:ReturnType<typeof setInterval>|undefined;
@@ -992,7 +1006,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       refreshPriceSubscriptions();
     }catch{priceTargetError='PRICE_STREAM_TARGET_REFRESH_FAILED';}
   };
-  return {client,providers,store,orders,entry,dailyReview,scanner,debotScanner,debotStream,debotAuth,archive,followupReview,tracking,priceRouter,walletHistory,walletIndexRunner,walletObserver,walletResearchStatus,walletProfiles,walletProfilesStatus,walletScreening,watchRechecker,exitShadow,chainMonitor,chainStreamStatus,memeObserver,sourceEvidence,aveScanner,aveSession,tokenRankResearch,jevShadow,telegram,tradeNotifications,telegramStatus,heldMonitor,heldTracking,
+  return {client,providers,store,orders,entry,dailyReview,scanner,debotScanner,debotStream,debotAuth,archive,followupReview,tracking,priceRouter,walletHistory,walletIndexRunner,walletObserver,walletResearchStatus,walletAssociationsStatus,walletProfiles,walletProfilesStatus,walletScreening,watchRechecker,exitShadow,chainMonitor,chainStreamStatus,memeObserver,sourceEvidence,aveScanner,aveSession,tokenRankResearch,jevShadow,telegram,tradeNotifications,telegramStatus,heldMonitor,heldTracking,
     signalCounting,telegramControls,telegramPositions,manualClose,directSell,manualNativeBuy,telegramTokenCard,
     executionStatus:()=>{const counting=signalCounting.status();return {
       configuredEntryMode:config.entryMode,configuredThirdSignalMode:config.thirdSignalExecutionMode,
@@ -1001,7 +1015,9 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       executionEnabled:counting.executionEnabled,countingRunning:counting.running,executionReady:counting.executionReady};},
     signalCountingPage:(options:{limit?:number;offset?:number}={})=>({...signalCounting.page(options),controls:telegramControls?.status()}),
     signalCountingControl:(action:'start'|'stop',actor:'web')=>signalCounting.control(action,actor),
-    jevStatus:()=>({...jevShadow?.status(),captureError:jevCaptureError}),
+    jevStatus:()=>{const summary=jevStatusRunner?.snapshot();return {...jevShadow?.status(summary?.aggregate??null),captureError:jevCaptureError,
+      summaryState:summary?.state??'disabled',summaryComputedAt:summary?.aggregate?.computedAt,summaryStale:summary?.stale??false,
+      summaryError:summary?.error,summaryWorker:summary?.worker};},
     dashboardHome:()=>{
       const host=system?.get();
       const nativeStatus=nativeTrading?.status();
@@ -1056,6 +1072,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       walletStatsRunner?.start();
       walletIndexRunner?.start();
       followupReview?.start();
+      jevStatusRunner?.start();
       nativeTrading?.start();
       if(telegram&&tradeNotifications&&config.telegram){
         try {
@@ -1083,6 +1100,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       recoverManualClose();recoverDirectSell();
       if((manualClose||directSell)&&!manualCloseTimer){manualCloseTimer=setInterval(()=>{recoverManualClose();recoverDirectSell();},15000);manualCloseTimer.unref();}
       jevShadow?.start();
+      walletExitPressure?.start();
       try{exitShadow?.migrateActiveToV3();}catch{exitCaptureError='EXIT_SHADOW_MIGRATION_FAILED';}
       maintainProtection();
       if(!exitMaintenanceTimer){exitMaintenanceTimer=setInterval(maintainProtection,15_000);exitMaintenanceTimer.unref();}
@@ -1113,19 +1131,23 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
     async close(){
       if(closed) return;closed=true;scanner.stop();clearInterval(sweep);clearInterval(reconcileTimer);clearInterval(debotSyncTimer);clearInterval(exitMaintenanceTimer);clearInterval(telegramTimer);
       await telegramControls?.close();
+      // Fence both sources before draining third-signal callbacks. Otherwise a
+      // final socket/page event can be admitted after waitForDispatches returns.
+      await debotStream?.stop();
+      await Promise.all([aveScanner?.stop(),debotScanner?.stop()]);
       await thirdEntry?.stop();await signalCounting.waitForDispatches();
       await manualNativeBuy?.close();
       await nativeTrading?.stop();
       clearInterval(manualCloseTimer);await directSell?.stop();await directSellRecovery;
       await manualClose?.stop();await manualCloseRecovery;
       for(const task of jevPending)clearImmediate(task);jevPending.clear();
+      await jevStatusRunner?.stop();
       await jevShadow?.stop();
       await heldTracking?.stop();await heldMonitor?.stop();
       priceRouter.close();
       await walletFast?.stop();walletVerifier?.stop();await walletFastResearch?.stop();walletActivity?.close();
-      await debotStream?.stop();
-      await aveScanner?.stop();
-      await Promise.all([chainMonitor?.stop(),tracking?.stop(),balances?.stop(),walletObserver?.stop(),system?.stop(),watchRechecker?.stop(),debotScanner?.stop()]);
+      await Promise.all([chainMonitor?.stop(),tracking?.stop(),balances?.stop(),walletObserver?.stop(),system?.stop(),watchRechecker?.stop()]);
+      await walletExitPressure?.stop();
       await walletIndexRunner?.stop();
       await followupReview?.stop();
       await reconciler.stop();

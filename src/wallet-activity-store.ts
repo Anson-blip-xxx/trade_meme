@@ -8,7 +8,7 @@ import type {WalletActivity,ActivityKind} from './wallet-activity.js';
 const kinds:ActivityKind[]=['buy','sell','received_purchase','distribution','transfer','self_transfer','approval','liquidity','wrap','failed','retracted','no_change','unknown'];
 /** Classification evidence stays separate from buy metrics and vendor profit claims. */
 export class WalletActivityStore {
-  private db:DatabaseSync;private error?:string;
+  private db:DatabaseSync;private error?:string;private readonly counts:Partial<Record<ActivityKind,number>>={};
   constructor(private path:string,private maxBytes=128*1024*1024){
     if(path!==':memory:')mkdirSync(dirname(path),{recursive:true,mode:0o700});
     this.db=new DatabaseSync(path);if(path!==':memory:')chmodSync(path,0o600);
@@ -18,6 +18,8 @@ export class WalletActivityStore {
       CREATE INDEX IF NOT EXISTS wallet_activity_kind ON wallet_activity(kind);
       CREATE TABLE IF NOT EXISTS wallet_activity_meta(key TEXT PRIMARY KEY,value TEXT);`);
     this.error=this.db.prepare("SELECT value FROM wallet_activity_meta WHERE key='error'").get()?.value as string|undefined;
+    for(const row of this.db.prepare('SELECT kind,count(*) AS n FROM wallet_activity GROUP BY kind').all())
+      if(kinds.includes(row.kind as ActivityKind))this.counts[row.kind as ActivityKind]=Number(row.n);
   }
   record(input:WalletActivity):boolean {
     const wallet=chainAddress(input.chain,input.wallet);if(!wallet||!kinds.includes(input.classification)||input.version!==1)return false;
@@ -43,11 +45,17 @@ export class WalletActivityStore {
     if(!old&&this.bytes()+16384+JSON.stringify(data).length*3>this.maxBytes){this.error='WALLET_ACTIVITY_CAPACITY_REACHED';
       this.db.prepare("INSERT INTO wallet_activity_meta VALUES ('error',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(this.error);return false;}
     this.db.prepare('INSERT INTO wallet_activity VALUES (?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET kind=excluded.kind,checked_at=excluded.checked_at,data=excluded.data')
-      .run(id,data.chain,wallet,data.txHash,data.classification,data.checkedAt,JSON.stringify(data));return true;
+      .run(id,data.chain,wallet,data.txHash,data.classification,data.checkedAt,JSON.stringify(data));
+    const oldKind=old?.kind as ActivityKind|undefined;
+    if(oldKind!==data.classification){
+      if(oldKind&&this.counts[oldKind]!==undefined){const next=this.counts[oldKind]!-1;if(next>0)this.counts[oldKind]=next;else delete this.counts[oldKind];}
+      this.counts[data.classification]=(this.counts[data.classification]??0)+1;
+    }
+    return true;
   }
   private bytes(){return this.path===':memory:'?Number(this.db.prepare('PRAGMA page_count').get()!.page_count)*Number(this.db.prepare('PRAGMA page_size').get()!.page_size):
     [this.path,this.path+'-wal',this.path+'-shm'].reduce((n,p)=>{try{return n+statSync(p).size;}catch{return n;}},0);}
-  status(){return {persisted:true,counts:Object.fromEntries(this.db.prepare('SELECT kind,count(*) AS n FROM wallet_activity GROUP BY kind').all().map(r=>[r.kind,Number(r.n)])),
+  status(){return {persisted:true,counts:{...this.counts},
     recent:this.db.prepare('SELECT data FROM wallet_activity ORDER BY checked_at DESC LIMIT 20').all().map(r=>JSON.parse(String(r.data)) as WalletActivity),
     error:this.error,maxBytes:this.maxBytes,bytes:this.bytes(),scope:'transaction_classification_not_profit_or_ownership'};}
   close(){this.db.close();}

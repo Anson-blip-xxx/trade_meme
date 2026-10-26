@@ -36,6 +36,20 @@ test('profile worker continuously processes new evidence without web requests an
   } finally {await runner.stop();history.close();rmSync(directory,{recursive:true,force:true});}
 });
 
+test('profile worker publishes and persists compact profit cohorts for the live reader',async()=>{
+  const directory=mkdtempSync(join(tmpdir(),'wallet-profile-cohort-worker-'));
+  const history=new WalletHistory(join(directory,'history.sqlite')),now=Date.now(),observedAt=new Date(now-1000).toISOString();
+  const options={database:join(directory,'profiles.sqlite'),historyDatabase:join(directory,'history.sqlite'),maxBytes:16*1024*1024,intervalSec:1,batchSize:10};
+  let runner=new WalletProfileRunner(options);
+  try {
+    history.recordTrade({chain:'bsc',wallet:address(1),tokenAddress:address(99),txHash:'0x'+('1'.padStart(64,'0')),side:'buy',
+      eventAt:new Date(now-2000).toISOString(),observedAt,source:'gmgn_kol_feed'});
+    history.captureLeaders('bsc',[{address:address(1),period:'7d',realizedProfitUsd:'123'}],{source:'gmgn_stats',observedAt});
+    runner.start();await until(()=>runner.reader.profitCohort('bsc').includes(123));await runner.stop();
+    runner=new WalletProfileRunner(options);assert.deepEqual(runner.reader.profitCohort('bsc'),[123]);
+  } finally {await runner.stop();history.close();rmSync(directory,{recursive:true,force:true});}
+});
+
 test('background worker persists frozen peer qualification and retains it when a later buy refreshes the current profile',async()=>{
   const directory=mkdtempSync(join(tmpdir(),'wallet-profile-qualification-worker-'));
   const history=new WalletHistory(join(directory,'history.sqlite'));
@@ -82,9 +96,11 @@ test('derived profile APIs require authentication, bound filters and never allow
 
 test('profiles follow research enablement by default, allow explicit disabling and reject source/output path collisions',()=>{
   assert.equal(readConfig({WALLET_RESEARCH_ENABLED:'true'}).walletProfiles.enabled,true);
+  assert.equal(readConfig({WALLET_RESEARCH_ENABLED:'true'}).walletProfiles.refreshAfterSec,21600);
   assert.equal(readConfig({WALLET_RESEARCH_ENABLED:'true',WALLET_PROFILES_ENABLED:'false'}).walletProfiles.enabled,false);
   assert.equal(readConfig({}).walletProfiles.enabled,false);
-  for(const values of [{WALLET_PROFILES_INTERVAL_SEC:'0'},{WALLET_PROFILES_BATCH_SIZE:'501'},{WALLET_PROFILES_DATABASE_PATH:':memory:'}])
+  for(const values of [{WALLET_PROFILES_INTERVAL_SEC:'0'},{WALLET_PROFILES_BATCH_SIZE:'501'},
+    {WALLET_PROFILES_REFRESH_AFTER_SEC:'299'},{WALLET_PROFILES_DATABASE_PATH:':memory:'}])
     assert.throws(()=>readConfig(values));
   assert.throws(()=>new WalletProfileRunner({database:'/tmp/a.sqlite',historyDatabase:'/tmp/../tmp/a.sqlite',
     maxBytes:16*1024*1024,intervalSec:2,batchSize:10}),/MUST_BE_SEPARATE/);

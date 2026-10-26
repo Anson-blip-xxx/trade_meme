@@ -78,9 +78,9 @@ export class NativeTradingRuntime {
       reset:event=>{if(event.reason==='accounts_removed')return;this.cacheGeneration++;this.adapter.invalidateCache();this.inventory.invalidate();this.finalizedZero.clear();this.incompleteSince.clear();},
       state:state=>{this.positions?.setStreamState(state);if(this.running&&this.transportHealthy()){
         void this.bootstrap();for(const id of this.mintOrders.values())if(this.positionStreamHealthy(id))this.positions.markDirty(id);
-      }}});
+      }}},undefined,{maxAccounts:300});
     const stopLossDropPct=config.exitPolicy?.stopLoss.dropPct??CURRENT_STOP_LOSS_DROP_PCT;
-    this.positions=new NativePositionSupervisor(n.positionsPath,{fallbackIntervalMs:1000,minCheckIntervalMs:0,loopMs:50,batchSize:20,
+    this.positions=new NativePositionSupervisor(n.positionsPath,{fallbackIntervalMs:1000,minCheckIntervalMs:0,loopMs:50,batchSize:20,maxPositions:40,
       eventDriven:true,staleAfterMs:1500,
       stopLossDropPct,
       io:{balance:async request=>{
@@ -98,7 +98,7 @@ export class NativeTradingRuntime {
         quote:async request=>{
           if(!this.positionStreamHealthy(request.orderId))throw Error('NATIVE_WEBSOCKET_UNAVAILABLE');
           const q=this.adapter.quoteSellCached({wallet:request.wallet,mint:request.mint,amount:request.amount,slippageBps:config.entrySlippagePct*100},
-            {headSlot:this.stream.status().lastHeadSlot});
+            {headSlot:this.stream.headSlot()});
           const now=Date.now();
           return {wallet:request.wallet,mint:request.mint,inputAmount:request.amount,outputAmount:q.expectedOutputAmount,
             minimumOutputAmount:q.minimumOutputAmount,quotedAt:new Date(now).toISOString(),expiresAt:new Date(now+1000).toISOString(),
@@ -151,11 +151,9 @@ export class NativeTradingRuntime {
   private latencyStatus(){const values=[...this.eventLatencies].sort((a,b)=>a-b);return {samples:values.length,
     p50:values.length?values[Math.floor((values.length-1)*.5)]:undefined,
     p95:values.length?values[Math.ceil((values.length-1)*.95)]:undefined,max:values.at(-1)};}
-  private transportHealthy(){const s=this.stream.status() as ReturnType<NativeAccountStream['status']>&{transportHealthy?:boolean};return s.transportHealthy??s.connected;}
+  private transportHealthy(){return this.stream.transportReady();}
   private positionStreamHealthy(orderId:string){
-    const s=this.stream.status() as ReturnType<NativeAccountStream['status']>&{transportHealthy?:boolean};
-    if(s.transportHealthy===undefined)return s.connected;
-    const p=this.positions?.get(orderId);return !!s.transportHealthy&&!!p&&p.buy.subscriptionAccounts.every(a=>s.subscribedAccounts.includes(a));
+    const p=this.positions?.get(orderId);return !!p&&this.stream.isSubscribed(p.buy.subscriptionAccounts);
   }
   private syncAccountWatches(accounts=this.positions.accounts()){
     const wanted=[...new Set([...accounts,...[...this.entryWatches.values()].flat()])].sort(),key=wanted.join(',');

@@ -132,15 +132,9 @@ test('共同资金来源排除公共服务/冲突，协同行为至少双方各�
 });
 
 test('批量报告对重复资金来源只做一次关联失效且完整保存每个钱包证据',()=>{
-  const {history}=fixture(),internal=history as unknown as {associations:{
-    fundingChangedMany:(changes:Iterable<{chain:'bsc';wallet:string}>)=>void;
-    publicServiceChangedMany:(changes:Iterable<{chain:'bsc';funder:string}>)=>void;
-  }};
-  const fundingCalls:{wallets:string[][];funders:string[][]}={wallets:[],funders:[]};
-  const fundingChangedMany=internal.associations.fundingChangedMany.bind(internal.associations);
-  const publicServiceChangedMany=internal.associations.publicServiceChangedMany.bind(internal.associations);
-  internal.associations.fundingChangedMany=changes=>{const values=[...changes];fundingCalls.wallets.push(values.map(item=>item.wallet));fundingChangedMany(values);};
-  internal.associations.publicServiceChangedMany=changes=>{const values=[...changes];fundingCalls.funders.push(values.map(item=>item.funder));publicServiceChangedMany(values);};
+  const {history,setNow}=fixture(),db=(history as unknown as {db:DatabaseSync}).db;
+  const queued=()=>Object.fromEntries(db.prepare('SELECT kind,count(*) AS n FROM wh_association_invalidations GROUP BY kind').all()
+    .map(row=>[String(row.kind),Number(row.n)]));
   try {
     const wallets=Array.from({length:200},(_,index)=>{
       const value=wallet(index+1,{enrichment:{status:'complete',reasons:[]}});
@@ -148,8 +142,17 @@ test('批量报告对重复资金来源只做一次关联失效且完整保存�
     });
     history.captureAnalysis(token,analysis(wallets),{source:'gmgn_analysis',observedAt:iso(100)});
     assert.equal(history.stats().wallets,200);assert.equal(history.stats().fundingLinks,200);
-    assert.equal(fundingCalls.wallets.length,1);assert.equal(new Set(fundingCalls.wallets[0]).size,200);
-    assert.deepEqual(fundingCalls.funders,[[address(500)]]);
+    assert.equal(history.associationInvalidationStatus().pending,202);
+    assert.deepEqual(queued(),{funding_address:1,funding_wallet:200,public_service:1});
+    // A later vendor snapshot creates new evidence rows, but a funder already
+    // known as a shared service must not invalidate all historical recipients
+    // again on the latency-sensitive report path.
+    setNow(200);history.captureAnalysis(token,analysis(wallets,iso(200)),{source:'gmgn_analysis',observedAt:iso(200)});
+    assert.equal(history.stats().fundingLinks,400);
+    assert.equal(history.associationInvalidationStatus().pending,202,'the durable queue deduplicates repeated vendor refreshes');
+    assert.deepEqual(queued(),{funding_address:1,funding_wallet:200,public_service:1});
+    for(let batch=0;batch<32&&history.associationInvalidationStatus().pending;batch++)history.flushAssociationInvalidations(64);
+    assert.equal(history.associationInvalidationStatus().pending,0);
     history.refreshCoordination(20);
     assert.equal(history.getWallet('bsc',address(1))!.wallet.coordination.sharedFundingPeers,0);
   } finally {history.close();}
@@ -170,7 +173,15 @@ test('200钱包报告在密集关联表上保持有界，不按钱包重复扫�
     const started=performance.now();
     history.captureAnalysis(token,analysis(wallets),{source:'gmgn_analysis',observedAt:iso(100)});
     const elapsed=performance.now()-started;
-    assert.ok(elapsed<1_500,`batch capture took ${elapsed.toFixed(1)}ms`);
+    assert.ok(elapsed<300,`main-loop batch capture took ${elapsed.toFixed(1)}ms`);
+    assert.equal(history.associationInvalidationStatus().pending,202);
+    const batches:number[]=[];
+    for(let batch=0;batch<200&&history.associationInvalidationStatus().pending;batch++){
+      const began=performance.now(),result=history.flushAssociationInvalidations(64);batches.push(performance.now()-began);
+      assert.ok(result.touched<=64,'one transaction exceeded its target-row budget');
+    }
+    assert.equal(history.associationInvalidationStatus().pending,0);
+    assert.ok(Math.max(...batches)<50,`slowest invalidation transaction took ${Math.max(...batches).toFixed(1)}ms`);
     assert.equal(Number(db.prepare('SELECT COUNT(*) AS n FROM wh_assoc_relations WHERE dirty=1').get()!.n),5_000);
   } finally {history.close();}
 });
@@ -226,6 +237,46 @@ test('coordination funding checks use covering scalar indexes and dirty queue se
     assert.ok(queuePlan.every(detail=>!detail.includes('TEMP B-TREE')));
     assert.equal(history.getWallet('bsc',address(1))!.wallet.coordination.sharedFundingPeers,1);
   }finally{db.prepare=original;history.close();}
+});
+
+test('关联失效队列跨重启保留，派生更新失败时原子回滚并可重试',()=>{
+  const directory=mkdtempSync(join(tmpdir(),'wallet-invalidation-')),path=join(directory,'history.sqlite');
+  let history=new WalletHistory(path,{now:()=>new Date(base+100_000)});
+  try {
+    history.captureFunding(token,address(1),{address:address(500),timestamp:iso(50),txHash:hash(500)},
+      {source:'gmgn_funding',observedAt:iso(80),snapshotAt:iso(70)});
+    assert.equal(history.associationInvalidationStatus().pending,2);
+    history.close();history=new WalletHistory(path,{now:()=>new Date(base+100_000)});
+    assert.equal(history.associationInvalidationStatus().pending,2);
+    const db=(history as unknown as {db:DatabaseSync}).db;
+    db.exec(`CREATE TRIGGER reject_wallet_invalidation BEFORE UPDATE OF coordination_dirty ON wh_metrics
+      BEGIN SELECT RAISE(ABORT,'test failure'); END`);
+    assert.throws(()=>history.flushAssociationInvalidations(64));
+    assert.equal(history.associationInvalidationStatus().pending,2,'failed derived update keeps every queue row');
+    db.exec('DROP TRIGGER reject_wallet_invalidation');
+    const result=history.flushAssociationInvalidations(64);
+    assert.equal(result.completed,2);assert.equal(result.remaining,false);
+    assert.equal(history.associationInvalidationStatus().pending,0);
+  } finally {history.close();rmSync(directory,{recursive:true,force:true});}
+});
+
+test('旧关联失效队列启动时补齐分片进度列且不丢待办',()=>{
+  const directory=mkdtempSync(join(tmpdir(),'wallet-invalidation-migrate-')),path=join(directory,'history.sqlite');
+  const legacy=new DatabaseSync(path);
+  legacy.exec(`CREATE TABLE wh_association_invalidations(
+    kind TEXT NOT NULL,chain TEXT NOT NULL,address TEXT NOT NULL,enqueued_at TEXT NOT NULL,
+    PRIMARY KEY(kind,chain,address));`);
+  legacy.prepare('INSERT INTO wh_association_invalidations VALUES (?,?,?,?)')
+    .run('funding_wallet','bsc',address(1),iso(1));legacy.close();
+  const history=new WalletHistory(path,{now:()=>new Date(base+100_000)});
+  try {
+    const columns=new Set(((history as unknown as {db:DatabaseSync}).db)
+      .prepare('PRAGMA table_info(wh_association_invalidations)').all().map(row=>String(row.name)));
+    assert.equal(columns.has('stage'),true);assert.equal(columns.has('cursor'),true);
+    assert.equal(history.associationInvalidationStatus().pending,1);
+    assert.equal(history.flushAssociationInvalidations().remaining,false);
+    assert.equal(history.associationInvalidationStatus().pending,0);
+  } finally {history.close();rmSync(directory,{recursive:true,force:true});}
 });
 
 test('stream wallet targets preserve relationship priority and recent fallback through covering ordered indexes',()=>{
@@ -390,6 +441,86 @@ test('至少1000钱包排序先SQL分页，未知利润/涨幅排最后且列表
     result=history.listWallets({sort:'profit',offset:1000,limit:10});assert.equal(result.items[0].address,address(1001));
     assert.equal(history.listWallets({search:"%' OR 1=1 --"}).total,0);
   } finally {history.close();}
+});
+
+test('钱包列表四种排序使用覆盖分页索引，链过滤、深分页和三字符搜索保持精确',()=>{
+  const {history}=fixture();
+  try {
+    history.captureLeaders('bsc',[
+      {address:address(1),period:'7d',realizedProfitUsd:'50',name:'Alpha Smart'},
+      {address:address(2),period:'7d',realizedProfitUsd:'50',name:'Beta'},
+      {address:address(3),period:'7d',realizedProfitUsd:null,name:'Gamma Smart'},
+    ],{source:'gmgn_stats',observedAt:iso(20)});
+    history.captureLeaders('solana',[],{source:'gmgn_stats',observedAt:iso(20)}); // Valid empty cross-chain sample.
+    history.recordTrade(trade({wallet:address(2),txHash:hash(2),observedAt:iso(30)}));
+    history.recordTrade(trade({wallet:address(4),txHash:hash(4),observedAt:iso(40)}));
+    const db=(history as unknown as {db:DatabaseSync}).db;
+    const gain=(value:number)=>JSON.stringify({tokenAddress:token.address,baselineAt:iso(1),baselinePriceUsd:1,
+      peakAt:iso(2),peakPriceUsd:1+value/100,maxGainPct:value,latestAt:iso(2),latestPriceUsd:1,source:'test',
+      kind:'first_post_observed_buy_quote'});
+    db.prepare('UPDATE wh_metrics SET gain_pct=?,gain_data=?,coordination_score=? WHERE chain=? AND address=?').run(90,gain(90),40,'bsc',address(1));
+    db.prepare('UPDATE wh_metrics SET gain_pct=?,gain_data=?,coordination_score=? WHERE chain=? AND address=?').run(90,gain(90),40,'bsc',address(2));
+    db.prepare('UPDATE wh_metrics SET coordination_score=? WHERE chain=? AND address=?').run(100,'bsc',address(4));
+
+    assert.deepEqual(history.listWallets({sort:'profit'}).items.map(item=>item.address),
+      [address(2),address(1),address(4),address(3)]);
+    assert.deepEqual(history.listWallets({sort:'gain'}).items.map(item=>item.address),
+      [address(2),address(1),address(4),address(3)]);
+    assert.deepEqual(history.listWallets({sort:'coordination',limit:2}).items.map(item=>item.address),[address(4),address(2)]);
+    assert.equal(history.listWallets({sort:'recent',offset:1,limit:2}).items[0].address,address(2));
+    assert.deepEqual(history.listWallets({search:'smart'}).items.map(item=>item.address),[address(1),address(3)]);
+    assert.equal(history.listWallets({chain:'bsc',search:'alpha smart'}).total,1);
+    assert.equal(history.listWallets({chain:'solana',search:'alpha smart'}).total,0);
+    assert.equal(history.listWallets({search:'ma'}).total,2); // Short literals retain the original instr semantics.
+
+    const prepare=db.prepare.bind(db),plans:{sql:string;plan:string}[]=[];
+    db.prepare=(sql:string)=>{
+      if(sql.startsWith('WITH page AS MATERIALIZED'))plans.push({sql,plan:prepare(`EXPLAIN QUERY PLAN ${sql}`)
+        .all(...Array((sql.match(/\?/g)||[]).length).fill(null)).map(row=>String(row.detail)).join('\n')});
+      return prepare(sql);
+    };
+    try {
+      for(const sort of ['profit','gain','coordination','recent'] as const) {
+        history.listWallets({sort,limit:1});history.listWallets({sort,chain:'bsc',limit:1});
+      }
+    } finally {db.prepare=prepare;}
+    for(const name of ['profit','gain','coordination']) {
+      assert.ok(plans.some(item=>item.plan.includes(`COVERING INDEX wh_metrics_${name}_page`)),`${name} global index`);
+      assert.equal(plans.filter(item=>item.plan.includes(`COVERING INDEX wh_metrics_${name}_page`)).length,2,
+        `${name} global and chain-filtered pages share the ordered covering index`);
+    }
+    assert.ok(plans.some(item=>item.plan.includes('COVERING INDEX wh_wallets_recent_page')));
+    assert.ok(plans.some(item=>item.plan.includes('COVERING INDEX wh_stream_recent_wallets')));
+    const ftsPlan=db.prepare(`EXPLAIN QUERY PLAN SELECT count(*) FROM wh_wallet_search s
+      CROSS JOIN wh_wallets w ON w.rowid=s.rowid WHERE wh_wallet_search MATCH ?
+      AND (instr(lower(w.address),?)>0 OR instr(lower(w.profile),?)>0) AND w.chain=?`)
+      .all('"missing smart"','missing smart','missing smart','bsc').map(row=>String(row.detail)).join('\n');
+    assert.match(ftsPlan,/SCAN s VIRTUAL TABLE/);assert.match(ftsPlan,/SEARCH w USING INTEGER PRIMARY KEY \(rowid=\?\)/);
+    assert.doesNotMatch(ftsPlan,/SEARCH w USING INDEX .*\(chain=\?\)/);
+    assert.equal(db.prepare('SELECT count(*) AS n FROM wh_metrics m JOIN wh_wallets w USING(chain,address) WHERE m.last_at=w.last_at').get()!.n,4);
+  } finally {history.close();}
+});
+
+test('旧钱包库启动时原子补齐列表时间、排序索引和搜索索引',()=>{
+  const dir=mkdtempSync(join(tmpdir(),'wallet-list-migrate-')),path=join(dir,'research.sqlite');
+  const legacy=new DatabaseSync(path);
+  legacy.exec(`CREATE TABLE wh_wallets(chain TEXT,address TEXT,first_at TEXT,last_at TEXT,profile TEXT NOT NULL,PRIMARY KEY(chain,address));
+    CREATE TABLE wh_metrics(chain TEXT,address TEXT,event_count INTEGER DEFAULT 0,buy_count INTEGER DEFAULT 0,sell_count INTEGER DEFAULT 0,
+      token_count INTEGER DEFAULT 0,profit_usd REAL,profit_at TEXT,profit_observed_at TEXT,profit_data TEXT,gain_pct REAL,gain_data TEXT,
+      coordination_score INTEGER DEFAULT 0,coordination_data TEXT,coordination_checked_at TEXT,coordination_dirty INTEGER DEFAULT 1,PRIMARY KEY(chain,address));
+    INSERT INTO wh_wallets VALUES ('bsc','${address(1)}','${iso(1)}','${iso(20)}','{"labels":[],"name":"Legacy Smart"}');
+    INSERT INTO wh_metrics(chain,address,profit_usd) VALUES ('bsc','${address(1)}',123);`);
+  legacy.close();
+  const history=new WalletHistory(path,{now:()=>new Date(base+100_000)});
+  try {
+    const db=(history as unknown as {db:DatabaseSync}).db;
+    assert.equal(db.prepare('SELECT last_at FROM wh_metrics WHERE chain=? AND address=?').get('bsc',address(1))!.last_at,iso(20));
+    assert.equal(history.listWallets({sort:'profit'}).items[0].address,address(1));
+    assert.equal(history.listWallets({search:'legacy smart'}).total,1);
+    const indexes=new Set(db.prepare("SELECT name FROM sqlite_master WHERE type='index'").all().map(row=>String(row.name)));
+    assert.ok(indexes.has('wh_metrics_profit_page'));assert.ok(indexes.has('wh_metrics_coordination_page'));
+    assert.equal(db.prepare("SELECT value FROM wh_meta WHERE key='wallet_search_schema_v1'").get()!.value,'1');
+  } finally {history.close();rmSync(dir,{recursive:true,force:true});}
 });
 
 test('同链token轮询公平且链过滤不被200个BSC目标阻塞，Solana保持大小写',()=>{

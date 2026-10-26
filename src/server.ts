@@ -160,6 +160,7 @@ if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href) {
       return {...detail,priceRouter:runtime.priceRouter.getStatus(),item:{...detail.item,priceRoute:runtime.priceRouter.latest(detail.item)}};
     },
     walletHistory:runtime.walletHistory,walletResearchStatus:runtime.walletResearchStatus,walletAssociations:runtime.walletHistory,
+    walletAssociationsStatus:runtime.walletAssociationsStatus,
     walletResearchHints:(chain,address)=>runtime.walletHistory?.researchSeedHints(chain,address)??[],
     walletProfiles:runtime.walletProfiles?.reader,walletProfilesStatus:runtime.walletProfilesStatus,walletScreening:runtime.walletScreening?.ledger}):undefined;
   const fatal=()=>{console.error('SERVICE_LISTEN_FAILED');process.exit(1);};

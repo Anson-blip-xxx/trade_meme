@@ -198,6 +198,7 @@ test('token-card sell callbacks route fixed percentages directly and custom perc
   await f.poll([...valid,forged,
     callback(6,`sell:31:${nativeRef}`),callback(7,`sell:30:${nativeRef}:extra`),
     callback(8,`sell:100:np${'d'.repeat(29)}`),callback(9,`sell:Custom:${nativeRef}`)]);
+  await f.controls.waitForTradeActions();
   assert.deepEqual(sells,[
     {ref:nativeRef,pct:30},{ref:nativeRef,pct:50},{ref:nativeRef,pct:100},
   ]);
@@ -211,6 +212,7 @@ test('token-card sell callbacks route fixed percentages directly and custom perc
   await f.poll([...invalid.map((value,index)=>message(20+index,value)),wrongOwner]);
   assert.equal(sells.length,3);
   await f.poll([message(50,'37%'),message(51,'38%'),message(52,'30')]);
+  await f.controls.waitForTradeActions();
   assert.deepEqual(sells.at(-1),{ref:nativeRef,pct:37});
   assert.equal(sells.length,4);
   assert.deepEqual(buys,[{action:'custom_value',address:undefined,value:'30'}]);
@@ -300,6 +302,25 @@ test('slow token-card callback acknowledgement does not hold a later stop comman
   assert.deepEqual(f.actions,['stop']);assert.equal(f.controls.status().pendingTokenCards,1);
   releaseAck(result(true));await f.controls.waitForTokenCards();
   assert.equal(f.notifications.length,2);assert.equal(f.controls.status().pendingTokenCards,0);
+});
+
+test('slow native sell receipt never stops later stop, status, or Telegram polling',async t=>{
+  let release!:()=>void,entered!:()=>void;
+  const gate=new Promise<void>(resolve=>{release=resolve;}),started=new Promise<void>(resolve=>{entered=resolve;});
+  const nativeRef=`np${'e'.repeat(30)}`;
+  const f=fixture(t,{onSell:async()=>{entered();await gate;return '【持仓卖出】\n已受理';}});
+  await f.poll();
+  await f.poll([callback(1,`sell:100:${nativeRef}`),message(2,'停止计数')]);
+  await started;
+  assert.deepEqual(f.actions,['stop']);
+  assert.equal(f.controls.status().pendingTradeActions,1);
+  assert.equal(f.notifications.length,1);
+  await f.poll([message(3,'计数状态')]);
+  assert.deepEqual(f.actions,['stop','status']);
+  assert.equal(f.notifications.length,2);
+  release();await f.controls.waitForTradeActions();
+  assert.equal(f.controls.status().pendingTradeActions,0);
+  assert.equal(f.notifications.length,3);assert.match(f.notifications[2].text,/已受理/);
 });
 
 test('token-card low-priority queue is bounded and excess lookups fail closed without delaying controls',async t=>{
@@ -506,7 +527,7 @@ test('four direct sell sizes route old own-bot callbacks after acknowledgement w
  const values=[25,50,75,100].map((pct,index)=>{
    const item=callback(index,`sell:${pct}:${closeRef}`);item.callback_query.message.date=startTime/1000-86400;return item;
  });
- await f.poll(values);
+ await f.poll(values);await f.controls.waitForTradeActions();
  assert.deepEqual(sales,[25,50,75,100].map(pct=>({ref:closeRef,pct})));
  assert.equal(legacy,0);assert.equal(f.notifications.length,4);assert.deepEqual(f.actions,[]);
  assert.equal(f.controls.status().manualCloseEnabled,true);

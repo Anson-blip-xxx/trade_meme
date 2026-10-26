@@ -120,6 +120,11 @@ const labels=(v:unknown):string[]=>Array.isArray(v)?[...new Set(v.filter((x):x i
 const twitter=(v:unknown):string|undefined=>typeof v==='string'&&/^@?[A-Za-z0-9_]{1,100}$/.test(v)?v.replace(/^@/,''):undefined;
 const code=(v:unknown):string|undefined=>typeof v==='string'&&/^[A-Z][A-Z0-9_]{0,99}$/.test(v)?v:undefined;
 const CAPACITY='WALLET_HISTORY_CAPACITY_REACHED';
+interface AssociationChanges {
+  fundingWallets:Map<Chain,Set<string>>;
+  fundingAddresses:Map<Chain,Set<string>>;
+  publicServices:Map<Chain,Set<string>>;
+}
 
 /** Long-lived research evidence. Never uses this data as a trading permission or deletes history to make space. */
 export class WalletHistory {
@@ -288,15 +293,17 @@ export class WalletHistory {
     const records=analysis.wallets.slice(0,200).flatMap(wallet=>this.snapshot(target,wallet,context.source,observed,snapshotAt)??[]);
     this.append(records,()=>{
       if(reportKey&&!Number(this.db.prepare('INSERT OR IGNORE INTO wh_report_captures VALUES (?,?)').run(reportKey,observed).changes)) return;
+      const changes=this.associationChanges();
       this.putToken(target,observed);
       for(const record of records) {
-        this.putWallet(target.chain,record.holding.wallet,observed,{labels:record.holding.labels,name:record.holding.name,twitter:record.holding.twitter});
+        this.putWallet(target.chain,record.holding.wallet,observed,{labels:record.holding.labels,name:record.holding.name,twitter:record.holding.twitter},changes);
         this.putWalletToken(target.chain,record.holding.wallet,target.address);
         this.observation('holding',record.holding,record.holding.wallet,target.address);
         if(record.stats) this.observation('stats',record.stats,record.holding.wallet,target.address);
-        if(record.funding) this.putFunding(record.funding);
+        if(record.funding) this.putFunding(record.funding,changes);
         for(const event of record.events) this.putTrade(event);
       }
+      this.flushAssociationChanges(changes);
       this.db.prepare('UPDATE wh_tokens SET last_checked_at=? WHERE chain=? AND address=?').run(observed,target.chain,target.address);
     });
   }
@@ -309,9 +316,9 @@ export class WalletHistory {
         realizedProfitUsd:decimal(row.realizedProfitUsd),winRate:ratio(row.winRate),verification:'vendor_claim' as const,
         rank:count(row.rank)??undefined,labels:labels(row.labels),name:clean(row.name),twitter:twitter(row.twitter)}];
     });
-    this.append(values,()=>{for(const value of values) {
-      this.putWallet(chain,value.wallet,observed,value);this.observation('stats',value,value.wallet);
-    }});
+    this.append(values,()=>{const changes=this.associationChanges();for(const value of values) {
+      this.putWallet(chain,value.wallet,observed,value,changes);this.observation('stats',value,value.wallet);
+    }this.flushAssociationChanges(changes);});
   }
 
   captureTokenRanks(chain:Chain,rows:WalletTokenRankObservation[],context:WalletHistoryContext):void {
@@ -340,10 +347,10 @@ export class WalletHistory {
         sampleLimit:row.sampleLimit===20||row.sampleLimit===100?row.sampleLimit:undefined,
         source:context.source,observedAt:observed,scope:'token_cumulative',verification:'vendor_claim'}];
     });
-    this.append(values,()=>{this.putToken(target,observed);for(const value of values) {
-      this.putWallet(target.chain,value.wallet,observed,value);this.putWalletToken(target.chain,value.wallet,target.address);
+    this.append(values,()=>{const changes=this.associationChanges();this.putToken(target,observed);for(const value of values) {
+      this.putWallet(target.chain,value.wallet,observed,value,changes);this.putWalletToken(target.chain,value.wallet,target.address);
       this.observation('token_trader',value,value.wallet,target.address);
-    }});
+    }this.flushAssociationChanges(changes);});
   }
 
   /** A funding snapshot has its own provenance; no fabricated holding is required. */
@@ -667,7 +674,7 @@ export class WalletHistory {
     this.observation('trade',value,value.wallet,value.tokenAddress,id,evidenceId);
     if(Number(inserted.changes)||newEvidence) this.associations.recordTrade(value);
   }
-  private putWallet(chain:Chain,address:string,observed:string,profile:{labels?:string[];name?:string;twitter?:string}):void {
+  private putWallet(chain:Chain,address:string,observed:string,profile:{labels?:string[];name?:string;twitter?:string},changes?:AssociationChanges):void {
     const previous=this.db.prepare('SELECT profile,last_at FROM wh_wallets WHERE chain=? AND address=?').get(chain,address);
     const old=previous?JSON.parse(String(previous.profile)):{labels:[]};
     const latest=!previous||observed>=String(previous.last_at);
@@ -677,8 +684,9 @@ export class WalletHistory {
       .run(chain,address,observed,observed,JSON.stringify(compact));
     this.db.prepare('INSERT OR IGNORE INTO wh_metrics(chain,address) VALUES (?,?)').run(chain,address);
     const serviceLabels=['exchange_or_pool','exchange','pool','router','bridge','cex'];
-    if(compact.labels.some(label=>serviceLabels.includes(label))&&!old.labels.some((label:string)=>serviceLabels.includes(label)))
-      this.associations.publicServiceChanged(chain,address);
+    if(compact.labels.some(label=>serviceLabels.includes(label))&&!old.labels.some((label:string)=>serviceLabels.includes(label))) {
+      if(changes) this.change(changes.publicServices,chain,address);else this.associations.publicServiceChanged(chain,address);
+    }
   }
   private putWalletToken(chain:Chain,wallet:string,tokenAddress:string):void {
     if(Number(this.db.prepare('INSERT OR IGNORE INTO wh_wallet_tokens VALUES (?,?,?)').run(chain,wallet,tokenAddress).changes))
@@ -700,18 +708,39 @@ export class WalletHistory {
         .run(Number.isFinite(numeric)?numeric:null,snapshotAt,data.observedAt,JSON.stringify(data),data.chain,wallet,snapshotAt,snapshotAt,data.observedAt);
     }
   }
-  private putFunding(value:WalletFundingEdge):void {
+  private putFunding(value:WalletFundingEdge,changes?:AssociationChanges):void {
     const {observedAt:_,...snapshot}=value;
     const inserted=this.db.prepare('INSERT OR IGNORE INTO wh_funding(id,chain,wallet,funding_address,observed_at,shared,conflict,snapshot_at,data) VALUES (?,?,?,?,?,?,?,?,?)')
       .run(digest(value.snapshotAt?snapshot:value),value.chain,value.wallet,value.fundingAddress,
         value.observedAt,value.sharedService?1:0,value.conflict?1:0,value.snapshotAt??value.observedAt,JSON.stringify(value));
     if(Number(inserted.changes)) {
-      this.db.prepare('UPDATE wh_metrics SET coordination_dirty=1 WHERE chain=? AND address IN (SELECT wallet FROM wh_funding WHERE chain=? AND funding_address=?)')
-        .run(value.chain,value.chain,value.fundingAddress);
-      this.associations.fundingChanged(value.chain,value.wallet);
-      // Reclassifying a shared funding service affects all currently associated recipients.
-      if(value.sharedService) this.associations.publicServiceChanged(value.chain,value.fundingAddress);
+      if(changes) {
+        this.change(changes.fundingWallets,value.chain,value.wallet);this.change(changes.fundingAddresses,value.chain,value.fundingAddress);
+        if(value.sharedService) this.change(changes.publicServices,value.chain,value.fundingAddress);
+      } else {
+        this.db.prepare('UPDATE wh_metrics SET coordination_dirty=1 WHERE chain=? AND address IN (SELECT wallet FROM wh_funding WHERE chain=? AND funding_address=?)')
+          .run(value.chain,value.chain,value.fundingAddress);
+        this.associations.fundingChanged(value.chain,value.wallet);
+        // Reclassifying a shared funding service affects all currently associated recipients.
+        if(value.sharedService) this.associations.publicServiceChanged(value.chain,value.fundingAddress);
+      }
     }
+  }
+  private associationChanges():AssociationChanges {
+    return {fundingWallets:new Map(),fundingAddresses:new Map(),publicServices:new Map()};
+  }
+  private change(values:Map<Chain,Set<string>>,chain:Chain,value:string):void {
+    const group=values.get(chain)??new Set<string>();group.add(value);values.set(chain,group);
+  }
+  private flushAssociationChanges(changes:AssociationChanges):void {
+    for(const [chain,addresses] of changes.fundingAddresses) {
+      const values=JSON.stringify([...addresses]);
+      this.db.prepare(`UPDATE wh_metrics SET coordination_dirty=1 WHERE chain=? AND address IN
+        (SELECT wallet FROM wh_funding INDEXED BY wh_funding_address JOIN json_each(?) a ON a.value=funding_address WHERE chain=?)`)
+        .run(chain,values,chain);
+    }
+    this.associations.fundingChangedMany([...changes.fundingWallets].flatMap(([chain,wallets])=>[...wallets].map(wallet=>({chain,wallet}))));
+    this.associations.publicServiceChangedMany([...changes.publicServices].flatMap(([chain,funders])=>[...funders].map(funder=>({chain,funder}))));
   }
   private snapshot(target:WalletHistoryToken,wallet:WalletRecord,provider:string,observedAt:string,snapshotAt?:string):
     {holding:WalletHoldingSnapshot;stats?:WalletVendorStats;funding?:WalletFundingEdge;events:WalletTradeObservation[]}|undefined {

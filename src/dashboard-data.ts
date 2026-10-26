@@ -3,8 +3,8 @@ import type {Config} from './config.js';
 import {readNativeBalance,nativeCurrency,type NativeBalance} from './native-balance.js';
 import type {Chain} from './types.js';
 import type {OrderStore,OpeningOrder} from './orders.js';
+import {normalizeStoredEntryHolderRisk} from './entry-holder-risk.js';
 
-const chains:Chain[]=['bsc','solana','robinhood'];
 export interface DashboardBalance {
   chain:Chain;symbol:string;address?:string;amount?:string;
   status:'ok'|'stale'|'unavailable'|'loading';checkedAt?:string;lastAttemptAt?:string;reason?:string;
@@ -13,15 +13,20 @@ export function dashboardSettings(config:Config) {
   return {scanRetentionDays:config.dashboard.retentionDays,trackingHours:config.dashboard.trackingHours,
     watchRecheck:config.watch,
     sampleIntervalSec:config.dashboard.sampleIntervalSec,balanceIntervalSec:120,balanceRetryIntervalSec:30,
-    caps:chains.map(chain=>({chain,symbol:nativeCurrency(chain).symbol,
+    caps:config.scannerChains.map(chain=>({chain,symbol:nativeCurrency(chain).symbol,
       sizing:config.entryBalanceBps?.[chain]===undefined?config.entrySizing:'balance_fraction',
       balanceBps:config.entryBalanceBps?.[chain]??null,
+      balanceBasis:config.entryBalanceBps?.[chain]===undefined?null:'total_native_balance',
       maxPerOrder:config.entryBalanceBps?.[chain]===undefined&&config.entryAmounts[chain]?formatUnits(BigInt(config.entryAmounts[chain]!),nativeCurrency(chain).decimals):null,
       feeReserve:formatUnits(BigInt(config.entryFeeReserves[chain]),nativeCurrency(chain).decimals)})),
     exitPolicy:config.exitPolicy??null};
 }
 function projectOrder(order:OpeningOrder) {
+  const raw=order.details.token,token=raw&&typeof raw==='object'&&!Array.isArray(raw)?raw as Record<string,unknown>:undefined;
+  const display=(value:unknown,max:number)=>typeof value==='string'?value.replace(/[\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069]/g,' ').trim().slice(0,max)||undefined:undefined;
+  const matched=token?.chain===order.chain&&token?.address===order.tokenAddress;
   return {id:order.id,chain:order.chain,tokenAddress:order.tokenAddress,
+    ...(matched?{name:display(token.name,80),symbol:display(token.symbol,40)}:{}),
     createdAt:order.createdAt,updatedAt:order.updatedAt,status:order.status,mode:order.mode,
     amountIn:formatUnits(BigInt(order.actualInputAmount??order.inputAmount),nativeCurrency(order.chain).decimals),
     requestedAmount:formatUnits(BigInt(order.inputAmount),nativeCurrency(order.chain).decimals),
@@ -29,6 +34,8 @@ function projectOrder(order:OpeningOrder) {
     amountBasis:order.actualInputAmount?'actual':'requested',
     inputSymbol:nativeCurrency(order.chain).symbol,transactionHash:order.transactionHash,
     failureReason:order.failureReason,
+    entryHolderRisk:normalizeStoredEntryHolderRisk(order.details.entryHolderRisk,{chain:order.chain,address:order.tokenAddress}),
+    entryHolderRiskBlocked:order.status==='failed'&&!!order.failureReason?.startsWith('ENTRY_HOLDER_RISK_')&&!order.providerOrderId&&!order.transactionHash,
     // Explicit projection: never return the request body, signing material or raw provider response.
     exit:order.exit?{state:order.exit.state,reasons:order.exit.reasons,checkedAt:order.exit.checkedAt,
       positionClosed:order.exit.positionClosed,policy:order.exit.policy}:null};
@@ -44,22 +51,25 @@ export function dashboardOrders(orders:OrderStore,options?:OrderPageOptions) {
 }
 /** Cached read-only RPC balances. Polling the page never multiplies RPC calls. */
 export class DashboardBalances {
+  private readonly chains:Chain[];
   private rows:DashboardBalance[];
   private inFlight?:Promise<void>;
   private timer?:ReturnType<typeof setTimeout>;
   private running=false;
-  private nextDue=new Map<Chain,number>(chains.map(chain=>[chain,0]));
+  private nextDue=new Map<Chain,number>();
   private closed=false;
   constructor(private readonly config:Config,
     private readonly read:(chain:Chain,wallet:string,config:Config)=>Promise<NativeBalance>=readNativeBalance) {
-    this.rows=chains.map(chain=>({chain,symbol:nativeCurrency(chain).symbol,address:config.entryWallets[chain],status:'loading'}));
+    this.chains=[...new Set(config.scannerChains)];
+    this.nextDue=new Map(this.chains.map(chain=>[chain,0]));
+    this.rows=this.chains.map(chain=>({chain,symbol:nativeCurrency(chain).symbol,address:config.entryWallets[chain],status:'loading'}));
   }
   get():DashboardBalance[] {return structuredClone(this.rows);}
   runOnce():Promise<void> {return this.refresh(false);}
   private refresh(onlyDue:boolean):Promise<void> {
     if(this.inFlight) return this.inFlight;
     if(this.closed) return Promise.resolve();
-    this.inFlight=Promise.all(chains.map(async(chain):Promise<DashboardBalance>=>{
+    this.inFlight=Promise.all(this.chains.map(async(chain):Promise<DashboardBalance>=>{
       const previous=this.rows.find(row=>row.chain===chain)!;
       if(onlyDue&&(this.nextDue.get(chain)??0)>Date.now())return previous;
       const base={chain,symbol:nativeCurrency(chain).symbol,address:this.config.entryWallets[chain]};

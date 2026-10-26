@@ -23,6 +23,7 @@ async function main() {
   const content=readFileSync(path,'utf8');if(Buffer.byteLength(content)>65536) throw new Error('INPUT_TOO_LARGE');
   const input:unknown=JSON.parse(content),signal=args.includes('--debot-story')?normalizeDebotImport(input):args.includes('--notification')?normalizeNotification(input):parseSignal(input);
   if(args.includes('--normalize-only')) {console.log(JSON.stringify(signal,null,2));return;}
+  if(!config.scannerChains.includes(signal.token.chain))throw new Error('SIGNAL_CHAIN_DISABLED');
   const runtime=createRuntime(config),store=runtime.store;
   try {
     const isDebot=args.includes('--debot-story');

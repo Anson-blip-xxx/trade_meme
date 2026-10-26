@@ -47,7 +47,8 @@ test('DeBot pages are filtered in SQL with stable time anchors, bounded argument
     items[1].signal.token.chain='robinhood';scanner.acceptPage(page(...items,observation(20,1)));
     const first=scanner.list({limit:2});assert.equal(first.total,6);assert.equal(first.hasMore,true);
     assert.deepEqual(first.items.map(r=>r.eventId),['debot:signal:6','debot:signal:5']);
-    f.advance(1001);scanner.acceptPage(page(observation(7,1000,1001)));
+    f.advance(1001);const sameToken=observation(7,1000,1001);sameToken.signal.token.address=address(6);scanner.acceptPage(page(sameToken));
+    assert.equal(scanner.list({limit:1}).items[0].eventId,'debot:signal:7');
     const next=scanner.list({limit:2,offset:2,asOf:first.asOf});assert.equal(next.total,6);
     assert.deepEqual(next.items.map(r=>r.eventId),['debot:signal:4','debot:signal:3']);
     assert.equal(scanner.list({limit:2,offset:20,asOf:first.asOf}).items.length,0);
@@ -56,7 +57,68 @@ test('DeBot pages are filtered in SQL with stable time anchors, bounded argument
     const serialized=JSON.stringify(first);for(const secret of ['payload','details','platform-alias'])assert.equal(serialized.includes(secret),false);
     for(const options of [{limit:0},{limit:101},{offset:-1},{offset:1000001},{chain:'eth'},{state:'active'},{asOf:'bad'}])
       assert.throws(()=>scanner.list(options as any),/INVALID_FILTER/);
+    const hidden=scanner as unknown as {eventList:()=>never};hidden.eventList=()=>{throw new Error('EVENT_LIST_MUST_NOT_RUN');};
+    assert.doesNotThrow(()=>scanner.list({limit:1}));
+    const db=new DatabaseSync(f.database,{readOnly:true});
+    try {
+      const legacy=db.prepare(`WITH visible AS (SELECT rowid seq,* FROM debot_signals WHERE observed_at<=? AND (reason IS NULL OR reason!='DEBOT_SIGNAL_STALE')),
+        ranked AS (SELECT id,chain,address,MAX(observed_at) OVER (PARTITION BY chain,address) latest,MAX(seq) OVER (PARTITION BY chain,address) latest_seq,
+          ROW_NUMBER() OVER (PARTITION BY chain,address ORDER BY CASE WHEN state='dispatching' THEN 0 WHEN analyzed=1 OR verdict IS NOT NULL THEN 1 WHEN state='pending' THEN 2 ELSE 3 END,
+            observed_at DESC,seq DESC) position FROM visible)
+        SELECT id,chain,address,latest,latest_seq FROM ranked WHERE position=1 ORDER BY latest DESC,latest_seq DESC,chain,address`).all(iso(1001));
+      const materialized=db.prepare(`SELECT s.id,t.chain,t.address,t.latest_observed_at latest,t.latest_seq FROM debot_signal_tokens t
+        JOIN debot_signals s ON s.id=t.display_id WHERE t.latest_observed_at<=? ORDER BY latest DESC,t.latest_seq DESC,t.chain,t.address`).all(iso(1001));
+      assert.deepEqual(materialized,legacy);
+      const probePlan=db.prepare(`EXPLAIN QUERY PLAN SELECT 1 FROM debot_signals INDEXED BY debot_signals_pending_chain
+        WHERE state='pending' AND chain IN (?,?) LIMIT 1`).all('bsc','robinhood').map(row=>String(row.detail));
+      assert.ok(probePlan.some(detail=>detail.includes('debot_signals_pending_chain')));
+      const listPlan=db.prepare(`EXPLAIN QUERY PLAN SELECT s.id FROM debot_signal_tokens t JOIN debot_signals s ON s.id=t.display_id
+        WHERE t.latest_observed_at<=? ORDER BY t.latest_observed_at DESC,t.latest_seq DESC,t.chain,t.address LIMIT 20`).all(iso(1001)).map(row=>String(row.detail));
+      assert.ok(listPlan.some(detail=>detail.includes('debot_signal_tokens_latest')));
+      const anchorPlan=db.prepare(`EXPLAIN QUERY PLAN WITH affected AS MATERIALIZED
+        (SELECT chain,address FROM debot_signal_tokens WHERE latest_observed_at>?)
+        SELECT s.id FROM affected a JOIN debot_signals AS s INDEXED BY debot_signals_token_observed
+          ON s.chain=a.chain AND s.address=a.address WHERE s.observed_at<=?`).all(first.asOf,first.asOf).map(row=>String(row.detail));
+      assert.ok(anchorPlan.some(detail=>detail.includes('debot_signals_token_observed')));
+    }finally{db.close();}
   }finally{await f.close();}
+});
+
+test('DeBot status caches database facts for five seconds and uses the latest-dispatch index',async()=>{
+  const f=fixture({mode:'authenticated_stream'});
+  try {
+    const scanner=f.create();scanner.acceptPage(page(observation(1)));
+    const first=scanner.getStatus();assert.equal(first.stored,1);assert.equal(first.pending,1);
+    const db=new DatabaseSync(f.database);
+    try {
+      db.prepare(`UPDATE debot_signals SET state='completed',analyzed=1,details='{}',
+        details_error='DEBOT_DETAILS_UNAVAILABLE',dispatched_at=?,completed_at=? WHERE id=?`)
+        .run(iso(1002),iso(1002),'debot:signal:1');
+      db.prepare(`INSERT INTO debot_signals(id,chain,address,occurred_at,observed_at,state,payload)
+        VALUES('external:2','bsc',?,?,?,'ignored','{}')`).run(address(2),iso(1001),iso(1003));
+      const plan=db.prepare(`EXPLAIN QUERY PLAN SELECT observed_at,dispatched_at FROM debot_signals
+        WHERE dispatched_at IS NOT NULL ORDER BY dispatched_at DESC LIMIT 1`).all().map(row=>String(row.detail));
+      assert.ok(plan.some(detail=>detail.includes('debot_signals_dispatched_latest')),plan.join('\n'));
+    }finally{db.close();}
+    f.advance(1004);
+    const cached=scanner.getStatus();assert.equal(cached.stored,1);assert.equal(cached.pending,1);assert.equal(cached.dispatched,0);
+    f.advance(1005);
+    const fresh=scanner.getStatus();assert.equal(fresh.stored,2);assert.equal(fresh.pending,0);assert.equal(fresh.dispatched,1);
+    assert.equal(fresh.ignored,1);assert.equal(fresh.detailsReceived,1);assert.equal(fresh.detailsFailed,1);
+    assert.equal(fresh.lastObservedAt,iso(1003));assert.equal(fresh.lastAnalysisQueueDelayMs,2000);
+  }finally{await f.close();}
+});
+
+test('DeBot status reports runtime state immediately while database facts remain cached',async()=>{
+  const response=deferred<NormalizedDebotSignals>();
+  const f=fixture({fetchPage:async()=>response.promise});
+  try {
+    const scanner=f.create();const initial=scanner.getStatus();assert.equal(initial.running,false);assert.equal(initial.inFlight,false);
+    const work=scanner.runOnce();assert.equal(scanner.getStatus().inFlight,true);
+    response.resolve(page());await work;assert.equal(scanner.getStatus().inFlight,false);
+    scanner.start();assert.equal(scanner.getStatus().running,true);
+    await scanner.stop();assert.equal(scanner.getStatus().running,false);
+  }finally{response.resolve(page());await f.close();}
 });
 
 test('DeBot inbox survives restart and freezes the first observed payload while repeated card updates deduplicate',async()=>{
@@ -77,6 +139,18 @@ test('DeBot inbox survives restart and freezes the first observed payload while 
     await restarted.close();
     const again=f.create();await again.runOnce();await again.dispatchOnce();
     assert.equal(f.signals.length,1);assert.equal(again.getStatus().dispatched,1);
+  }finally{await f.close();}
+});
+
+test('pausing a chain preserves its inbox but prevents replay observations, details and pending research after restart',async()=>{
+  let observed=0,details=0;
+  const f=fixture({onObservation:()=>{observed++;},fetchDetails:async()=>{details++;throw Error('unexpected details');}});
+  try {
+    const first=f.create();first.acceptPage(page(observation(1)));await first.close();
+    assert.equal(observed,1);f.options.chains=['solana'];const resumed=f.create();
+    resumed.acceptPage(page(observation(1),observation(2)));await resumed.dispatchOnce();
+    assert.equal(f.rows().length,1);assert.equal(observed,1);assert.equal(details,0);assert.equal(f.signals.length,0);
+    assert.equal(resumed.list({chain:'bsc'}).total,1);
   }finally{await f.close();}
 });
 

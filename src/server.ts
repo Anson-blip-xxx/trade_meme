@@ -28,21 +28,41 @@ async function body(req:IncomingMessage):Promise<unknown> {
   return JSON.parse(Buffer.concat(chunks).toString('utf8'));
 }
 const view=(entry:Stored)=>{const {claimId,...visible}=entry;return {...visible,...(entry.report?{report:effectiveReport(entry.report)}:{})};};
-export interface ServerServices {orders?:OrderStore;entry?:Pick<EntryController,'consider'|'reconcile'>;scanner?:GmgnScanner;}
+export interface ServerExecutionStatus {
+  configuredEntryMode:Config['entryMode'];
+  configuredThirdSignalMode:Config['thirdSignalExecutionMode'];
+  executionEnabled:boolean;
+  countingRunning:boolean;
+  /** Local configuration readiness, not proof of successful platform protection triggers. */
+  executionReady:boolean;
+}
+export interface ServerServices {
+  orders?:OrderStore;entry?:Pick<EntryController,'consider'|'reconcile'>;scanner?:GmgnScanner;
+  executionStatus?:()=>ServerExecutionStatus;
+}
 export function buildServer(config:Config,store:Store,providers:Providers=liveProviders(config),services:ServerServices={}) {
   if(!config.ingestToken||config.ingestToken.length<24) throw new Error('INGEST_TOKEN must be at least 24 characters');
   let active=0;
+  const executionStatus=()=>{
+    const current=services.executionStatus?.();
+    return {configuredEntryMode:current?.configuredEntryMode??config.entryMode,
+      configuredThirdSignalMode:current?.configuredThirdSignalMode??config.thirdSignalExecutionMode,
+      executionEnabled:current?.executionEnabled===true,countingRunning:current?.countingRunning===true,
+      executionReady:current?.executionReady===true,executionStatusAvailable:!!current};
+  };
   const server=createServer(async(req,res)=>{
     try {
       const url=new URL(req.url??'/', 'http://localhost');
-      if(req.method==='GET'&&url.pathname==='/health') {send(res,200,{status:'ok',version:'0.2.0',executionEnabled:false,
-        configuredEntryMode:config.entryMode,unattendedProtectionReady:false});return;}
+      if(req.method==='GET'&&url.pathname==='/health') {send(res,200,{status:'ok',version:'0.2.0',...executionStatus(),
+        unattendedProtectionReady:false});return;}
       if(!authorized(req,config.ingestToken!)) {send(res,401,{error:'UNAUTHORIZED'});return;}
       store.prune(config.researchCacheTtlSec,config.researchCacheMax);
       if(req.method==='GET'&&url.pathname==='/v1/status') {send(res,200,await runDoctor(config));return;}
       if(req.method==='GET'&&url.pathname==='/v1/orders'&&services.orders) {send(res,200,services.orders.list());return;}
       if(req.method==='GET'&&url.pathname==='/v1/exits'&&services.orders) {
-        send(res,200,{policy:config.exitPolicy??null,execution:config.entryMode,monitor:'gmgn_server_conditions_local_readback',
+        const execution=executionStatus();
+        send(res,200,{policy:config.exitPolicy??null,execution:execution.executionEnabled?'live':config.entryMode,
+          ...execution,unattendedProtectionReady:false,monitor:'gmgn_server_conditions_local_readback',
           orders:services.orders.list().filter(order=>order.exit).map(order=>({id:order.id,chain:order.chain,tokenAddress:order.tokenAddress,
             openingStatus:order.status,exit:order.exit}))});return;
       }
@@ -51,8 +71,13 @@ export function buildServer(config:Config,store:Store,providers:Providers=livePr
         if(req.method==='GET'&&!orderMatch[2]) {const order=services.orders.get(orderMatch[1]);send(res,order?200:404,order??{error:'NOT_FOUND'});return;}
         if(req.method==='POST'&&orderMatch[2]==='reconcile'&&services.entry) {send(res,200,await services.entry.reconcile(orderMatch[1]));return;}
       }
-      if(url.pathname==='/v1/scanner'&&req.method==='GET') {send(res,200,services.scanner?.getStatus()??{running:false,configured:false});return;}
-      if(url.pathname==='/v1/scanner/run'&&req.method==='POST'&&services.scanner) {send(res,200,await services.scanner.runOnce());return;}
+      if(url.pathname==='/v1/scanner'&&req.method==='GET') {send(res,200,{
+        ...(services.scanner?.getStatus()??{running:false,configured:false}),
+        ...(config.gmgnBackgroundResearchEnabled===false?{enabled:false,pausedReason:'GMGN_BACKGROUND_RESEARCH_DISABLED'}:{})});return;}
+      if(url.pathname==='/v1/scanner/run'&&req.method==='POST'&&services.scanner) {
+        if(config.gmgnBackgroundResearchEnabled===false){send(res,409,{error:'GMGN_BACKGROUND_RESEARCH_DISABLED'});return;}
+        send(res,200,await services.scanner.runOnce());return;
+      }
       if(req.method==='GET'&&url.pathname==='/v1/signals') {send(res,200,store.list().map(view));return;}
       const match=url.pathname.match(/^\/v1\/signals\/([0-9a-f-]{36})(?:\/(retry|history|report|imports))?$/);
       if(req.method==='GET'&&match&&!match[2]) {const e=store.get(match[1]);send(res,e?200:404,e?view(e):{error:'NOT_FOUND'});return;}
@@ -69,11 +94,18 @@ export function buildServer(config:Config,store:Store,providers:Providers=livePr
         if(active>=4) {res.setHeader('retry-after','5');send(res,429,{error:'BUSY'});return;}
         let entry:Stored;
         if(match?.[2]==='retry') {
+          const previous=store.get(match[1]);
+          if(previous&&!config.scannerChains.includes(previous.signal.token.chain)) {
+            send(res,409,{error:'SIGNAL_CHAIN_DISABLED',chain:previous.signal.token.chain,allowedChains:config.scannerChains});return;
+          }
           const retried=store.retry(match[1]);
           if(!retried) {send(res,409,{error:'NOT_FOUND_OR_PROCESSING'});return;} entry=retried;
         } else {
           const input=await body(req),notification=url.pathname==='/v1/notifications',debot=url.pathname==='/v1/debot/stories';
           const signal=debot?normalizeDebotImport(input):notification?normalizeNotification(input):parseSignal(input);
+          if(!config.scannerChains.includes(signal.token.chain)) {
+            send(res,409,{error:'SIGNAL_CHAIN_DISABLED',chain:signal.token.chain,allowedChains:config.scannerChains});return;
+          }
           if(active>=4) {res.setHeader('retry-after','5');send(res,429,{error:'BUSY'});return;}
           const reserved=store.reserve(signal,notification||debot?input:undefined,debot?'debot_story_response':'notification_copy');
           if(reserved.conflict) {send(res,409,{error:'EVENT_ID_PAYLOAD_CONFLICT',id:reserved.entry.id});return;}
@@ -108,6 +140,7 @@ if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href) {
   const server=buildServer(config,runtime.store,runtime.providers,runtime);
   const dashboard=config.dashboard.enabled&&runtime.archive?buildDashboard(config,{
     archive:runtime.archive,home:runtime.dashboardHome,overview:runtime.dashboardOverview,orders:runtime.dashboardOrders,
+    signalCountingPage:runtime.signalCountingPage,signalCountingControl:runtime.signalCountingControl,
     dailyReview:options=>runtime.dailyReview?.page(options),
     jev:runtime.jevShadow?{status:runtime.jevStatus,list:options=>runtime.jevShadow!.list(options),detail:id=>runtime.jevShadow!.detail(id)}:undefined,
     debotAuth:runtime.debotAuth,

@@ -30,6 +30,33 @@
   const assessmentNames = {favorable: '研究判断有利', watch: '继续观察', adverse: '研究判断不利'};
   const checkNames = {provenance: '发行来源', safety: '合约与安全', market: '市场风险', narrative: '叙事参考（非必需）', wallets: '钱包样本', flow: '近期资金流'};
   const reasonNames = {
+    ENTRY_HOLDER_RISK_TOP10_EXCEEDED: '前10持仓占比超过 25%，未提交买单',
+    ENTRY_HOLDER_RISK_BUNDLER_EXCEEDED: '捆绑持仓占比超过 40%，未提交买单',
+    ENTRY_HOLDER_RISK_RAT_TRADER_EXCEEDED: '老鼠仓持仓占比超过 30%，未提交买单',
+    ENTRY_HOLDER_RISK_TOP10_MISSING: '前10持仓占比未知，未提交买单',
+    ENTRY_HOLDER_RISK_BUNDLER_MISSING: '捆绑持仓占比未知，未提交买单',
+    ENTRY_HOLDER_RISK_RAT_TRADER_MISSING: '老鼠仓持仓占比未知，未提交买单',
+    ENTRY_HOLDER_RISK_TOP10_INVALID: '前10持仓数据无效，未提交买单',
+    ENTRY_HOLDER_RISK_BUNDLER_INVALID: '捆绑持仓数据无效，未提交买单',
+    ENTRY_HOLDER_RISK_RAT_TRADER_INVALID: '老鼠仓持仓数据无效，未提交买单',
+    ENTRY_HOLDER_RISK_READ_FAILED: '最新持仓数据暂时无法取得，未提交买单',
+    ENTRY_HOLDER_RISK_PROVIDER_MISSING: '最新持仓数据服务未就绪，未提交买单',
+    ENTRY_HOLDER_RISK_TOKEN_MISMATCH: '持仓数据与目标合约不匹配，未提交买单',
+    ENTRY_HOLDER_RISK_TOKEN_INVALID: '目标合约无法核验，未提交买单',
+    ENTRY_HOLDER_RISK_TIME_INVALID: '持仓数据时间无法核验，未提交买单',
+    ENTRY_HOLDER_RISK_STALE: '持仓数据已过期，未提交买单',
+    ENTRY_HOLDER_RISK_EVIDENCE_INVALID: '持仓核验证据无效，未提交买单',
+    ENTRY_HOLDER_RISK_RESPONSE_INVALID: '持仓数据格式无法核验，未提交买单',
+    ENTRY_HOLDER_RISK_UNAVAILABLE: '持仓数据尚未完整核验，未提交买单',
+    ENTRY_HOLDER_RISK_TOP10_COVERAGE_INCOMPLETE: '前10持仓覆盖不完整，完整占比未知',
+    ENTRY_HOLDER_RISK_BUNDLER_COVERAGE_INCOMPLETE: '捆绑持仓覆盖不完整，完整占比未知',
+    ENTRY_HOLDER_RISK_RAT_TRADER_COVERAGE_INCOMPLETE: '老鼠仓持仓覆盖不完整，完整占比未知',
+    ENTRY_HOLDER_RISK_TOP10_COVERAGE_UNVERIFIED: '前10持仓覆盖范围尚未核实',
+    ENTRY_HOLDER_RISK_BUNDLER_COVERAGE_UNVERIFIED: '捆绑持仓覆盖范围尚未核实',
+    ENTRY_HOLDER_RISK_RAT_TRADER_COVERAGE_UNVERIFIED: '老鼠仓持仓覆盖范围尚未核实',
+    ENTRY_HOLDER_RISK_TOP10_SOURCE_INVALID: '前10持仓数据来源无法核验',
+    ENTRY_HOLDER_RISK_BUNDLER_SOURCE_INVALID: '捆绑持仓数据来源无法核验',
+    ENTRY_HOLDER_RISK_RAT_TRADER_SOURCE_INVALID: '老鼠仓持仓数据来源无法核验',
     OFFICIAL_FACTORY_CREATION_VERIFIED: '已验证来自配置中的官方发行工厂',
     SECURITY_FIELDS_UNVERIFIED: '部分安全字段尚未核实',
     SECURITY_REPORT_MISSING: '安全报告暂未取得',
@@ -172,6 +199,7 @@
     DEBOT_STREAM_SYNC_FAILED: 'DeBot 登录后的信号补充读取未完成',
     SERVICE_STOPPING: '服务正在停止',
     GMGN_API_KEY_MISSING: '尚未配置 GMGN 访问凭证',
+    GMGN_BACKGROUND_RESEARCH_DISABLED: '按配置暂停 GMGN 后台行情研究，保留交易与按需查询',
     RESEARCH_BUSY: '等待当前研究任务完成',
     SCANNER_BUSY: '等待当前扫描任务完成',
     NATIVE_RPC_RATE_LIMITED: '网络 RPC 请求受到限流，稍后自动重试',
@@ -190,7 +218,7 @@
     GMGN_FEED_SCHEMA_INVALID: 'GMGN 信号响应格式异常',
     GMGN_FEED_CHAIN_MISMATCH: '信号网络与请求的网络不匹配',
     ENTRY_INSUFFICIENT_BALANCE: '可用余额不足',
-    ENTRY_BALANCE_FRACTION_EXCEEDED: '余额变化后，原报价超过当前可用余额的比例上限',
+    ENTRY_BALANCE_FRACTION_EXCEEDED: '余额变化后，原报价超过当前原生币总余额的比例上限',
     ENTRY_BALANCE_STALE: '余额查询结果已过期',
     EXIT_PROTECTION_UNVERIFIED: '退出保护尚未验证',
     ASSET_ALREADY_OPEN: '同一资产已有占用仓位',
@@ -348,6 +376,7 @@
     walletSort: 'profiles', associationStatus: null, walletProfileStatus: null, walletProfilesReady: false, walletGroup: '', walletChain: '', walletSearch: '', walletOffset: 0, walletTotal: 0, walletItems: [], walletStatus: null, walletsLoaded: false, walletSearchTimer: null, protection: null, protectionLoaded: false, chainStream: null, chainStreamLoaded: false, followup: null, followupLoaded: false};
 
   const debotAuth = {status: null, busy: '', message: '', error: false, generation: 0};
+  const signalCounting = {data: null, offset: 0, busy: '', loading: false, message: '', messageError: false, generation: 0};
   state.jev = null; state.jevStatus = null; state.jevLoaded = false; state.listPages.jev = {offset: 0,total: 0,chain: ''};
   state.ave = null; state.aveLoaded = false; state.listPages.ave = {offset: 0,total: 0,chain: '',asOf: ''};
   state.rankResearchTab='tokens'; state.rankWallets=null; state.rankWalletsLoaded=false; state.listPages.rankWallets={offset:0,total:0,chain:'',sort:'early',asOf:''};
@@ -411,6 +440,25 @@
   function date(value, full = false) { const d = validDate(value); return d ? new Intl.DateTimeFormat('zh-CN', {month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', ...(full ? {second: '2-digit'} : {}), hour12: false}).format(d) : '—'; }
   function time(value) { const d = validDate(value); return d ? new Intl.DateTimeFormat('zh-CN', {hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false}).format(d) : '—'; }
   function badge(label, tone = 'neutral') { return el('span', `badge ${tone}`, label); }
+  function holderRiskDetails(risk) {
+    if (!risk || risk.provider !== 'gmgn' || risk.chain !== 'solana' || !risk.metrics) return null;
+    const detail = el('details', 'cell-subtitle'), summary = el('summary', '', `开仓持仓检查：${({pass:'通过',blocked:'超限拦截',unavailable:'数据未核实'})[risk.status] || '未知'}`);
+    detail.append(summary);
+    const lines = [];
+    for (const [key,label] of [['top10','前10持仓'],['bundler','捆绑持仓'],['ratTrader','老鼠仓持仓']]) {
+      const metric=risk.metrics[key], known=metric?.status==='available'&&typeof metric.percentageText==='string'&&/^(?:0|[1-9]\d{0,2})(?:\.\d{1,140})?$/.test(metric.percentageText);
+      const limit=finite(metric?.limitPct)?`${metric.limitPct}%`:'未知';
+      const lower=typeof metric?.lowerBoundPercentageText==='string'&&/^(?:0|[1-9]\d{0,2})(?:\.\d{1,140})?$/.test(metric.lowerBoundPercentageText)?metric.lowerBoundPercentageText:undefined;
+      const line=known?(metric.coverage==='lower_bound'?`${label}：至少 ${metric.percentageText}%${metric.exceeded?` > ${limit} · 已超限`:` · 完整占比未知 · 上限 ${limit}`}`:`${label}：${metric.percentageText}% ${metric.exceeded?'>':'≤'} ${limit}${metric.exceeded?' · 超限':''}`):
+        `${label}：未知 · 上限 ${limit}${lower?` · 已核实至少 ${lower}%`:''}${metric?.status==='invalid'?' · 数据无效':''}`;
+      lines.push(line);detail.append(el('div','',line));
+    }
+    for (const reason of Array.isArray(risk.reasons)?risk.reasons:[])detail.append(el('div','',reasonNames[reason]||'持仓数据尚未完整核验'));
+    detail.append(el('div','',`检查于 ${date(risk.checkedAt,true)}`));
+    detail.title=lines.join('\n');
+    if(risk.status!=='pass')detail.open=true;
+    return detail;
+  }
   function safeUrl(value) { try { const u = new URL(value); return u.protocol === 'https:' && !u.username && !u.password ? u.href : null; } catch { return null; } }
   function gmgnTokenLink(chain, address, label = 'GMGN ↗') {
     const network = {bsc: 'bsc', solana: 'sol', robinhood: 'robinhood'}[chain];
@@ -902,6 +950,7 @@
   setInterval(() => { if (debotRiskVisible()) renderDebotRisk(); }, 1000);
   function showLogin(message = '') {
     state.authenticated = false; cancelRefresh();
+    signalCounting.generation++;signalCounting.data=null;signalCounting.busy='';signalCounting.loading=false;signalCounting.message='';
     stopDebotRiskPolling(true);
     debotAuth.generation++; debotAuth.status = null; debotAuth.busy = ''; clearDebotCodes();
     clearTimeout(state.timer); closeDrawer();
@@ -1059,7 +1108,7 @@
     $('network-warning').hidden = failures.length === 0 && !archival && !walletError && !protectionError;
     if (failures.length) text('network-warning', `部分数据暂时无法更新，已保留最近一次成功结果。${state.lastSuccess ? `最近同步 ${date(state.lastSuccess, true)}。` : ''} 页面会自动重试。`);
     else if (archival) text('network-warning', '扫描档案写入异常，页面记录可能不完整。请检查服务端运行状态。');
-    else if (protectionError) text('network-warning', `影子保护记录异常：${protectionReason(protectionError)}。已有记录可能未更新，实盘保护仍未就绪。`);
+    else if (protectionError) text('network-warning', `影子保护记录异常：${protectionReason(protectionError)}。已有研究记录可能未更新；GMGN 条件状态请查看订单记录。`);
     else if (walletError) text('network-warning', walletError === 'WALLET_HISTORY_CAPACITY_REACHED' ? '钱包历史库已到容量上限，新增数据暂未保存。原有研究记录仍保留，请检查服务端存储配置。' : '钱包历史保存异常，新增数据可能不完整。请检查服务端运行状态。');
   }
   function cancelRefresh() {
@@ -1093,7 +1142,25 @@
     state.refreshing = true; clearTimeout(state.timer); $('refresh').classList.add('spinning'); $('refresh').setAttribute('aria-busy', 'true');
     const version = state.queryVersion, activeView = state.view, jobs = [];
     const add = (key, path, apply) => jobs.push({key, run: () => api(path, {signal: controller.signal}), apply});
-    if (activeView === 'home') add('home', '/home', data => { state.home = data; renderHome(); });
+    if (activeView === 'home') {
+      add('home', '/home', data => { state.home = data; renderHome(); });
+      if(!signalCounting.busy) {
+        signalCounting.loading=true;renderSignalCounting();
+        add('signalCounting',`/signal-counting?limit=20&offset=${signalCounting.offset}`,data=>{
+          if(!validCountingStatus(data?.status)||!Array.isArray(data.items)||data.items.length>PAGE_SIZE||
+            !Number.isSafeInteger(data.total)||data.total<0||!Number.isSafeInteger(data.offset)||data.offset<0)throw new RequestError(502);
+          const changed=signalCounting.data?.status?.runId!==data.status.runId;
+          signalCounting.data=data;signalCounting.loading=false;
+          if(signalCounting.messageError&&signalCounting.message.startsWith('指令结果尚未确认')){
+            signalCounting.message=`已重新读取状态：${countingStateLabel(data.status)}。以当前状态为准，未自动重发控制指令。`;
+            signalCounting.messageError=false;
+          }
+          const nextOffset=changed?0:Math.min(signalCounting.offset,Math.max(0,Math.ceil(data.total/PAGE_SIZE)-1)*PAGE_SIZE);
+          if(nextOffset!==signalCounting.offset){signalCounting.offset=nextOffset;state.queued=true;}
+          renderSignalCounting();
+        });
+      }
+    }
     if (activeView === 'jev') {
       add('jevStatus', '/jev/status', data => { state.jevStatus = data; renderJev(); });
       add('jev', `/jev?${listQuery('jev')}`, data => { state.jev = data; state.jevLoaded = true; savePage('jev', data); renderJev(); });
@@ -1150,6 +1217,7 @@
       if (activeView === 'rankResearch' && state.resourceErrors.rankWallets) { if (finite(state.rankWallets?.offset)) state.listPages.rankWallets.offset=state.rankWallets.offset; renderRankResearch(); }
       if (activeView === 'jev' && (state.resourceErrors.jev || state.resourceErrors.jevStatus)) { if (finite(state.jev?.offset)) state.listPages.jev.offset = state.jev.offset; renderJev(); }
       if (activeView === 'protection' && state.resourceErrors.protection) renderProtection();
+      if(activeView==='home'&&state.resourceErrors.signalCounting){signalCounting.loading=false;renderSignalCounting();}
       if(activeView==='dailyReview'&&state.resourceErrors.dailyReview){if(state.dailyReviewSelection)Object.assign(state.listPages.dailyReview,state.dailyReviewSelection,{offset:state.dailyReview.offset||0});renderDailyReview();}
       networkState();
     } finally {
@@ -1163,12 +1231,21 @@
     }
   }
   function isHistoryPage() {
+    if(state.view==='home')return signalCounting.offset>0;
     if(state.view==='dailyReview')return state.listPages.dailyReview.pinned||state.listPages.dailyReview.offset>0||Boolean(state.listPages.dailyReview.date);
     return ['scans', 'candidates'].includes(state.view) ? state.offset > 0 : ['wallets', 'associations'].includes(state.view) ? state.walletOffset > 0 : state.view === 'rankResearch' ? state.listPages[state.rankResearchTab==='wallets'?'rankWallets':'rankResearch'].offset>0 : state.view === 'sources' ? state.listPages.ave.offset > 0 : state.view === 'followup' ? (state.followupTab === 'records' ? state.listPages.followup.offset > 0 : state.listPages.learning.offset > 0 || state.listPages.groups.offset > 0) : state.listPages[state.view]?.offset > 0;
   }
   function refreshQuery() { state.queryVersion++; cancelRefresh(); void refresh(); }
   $('refresh').addEventListener('click',()=>{if(state.view==='dailyReview'){state.listPages.dailyReview.pinned=false;state.listPages.dailyReview.offset=0;refreshQuery();}else void refresh();});
   $('system-details').addEventListener('click', () => setView('system'));
+  $('signal-counting-start').addEventListener('click',()=>void controlSignalCounting('start'));
+  $('signal-counting-stop').addEventListener('click',()=>void controlSignalCounting('stop'));
+  for(const [direction,delta] of [['previous',-PAGE_SIZE],['next',PAGE_SIZE]])$(`signal-counting-${direction}-page`).addEventListener('click',()=>{
+    if(signalCounting.busy||signalCounting.loading)return;
+    const total=signalCounting.data?.total??0,next=signalCounting.offset+delta;
+    if(next<0||next>=total)return;
+    signalCounting.offset=next;refreshQuery();
+  });
   $('system-protection-link').addEventListener('click', () => setView('protection'));
   $('chain-stream-summary').addEventListener('click', () => { setView('system'); $('chain-stream-panel').scrollIntoView({block: 'start'}); });
   $('debot-settings-link').addEventListener('click', () => { setView('sources'); $('debot-auth-panel').scrollIntoView({block: 'start'}); });
@@ -1245,7 +1322,7 @@
     if (view !== 'sources') clearDebotCodes();
     if (view === 'risk') { debotRisk.signature = ''; renderDebotRisk(); if (load) syncDebotRiskPolling(); }
     if (view === 'followup') syncFollowupTab();
-    if (view === 'home') renderHome();
+    if (view === 'home') {renderHome();renderSignalCounting();}
     if (view === 'meme') renderMeme();
     if (view === 'jev') renderJev();
     if (view === 'sources') { renderAveStatus(); renderAveSignals(); }
@@ -1258,8 +1335,118 @@
     text('metric-total', count(stats.total)); text('metric-eligible', count(stats.eligible)); text('metric-tracking', count(stats.tracking)); text('metric-peak', percent(stats.maxGainPct)); text('candidate-count', count(stats.eligible));
     text('metric-total-note', finite(settings.scanRetentionDays) ? `最近 ${settings.scanRetentionDays} 天 · 信号档案` : '保留期内的全部信号');
     const strip = $('home-service-strip'); strip.replaceChildren();
-    strip.append(badge(status.scannerRunning ? '扫描运行中' : '扫描待确认', status.scannerRunning ? 'pass' : 'neutral'), badge(`DeBot · ${{live:'实时连接',connected:'已连接',authorized:'已认证',disabled:'未启用',connecting:'连接中',authorizing:'认证中',auth_required:'需要登录',disconnected:'已断开',error:'连接异常',stopped:'已停止',subscribed:'实时订阅'}[status.debotState] || scalar(status.debotState, '读取中')}`, ['live','connected','authorized','subscribed'].includes(status.debotState) ? 'pass' : 'neutral'), badge(status.trackingRunning ? '价格追踪运行中' : '价格追踪待确认', status.trackingRunning ? 'pass' : 'neutral'), el('span','home-uptime',`连续运行 ${duration(status.uptimeSec)}`), el('span','home-mode',entryModeLabel(data.entryMode)));
+    strip.append(badge(status.scannerPausedReason === 'GMGN_BACKGROUND_RESEARCH_DISABLED' ? 'GMGN · 交易与按需查询' : status.scannerRunning ? '扫描运行中' : '扫描待确认', status.scannerRunning ? 'pass' : 'neutral'), badge(`DeBot · ${{live:'实时连接',connected:'已连接',authorized:'已认证',disabled:'未启用',connecting:'连接中',authorizing:'认证中',auth_required:'需要登录',disconnected:'已断开',error:'连接异常',stopped:'已停止',subscribed:'实时订阅'}[status.debotState] || scalar(status.debotState, '读取中')}`, ['live','connected','authorized','subscribed'].includes(status.debotState) ? 'pass' : 'neutral'), badge(status.trackingRunning ? '价格追踪运行中' : '价格追踪待确认', status.trackingRunning ? 'pass' : 'neutral'), el('span','home-uptime',`连续运行 ${duration(status.uptimeSec)}`), el('span','home-mode',entryModeLabel(data.entryMode)));
     const details = el('button','text-button','查看运行状态 ↗'); details.type = 'button'; details.addEventListener('click', () => setView('system')); strip.append(details);
+    if(status.nativeExecution){const n=status.nativeExecution,ready=n.readiness?.ready;
+      const label=ready?'SOL 原生交易 · Jito 防夹':'SOL 原生交易待就绪 · '+(n.readiness?.reason==='NATIVE_SIGNER_UNAVAILABLE'?'钱包签名文件未配置':scalar(n.readiness?.reason,'初始化中'));
+      const indicator=badge(label,ready?'pass':'warn');indicator.title=n.antiMev||'';strip.append(indicator);}
+  }
+  function validCountingStatus(value) {
+    return value&&['simulation','live'].includes(value.mode)&&typeof value.executionEnabled==='boolean'&&typeof value.running==='boolean'&&
+      (value.mode!=='simulation'||value.executionEnabled===false)&&(!value.executionEnabled||value.running);
+  }
+  function countingStateLabel(status) {
+    if(!validCountingStatus(status))return '状态待核对';
+    if(!status.running)return status.runId?'已停止':'尚未启动';
+    if(status.mode==='live')return status.executionEnabled?'实盘计数运行中':'计数运行中 · 开仓未就绪';
+    return '模拟计数运行中';
+  }
+  function renderSignalCounting() {
+    const data=signalCounting.data,status=data?.status,valid=validCountingStatus(status),failed=!!state.resourceErrors.signalCounting;
+    const working=!!signalCounting.busy,disabled=working||!valid||failed||status?.enabled===false;
+    const running=valid&&status.running,live=valid&&(status.configuredExecutionMode??status.mode)==='live';
+    const upgradeRun=running&&live&&status.mode!=='live',readinessBlocked=live&&status.executionReady===false;
+    const statusNode=$('signal-counting-status');
+    statusNode.className=`badge ${running&&!failed?'pass':'neutral'}`;
+    statusNode.textContent=failed?'状态待核对':status?.enabled===false?'服务未启用':valid?countingStateLabel(status):'等待读取';
+    text('signal-counting-mode',valid?(live?'实盘策略 · 启动后达标自动买入':'模拟计数 · 不执行实盘'):'模式等待读取');
+    text('signal-counting-action-note',valid?(live?'通过开仓核验后提交实盘买单，每单最多使用 SOL 总余额的 3%。':'登记模拟候选，不提交实盘买单。'):'请以服务返回的策略模式为准。');
+    $('signal-counting-start').disabled=disabled||(running&&!upgradeRun)||readinessBlocked;$('signal-counting-stop').disabled=disabled||!running;
+    text('signal-counting-start',signalCounting.busy==='start'?'正在启动…':'启动计数');
+    text('signal-counting-stop',signalCounting.busy==='stop'?'正在停止…':'停止计数');
+    $('signal-counting-panel').setAttribute('aria-busy',String(working||signalCounting.loading));
+    text('signal-counting-cap',usd(status?.maxMarketCapUsd??100000));
+    const metrics=$('signal-counting-metrics');metrics.replaceChildren();
+    for(const [key,label] of [['groups','本轮分组'],['events','有效通知'],['candidates',live?'达标信号':'模拟候选'],['globalClaims','永久去重名单']]) {
+      const metric=el('div','signal-counting-metric');metric.append(el('span','',label),el('strong','',count(status?.[key])));metrics.append(metric);
+    }
+    const runText=status?.runId?`本轮开始 ${date(status.startedAt,true)}${status.stoppedAt?` · 停止 ${date(status.stoppedAt,true)}`:''} · 轮次 ${status.runId}`:
+      valid?'启动后只计入新收到的通知，历史通知不会补算。':'正在读取当前轮次…';
+    text('signal-counting-run',`${Array.isArray(status?.activeChains)?'处理链：'+status.activeChains.map(chainName).join(' / ')+' · ':''}${runText}`);
+    const warning=failed?'计数状态读取失败，已保留上次记录。请刷新核对后再操作；不会自动重复提交启停指令。':
+      readinessBlocked?`实盘开仓暂未就绪：${reasonNames[status.readinessReason]||scalar(status.readinessReason,'等待服务核验')}。`:
+        upgradeRun?'当前为旧模拟批次；点击启动计数会建立新的实盘批次，历史通知不补发买单。':signalCounting.message;
+    const feedback=$('signal-counting-feedback');feedback.hidden=!warning;feedback.textContent=warning;
+    feedback.className=`signal-counting-feedback${failed||readinessBlocked||signalCounting.messageError?' error':''}`;
+    const total=finite(data?.total)?Math.max(0,data.total):0,offset=finite(data?.offset)?data.offset:signalCounting.offset;
+    text('signal-counting-record-count',`${count(total)} 组`);
+    text('signal-counting-pagination-info',total?`两来源合计 ${count(total)} 组 · 第 ${count(offset+1)}–${count(Math.min(offset+PAGE_SIZE,total))} 组`:'当前轮次暂无计数记录');
+    text('signal-counting-page-number',`${Math.floor(offset/PAGE_SIZE)+1} / ${Math.max(1,Math.ceil(total/PAGE_SIZE))}`);
+    $('signal-counting-previous-page').disabled=working||signalCounting.loading||offset<=0;
+    $('signal-counting-next-page').disabled=working||signalCounting.loading||data?.hasMore!==true;
+    const container=$('signal-counting-tables');container.replaceChildren();
+    const items=Array.isArray(data?.items)?data.items.slice(0,PAGE_SIZE):[];
+    if(!data){container.append(el('p','signal-counting-empty',failed?'计数记录暂时不可用。':'正在读取计数记录…'));return;}
+    for(const [source,label] of [['debot','DeBot'],['ave','Ave']]) {
+      const rows=items.filter(row=>row?.source===source),section=el('section','signal-counting-source');
+      const heading=el('h3','');heading.append(document.createTextNode(label),el('span','',`本页 ${rows.length} 组 · 独立计数`));section.append(heading);
+      if(!rows.length){section.append(el('p','signal-counting-empty',total?'本页没有此来源的记录，可翻页查看。':running?'等待此来源的新通知。':'启动后在这里显示新通知。'));container.append(section);continue;}
+      const table=el('table','signal-counting-table'),head=el('thead'),headers=el('tr'),body=el('tbody');
+      for(const title of ['代币 / 链 / CA','通知次数','最近接收','计数到期','第三次市值','当前判断','永久去重']){const th=el('th','',title);th.scope='col';headers.append(th);}
+      head.append(headers);table.append(head,body);
+      for(const item of rows) {
+        const row=el('tr',item.expired?'expired':''),identity=el('td','signal-counting-identity');identity.dataset.label='代币 / 链 / CA';
+        const name=el('div','signal-counting-name');name.append(el('strong','',scalar(item.name||item.symbol,'未命名代币')),badge(chainName(item.chain),chainClass(item.chain)));identity.append(name);
+        const address=el('div','signal-counting-address');address.append(el('code','',scalar(item.address)),copyButton(item.address));identity.append(address,gmgnTokenLink(item.chain,item.address));row.append(identity);
+        const addCell=(label,child)=>{const cell=el('td');cell.dataset.label=label;cell.append(child);row.append(cell);return cell;};
+        const counted=addCell('通知次数',el('strong','signal-counting-number',count(item.count)));
+        counted.append(el('small','',item.expired?'下条重新从 1 计数':item.count<3?`还差 ${3-item.count} 次到第三次`:'第三次判断已记录'));
+        addCell('最近接收',el('time','',date(item.lastReceivedAt,true))).title=scalar(item.lastReceivedAt);
+        const expiry=addCell('计数到期',el('time','',date(item.expiresAt,true)));expiry.title=scalar(item.expiresAt);expiry.append(el('small','',item.expired?'已过期':running?'继续收到通知会顺延':'计数已停止'));
+        addCell('第三次市值',el('strong','',finite(item.thirdMarketCapUsd)?usd(item.thirdMarketCapUsd):item.count<3?'尚未到第三次':'未知'));
+        const decisions={waiting:'等待第三次',simulation_candidate:'模拟候选',live_candidate:'已达条件',rejected:'不下单',unknown:'第三次数据不足'};
+        const holderBlocked=['blocked','failed'].includes(item.executionStatus)&&typeof item.executionReason==='string'&&item.executionReason.startsWith('ENTRY_HOLDER_RISK_');
+        const result=addCell('当前判断',badge(holderBlocked?'风控拦截 · 未提交':decisions[item.decision]||scalar(item.decision,'待核对'),holderBlocked?'warning':['simulation_candidate','live_candidate'].includes(item.decision)?'pass':item.decision==='rejected'?'warning':'neutral'));
+        const reasons={GLOBAL_TOKEN_ALREADY_CLAIMED:'同链 CA 已登记，跨来源也不重复',THIRD_MARKET_CAP_UNKNOWN:'第三次市值缺失，后续价格不代填',THIRD_MARKET_CAP_OVER_LIMIT:'第三次市值超过上限',THIRD_SIGNAL_SIMULATION_CANDIDATE:'已登记模拟候选；未下实盘单',THIRD_SIGNAL_LIVE_CANDIDATE:'第三次信号达标；成交以订单回执为准'};
+        if(item.reason)result.append(el('small','',reasons[item.reason]||scalar(item.reason)));
+        if(item.executionStatus)result.append(el('small','',`订单：${holderBlocked?'风控拦截 · 未提交':item.executionStatus==='blocked'?'开仓检查未通过':orderStatuses[item.executionStatus]?.[0]||scalar(item.executionStatus)}`));
+        if(item.executionReason)result.append(el('small','',reasonNames[item.executionReason]||scalar(item.executionReason)));
+        const holderRisk=holderRiskDetails(item.holderRisk);if(holderRisk)result.append(holderRisk);
+        if(item.executionOrderId)result.append(el('small','',`订单号：${scalar(item.executionOrderId)}`));
+        if(!item.executionStatus&&item.dispatchState)result.append(el('small','',({claimed:'已占用触发，等待处理',dispatched:'开仓处理中',handled:'已处理；成交以订单回执为准',failed:'处理异常，未自动重试'})[item.dispatchState]||scalar(item.dispatchState)));
+        if(item.dispatchReason)result.append(el('small','',reasonNames[item.dispatchReason]||scalar(item.dispatchReason)));
+        const claimed=item.repeatBlocked||item.claimPhase;
+        const dedup=addCell('永久去重',badge(claimed?'已登记':'尚未登记',claimed?'neutral':'watch'));
+        if(claimed)dedup.append(el('small','',item.claimPhase==='actual_opened_imported'?'已有实盘开仓记录':item.claimPhase==='simulation_candidate'?'模拟候选已登记':item.claimPhase==='live_candidate'?'实盘触发已占用，禁止重复下单':'跨来源 / 跨轮次去重'));
+        body.append(row);
+      }
+      section.append(table);container.append(section);
+    }
+  }
+  async function controlSignalCounting(action) {
+    const current=signalCounting.data?.status;
+    if(signalCounting.busy||!state.authenticated||state.view!=='home'||!validCountingStatus(current)||current.enabled===false||state.resourceErrors.signalCounting||
+      action==='start'&&(current.running&&(current.configuredExecutionMode??current.mode)===current.mode||(current.configuredExecutionMode??current.mode)==='live'&&current.executionReady===false)||action==='stop'&&!current.running)return;
+    const generation=signalCounting.generation;
+    signalCounting.busy=action;signalCounting.message=action==='start'&&(current.configuredExecutionMode??current.mode)==='live'?'正在启动实盘计数…':'正在提交计数指令…';signalCounting.messageError=false;
+    state.queryVersion++;cancelRefresh();renderSignalCounting();
+    try {
+      const status=await api('/signal-counting/control',{method:'POST',body:JSON.stringify({action})});
+      if(generation!==signalCounting.generation||!state.authenticated)return;
+      if(!validCountingStatus(status))throw new RequestError(502);
+      const changed=current.runId!==status.runId;
+      signalCounting.data=changed?{status,items:[],total:0,limit:PAGE_SIZE,offset:0,hasMore:false}:{...signalCounting.data,status};
+      signalCounting.offset=0;
+      signalCounting.message=action==='start'?(status.running?(status.mode==='live'?(status.executionEnabled?'实盘计数已启动；后续达标将自动提交买单。':'计数已启动，但开仓未就绪，请核对服务状态。'):'模拟计数已启动；未开启实盘交易。'):'计数未启动，请核对服务状态。'):'计数已停止；持仓监控与保护继续，永久去重名单仍保留。';
+    }catch(error) {
+      if(generation!==signalCounting.generation)return;
+      if(error.status===401){showLogin('会话已结束，请重新登录。');return;}
+      signalCounting.messageError=true;
+      signalCounting.message=error.status===403?'没有计数控制权限，请检查登录状态。':'指令结果尚未确认，正在重新读取状态。请勿连续重复提交；不会自动重发控制指令。';
+      state.resourceErrors.signalCounting=true;
+    }finally {
+      if(generation===signalCounting.generation){signalCounting.busy='';renderSignalCounting();if(state.authenticated&&state.view==='home')refreshQuery();}
+    }
   }
   function syncFollowupTab() {
     const learning = state.followupTab === 'learning';
@@ -1301,6 +1488,7 @@
   }
   function entryModeLabel(mode) { return {disabled: '未启用开仓', off: '未启用开仓', paper: '模拟开仓', live: '实盘配置'}[mode] || scalar(mode); }
   function watchRecheckLabel(watch) {
+    if (watch?.pausedReason === 'GMGN_BACKGROUND_RESEARCH_DISABLED') return '按配置暂停 · 新通知照常分析';
     return !watch ? '状态暂不可用' : !watch.enabled ? '未启用' : watch.lastError ? '最近复评异常' : watch.inFlight ? '正在复评' : !watch.running ? '未运行' : watch.deferredReason ? `延后 · ${reasonNames[watch.deferredReason] || scalar(watch.deferredReason)}` : watch.queue?.due > 0 ? '等待队列调度' : '等待下一次计划';
   }
   function statusDot(id, tone) { $(id).className = `tiny-dot status-dot ${tone}`; }
@@ -1308,16 +1496,18 @@
     const data = state.overview || {}, system = data.system || {}, scanner = data.scanner || {}, research = data.walletResearch || state.walletStatus || {};
     const balances = Array.isArray(data.balances) ? data.balances : [], cycle = scanner.lastCycle || {}, observer = research.observer || {}, walletCycle = observer.lastCycle || {}, store = research.store || {};
     const cooling = scanner.cooldownUntil && Date.parse(scanner.cooldownUntil) > Date.now();
+    const scannerPaused = scanner.pausedReason === 'GMGN_BACKGROUND_RESEARCH_DISABLED';
     const watch = data.watchRecheck, watchProblem = Boolean(watch?.enabled && (watch.lastError || !watch.running || ['GMGN_API_KEY_MISSING', 'GMGN_RATE_LIMITED'].includes(watch.deferredReason)));
-    const scanProblem = Boolean(cooling || !scanner.running || cycle.status === 'partial' || cycle.errors > 0 || watchProblem);
-    text('status-scanner', cooling ? '限流冷却中' : scanner.running ? scanner.inFlight ? '正在扫描' : '持续运行中' : '未运行');
-    text('status-scanner-note', cooling ? `恢复时间 ${time(scanner.cooldownUntil)}` : cycle.completedAt ? `最近 ${time(cycle.completedAt)} · 接收 ${count(cycle.received)} 条` : '等待第一轮扫描完成');
+    const scanProblem = Boolean(cooling || !scannerPaused && (!scanner.running || cycle.status === 'partial' || cycle.errors > 0) || watchProblem);
+    text('status-scanner', cooling ? '限流冷却中' : scannerPaused ? scalar(data.gmgnUsage?.label, '交易与按需查询') : scanner.running ? scanner.inFlight ? '正在扫描' : '持续运行中' : '未运行');
+    text('status-scanner-note', cooling ? `恢复时间 ${time(scanner.cooldownUntil)}` : scannerPaused ? 'GMGN 后台研究已暂停；DeBot / Ave 继续接收信号' : cycle.completedAt ? `最近 ${time(cycle.completedAt)} · 接收 ${count(cycle.received)} 条` : '等待第一轮扫描完成');
     text('status-watch-note', `复评：${watchRecheckLabel(watch)}${watch?.enabled ? ` · 待复评 ${count(watch.queue?.scheduled)} 条${watch.queue?.due > 0 ? `（到期排队 ${count(watch.queue.due)}）` : ''}` : ''}`);
-    statusDot('status-scanner-dot', scanProblem ? 'watch' : 'pass');
+    statusDot('status-scanner-dot', scanProblem ? 'watch' : scannerPaused ? 'neutral' : 'pass');
     const walletError = store.error || research.captureError || observer.feedError;
     const walletCooling = observer.cooldownUntil && Date.parse(observer.cooldownUntil) > Date.now();
-    const walletProblem = Boolean(walletError || research.enabled && (!observer.running || walletCooling || walletCycle.status === 'partial'));
-    text('status-wallet', walletError ? '保存异常' : !research.enabled ? '未启用' : walletCooling ? '归档运行 · 增强采集冷却' : observer.running ? observer.inFlight ? '正在增强采集' : '持续积累中' : '增强采集未运行');
+    const observerPaused = observer.pausedReason === 'GMGN_BACKGROUND_RESEARCH_DISABLED';
+    const walletProblem = Boolean(walletError || research.enabled && !observerPaused && (!observer.running || walletCooling || walletCycle.status === 'partial'));
+    text('status-wallet', walletError ? '保存异常' : !research.enabled ? '未启用' : observerPaused ? '本地积累中 · 增强采集已暂停' : walletCooling ? '归档运行 · 增强采集冷却' : observer.running ? observer.inFlight ? '正在增强采集' : '持续积累中' : '增强采集未运行');
     text('status-wallet-note', walletError ? reasonNames[walletError] || scalar(walletError) : `${count(store.wallets)} 个钱包 · ${count(store.events)} 条活动${walletCycle.status === 'partial' ? ' · 增强数据待补全' : ''}`);
     statusDot('status-wallet-dot', walletProblem ? 'watch' : research.enabled ? 'pass' : 'neutral');
     const successCount = balances.filter(balance => balance.status === 'ok').length, failed = balances.filter(balance => ['stale', 'unavailable', 'error'].includes(balance.status));
@@ -1332,7 +1522,7 @@
     text('status-resource-note', system.sampledAt ? `采样 ${time(system.sampledAt)} · 磁盘剩余 ${bytes(system.disk?.freeBytes)}` : '等待服务器采样');
     text('system-uptime', `已运行 ${duration(system.uptimeSec)}`); text('system-entry-mode', entryModeLabel(data.entryMode));
     const protectionError = data.exitProtection?.captureError || data.exitProtection?.status?.lastError;
-    text('system-protection-link', protectionError ? '止盈：影子记录异常 / 实盘未就绪' : data.exitProtection?.enabled ? '止盈：影子验证 / 实盘未就绪' : '止盈：实盘保护未就绪');
+    text('system-protection-link', protectionError ? '动态保护：影子记录异常' : data.exitProtection?.enabled ? '动态保护：影子研究' : '动态保护：未启用');
     const stream = data.chainStream, streamChains = Array.isArray(stream?.chains) ? stream.chains : [];
     const streamIssue = Boolean(stream?.enabled && (!stream.running || stream.store?.incomplete || streamChains.some(chain => ['reconnecting', 'degraded'].includes(chain.state) || chain.state === 'live' && chain.identityVerified !== true || hasGapIssue(chain.gap?.incomplete))));
     const streamLive = streamChains.filter(chain => chain.state === 'live' && chain.identityVerified === true).length;
@@ -1454,8 +1644,9 @@
     if (!scanner) { text('scanner-label', '状态暂不可用'); text('scanner-description', '尚未获得扫描器运行信息'); text('scanner-last', '—'); return; }
     const cycle = scanner.lastCycle || {};
     const cooling = scanner.cooldownUntil && Date.parse(scanner.cooldownUntil) > Date.now();
-    text('scanner-label', cooling ? '限流冷却中' : scanner.running ? scanner.inFlight ? '正在扫描信号' : '扫描器运行中' : '扫描器未运行');
-    text('scanner-description', cooling ? `上游冷却至 ${date(scanner.cooldownUntil, true)}` : cycle.status === 'partial' ? '部分来源暂不可用，已保留成功结果' : scanner.running ? '持续读取配置中的网络与信号来源' : '等待服务端启动或配置扫描任务');
+    const paused = scanner.pausedReason === 'GMGN_BACKGROUND_RESEARCH_DISABLED';
+    text('scanner-label', cooling ? '限流冷却中' : paused ? 'GMGN 后台扫描已暂停' : scanner.running ? scanner.inFlight ? '正在扫描信号' : '扫描器运行中' : '扫描器未运行');
+    text('scanner-description', cooling ? `上游冷却至 ${date(scanner.cooldownUntil, true)}` : paused ? reasonNames[scanner.pausedReason] : cycle.status === 'partial' ? '部分来源暂不可用，已保留成功结果' : scanner.running ? '持续读取配置中的网络与信号来源' : '等待服务端启动或配置扫描任务');
     text('scanner-last', time(cycle.completedAt));
   }
   function renderScanEmpty(title, description) { $('scan-empty').hidden = false; text('scan-empty-title', title); text('scan-empty-description', description); }
@@ -1824,7 +2015,7 @@
     const container = $('protection-items'); const openEvents = new Set([...container.querySelectorAll('details[data-protection-id][open]')].map(item => item.dataset.protectionId)); container.replaceChildren();
     text('protection-total', count(status.positions)); text('protection-active', count(status.active)); text('protection-triggered', count(status.triggered)); text('protection-stale', count(status.stale)); text('protection-count', count(state.listPages.protection.total));
     const marker = $('protection-status-badge'); marker.className = `badge ${data?.enabled ? 'watch' : 'neutral'}`; marker.textContent = data ? data.enabled ? '仅影子验证' : '影子验证未启用' : '正在读取';
-    text('protection-policy-note', `策略版本 ${scalar(data?.policyVersion)}${data?.policyVersion==='adaptive-shadow-v3'?' · 无固定持有时限 / 按行情持续保护':''} · 实盘保护未就绪`);
+    text('protection-policy-note', `策略版本 ${scalar(data?.policyVersion)}${data?.policyVersion==='adaptive-shadow-v3'?' · 无固定持有时限 / 按行情持续保护':''} · 影子研究，GMGN 条件另见订单`);
     $('protection-price-router').replaceChildren(priceRouterSummary(data?.priceRouter));
     text('protection-history-note', status.historyComplete === true ? '启用后成功获取的原始报价逐条保留；采样间隔内的行情仍未知。' : status.historyComplete === false ? '原始报价存档存在缺失，请结合记录异常复核。' : '原始采样保存状态尚未确认。');
     text('protection-collection-status', data?.enabled ? `累计 ${count(status.samples)} 个价格样本 · ${count(status.events)} 条观察事件${finite(status.pending)&&status.pending>0?` · ${count(status.pending)} 条待退出意图记录`:''} · 最近采样 ${date(status.lastSampleAt, true)}` : data ? '尚未启用影子观察，当前页面不提供开启交易或挂单操作。' : '正在读取保护观察记录…');
@@ -1839,7 +2030,7 @@
     if (!items.length) {
       if (state.resourceErrors.protection && !state.protectionLoaded) protectionEmpty('暂时无法读取保护观察记录', '连接恢复后会自动重试。页面不会补入模拟收益或历史峰值。');
       else if (!data) protectionEmpty('正在读取影子验证状态', '读取真实观察记录后，会展示动态保护线和行情健康状况。');
-      else if (!data.enabled) protectionEmpty('影子验证尚未启用', '目前没有前瞻保护记录。实盘保护仍未就绪，页面不提供交易操作。');
+      else if (!data.enabled) protectionEmpty('影子验证尚未启用', '目前没有前瞻保护研究记录。GMGN 条件与实盘状态请查看订单记录。');
       else protectionEmpty('等待第一条前瞻保护记录', '符合条件的对象收到新的有效报价后，才建立模拟基准。已有历史高点不会回填为模拟收益。');
     }
     renderProtectionRows(container, items);
@@ -1866,11 +2057,13 @@
     const body = $('order-rows'); body.replaceChildren(); text('orders-count', count(state.listPages.orders.total)); $('orders-empty').hidden = state.orders.length > 0;
     $('orders-empty').querySelector('h3').textContent = '暂无订单记录'; $('orders-empty').querySelector('p').textContent = '当服务端产生订单后，这里会展示实际执行状态。';
     for (const order of state.orders) {
-      const row = el('tr'); const asset = el('td'); asset.append(el('div', 'token-meta', chainName(order.chain)), addressNode(order.tokenAddress), el('div', 'cell-subtitle', `ID ${scalar(order.id)}`)); row.append(asset);
+      const row = el('tr'); const asset = el('td'); if(order.name||order.symbol)asset.append(el('strong','',order.name||order.symbol));asset.append(el('div', 'token-meta', chainName(order.chain)), addressNode(order.tokenAddress), el('div', 'cell-subtitle', `ID ${scalar(order.id)}`)); row.append(asset);
       row.append(el('td', 'cell-date', date(order.createdAt, true)));
       const amount = order.amountIn !== undefined ? `${scalar(order.amountIn)} ${scalar(order.inputSymbol, chainSymbols[order.chain] || '')}` : order.inputAmount !== undefined ? `${scalar(order.inputAmount)} 原子单位` : '—';
       const amountCell = el('td', '', amount); amountCell.append(el('div', 'cell-subtitle', order.amountBasis === 'actual' ? '成交支出' : '计划金额 · 未确认')); row.append(amountCell);
-      const status = el('td'); status.append(badge(...(orderStatuses[order.status] || [scalar(order.status), 'neutral']))); if (order.mode === 'paper' && order.status !== 'paper_open') status.append(el('div', 'cell-subtitle', '模拟订单')); row.append(status);
+      const status = el('td'); status.append(badge(...(order.entryHolderRiskBlocked?['风控拦截 · 未提交','warning']:orderStatuses[order.status] || [scalar(order.status), 'neutral']))); if (order.mode === 'paper' && order.status !== 'paper_open') status.append(el('div', 'cell-subtitle', '模拟订单'));
+      if(order.failureReason)status.append(el('div','cell-subtitle',reasonNames[order.failureReason]||scalar(order.failureReason)));
+      const holderRisk=holderRiskDetails(order.entryHolderRisk);if(holderRisk)status.append(holderRisk);row.append(status);
       const exit = el('td'); exit.append(badge(exitStatuses[order.exit?.state] || '未配置 / 无记录', ['attention', 'unverified'].includes(order.exit?.state) ? 'watch' : order.exit?.state === 'monitoring' ? 'pass' : 'neutral')); if (order.exit?.checkedAt) exit.append(el('div', 'cell-subtitle', date(order.exit.checkedAt))); row.append(exit); body.append(row);
     }
   }
@@ -2030,6 +2223,7 @@
     const data = state.overview;
     if (!data) { runtime.append(el('p', 'panel-placeholder', '正在读取运行信息…')); policy.append(el('p', 'panel-placeholder', '等待服务端配置')); return; }
     const scanner = data.scanner || {}; const cycle = scanner.lastCycle || {}; const settings = data.settings || {}; const tracking = data.tracking || {};
+    const scannerPaused = scanner.pausedReason === 'GMGN_BACKGROUND_RESEARCH_DISABLED';
     const mode = entryModeLabel(data.entryMode);
     const system = data.system || {}; const research = data.walletResearch || state.walletStatus || {};
     runtime.append(kv('服务启动时间', date(system.startedAt, true)), kv('连续运行', duration(system.uptimeSec)), kv('服务器 CPU', `${plainPercent(system.cpu?.usagePct)} · ${scalar(system.cpu?.cores)} 核`), kv('服务器内存', `${bytes(system.memory?.usedBytes)} / ${bytes(system.memory?.totalBytes)}`), kv('机器人进程内存', bytes(system.memory?.processRssBytes)), kv('磁盘已用 / 总量', `${bytes(system.disk?.usedBytes)} / ${bytes(system.disk?.totalBytes)}`), kv('磁盘可用空间', bytes(system.disk?.freeBytes)), kv('资源采样时间', date(system.sampledAt, true)));
@@ -2045,7 +2239,18 @@
       runtime.append(kv(`${chainName(balance.chain)} · 余额查询`, balance.status === 'ok' ? `正常 · ${date(balance.checkedAt, true)}` : balance.status === 'stale' ? `刷新失败 · 上次成功 ${date(balance.checkedAt, true)}` : balance.status === 'loading' ? '查询中' : '暂不可用'));
       if (balance.status !== 'ok' && balance.reason) runtime.append(el('p', 'detail-message detail-error', reasonNames[balance.reason] || scalar(balance.reason)));
     }
-    runtime.append(kv('服务端开仓模式', mode), kv('扫描任务', scanner.running ? '运行中' : '未运行'), kv('当前扫描', scanner.inFlight ? '正在处理' : '等待下一轮'), kv('最近扫描结束', date(cycle.completedAt, true)), kv('最近一轮接收 / 输出', finite(cycle.received) ? `${cycle.received} / ${scalar(cycle.emitted)}` : '—'), kv('最近一轮错误数', cycle.errors), kv('档案保留', finite(settings.scanRetentionDays) ? `${settings.scanRetentionDays} 天` : '—'), kv('条件后追踪窗口', finite(settings.trackingHours) ? `${settings.trackingHours} 小时` : '—'), kv('价格轮询间隔', finite(settings.sampleIntervalSec) ? `${settings.sampleIntervalSec} 秒 / 轮` : '—'));
+    if (data.gmgnUsage) runtime.append(kv('GMGN 使用模式', scalar(data.gmgnUsage.label)), ...(data.gmgnUsage.pausedReason ? [kv('后台研究状态', reasonNames[data.gmgnUsage.pausedReason] || scalar(data.gmgnUsage.pausedReason))] : []));
+    if (data.telegram) {
+      const tg = data.telegram;
+      runtime.append(kv('Telegram 交易通知', !tg.enabled ? '未启用' : !tg.configured ? '等待配置机器人与私聊 ID' : tg.blocked ? '发送暂停 · 请检查机器人权限' : tg.running ? '发送服务运行中' : '未运行'), kv('TG 待发送 / 已送达 / 失败', `${count(tg.pending)} / ${count(tg.sent)} / ${count(tg.failed)}`), kv('TG 最近送达', date(tg.lastSuccessAt, true)));
+      if (tg.lastError || tg.captureError || tg.events?.lastError) runtime.append(el('p', 'detail-message detail-error', scalar(tg.captureError || tg.lastError || tg.events?.lastError)));
+    }
+    if (data.priceCapacity) {
+      const capacity = data.priceCapacity;
+      runtime.append(kv('价格观察上限 / 每轮查询数', `${count(capacity.observationTargetLimit)} / ${count(capacity.maxTokensPerCycle)}`), kv('真实订单优先观察代币', count(capacity.activeOrderTokens)), kv('最多同时开仓', count(capacity.maxOpenPositions)));
+      runtime.append(el('p', 'detail-small', '真实订单优先查询价格。观察上限不代表每个代币都能实时刷新；GMGN 条件回读和实际成交状态在订单中单独记录。'));
+    }
+    runtime.append(kv('服务端开仓模式', mode), kv('GMGN 扫描任务', scannerPaused ? '按配置暂停' : scanner.running ? '运行中' : '未运行'), kv('当前扫描', scannerPaused ? '新通知按需分析' : scanner.inFlight ? '正在处理' : '等待下一轮'), kv('最近扫描结束', date(cycle.completedAt, true)), kv('最近一轮接收 / 输出', finite(cycle.received) ? `${cycle.received} / ${scalar(cycle.emitted)}` : '—'), kv('最近一轮错误数', cycle.errors), kv('档案保留', finite(settings.scanRetentionDays) ? `${settings.scanRetentionDays} 天` : '—'), kv('条件后追踪窗口', finite(settings.trackingHours) ? `${settings.trackingHours} 小时` : '—'), kv('价格轮询间隔', finite(settings.sampleIntervalSec) ? `${settings.sampleIntervalSec} 秒 / 轮` : '—'));
     if (tracking.lastCycle?.completedAt || tracking.lastAt) runtime.append(kv('最近价格轮询', date(tracking.lastCycle?.completedAt || tracking.lastAt, true)));
     const comparison = data.stats?.comparison;
     if (comparison) {
@@ -2064,7 +2269,7 @@
     renderDebotScanner(runtime, data.debotScanner, data.debotStream);
     if (data.archiveError) runtime.append(el('p', 'detail-message detail-error', '档案写入失败，记录可能不完整。'));
     runtime.append(el('p', 'policy-caption', '工作台只展示服务端状态。通过研究门槛不代表已下单；实际开单还需报价、余额和执行检查。价格任务逐币轮询，实际间隔以最后报价时间为准。'));
-    if (settings.watchRecheck) policy.append(kv('观察定时复评', settings.watchRecheck.enabled ? '已启用' : '未启用'), kv('最长观察窗口', `${scalar(settings.watchRecheck.windowSec)} 秒（受原始信号有效期限制）`), kv('复评队列调度', `每 ${scalar(settings.watchRecheck.intervalSec)} 秒，单轮最多 ${scalar(settings.watchRecheck.maxPerCycle)} 条`));
+    if (settings.watchRecheck) policy.append(kv('观察定时复评', data.watchRecheck?.pausedReason === 'GMGN_BACKGROUND_RESEARCH_DISABLED' ? '按配置暂停 · 新通知照常分析' : settings.watchRecheck.enabled ? '已启用' : '未启用'), kv('最长观察窗口', `${scalar(settings.watchRecheck.windowSec)} 秒（受原始信号有效期限制）`), kv('复评队列调度', `每 ${scalar(settings.watchRecheck.intervalSec)} 秒，单轮最多 ${scalar(settings.watchRecheck.maxPerCycle)} 条`));
     const watch = data.watchRecheck;
     if (watch) {
       runtime.append(kv('观察复评运行状态', watchRecheckLabel(watch)));
@@ -2079,11 +2284,11 @@
     if(data.priceRouter)runtime.append(priceRouterSummary(data.priceRouter));
     if(data.meme?.marketSampleCallbackError)runtime.append(el('p','detail-message detail-error','行情已采集，但复盘复用写入失败；新样本覆盖可能缺失。'));
     const protection = data.exitProtection || {};
-    policy.append(kv('动态止盈保护', protection.enabled ? '仅影子验证 · 不发送卖单' : '影子验证未启用'), kv('实盘保护就绪', '未就绪'), kv('保护策略版本', protection.policyVersion), kv('影子观察对象 / 触发建议', `${count(protection.status?.positions)} / ${count(protection.status?.triggered)}`));
+    policy.append(kv('动态止盈保护', protection.enabled ? '影子研究 · 不发送卖单' : '影子研究未启用'), kv('GMGN 条件保护', '按订单回读状态核验'), kv('影子策略版本', protection.policyVersion), kv('影子观察对象 / 触发建议', `${count(protection.status?.positions)} / ${count(protection.status?.triggered)}`));
     if(protection.policyVersion==='adaptive-shadow-v3')policy.append(kv('持有时限','无固定持有时限 / 按行情持续保护'));
     if (protection.captureError) policy.append(el('p', 'detail-message detail-error', `影子保护记录异常：${protectionReason(protection.captureError)}`));
     const caps = Array.isArray(settings.caps) ? settings.caps : [];
-    if (caps.length) for (const cap of caps) { const fraction=cap.sizing==='balance_fraction'&&finite(cap.balanceBps);policy.append(kv(`${chainName(cap.chain)} · 单笔上限`, fraction?`可用余额 × ${count(cap.balanceBps/100)}%`:`${scalar(cap.maxPerOrder)} ${scalar(cap.symbol, chainSymbols[cap.chain] || '')}`), kv(`${chainName(cap.chain)} · 费用预留`, `${scalar(cap.feeReserve)} ${scalar(cap.symbol, chainSymbols[cap.chain] || '')}`));if(fraction)policy.append(el('p','policy-caption','先扣手续费预留与未结算订单占用，再计算本笔金额；提交前复核，不设固定 1 SOL 上限。')); }
+    if (caps.length) for (const cap of caps) { const fraction=cap.sizing==='balance_fraction'&&finite(cap.balanceBps);policy.append(kv(`${chainName(cap.chain)} · 单笔上限`, fraction?`原生币总余额 × ${count(cap.balanceBps/100)}%`:`${scalar(cap.maxPerOrder)} ${scalar(cap.symbol, chainSymbols[cap.chain] || '')}`), kv(`${chainName(cap.chain)} · 费用预留`, `${scalar(cap.feeReserve)} ${scalar(cap.symbol, chainSymbols[cap.chain] || '')}`));if(fraction)policy.append(el('p','policy-caption','按该链交易钱包原生币总余额计算比例，并受手续费预留及未结算订单占用后的可用金额限制；提交前再次核验。')); }
     else policy.append(el('p', 'panel-placeholder', '暂无可展示的开仓上限。'));
     const exit = settings.exitPolicy;
     if (exit?.enabled) {

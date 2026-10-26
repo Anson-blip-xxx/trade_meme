@@ -10,8 +10,8 @@ import {buildExitConditions} from '../src/exit-policy.js';
 const authorized = () => ({
   enabled: true,
   sellRatioType: 'hold_amount',
-  takeProfit: [{gainPct: 500, sellPct: 20}, {gainPct: 1000, sellPct: 10}],
-  stopLoss: {dropPct: 40, sellPct: 100},
+  takeProfit: [{gainPct: 100, sellPct: 50}],
+  stopLoss: {dropPct: 60, sellPct: 100},
 });
 
 function temporaryDirectory(t: {after: (fn: () => void) => void}): string {
@@ -38,12 +38,12 @@ test('explicit policy path loads the exact owner JSON and uses current-holding p
   assert.deepEqual(config.exitPolicy, authorized());
   assert.equal(config.exitPolicy?.sellRatioType, 'hold_amount');
   assert.deepEqual(buildExitConditions(config.exitPolicy!).map(order => [order.price_scale, order.sell_ratio]),
-    [['500', '20'], ['1000', '10'], ['40', '100']]);
+    [['100', '50'], ['60', '100']]);
   assert.equal(config.entryMode, 'off');
   writeFileSync(path, JSON.stringify({enabled: false}), {mode: 0o600});
   assert.equal(readConfig({EXIT_POLICY_PATH: path}).exitPolicy, undefined);
   // Reading a disabled replacement does not mutate the already loaded owner's policy.
-  assert.equal(config.exitPolicy?.takeProfit[0].sellPct, 20);
+  assert.equal(config.exitPolicy?.takeProfit[0].sellPct, 50);
 });
 
 test('missing, malformed or unauthorized policy files fail startup with a redacted configuration error', t => {
@@ -54,7 +54,8 @@ test('missing, malformed or unauthorized policy files fail startup with a redact
   redactedError(() => readConfig({EXIT_POLICY_PATH: dir}), 'EXIT_POLICY_CONFIG_INVALID', [dir]);
   for (const content of ['', '{', `{"secret":"${marker}"`, 'null', '[]', '{}',
     JSON.stringify({...authorized(), sellRatioType: 'buy_amount'}),
-    JSON.stringify({...authorized(), stopLoss: {dropPct: 40, sellPct: 99}}),
+    JSON.stringify({...authorized(), stopLoss: {dropPct: 40, sellPct: 100}}),
+    JSON.stringify({...authorized(), stopLoss: {dropPct: 60, sellPct: 99}}),
     JSON.stringify({...authorized(), apiKey: marker})]) {
     writeFileSync(path, content, {mode: 0o600});
     redactedError(() => readConfig({EXIT_POLICY_PATH: path}), 'EXIT_POLICY_CONFIG_INVALID', [marker, path]);

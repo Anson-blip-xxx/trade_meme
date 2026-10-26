@@ -51,6 +51,16 @@ test('authorized thresholds preserve gains and drops, with each sell measured ag
   }
 });
 
+test('current owner plan recovers principal at double and stops all remaining tokens at minus60',()=>{
+ const policy=parseExitPolicy({enabled:true,sellRatioType:'hold_amount',takeProfit:[{gainPct:100,sellPct:50}],stopLoss:{dropPct:60,sellPct:100}})!;
+ assert.deepEqual(buildExitConditions(policy),[
+   {order_type:'profit_stop',side:'sell',price_scale:'100',sell_ratio:'50'},
+   {order_type:'loss_stop',side:'sell',price_scale:'60',sell_ratio:'100'}]);
+ assert.equal(100*2*0.5,100);
+ for(const takeProfit of [[{gainPct:100,sellPct:49}],[{gainPct:100,sellPct:50},{gainPct:500,sellPct:20}]])
+   invalid({enabled:true,sellRatioType:'hold_amount',takeProfit,stopLoss:{dropPct:60,sellPct:100}});
+});
+
 test('original-buy basis is explicitly rejected rather than weakening the full remaining-position stop', () => {
   invalid({...settings(), sellRatioType: 'buy_amount'}, 'EXIT_POLICY_FULL_STOP_REQUIRES_HOLD_AMOUNT');
   for (const basis of ['HOLD_AMOUNT', 'balance', '', null, 1]) invalid({...settings(), sellRatioType: basis});
@@ -68,7 +78,7 @@ test('missing, extra, reordered and unauthorized thresholds fail closed without 
     const input = settings();
     invalid({...input, takeProfit: [{gainPct: 500, sellPct: value}, input.takeProfit[1]]});
   }
-  for (const dropPct of [0, -40, 39, 41, 60, 100, 101, '40', undefined]) {
+  for (const dropPct of [0, -40, 39, 41, 59, 61, 100, 101, '40', undefined]) {
     invalid({...settings(), stopLoss: {dropPct, sellPct: 100}});
   }
   for (const sellPct of [0, 40, 72, 99, 101, '100', undefined]) {

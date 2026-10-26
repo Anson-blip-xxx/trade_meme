@@ -74,6 +74,7 @@ export interface ScanPrice extends ScanToken {
 }
 
 const MAX_POINTS=256;
+const STATS_CACHE_MS=15_000;
 interface WatchRow {
   id:string;chain:Chain;address:string;state:ScanObservation['state'];first_received_at:string;occurred_at:string;
   ends_at:string;next_check_at:string|null;last_check_at:string|null;attempts:number;end_reason:string|null;
@@ -224,6 +225,7 @@ export class ScanArchive {
   private readonly trackingMs:number;
   private watch?:WatchOptions;
   private cachedOverview?:{at:number;value:{total:number;eligible:number;tracking:number;maxGainPct?:number;computedAt:string}};
+  private cachedStats?:{at:number;value:ScanArchiveStats};
   constructor(path:string,options:ScanArchiveOptions={}) {
     this.retentionDays=options.retentionDays??30;this.maxEntries=options.maxEntries??10_000;
     const hours=options.trackingHours??24;
@@ -269,10 +271,16 @@ export class ScanArchive {
       if(!columns.some(column=>column.name==='max_gain_pct')) {
         this.db.exec("ALTER TABLE scan_summaries ADD COLUMN max_gain_pct REAL; UPDATE scan_summaries SET max_gain_pct=json_extract(record,'$.performance.maxGainPct')");
       }
+      this.db.exec(`CREATE INDEX IF NOT EXISTS scan_summaries_processing_lease
+        ON scan_summaries(lease_expires_at) WHERE status='processing';
+        CREATE INDEX IF NOT EXISTS scan_summaries_active_performance
+        ON scan_summaries(eligible_at) WHERE eligible_at IS NOT NULL AND performance_status<>'ended';
+        CREATE INDEX IF NOT EXISTS scan_summaries_stats_cover
+        ON scan_summaries(eligible_at,performance_status,max_gain_pct,status,decision);`);
       this.db.exec('COMMIT');
     } catch(error) {this.db.exec('ROLLBACK');this.db.close();throw error;}
     this.comparison=new StrategyObservation(this.db);
-    if(options.followupEnabled)this.followup=new SignalFollowup(this.db);
+    if(options.followupEnabled)this.followup=new SignalFollowup(this.db,{persistedReviewReads:true});
     this.prune();
   }
 
@@ -484,23 +492,26 @@ export class ScanArchive {
   }
 
   stats():ScanArchiveStats {
-    this.prune();
+    const now=this.now(),at=now.getTime();
+    if(this.cachedStats&&at>=this.cachedStats.at&&at-this.cachedStats.at<STATS_CACHE_MS)
+      return structuredClone(this.cachedStats.value);
     const result:ScanArchiveStats={total:0,eligible:0,tracking:0,
       byStatus:{processing:0,completed:0,interrupted:0},byDecision:{BUY_CANDIDATE:0,WATCH:0,REJECT:0,PENDING:0}};
-    // Aggregate scalar columns; dashboard polling must not deserialize every
-    // historical sparkline just to count records or find the largest sampled gain.
+    // One scalar pass only; dashboard polling never deserializes historical
+    // sparklines or performs retention maintenance on the request thread.
     const aggregate=this.db.prepare(`SELECT count(*) AS total,SUM(eligible_at IS NOT NULL) AS eligible,
-      SUM(eligible_at IS NOT NULL AND performance_status<>'ended') AS tracking,MAX(max_gain_pct) AS gain FROM scan_summaries`).get()!;
+      SUM(eligible_at IS NOT NULL AND performance_status<>'ended') AS tracking,MAX(max_gain_pct) AS gain,
+      SUM(status='processing') AS processing,SUM(status='completed') AS completed,SUM(status='interrupted') AS interrupted,
+      SUM(decision='BUY_CANDIDATE') AS buy_candidate,SUM(decision='WATCH') AS watch,SUM(decision='REJECT') AS reject,
+      SUM(decision IS NULL) AS pending FROM scan_summaries`).get()!;
     result.total=Number(aggregate.total);result.eligible=Number(aggregate.eligible??0);result.tracking=Number(aggregate.tracking??0);
     if(typeof aggregate.gain==='number'&&Number.isFinite(aggregate.gain)) result.maxGainPct=aggregate.gain;
-    for(const row of this.db.prepare('SELECT status,count(*) AS n FROM scan_summaries GROUP BY status').all())
-      if(Object.hasOwn(result.byStatus,String(row.status))) result.byStatus[row.status as Stored['status']]=Number(row.n);
-    for(const row of this.db.prepare('SELECT decision,count(*) AS n FROM scan_summaries GROUP BY decision').all()) {
-      const decision=row.decision===null?'PENDING':String(row.decision);
-      if(Object.hasOwn(result.byDecision,decision)) result.byDecision[decision as keyof ScanArchiveStats['byDecision']]=Number(row.n);
-    }
-    result.comparison=this.comparison.summary(this.now());
-    return result;
+    result.byStatus={processing:Number(aggregate.processing??0),completed:Number(aggregate.completed??0),
+      interrupted:Number(aggregate.interrupted??0)};
+    result.byDecision={BUY_CANDIDATE:Number(aggregate.buy_candidate??0),WATCH:Number(aggregate.watch??0),
+      REJECT:Number(aggregate.reject??0),PENDING:Number(aggregate.pending??0)};
+    result.comparison=this.comparison.summary(now);
+    this.cachedStats={at,value:result};return structuredClone(result);
   }
 
   /** Home counters only; no retention sweep, comparisons, payloads or external calls. */
@@ -604,8 +615,7 @@ export class ScanArchive {
     if(price.source==='chain_pool_sample'&&!evidence)return;
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      this.pruneInside(now);
-      this.comparison.price({...price,...identity,observedAt:at},now);
+      if(this.comparison.price({...price,...identity,observedAt:at},now))this.cachedStats=undefined;
       this.followup?.price({...price,...identity,observedAt:at},now,walletEvidence);
       for(const row of this.db.prepare('SELECT record,last_price_attempt_at FROM scan_summaries WHERE chain=? AND address=? AND eligible_at IS NOT NULL')
         .all(identity.chain,identity.address)) {
@@ -634,13 +644,13 @@ export class ScanArchive {
     const error=reasonCodes([reason])[0]??'PRICE_SAMPLE_UNAVAILABLE';
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      this.pruneInside(now);
-      this.comparison.error(identity,error,now);
+      if(this.comparison.error(identity,error,now))this.cachedStats=undefined;
       this.followup?.error(identity,error,now);
       for(const row of this.db.prepare('SELECT record,last_price_attempt_at FROM scan_summaries WHERE chain=? AND address=? AND eligible_at IS NOT NULL')
         .all(identity.chain,identity.address)) {
         const record=JSON.parse(String(row.record)) as ScanRecord,p=record.performance!;
-        if(p.status==='ended'||Date.parse(p.eligibleAt)>now.getTime()||
+        const eligible=Date.parse(p.eligibleAt);
+        if(p.status==='ended'||eligible>now.getTime()||now.getTime()>=eligible+this.trackingMs||
           row.last_price_attempt_at&&String(row.last_price_attempt_at)>now.toISOString()) continue;
         record.performance={...p,status:'unavailable',error,errorCount:Math.min(1_000_000_000,(p.errorCount??0)+1),
           lastErrorAt:now.toISOString(),lastError:error};this.write(record,now.toISOString());
@@ -741,14 +751,16 @@ export class ScanArchive {
       .run(record.id,record.chain,record.address,record.status,record.receivedAt,record.decision??null,
         record.performance?.eligibleAt??null,lastAttempt??null,lease??null,record.performance?.status??null,
         record.performance?.maxGainPct??null,JSON.stringify(record));
+    this.cachedStats=undefined;
   }
   private pruneInside(now:Date):void {
-    this.comparison.prune(now);
+    if(this.comparison.prune(now))this.cachedStats=undefined;
     this.followup?.prune(now);
     const cutoff=new Date(now.getTime()-this.retentionDays*86_400_000).toISOString();
-    this.db.prepare('DELETE FROM scan_summaries WHERE received_at<?').run(cutoff);
+    if(Number(this.db.prepare('DELETE FROM scan_summaries WHERE received_at<?').run(cutoff).changes))this.cachedStats=undefined;
     if(Number(this.db.prepare('SELECT count(*) AS n FROM scan_summaries').get()!.n)>this.maxEntries)
-      this.db.prepare('DELETE FROM scan_summaries WHERE id NOT IN (SELECT id FROM scan_summaries ORDER BY received_at DESC,rowid DESC LIMIT ?)').run(this.maxEntries);
+      if(Number(this.db.prepare('DELETE FROM scan_summaries WHERE id NOT IN (SELECT id FROM scan_summaries ORDER BY received_at DESC,rowid DESC LIMIT ?)').run(this.maxEntries).changes))
+        this.cachedStats=undefined;
     this.db.exec('DELETE FROM watch_jobs WHERE id NOT IN (SELECT id FROM scan_summaries); DELETE FROM watch_heads WHERE id NOT IN (SELECT id FROM scan_summaries)');
     this.db.prepare("UPDATE watch_jobs SET state='ended',end_reason=expiry_reason,next_check_at=NULL,lease_until=NULL,claim_id=NULL WHERE state<>'ended' AND ends_at<=?")
       .run(now.toISOString());

@@ -140,6 +140,45 @@ test('durable reopen preserves original timestamps and immutable metadata while 
   }finally{f.close();}
 });
 
+test('legacy ledgers backfill status metadata once, then restart and status reads avoid notification scans',()=>{
+  const f=fixture();try {
+    let ledger=f.create();
+    ledger.record(signal());f.advance(10);ledger.record(signal('debot',10));ledger.record(signal('debot',10));ledger.close();
+    const legacy=new DatabaseSync(f.database);
+    try {
+      legacy.exec(`DROP TRIGGER IF EXISTS source_notifications_status_insert;
+        DROP TRIGGER IF EXISTS source_notifications_status_update;
+        DROP TRIGGER IF EXISTS source_notifications_status_delete;
+        DROP INDEX IF EXISTS source_notifications_first_observed;
+        DELETE FROM source_corroboration_meta WHERE key IN ('status_version','events','deliveries','latest_observed_at')`);
+    } finally {legacy.close();}
+
+    ledger=f.create();
+    assert.deepEqual({events:ledger.status().events,deliveries:ledger.status().deliveries,latest:ledger.status().latestObservedAt},
+      {events:2,deliveries:3,latest:at(10)});
+    const migrated=new DatabaseSync(f.database,{readOnly:true});
+    try {
+      const meta=new Map(migrated.prepare(`SELECT key,value FROM source_corroboration_meta
+        WHERE key IN ('status_version','events','deliveries','latest_observed_at')`).all().map(row=>[String(row.key),String(row.value)]));
+      assert.deepEqual(Object.fromEntries(meta),{deliveries:'3',events:'2',latest_observed_at:at(10),status_version:'1'});
+    } finally {migrated.close();}
+    assert.deepEqual(ledger.record(signal('debot',10)),{accepted:true,duplicate:true});
+    assert.equal(ledger.status().events,2);assert.equal(ledger.status().deliveries,4);
+    ledger.close();
+
+    const statements:string[]=[],prototype=DatabaseSync.prototype as any,prepare=prototype.prepare;
+    prototype.prepare=function(sql:string){statements.push(sql);return prepare.call(this,sql);};
+    try {ledger=f.create();} finally {prototype.prepare=prepare;}
+    assert.equal(statements.some(sql=>/SELECT\s+count\(\*\).*FROM\s+source_notifications/is.test(sql)),false);
+
+    statements.length=0;prototype.prepare=function(sql:string){statements.push(sql);return prepare.call(this,sql);};
+    try {
+      for(let index=0;index<5;index++)assert.equal(ledger.status().deliveries,4);
+    } finally {prototype.prepare=prepare;}
+    assert.equal(statements.some(sql=>/FROM\s+source_notifications/i.test(sql)),false);
+  }finally{f.close();}
+});
+
 test('unsupported chains, incomplete addresses, manual sources, invalid references and future receive times cannot generate corroboration',()=>{
   const f=fixture();try {
     const ledger=f.create();for(const bad of [signal('ave',0,'bad',{chain:'bsc',address:'0x1234'}),signal('ave',0,'bad',{chain:'other',address:address()} as never),

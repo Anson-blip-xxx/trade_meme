@@ -60,7 +60,7 @@ function setup(t: TestCleanup, options: {
   rpc?: (method: string) => unknown; rpcFails?: boolean;
 } = {}) {
   const chain = options.chain ?? 'bsc', item = identity(chain);
-  const config: Config = {...readConfig({}), entryMode: 'live', gmgnApiKey: `exit-test-${randomUUID()}`,
+  const config: Config = {...readConfig({}), entryBalanceBps: {}, entryMode: 'live', gmgnApiKey: `exit-test-${randomUUID()}`,
     gmgnPrivateKey: syntheticPem, gmgnMinIntervalMs: 0, exitPolicy: policy(),
     entryWallets: {[chain]: item.wallet}, entryInputTokens: {[chain]: item.spend}, entryAmounts: {[chain]: '100000'},
     rpc: {[chain]: `https://${chain}.invalid/rpc`}, ...options.config};
@@ -227,7 +227,7 @@ test('missing, mismatched, malformed and unknown strategy data cannot close even
   }
 });
 
-test('three terminal conditions plus verified zero balance release the asset for a new non-DeBot event only', async t => {
+test('three terminal conditions plus verified zero balance close the position but never release permanent token identity', async t => {
   for (const chain of ['bsc', 'solana', 'robinhood'] as const) {
     const ctx = setup(t, {chain, config: {entryMaxOpen: 1}});
     const original = candidate(chain);
@@ -245,9 +245,9 @@ test('three terminal conditions plus verified zero balance release the asset for
     assert.equal(replay.order?.id, created.order!.id);
     const nextReport=candidate(chain,'new-event');nextReport.signal.source='gmgn';
     const next = await ctx.controller.consider(nextReport);
-    assert.equal(next.status, 'created');
-    assert.notEqual(next.order?.id, created.order!.id);
-    assert.equal(ctx.signedCalls.filter(call => call.url.pathname === '/v1/trade/swap').length, 2);
+    assert.equal(next.status, 'blocked');
+    assert.equal(next.reason, 'ASSET_REENTRY_BLOCKED');
+    assert.equal(ctx.signedCalls.filter(call => call.url.pathname === '/v1/trade/swap').length, 1);
   }
 });
 

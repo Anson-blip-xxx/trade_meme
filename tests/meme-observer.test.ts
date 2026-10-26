@@ -7,6 +7,7 @@ import {DatabaseSync} from 'node:sqlite';
 import {MemeObserver,type MemeObserverOptions} from '../src/meme-observer.js';
 import {assessMeme} from '../src/meme-assessment.js';
 import {SourceCorroboration} from '../src/source-corroboration.js';
+import {buildReviewSamplingPlan,writeReviewSamplingPlan} from '../src/review-sampling.js';
 import type {MemeMarketSample,MemeAssessment,MemeCatalystSnapshot} from '../src/meme-assessment.js';
 import type {Signal,Report,Check} from '../src/types.js';
 
@@ -37,6 +38,86 @@ function fixture(overrides:Partial<MemeObserverOptions>={}){
   const rows=(table='meme_snapshots')=>{const db=new DatabaseSync(database,{readOnly:true});try{return db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all();}finally{db.close();}};
   return {create,options,calls,rows,now:()=>current,advance:(sec:number)=>{current=sec;},close:async()=>{for(const observer of observers)await observer.close();rmSync(directory,{recursive:true,force:true});}};
 }
+
+test('SOL-only restart filters research before the active limit and preserves disabled-chain history',async()=>{
+  const f=fixture({maxActive:1}),requests:Signal['token'][][]=[],catalysts:Signal['token'][]=[];
+  const sol:Signal={...signal(10),token:{chain:'solana',address:'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263'}};
+  try {
+    const original=f.create();original.register(sol);original.captureReport(report());
+    f.advance(1);original.register(signal(1,1,'bsc','bsc-new'));original.register(signal(2,1,'robinhood'));
+    const historical=f.rows('meme_tokens').filter(row=>row.chain!=='solana'),eventCount=f.rows('meme_signals').length;
+    await original.close();f.options.allowedChains=['solana'];
+    f.options.marketBatch=async tokens=>{requests.push(tokens);return [];};
+    f.options.catalyst=async input=>{catalysts.push(input.token);return catalyst(input.token,f.now());};
+    const restricted=f.create();f.advance(2);
+    assert.equal(restricted.register(signal(1,2,'bsc','blocked-new-bsc')),false);
+    assert.equal(restricted.register(signal(2,2,'robinhood','blocked-new-robinhood')),false);
+    restricted.captureReport(report(2));
+    await restricted.runOnce();await restricted.runCatalystOnce();
+    assert.deepEqual(requests.map(batch=>batch.map(({chain,address})=>({chain,address}))),[[sol.token]]);
+    assert.deepEqual(catalysts,[sol.token]);
+    assert.equal(f.rows('meme_signals').length,eventCount);
+    assert.deepEqual(f.rows('meme_tokens').filter(row=>row.chain!=='solana'),historical);
+    assert.equal(restricted.list().total,3);assert.ok(restricted.detail(token()).token);
+    assert.deepEqual(restricted.status().activeChains,['solana']);
+    assert.equal(restricted.status().active,1);assert.equal(restricted.status().waiting,0);
+  }finally{await f.close();}
+});
+
+test('status recent-window count uses the chain and signal-time covering index',async()=>{
+  const f=fixture({allowedChains:['solana']});
+  try {
+    const observer=f.create();observer.register({...signal(),token:{chain:'solana',address:'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263'}});
+    assert.equal(observer.status().active,1);
+    const db=new DatabaseSync(f.options.database,{readOnly:true});try {
+      const plan=db.prepare(`EXPLAIN QUERY PLAN SELECT count(*) AS n FROM meme_tokens
+        WHERE last_signal_at>=? AND chain IN (?)`).all(at(-7200),'solana').map(row=>String(row.detail)).join(' ');
+      assert.match(plan,/USING COVERING INDEX meme_tokens_chain_signal/);
+    }finally{db.close();}
+  }finally{await f.close();}
+});
+
+test('list pagination uses first-seen ordering indexes without a temporary sort',async()=>{
+  const f=fixture();
+  try {
+    const observer=f.create();observer.register(signal());
+    const db=new DatabaseSync(f.options.database,{readOnly:true});try {
+      const plans=[
+        db.prepare(`EXPLAIN QUERY PLAN SELECT * FROM meme_tokens WHERE first_seen_at<=?
+          ORDER BY first_seen_at DESC,chain,address LIMIT ? OFFSET ?`).all(at(),20,0),
+        db.prepare(`EXPLAIN QUERY PLAN SELECT * FROM meme_tokens WHERE first_seen_at<=? AND chain=?
+          ORDER BY first_seen_at DESC,chain,address LIMIT ? OFFSET ?`).all(at(),'bsc',20,0),
+      ].map(rows=>rows.map(row=>String(row.detail)).join(' '));
+      assert.match(plans[0],/meme_tokens_first_seen/);
+      assert.match(plans[1],/meme_tokens_chain_first_seen/);
+      for(const plan of plans)assert.doesNotMatch(plan,/USE TEMP B-TREE/);
+    }finally{db.close();}
+  }finally{await f.close();}
+});
+
+test('SOL-only fair and priority sampling pools exclude more than 600 disabled-chain candidates before LIMIT',async()=>{
+  const f=fixture({maxActive:2}),requests:Signal['token'][][]=[],catalysts:Signal['token'][]=[];
+  const sols:Signal[]=['DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263','So11111111111111111111111111111111111111112']
+    .map((address,i)=>({...signal(1000+i,1),token:{chain:'solana',address}}));
+  try {
+    const original=f.create();for(let i=1;i<=601;i++)original.register(signal(i));
+    original.register(signal(602,0,'robinhood'));f.advance(1);sols.forEach(input=>original.register(input));
+    await original.close();f.options.allowedChains=['solana'];f.options.samplingPlanPath=f.options.database+'.sampling.json';
+    writeReviewSamplingPlan(f.options.samplingPlanPath,buildReviewSamplingPlan({asOf:at(),windowEndAt:at(-3600),cohorts:[
+      {chain:'bsc',source:'debot',total:601,covered:0},{chain:'robinhood',source:'debot',total:1,covered:0},
+      {chain:'solana',source:'debot',total:2,covered:1}]}));
+    f.options.marketBatch=async tokens=>{requests.push(tokens);return [];};
+    f.options.catalyst=async input=>{catalysts.push(input.token);return catalyst(input.token,f.now());};
+    const restricted=f.create();await restricted.runOnce();await restricted.runCatalystOnce();
+    assert.equal(requests.length,1);assert.deepEqual(new Set(requests[0].map(t=>t.address)),new Set(sols.map(s=>s.token.address)));
+    assert.equal(requests[0].every(t=>t.chain==='solana'),true);assert.equal(catalysts.length,1);assert.equal(catalysts[0].chain,'solana');
+    assert.equal(restricted.status().active,2);assert.equal(restricted.status().waiting,0);assert.equal(restricted.list().total,604);
+    assert.equal(restricted.status().samplingPlan.status,'active');
+    const selections=f.rows('meme_sampling_selections');assert.ok(selections.length>=2);
+    assert.equal(selections.every(row=>row.chain==='solana'),true);
+    assert.ok(selections.some(row=>row.reason==='FAIR_ROTATION'));assert.ok(selections.some(row=>row.reason==='COVERAGE_DEFICIT'));
+  }finally{await f.close();}
+});
 
 test('market callback receives only committed sanitized new samples and cannot roll back collection',async()=>{
   const seen:MemeMarketSample[]=[];let fail=true;

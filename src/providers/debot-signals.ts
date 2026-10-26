@@ -21,6 +21,8 @@ export interface DebotSignalObservation {
   /** Vendor-reported entries, not independently verified buyers or wallet ownership. */
   walletCount:number;addressCount:number;aliases:string[];
   alertPriceUsd?:number;averageWalletVolumeUsd?:number;
+  /** Notification-bound market cap. Never substitute FDV or current token metadata. */
+  alertMarketCapUsd?:number;marketSnapshotAt?:string;marketCapTiming?:'event_snapshot'|'unverified';
   vendorPerformance?:VendorSignalPerformance;
   /** Vendor observations for later matching; absence of a transaction means no verified buy evidence. */
   vendorWallets?:DebotVendorWalletSnapshot[];
@@ -138,7 +140,13 @@ export function normalizeDebotSignals(payload:unknown,chain:Chain,observedAt:Dat
       const actualAddress=address(wallet.wallet,chain);
       if(actualAddress)addresses.add(actualAddress);
     }
-    const alertPriceUsd=object(row.token_trading_stat)?positive(row.token_trading_stat.price):undefined;
+    const stat=object(row.token_trading_stat)?row.token_trading_stat:undefined;
+    const alertPriceUsd=positive(stat?.price),alertMarketCapUsd=positive(stat?.mkt_cap);
+    const statSeconds=typeof stat?.lastUpdateTime==='number'?stat.lastUpdateTime:
+      typeof stat?.lastUpdateTime==='string'&&/^\d{1,10}$/.test(stat.lastUpdateTime)?Number(stat.lastUpdateTime):NaN;
+    const validStatTime=Number.isSafeInteger(statSeconds)&&statSeconds>0&&statSeconds<=9_999_999_999;
+    // A current quote embedded in a historical response cannot stand in for the third alert's cap.
+    const marketCapTiming=validStatTime&&statSeconds<=seconds&&seconds-statSeconds<=120?'event_snapshot':'unverified';
     const averageWalletVolumeUsd=positive(row.avg_wallet_volume);
     // Supplier performance is a separate retrospective observation, not part of signal identity.
     const stats=object(meta?.signals)?meta.signals:undefined;
@@ -154,6 +162,8 @@ export function normalizeDebotSignals(payload:unknown,chain:Chain,observedAt:Dat
       addressCount:addresses.size,aliases:[...aliases],
       ...(vendorWallets.length?{vendorWallets}:{}),
       ...(alertPriceUsd!==undefined?{alertPriceUsd}:{}),
+      ...(alertMarketCapUsd!==undefined?{alertMarketCapUsd,marketCapTiming}:{}),
+      ...(validStatTime?{marketSnapshotAt:new Date(statSeconds*1000).toISOString()}:{}),
       ...(averageWalletVolumeUsd!==undefined?{averageWalletVolumeUsd}:{}),...(vendorPerformance?{vendorPerformance}:{})});
   }
   result.rejected+=Math.max(0,rows.length-PAGE_SIZE);

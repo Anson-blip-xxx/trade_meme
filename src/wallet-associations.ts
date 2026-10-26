@@ -63,6 +63,7 @@ export class WalletAssociations {
       CREATE INDEX IF NOT EXISTS wh_assoc_episode_pair ON wh_assoc_episodes(chain,leader,candidate,active,updated_at DESC);
       CREATE INDEX IF NOT EXISTS wh_assoc_episode_anchor ON wh_assoc_episodes(chain,leader,token_address,active);
       CREATE INDEX IF NOT EXISTS wh_assoc_episode_token ON wh_assoc_episodes(chain,token_address,active,leader,candidate);
+      CREATE INDEX IF NOT EXISTS wh_assoc_episode_candidate ON wh_assoc_episodes(chain,candidate,active,leader,token_address);
       CREATE INDEX IF NOT EXISTS wh_assoc_source_index ON wh_observations(source,kind);
       CREATE INDEX IF NOT EXISTS wh_assoc_wallet_buy ON wh_events(chain,wallet,token_address,side,event_at);
       CREATE INDEX IF NOT EXISTS wh_assoc_funding_latest ON wh_funding(chain,wallet,snapshot_at DESC,observed_at DESC);
@@ -93,18 +94,42 @@ export class WalletAssociations {
       (SELECT leader,candidate FROM wh_assoc_episodes WHERE chain=? AND token_address=? AND active=1)`).run(value.chain,value.chain,value.tokenAddress);
   }
   fundingChanged(chain:Chain,wallet:string):void {
-    this.db.prepare(`UPDATE wh_assoc_anchors SET dirty=1 WHERE chain=? AND (leader=? OR (leader,token_address) IN
-      (SELECT leader,token_address FROM wh_assoc_episodes WHERE chain=? AND candidate=? AND active=1))`).run(chain,wallet,chain,wallet);
-    this.db.prepare('UPDATE wh_assoc_relations SET dirty=1 WHERE chain=? AND (leader=? OR candidate=?)').run(chain,wallet,wallet);
+    this.fundingChangedMany([{chain,wallet}]);
+  }
+  fundingChangedMany(changes:Iterable<{chain:Chain;wallet:string}>):void {
+    for(const [chain,wallets] of this.group(changes,'wallet')) {
+      const values=JSON.stringify(wallets);
+      this.db.prepare(`UPDATE wh_assoc_anchors SET dirty=1 WHERE rowid IN (
+        SELECT a.rowid FROM json_each(?) w JOIN wh_assoc_anchors a ON a.chain=? AND a.leader=w.value
+        UNION SELECT a.rowid FROM json_each(?) w JOIN wh_assoc_episodes e INDEXED BY wh_assoc_episode_candidate
+          ON e.chain=? AND e.candidate=w.value AND e.active=1
+          JOIN wh_assoc_anchors a ON a.chain=e.chain AND a.leader=e.leader AND a.token_address=e.token_address)`).run(values,chain,values,chain);
+      this.db.prepare(`UPDATE wh_assoc_relations SET dirty=1 WHERE rowid IN (
+        SELECT r.rowid FROM json_each(?) w JOIN wh_assoc_relations r ON r.chain=? AND r.leader=w.value
+        UNION SELECT r.rowid FROM json_each(?) w JOIN wh_assoc_relations r INDEXED BY wh_assoc_relation_candidate
+          ON r.chain=? AND r.candidate=w.value)`).run(values,chain,values,chain);
+    }
   }
 
   /** A rare service reclassification invalidates cached clues for every recipient; no evidence is erased. */
   publicServiceChanged(chain:Chain,funder:string):void {
-    this.db.prepare(`UPDATE wh_assoc_relations SET dirty=1 WHERE chain=? AND (leader IN (SELECT wallet FROM wh_funding WHERE chain=? AND funding_address=?)
-      OR candidate IN (SELECT wallet FROM wh_funding WHERE chain=? AND funding_address=?))`).run(chain,chain,funder,chain,funder);
-    this.db.prepare(`UPDATE wh_assoc_anchors SET dirty=1 WHERE chain=? AND (leader IN (SELECT wallet FROM wh_funding WHERE chain=? AND funding_address=?)
-      OR (leader,token_address) IN (SELECT e.leader,e.token_address FROM wh_assoc_episodes e JOIN wh_funding f ON f.chain=e.chain AND f.wallet=e.candidate
-        WHERE e.chain=? AND f.funding_address=? AND e.active=1))`).run(chain,chain,funder,chain,funder);
+    this.publicServiceChangedMany([{chain,funder}]);
+  }
+  publicServiceChangedMany(changes:Iterable<{chain:Chain;funder:string}>):void {
+    for(const [chain,funders] of this.group(changes,'funder')) {
+      const values=JSON.stringify(funders);
+      const recipients=`SELECT f.wallet FROM wh_funding f INDEXED BY wh_funding_address
+        JOIN json_each(?) s ON s.value=f.funding_address WHERE f.chain=?`;
+      this.db.prepare(`WITH recipients(wallet) AS (${recipients}) UPDATE wh_assoc_relations SET dirty=1 WHERE rowid IN (
+        SELECT r.rowid FROM recipients w JOIN wh_assoc_relations r ON r.chain=? AND r.leader=w.wallet
+        UNION SELECT r.rowid FROM recipients w JOIN wh_assoc_relations r INDEXED BY wh_assoc_relation_candidate
+          ON r.chain=? AND r.candidate=w.wallet)`).run(values,chain,chain,chain);
+      this.db.prepare(`WITH recipients(wallet) AS (${recipients}) UPDATE wh_assoc_anchors SET dirty=1 WHERE rowid IN (
+        SELECT a.rowid FROM recipients w JOIN wh_assoc_anchors a ON a.chain=? AND a.leader=w.wallet
+        UNION SELECT a.rowid FROM recipients w JOIN wh_assoc_episodes e INDEXED BY wh_assoc_episode_candidate
+          ON e.chain=? AND e.candidate=w.wallet AND e.active=1
+          JOIN wh_assoc_anchors a ON a.chain=e.chain AND a.leader=e.leader AND a.token_address=e.token_address)`).run(values,chain,chain,chain);
+    }
   }
 
   refresh(limit=3):void {
@@ -250,6 +275,11 @@ export class WalletAssociations {
   }
   private timestampConflict(id:string,eventAt:string):boolean {
     return !!this.db.prepare("SELECT 1 FROM wh_observations INDEXED BY wh_observations_event WHERE event_id=? AND kind='trade' AND json_extract(data,'$.eventAt')<>? LIMIT 1").get(id,eventAt);
+  }
+  private group<K extends 'wallet'|'funder'>(changes:Iterable<{chain:Chain}&Record<K,string>>,key:K):Map<Chain,string[]> {
+    const grouped=new Map<Chain,Set<string>>();
+    for(const change of changes) {const values=grouped.get(change.chain)??new Set<string>();values.add(change[key]);grouped.set(change.chain,values);}
+    return new Map([...grouped].map(([chain,values])=>[chain,[...values]]));
   }
   private summary(row:Row):WalletAssociationSummary {return {...JSON.parse(String(row.data)),status:Number(row.dirty)?'stale':'current'};}
 }

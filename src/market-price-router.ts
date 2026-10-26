@@ -26,6 +26,7 @@ export interface MarketPriceRouterOptions {
   client?:Pick<GmgnClient,'get'|'cooldownUntil'>&Partial<Pick<GmgnClient,'withSignal'>>;
   fetcher?:Fetcher;debotFetcher?:Fetcher;maxDebotPerBatch?:number;now?:()=>Date;httpTimeoutMs?:number;gmgnTimeoutMs?:number;maxGmgnPerBatch?:number;
   maxAgeMs?:number;maxSpreadPct?:number;
+  preferStreams?:boolean;minHttpIntervalMs?:number;
 }
 export interface MarketPriceBatch {
   samples:MarketPriceSample[];gaps:{token:ScanToken;reason:string}[];
@@ -58,6 +59,7 @@ export class MarketPriceRouter {
   private readonly cache=new Map<string,Map<MarketPriceSource,MarketPriceSample>>();
   private readonly blocks=new Map<string,{source:MarketPriceSource;reason:string;until:number}>();
   private readonly published=new Map<string,number>();
+  private readonly httpAttempts=new Map<string,number>();
   private readonly sourceState=new Map<MarketPriceSource,{lastSuccessAt?:string;lastError?:string;until:number}>();
   private readonly controllers=new Set<AbortController>();
   private closed=false;
@@ -71,7 +73,7 @@ export class MarketPriceRouter {
     this.httpTimeout=options.httpTimeoutMs??3500;this.gmgnTimeout=options.gmgnTimeoutMs??1500;
     this.gmgnLimit=options.maxGmgnPerBatch??1;
     if(!bounded(this.maxAge,1000,120_000)||!bounded(this.httpTimeout,1,15_000)||!bounded(this.gmgnTimeout,1,10_000)||
-       !bounded(this.gmgnLimit,0,1)||!bounded(options.maxDebotPerBatch??2,0,3)||!Number.isFinite(this.spread)||this.spread<1||this.spread>100)
+       !bounded(this.gmgnLimit,0,1)||!bounded(options.maxDebotPerBatch??2,0,3)||!bounded(options.minHttpIntervalMs??0,0,300000)||!Number.isFinite(this.spread)||this.spread<1||this.spread>100)
       throw new Error('PRICE_ROUTER_CONFIG_INVALID');
     for(const source of SOURCES)this.sourceState.set(source,{until:0});
   }
@@ -119,6 +121,16 @@ export class MarketPriceRouter {
     return this.accept(input.source,input.token,input.priceUsd,input.eventAt,input.receivedAt,'provider_update',input.market);
   }
 
+  /** Preserve the actual provider timestamp, including when it becomes stale.
+   * HTTP observations can never make a silent websocket appear recovered. */
+  latestStream(raw:ScanToken):MarketPriceSample|undefined {
+    const token=normalizePriceToken(raw);if(!token||this.closed)return;
+    const samples=[...(this.cache.get(key(token))?.values()??[])].filter(sample=>
+      sample.timeBasis==='provider_update'&&['ave_price_stream_sample','debot_price_stream_sample'].includes(sample.source));
+    samples.sort((a,b)=>Date.parse(b.observedAt)-Date.parse(a.observedAt));
+    return samples[0]?structuredClone(samples[0]):undefined;
+  }
+
   observeChainSample(input:ScanPrice):boolean {
     if(!object(input)||input.source!=='chain_pool_sample')return false;
     return this.accept('chain_pool',input,input.priceUsd,input.observedAt,this.now().toISOString(),'chain_sample',input.market,input.metadata);
@@ -157,8 +169,20 @@ export class MarketPriceRouter {
     try {
       // Existing genuinely fresh stream/chain observations are useful even during slow HTTP requests.
       for(const token of tokens)publish(token);
+      const now=this.now().getTime();
+      const httpTokens=tokens.filter(token=>{
+        const route=this.latest(token),stream=this.latestStream(token);
+        if(this.options.preferStreams&&route.status==='available'&&
+          ((stream&&Date.parse(stream.validUntil)>now)||route.sample?.timeBasis==='chain_sample'))return false;
+        return now-(this.httpAttempts.get(key(token))??-Infinity)>=(this.options.minHttpIntervalMs??0);
+      });
+      // Reserve before awaiting network work, so independent monitoring loops
+      // cannot duplicate fallback requests for the same holding.
+      for(const token of httpTokens)this.httpAttempts.set(key(token),now);
+      if(this.httpAttempts.size>2000)for(const [id,at] of this.httpAttempts)
+        if(now-at>300000)this.httpAttempts.delete(id);
       await Promise.all(['bsc','solana','robinhood'].map(async chain=>{
-        const chainTokens=tokens.filter(token=>token.chain===chain);
+        const chainTokens=httpTokens.filter(token=>token.chain===chain);
         for(let start=0;start<chainTokens.length&&!signal.aborted;start+=30) {
           const batch=chainTokens.slice(start,start+30);
           if(this.cooling('dexscreener')) {result.sourceErrors.dexscreener='PRICE_SOURCE_COOLDOWN';break;}
@@ -173,7 +197,7 @@ export class MarketPriceRouter {
           }
         }
       }));
-      const missing=tokens.filter(token=>this.latest(token).status==='unavailable');
+      const missing=httpTokens.filter(token=>this.latest(token).status==='unavailable');
       const debotCandidates=missing;
       const debotLimit=Math.min(this.options.maxDebotPerBatch??2,debotCandidates.length);
       const debotTokens=Array.from({length:debotLimit},(_,i)=>debotCandidates[(this.debotCursor+i)%debotCandidates.length]);

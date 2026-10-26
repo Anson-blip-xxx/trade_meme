@@ -26,6 +26,69 @@ async function fixture(overrides:Partial<DashboardServices>={}) {
 const login=(base:string,value=password,origin?:string)=>fetch(`${base}/dashboard/api/login`,{
   method:'POST',headers:{'content-type':'application/json',...(origin?{origin}:{})},body:JSON.stringify({password:value})});
 
+test('signal counting uses authenticated bounded pages and strict configured-mode controls without touching trading services',async()=>{
+  const calls:unknown[]=[],headers={'x-dashboard-access':password,'content-type':'application/json'};
+  const f=await fixture({signalCountingPage:options=>{calls.push({page:options});return {status:{running:true,mode:'simulation',executionEnabled:false},...options,items:[],total:0};},
+    signalCountingControl:(action,actor)=>{calls.push({action,actor});return {running:action==='start',mode:'simulation',executionEnabled:false};},
+    orders:()=>{throw new Error('COUNTING_MUST_NOT_TRADE');}});
+  try {
+    for(const [route,method] of [['signal-counting','GET'],['signal-counting/control','POST']])
+      assert.equal((await fetch(`${f.base}/dashboard/api/${route}`,{method})).status,401);
+    const result=await fetch(`${f.base}/dashboard/api/signal-counting?limit=7&offset=14`,{headers});
+    assert.equal(result.status,200);assert.equal(result.headers.get('cache-control'),'no-store');
+    const page=await result.json();assert.equal(page.mode,'simulation');assert.equal(page.executionEnabled,false);assert.equal(page.status.running,true);
+    assert.deepEqual(calls,[{page:{limit:7,offset:14}}]);
+    for(const query of ['limit=0','limit=101','offset=-1','offset=1000001','chain=bsc','limit=1&limit=2','mode=live'])
+      assert.equal((await fetch(`${f.base}/dashboard/api/signal-counting?${query}`,{headers})).status,400,query);
+    const control=`${f.base}/dashboard/api/signal-counting/control`;
+    for(const method of ['GET','PUT','DELETE'])assert.equal((await fetch(control,{method,headers})).status,405);
+    assert.equal((await fetch(control,{method:'POST',headers:{...headers,origin:'https://evil.invalid'},body:'{"action":"start"}'})).status,403);
+    assert.equal((await fetch(control,{method:'POST',headers:{...headers,'sec-fetch-site':'cross-site'},body:'{"action":"start"}'})).status,403);
+    assert.equal((await fetch(control,{method:'POST',headers:{...headers,'content-type':'text/plain'},body:'{"action":"start"}'})).status,415);
+    assert.equal((await fetch(control,{method:'POST',headers,body:'x'.repeat(257)})).status,413);
+    assert.equal((await fetch(control,{method:'POST',headers,body:'{'})).status,400);
+    for(const body of ['null','[]','{}','{"action":"buy"}','{"action":"start","actor":"tg"}','{"action":["start"]}'])
+      assert.equal((await fetch(control,{method:'POST',headers,body})).status,400,body);
+    assert.equal(calls.length,1);
+    for(const action of ['start','start','stop']){
+      const response=await fetch(control,{method:'POST',headers,body:JSON.stringify({action})});assert.equal(response.status,200);
+      const status=await response.json();assert.equal(status.running,action==='start');assert.equal(status.mode,'simulation');assert.equal(status.executionEnabled,false);
+    }
+    assert.deepEqual(calls.slice(1),[{action:'start',actor:'web'},{action:'start',actor:'web'},{action:'stop',actor:'web'}]);
+  }finally{await f.close();}
+});
+
+test('live counting routes preserve running, stopped and readiness status instead of rewriting it to simulation',async()=>{
+  let running=false;
+  const status=()=>({enabled:true,mode:'live',configuredExecutionMode:'live',running,executionEnabled:running,
+    executionReady:true,activeChains:['solana']});
+  const f=await fixture({signalCountingPage:options=>({status:status(),...options,items:[],total:0}),
+    signalCountingControl:action=>{running=action==='start';return status();}});
+  const headers={'x-dashboard-access':password,'content-type':'application/json'};
+  try {
+    const session=await(await fetch(`${f.base}/dashboard/api/session`,{headers})).json();
+    assert.equal(session.readOnly,false);assert.equal(session.signalCountingControlEnabled,true);
+    let page=await(await fetch(`${f.base}/dashboard/api/signal-counting`,{headers})).json();
+    assert.equal(page.mode,'live');assert.equal(page.executionEnabled,false);assert.equal(page.status.executionReady,true);
+    for(const action of ['start','stop']){
+      const response=await fetch(`${f.base}/dashboard/api/signal-counting/control`,{method:'POST',headers,body:JSON.stringify({action})});
+      assert.equal(response.status,200);assert.deepEqual(await response.json(),status());
+      page=await(await fetch(`${f.base}/dashboard/api/signal-counting`,{headers})).json();
+      assert.equal(page.mode,'live');assert.equal(page.executionEnabled,action==='start');assert.deepEqual(page.status,status());
+    }
+  }finally{await f.close();}
+});
+
+test('signal counting supports dashboard session authentication and disabled services never expose execution',async()=>{
+  const f=await fixture();try {
+    const response=await login(f.base),cookie=response.headers.get('set-cookie')!.split(';')[0];
+    const page=await(await fetch(`${f.base}/dashboard/api/signal-counting?limit=5&offset=10`,{headers:{cookie}})).json();
+    assert.deepEqual(page,{status:{enabled:false,running:false,mode:'simulation',executionEnabled:false},items:[],total:0,limit:5,offset:10,hasMore:false,mode:'simulation',executionEnabled:false});
+    const result=await fetch(`${f.base}/dashboard/api/signal-counting/control`,{method:'POST',headers:{cookie,'content-type':'application/json'},body:'{"action":"start"}'});
+    assert.equal(result.status,503);assert.equal((await result.json()).executionEnabled,false);
+  }finally{await f.close();}
+});
+
 test('JEV parallel records require authentication and bounded read-only paging without invoking scoring',async()=>{
   const calls:unknown[]=[],headers={'x-dashboard-access':password};
   const f=await fixture({jev:{status:()=>({enabled:true,mode:'shadow',available:false,circuit:{reason:'JEV_QUOTA_EXHAUSTED'}}),
@@ -269,7 +332,7 @@ test('dashboard balances are exact native units, cached, and missing responses n
   } finally {await balances.stop();}
 });
 test('dashboard settings preserve approved caps and order projection omits private details',()=>{
-  const cfg=config();cfg.entryAmounts={bsc:'150000000000000000',solana:'1000000000',robinhood:'50000000000000000'};
+  const cfg=config();cfg.entryBalanceBps={};cfg.entryAmounts={bsc:'150000000000000000',solana:'1000000000',robinhood:'50000000000000000'};
   assert.deepEqual(dashboardSettings(cfg).caps.map(c=>c.maxPerOrder),['0.15','1','0.05']);
   const fake={list:()=>[{id:'order',chain:'bsc',tokenAddress:'token',createdAt:'now',updatedAt:'now',status:'confirmed',mode:'live',inputAmount:'150000000000000000',
     details:{apiKey:'secret',signature:'private'},wallet:'private-account'}]} as unknown as OrderStore;
@@ -288,4 +351,24 @@ test('dashboard fraction sizing suppresses retired fixed SOL cap while exposing 
   assert.deepEqual(caps.map(c=>c.maxPerOrder),['0.15',null,'0.05']);
   assert.equal(caps[1].sizing,'balance_fraction');assert.equal(caps[1].balanceBps,1000);
   assert.equal(caps[0].balanceBps,null);assert.equal(caps[2].balanceBps,null);
+});
+
+test('dashboard defaults show total-native-balance 3 percent on every chain with old fixed caps suppressed',()=>{
+  const cfg=config();cfg.entryAmounts={bsc:'150000000000000000',solana:'1000000000',robinhood:'50000000000000000'};
+  const caps=dashboardSettings(cfg).caps;
+  assert.deepEqual(caps.map(c=>c.maxPerOrder),[null,null,null]);
+  assert.deepEqual(caps.map(c=>c.balanceBps),[300,300,300]);
+  assert.deepEqual(caps.map(c=>c.balanceBasis),['total_native_balance','total_native_balance','total_native_balance']);
+});
+
+test('SOL-only settings and cached balances do not query disabled chains',async()=>{
+  const cfg=config();cfg.scannerChains=['solana'];cfg.entryWallets={bsc:'bsc-wallet',solana:'sol-wallet',robinhood:'rb-wallet'};
+  const queried:string[]=[],balances=new DashboardBalances(cfg,async(chain)=>{
+    queried.push(chain);return {status:'verified',amount:'1000000000',readStartedAt:new Date().toISOString(),checkedAt:new Date().toISOString(),reasons:[]};
+  });
+  try {
+    await balances.runOnce();assert.deepEqual(queried,['solana']);
+    assert.deepEqual(balances.get().map(row=>row.chain),['solana']);
+    assert.deepEqual(dashboardSettings(cfg).caps.map(row=>row.chain),['solana']);
+  }finally{await balances.stop();}
 });

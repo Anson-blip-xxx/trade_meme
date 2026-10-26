@@ -27,7 +27,11 @@ test('DeBot age and single-row capacity pruning preserve monotonic actual-deleti
     assert.equal(watermark(db,'debot'),undefined);
     seedSignals(db,'debot',[{id:'expired-1',at:at(-32*day)},{id:'expired-2',at:at(-31*day)}]);
     await scanner.runOnce();assert.equal(watermark(db,'debot'),at(-31*day));
+    const bulkStarted=performance.now();
     seedSignals(db,'debot',[{id:'capacity-oldest',at:at(-2*day)},...Array.from({length:9999},(_,i)=>({id:`recent-${i}`,at:at(-1000)}))]);
+    assert.ok(performance.now()-bulkStarted<10_000,'same-CA 10k summary maintenance must stay linear');
+    const summary=db.prepare('SELECT analysis_count,latest_observed_count FROM debot_signal_tokens WHERE chain=? AND address=?').get('bsc',address());
+    assert.deepEqual({...summary},{analysis_count:0,latest_observed_count:9999});
     const observation:DebotSignalObservation={id:'20001',observedAt:at(),walletCount:3,addressCount:0,aliases:[],
       signal:{source:'debot',sourceEventId:'debot:signal:20001',token:{chain:'bsc',address:address(20001)},occurredAt:at(),text:'',claim:'unspecified',evidenceUrls:[]}};
     scanner.acceptPage({observations:[observation],received:1,rejected:0});

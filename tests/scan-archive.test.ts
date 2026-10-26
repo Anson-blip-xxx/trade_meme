@@ -47,6 +47,8 @@ test('passive follow-up entry reuses prices without changing eligible scan perfo
   try {
     for(let n=1;n<=4;n++)archive.capture(make(n,'passive-'+n));
     const target={chain:'bsc' as const,address:tokenAddress(4)};
+    assert.equal((archive.followupDashboardSummary() as {total:number}).total,0,'dashboard waits for the persisted maintenance snapshot');
+    archive.refreshFollowup();assert.equal((archive.followupDashboardSummary() as {total:number}).total,4);
     assert.equal(archive.followupDetail(target)!.selected,false);
     elapsed=1200;archive.capture(make(4,'later-candidate',true));
     const before=archive.get('later-candidate')!.performance;
@@ -85,6 +87,68 @@ test('home counters are cached scalars and expire tracking by time without pruni
     assert.equal(Object.hasOwn(refreshed,'comparison'),false);refreshed.total=100;
     assert.equal(archive.overviewStats().total,2);setNow(86402000);assert.equal(archive.overviewStats().tracking,0);
   }finally{archive.close();}
+});
+
+test('detailed stats cache is isolated from callers and invalidated by archive writes',()=>{
+  const {archive,price}=fixture();try {
+    archive.capture(stored());
+    const first=archive.stats();assert.equal(first.total,1);first.total=99;first.byStatus.completed=99;
+    const cached=archive.stats();assert.equal(cached.total,1);assert.equal(cached.byStatus.completed,1);
+    archive.capture(stored('second'));
+    assert.equal(archive.stats().total,2,'capture invalidates the hot stats snapshot immediately');
+    price(2_000,10);price(3_000,20);
+    assert.equal(archive.stats().maxGainPct,100,'price writes invalidate max-gain statistics');
+  }finally{archive.close();}
+});
+
+test('stats is a read-only path; explicit maintenance expires processing leases and invalidates its cache',()=>{
+  const dir=mkdtempSync(join(tmpdir(),'meme-scan-stats-read-')),path=join(dir,'scans.sqlite');let elapsed=1_000;
+  const archive=new ScanArchive(path,{now:()=>new Date(start+elapsed)});const db=new DatabaseSync(path);
+  try {
+    const processing=stored('processing');processing.status='processing';processing.report=undefined;processing.leaseExpiresAt=iso(5_000);
+    archive.capture(processing);elapsed=20_000;
+    const before=archive.stats();assert.equal(before.byStatus.processing,1);assert.equal(before.byStatus.interrupted,0);
+    assert.equal(db.prepare("SELECT status FROM scan_summaries WHERE id='processing'").get()!.status,'processing');
+    const index=String(db.prepare("SELECT sql FROM sqlite_master WHERE type='index' AND name='scan_summaries_processing_lease'").get()!.sql);
+    assert.match(index,/WHERE status='processing'/);
+    const plan=db.prepare(`EXPLAIN QUERY PLAN SELECT count(*),SUM(eligible_at IS NOT NULL),
+      SUM(eligible_at IS NOT NULL AND performance_status<>'ended'),MAX(max_gain_pct),SUM(status='processing'),SUM(decision IS NULL)
+      FROM scan_summaries`).all().map(row=>String(row.detail));
+    assert.ok(plan.some(detail=>detail.includes('COVERING INDEX scan_summaries_stats_cover')));
+    archive.prune();
+    const after=archive.stats();assert.equal(after.byStatus.processing,0);assert.equal(after.byStatus.interrupted,1);
+    assert.equal(db.prepare("SELECT status FROM scan_summaries WHERE id='processing'").get()!.status,'interrupted');
+  }finally{db.close();archive.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('price writes do not run retention maintenance; explicit prune still removes expired scans',()=>{
+  const dir=mkdtempSync(join(tmpdir(),'meme-scan-price-prune-')),path=join(dir,'scans.sqlite');let elapsed=1_000;
+  const archive=new ScanArchive(path,{retentionDays:1,now:()=>new Date(start+elapsed)});const db=new DatabaseSync(path);
+  try {
+    archive.capture(stored());assert.equal(db.prepare('SELECT count(*) AS n FROM scan_summaries').get()!.n,1);
+    elapsed=2*86_400_000;
+    archive.recordPrice({chain:'bsc',address,priceUsd:2,observedAt:iso(elapsed),source:'gmgn'});
+    assert.equal(db.prepare('SELECT count(*) AS n FROM scan_summaries').get()!.n,1,
+      'a quote update must not perform a retention sweep');
+    archive.recordPriceError({chain:'bsc',address},'GMGN_RATE_LIMITED',new Date(start+elapsed));
+    assert.equal(db.prepare('SELECT count(*) AS n FROM scan_summaries').get()!.n,1,
+      'a quote error must not perform a retention sweep');
+    archive.prune();assert.equal(db.prepare('SELECT count(*) AS n FROM scan_summaries').get()!.n,0);
+  }finally{db.close();archive.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('detailed stats rebuild from persisted scalar columns after restart',()=>{
+  const dir=mkdtempSync(join(tmpdir(),'meme-scan-stats-restart-')),path=join(dir,'scans.sqlite');
+  let archive:ScanArchive|undefined=new ScanArchive(path,{now:()=>new Date(start+1_000)});
+  try {
+    archive.capture(stored());assert.equal(archive.stats().total,1);archive.close();archive=undefined;
+    const db=new DatabaseSync(path);
+    db.prepare(`INSERT INTO scan_summaries(id,chain,address,status,received_at,decision,max_gain_pct,record)
+      VALUES ('persisted-extra','bsc',?,'completed',?,'WATCH',12,'{}')`).run('0x'+'b'.repeat(40),iso(0));db.close();
+    archive=new ScanArchive(path,{now:()=>new Date(start+1_000)});
+    const restored=archive.stats();assert.equal(restored.total,2);assert.equal(restored.byStatus.completed,2);
+    assert.equal(restored.byDecision.BUY_CANDIDATE,1);assert.equal(restored.byDecision.WATCH,1);assert.equal(restored.maxGainPct,12);
+  }finally{archive?.close();rmSync(dir,{recursive:true,force:true});}
 });
 
 test('基线来自首次符合条件之后实际采样，涨跌和最高涨幅只由已采样报价计算',()=>{

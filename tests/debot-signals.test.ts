@@ -369,3 +369,22 @@ test('登录客户端的认证与限流错误跨列表和详情适配保留分�
     assert.equal(calls,2);
   }
 });
+
+test('通知市值保存 mkt_cap，时间不明、旧快照或事后更新不能充当第三次市值',()=>{
+  const raw:any=sample(),row=raw.data.results[0];
+  row.token_trading_stat={price:1,mkt_cap:'99000',fdv:150000,lastUpdateTime:row.create_time-8};
+  let result=normalizeDebotSignals(raw,'bsc',now).observations[0];
+  assert.equal(result.alertMarketCapUsd,99000);assert.equal(result.marketCapTiming,'event_snapshot');
+  assert.equal(result.marketSnapshotAt,new Date((row.create_time-8)*1000).toISOString());
+  const originalId=result.signal.sourceEventId;
+  for(const at of [0,undefined,row.create_time-121,row.create_time+1]) {
+    row.token_trading_stat.lastUpdateTime=at;
+    result=normalizeDebotSignals(raw,'bsc',now).observations[0];
+    assert.equal(result.marketCapTiming,'unverified');assert.equal(result.alertMarketCapUsd,99000);
+    assert.equal(result.signal.sourceEventId,originalId);
+  }
+  for(const value of [undefined,0,-1,'',NaN]) {
+    row.token_trading_stat.mkt_cap=value;
+    assert.equal(normalizeDebotSignals(raw,'bsc',now).observations[0].alertMarketCapUsd,undefined);
+  }
+});

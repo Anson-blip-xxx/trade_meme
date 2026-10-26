@@ -27,7 +27,7 @@ function setup(t: {after: (fn: () => void) => void}, options: {
   liveProtection?: LiveProtectionProvider | null;
 } = {}) {
   const chain = options.chain ?? 'bsc', clock = {time: Date.now()};
-  const config: Config = {...readConfig({}), entryMode: 'live', entrySizing: 'balance_cap',
+  const config: Config = {...readConfig({}), entryBalanceBps: {}, entryMode: 'live', entrySizing: 'balance_cap',
     gmgnApiKey: `sizing-test-${randomUUID()}`, gmgnPrivateKey: pem, gmgnMinIntervalMs: 0,
     entryAmounts: {[chain]: caps[chain]}, entryWallets: {[chain]: wallet(chain)},
     entryInputTokens: {[chain]: NATIVE_INPUT_TOKENS[chain]}, rpc: {[chain]: `https://${chain}.invalid/native-rpc`},
@@ -282,9 +282,9 @@ test('Solana fraction removes 1 SOL cap, floors atomic units and needs no fixed 
   for(const entryAmounts of [{solana:'1000000000'},{},{solana:'retired-invalid-fixed-cap'}]) {
     const ctx=setup(t,{chain:'solana',balances:[20_020_000_009n],config:{entrySizing:'fixed',entryAmounts,entryBalanceBps:{solana:1000}}});
     const result=await ctx.controller.consider(ctx.candidate());
-    assert.equal(result.order?.status,'submitted');assert.equal(result.order?.inputAmount,'2000000000');
-    assert.equal(ctx.readCalls[0].url.searchParams.get('input_amount'),'2000000000');
-    assert.equal(JSON.parse(String(ctx.signedCalls[0].init?.body)).input_amount,'2000000000');
+    assert.equal(result.order?.status,'submitted');assert.equal(result.order?.inputAmount,'2002000000');
+    assert.equal(ctx.readCalls[0].url.searchParams.get('input_amount'),'2002000000');
+    assert.equal(JSON.parse(String(ctx.signedCalls[0].init?.body)).input_amount,'2002000000');
     assert.equal(ctx.balanceReads(),2);
   }
 });
@@ -293,27 +293,27 @@ test('Solana fraction blocks a still-affordable quoted order when final balance 
   const ctx=setup(t,{chain:'solana',balances:[20_020_000_000n,20_019_999_999n],config:{entryBalanceBps:{solana:1000}}});
   const result=await ctx.controller.consider(ctx.candidate());
   assert.equal(result.status,'blocked');assert.equal(result.reason,'ENTRY_BALANCE_FRACTION_EXCEEDED');
-  assert.equal(result.order?.status,'failed');assert.equal(result.order?.inputAmount,'2000000000');
+  assert.equal(result.order?.status,'failed');assert.equal(result.order?.inputAmount,'2002000000');
   assert.equal(ctx.readCalls.length,1);assert.equal(ctx.balanceReads(),2);assert.equal(ctx.signedCalls.length,0);
 });
 
 test('Solana fraction never increases an already quoted amount after a balance increase',async t=>{
   const ctx=setup(t,{chain:'solana',balances:[20_020_000_000n,30_020_000_000n],config:{entryBalanceBps:{solana:1000}}});
   const result=await ctx.controller.consider(ctx.candidate());
-  assert.equal(result.order?.status,'submitted');assert.equal(result.order?.inputAmount,'2000000000');
-  assert.equal(JSON.parse(String(ctx.signedCalls[0].init?.body)).input_amount,'2000000000');
+  assert.equal(result.order?.status,'submitted');assert.equal(result.order?.inputAmount,'2002000000');
+  assert.equal(JSON.parse(String(ctx.signedCalls[0].init?.body)).input_amount,'2002000000');
 });
 
-test('parallel Solana paper quotes atomically take 10 percent of the remaining unreserved balance',async t=>{
+test('parallel Solana paper quotes use total balance percentage and still reserve principal plus gas',async t=>{
   const balance=20_020_000_009n,fee=20_000_000n;
   const ctx=setup(t,{chain:'solana',balances:[balance],config:{entryMode:'paper',entryBalanceBps:{solana:1000}}});
   const results=await Promise.all([ctx.controller.consider(ctx.candidate('fraction-paper-a')),
     ctx.controller.consider(ctx.candidate('fraction-paper-b',token('solana',4)))]);
   assert.ok(results.every(result=>result.order?.status==='paper_open'));
   const amounts=results.map(r=>BigInt(r.order!.inputAmount)).sort((a,b)=>a<b?1:-1);
-  const first=(balance-fee)/10n,second=(balance-fee-first-fee)/10n;
+  const first=balance/10n,second=balance/10n;
   assert.deepEqual(amounts,[first,second]);assert.equal(ctx.signedCalls.length,0);
-  assert.ok(first!==second);
+  assert.ok(first+second+2n*fee<=balance);
 });
 
 test('Solana fraction override leaves BSC and Robinhood fixed ceilings unchanged',async t=>{
@@ -334,16 +334,40 @@ test('fraction mode rejects unknown balance, non-native input, invalid config an
   }
 });
 
-test('fraction config is explicit, chain-scoped and rejects malformed basis points without changing defaults',()=>{
-  const legacy=readConfig({});assert.equal(legacy.entryBalanceBps?.solana,undefined);assert.equal(legacy.entryMode,'off');
+test('fraction config defaults every chain to 3 percent and rejects malformed overrides',()=>{
+  const defaults=readConfig({});assert.deepEqual(defaults.entryBalanceBps,{bsc:300,solana:300,robinhood:300});assert.equal(defaults.entryMode,'off');
   const cfg=readConfig({ENTRY_BALANCE_BPS_SOLANA:'1000'});
-  assert.equal(cfg.entryBalanceBps?.solana,1000);assert.equal(cfg.entryBalanceBps?.bsc,undefined);assert.equal(cfg.entryBalanceBps?.robinhood,undefined);
+  assert.equal(cfg.entryBalanceBps?.solana,1000);assert.equal(cfg.entryBalanceBps?.bsc,300);assert.equal(cfg.entryBalanceBps?.robinhood,300);
   for(const value of ['','0','-1','10001','10.5','1e3','01000',' 1000','NaN'])
     assert.throws(()=>readConfig({ENTRY_BALANCE_BPS_SOLANA:value}),/ENTRY_BALANCE_BPS_INVALID/);
+});
+
+test('all chains use 3 percent of total native balance and supersede retired fixed principal caps',async t=>{
+  for(const chain of ['bsc','solana','robinhood'] as const) {
+    const decimals=chain==='solana'?9n:18n,balance=100n*10n**decimals+29n;
+    const expected=(balance*300n/10000n).toString();
+    const ctx=setup(t,{chain,balances:[balance],config:{entryBalanceBps:readConfig({}).entryBalanceBps}});
+    const result=await ctx.controller.consider(ctx.candidate());
+    assert.equal(result.order?.status,'submitted');assert.equal(result.order?.inputAmount,expected);
+    assert.equal(ctx.readCalls[0].url.searchParams.get('input_amount'),expected);
+    assert.equal(JSON.parse(String(ctx.signedCalls[0].init?.body)).input_amount,expected);
+    assert.equal((result.order!.details.funding as Record<string,unknown>).balanceBasis,'total');
+    assert.ok(BigInt(expected)>BigInt(caps[chain]));
+    assert.equal(ctx.balanceReads(),2);
+  }
 });
 
 test('wallet-stream preview source cannot bypass independent execution readiness, even with a candidate report',async t=>{
   const ctx=setup(t,{chain:'solana'}),report=ctx.candidate();report.signal.source='wallet';
   const result=await ctx.controller.consider(report);
   assert.equal(result.reason,'ENTRY_WALLET_STREAM_RESEARCH_ONLY');assert.equal(ctx.readCalls.length,0);assert.equal(ctx.signedCalls.length,0);
+});
+
+test('paused chain candidates stop before protection, balance, reservation and quote without touching existing orders',async t=>{
+  for(const chain of ['bsc','robinhood'] as const) {
+    const ctx=setup(t,{chain,config:{scannerChains:['solana']}});
+    const result=await ctx.controller.consider(ctx.candidate());
+    assert.equal(result.reason,'SIGNAL_CHAIN_DISABLED');assert.equal(ctx.balanceReads(),0);
+    assert.equal(ctx.readCalls.length,0);assert.equal(ctx.signedCalls.length,0);assert.equal(ctx.orders.list().length,0);
+  }
 });

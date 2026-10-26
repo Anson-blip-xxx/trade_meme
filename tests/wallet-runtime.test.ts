@@ -85,20 +85,17 @@ test('persistent watch queue operates without dashboard and retains original exp
   }finally{await runtime.close();rmSync(dir,{recursive:true,force:true});}
 });
 
-test('local graph maintenance yields between wallets and shares historical counts across dashboard reads',async()=>{
+test('dashboard and status never run wallet stats or graph maintenance on the main thread',async()=>{
   const dir=mkdtempSync(join(tmpdir(),'wallet-maintenance-'));
   const cfg=readConfig({WALLET_RESEARCH_ENABLED:'true',WALLET_PROFILES_ENABLED:'false',
     WALLET_HISTORY_DATABASE_PATH:join(dir,'history.sqlite'),ORDERS_DATABASE_PATH:join(dir,'orders.sqlite')});
-  const runtime=createRuntime(cfg);let coordination=0,association=0,counts=0;
-  const stats=runtime.walletHistory!.stats();
-  runtime.walletHistory!.refreshCoordination=(limit)=>{assert.equal(limit,1);coordination++;};
-  runtime.walletHistory!.refreshAssociations=(limit)=>{assert.equal(limit,1);association++;};
-  runtime.walletHistory!.stats=()=>{counts++;return stats;};
+  const runtime=createRuntime(cfg);let counts=0;
+  runtime.walletHistory!.refreshCoordination=()=>{throw new Error('MAIN_THREAD_COORDINATION_FORBIDDEN');};
+  runtime.walletHistory!.refreshAssociations=()=>{throw new Error('MAIN_THREAD_ASSOCIATION_FORBIDDEN');};
+  runtime.walletHistory!.stats=()=>{counts++;throw new Error('MAIN_THREAD_STATS_FORBIDDEN');};
   try {
-    runtime.start();await new Promise<void>(r=>setImmediate(r));
-    assert.equal(coordination,1);assert.equal(association,0);
-    for(let i=0;i<20&&association<3;i++)await new Promise<void>(r=>setImmediate(r));
-    assert.equal(coordination,10);assert.equal(association,3);
-    runtime.walletResearchStatus();runtime.walletResearchStatus();assert.equal(counts,1);
+    runtime.start();
+    runtime.walletResearchStatus();runtime.dashboardOverview();runtime.walletResearchStatus();assert.equal(counts,0);
+    assert.equal(runtime.walletResearchStatus().localIndex.running,true);
   } finally {await runtime.close();rmSync(dir,{recursive:true,force:true});}
 });

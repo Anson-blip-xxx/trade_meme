@@ -4,11 +4,22 @@ import {z} from 'zod';
 export interface ExitPolicy {
   readonly enabled: true;
   readonly sellRatioType: 'hold_amount';
-  readonly takeProfit: readonly [
-    Readonly<{gainPct: 500; sellPct: 20}>,
-    Readonly<{gainPct: 1000; sellPct: 10}>,
-  ];
-  readonly stopLoss: Readonly<{dropPct: 40; sellPct: 100}>;
+  readonly takeProfit: readonly Readonly<{gainPct:number;sellPct:number}>[];
+  readonly stopLoss: Readonly<{dropPct: StopLossDropPct; sellPct: 100}>;
+}
+
+export const CURRENT_STOP_LOSS_DROP_PCT = 60 as const;
+export const LEGACY_STOP_LOSS_DROP_PCT = 40 as const;
+export type StopLossDropPct = typeof CURRENT_STOP_LOSS_DROP_PCT | typeof LEGACY_STOP_LOSS_DROP_PCT;
+
+export function isCurrentExitPolicy(policy: ExitPolicy | undefined): policy is ExitPolicy {
+  return !!policy && policy.sellRatioType === 'hold_amount' && policy.takeProfit.length === 1 &&
+    policy.takeProfit[0]?.gainPct === 100 && policy.takeProfit[0].sellPct === 50 &&
+    policy.stopLoss.dropPct === CURRENT_STOP_LOSS_DROP_PCT && policy.stopLoss.sellPct === 100;
+}
+
+export function stopLossPricePct(dropPct: StopLossDropPct): number {
+  return 100 - dropPct;
 }
 
 export interface GmgnConditionOrder {
@@ -33,16 +44,19 @@ const enabledSchema = z.object({
   enabled: z.literal(true),
   // Recognize this spelling only to give a precise rejection of the unsupported basis.
   sellRatioType: z.enum(['hold_amount', 'buy_amount']),
-  takeProfit: z.tuple([
+  takeProfit: z.union([z.tuple([z.object({gainPct:z.literal(100),sellPct:z.literal(50)}).strict()]),z.tuple([
     z.object({gainPct: z.literal(500), sellPct: z.literal(20)}).strict(),
     z.object({gainPct: z.literal(1000), sellPct: z.literal(10)}).strict(),
-  ]),
-  stopLoss: z.object({dropPct: z.literal(40), sellPct: z.literal(100)}).strict(),
+  ])]),
+  // 40 remains readable for immutable historical orders. New runtime config is
+  // restricted to CURRENT_STOP_LOSS_DROP_PCT by readConfig.
+  stopLoss: z.object({dropPct: z.union([z.literal(CURRENT_STOP_LOSS_DROP_PCT), z.literal(LEGACY_STOP_LOSS_DROP_PCT)]),
+    sellPct: z.literal(100)}).strict(),
 }).strict();
 
 /**
  * No settings disables exits. Explicitly disabled settings must contain only enabled:false.
- * An enabled policy must reproduce the three owner-authorized thresholds exactly;
+ * An enabled policy must reproduce either the current principal-recovery plan or the legacy owner plan exactly;
  * omitted fields, coercion, additional orders and alternate execution settings fail closed.
  */
 export function parseExitPolicy(input: unknown): ExitPolicy | undefined {
@@ -58,10 +72,7 @@ export function parseExitPolicy(input: unknown): ExitPolicy | undefined {
     return Object.freeze({
       enabled: true,
       sellRatioType: 'hold_amount',
-      takeProfit: Object.freeze([
-        Object.freeze({...parsed.data.takeProfit[0]}),
-        Object.freeze({...parsed.data.takeProfit[1]}),
-      ] as const),
+      takeProfit: Object.freeze(parsed.data.takeProfit.map(tier=>Object.freeze({...tier}))) as ExitPolicy['takeProfit'],
       stopLoss: Object.freeze({...parsed.data.stopLoss}),
     });
   } catch (error) {

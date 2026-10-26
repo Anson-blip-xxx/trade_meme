@@ -14,14 +14,90 @@ const expected: ExpectedExitStrategy = {
     {order_type: 'loss_stop', side: 'sell', price_scale: '40', sell_ratio: '100'},
   ],
 };
-const row = () => ({
-  order_id: expected.strategyOrderId, chain: 'bsc', wallet_address: expected.wallet,
-  base_token: expected.tokenAddress, quote_token: expected.inputToken,
-  open_sign_hash: expected.openingTransactionHash, order_type: 'smart_trade', sub_order_type: 'mix_trade',
-  sell_ratio_type: 'hold_amount', status: 'closed', strategy_status: 'stopped', token_balance: '0',
-  condition_orders: expected.policyConditions.map((condition, index) => ({...condition, cid: `child-${index}`, status: 'cancel'})),
+const row = (policy: ExpectedExitStrategy = expected) => ({
+  order_id: policy.strategyOrderId, chain: policy.chain === 'solana' ? 'sol' : policy.chain, wallet_address: policy.wallet,
+  base_token: policy.tokenAddress, quote_token: policy.inputToken,
+  open_sign_hash: policy.openingTransactionHash, order_type: 'smart_trade', sub_order_type: 'mix_trade',
+  sell_ratio_type: policy.sellRatioType, status: 'closed', strategy_status: 'stopped', token_balance: '0',
+  condition_orders: policy.policyConditions.map((condition, index) => ({...condition, cid: `child-${index}`, status: 'cancel'})),
 });
 const page = (entry: unknown = row()) => ({next_page_token: '', list: [entry]});
+const doubleExpected: ExpectedExitStrategy = {...expected, policyConditions: [
+  {order_type: 'profit_stop', side: 'sell', price_scale: '100', sell_ratio: '50'},
+  {order_type: 'loss_stop', side: 'sell', price_scale: '40', sell_ratio: '100'},
+]};
+
+test('翻倍卖半仓与剩余全仓止损两条规则可精确匹配，仍只确认策略终止', () => {
+  const entry = row(doubleExpected);
+  entry.condition_orders.reverse();
+  entry.condition_orders[0].price_scale = '40.00';
+  entry.condition_orders[1].sell_ratio = '50.000';
+  const result = assessExitStrategy(page(entry), doubleExpected, now);
+  assert.equal(result.policyMatched, true); assert.equal(result.terminal, true);
+  assert.equal(result.status, 'terminal'); assert.equal(result.hasLiveStop, false);
+  assert.equal(result.conditions.length, 2);
+  assert.deepEqual(result.reasons, ['EXIT_STRATEGY_TERMINAL_BALANCE_CHECK_REQUIRED']);
+});
+
+test('两条规则的运行父单及未文档化子状态仍不能证明已保护', () => {
+  for (const state of [undefined, '', 0, 'pending', 'running', 'open', 'active']) {
+    const entry = row(doubleExpected);
+    Object.assign(entry, {status: 'open', strategy_status: 'running'});
+    Object.assign(entry.condition_orders[1], {status: state});
+    const result = assessExitStrategy(page(entry), doubleExpected, now);
+    assert.equal(result.found, true); assert.equal(result.policyMatched, true);
+    assert.equal(result.status, 'unknown'); assert.equal(result.hasLiveStop, false);
+    assert.equal(result.terminal, false);
+    assert.deepEqual(result.reasons, ['EXIT_CONDITION_STATUS_UNKNOWN']);
+  }
+});
+
+test('两条规则缺失、篡改比例或止损、重复规则及子ID均不能通过', () => {
+  for (const index of [0, 1]) {
+    const entry = row(doubleExpected); entry.condition_orders.splice(index, 1);
+    const result = assessExitStrategy(page(entry), doubleExpected, now);
+    assert.equal(result.policyMatched, false); assert.equal(result.hasLiveStop, false);
+    assert.deepEqual(result.reasons, ['EXIT_CONDITIONS_INCOMPLETE']);
+  }
+  for (const [index, patch] of [
+    [0, {sell_ratio: '100'}], [1, {sell_ratio: '50'}], [1, {price_scale: '70'}],
+    [0, {sell_ratio: '100.01'}], [0, {sell_ratio: '0'}], [1, {price_scale: '0.4'}],
+    [1, {price_scale: '101'}], [1, {side: 'buy'}], [1, {order_type: 'profit_stop'}],
+  ] as const) {
+    const entry = row(doubleExpected); Object.assign(entry.condition_orders[index], patch);
+    const result = assessExitStrategy(page(entry), doubleExpected, now);
+    assert.equal(result.policyMatched, false); assert.equal(result.terminal, false);
+    assert.equal(result.hasLiveStop, false);
+    assert.deepEqual(result.reasons, ['EXIT_CONDITION_POLICY_MISMATCH']);
+  }
+  const repeatedRule = row(doubleExpected);
+  repeatedRule.condition_orders[1] = {...repeatedRule.condition_orders[0], cid: 'unique-child'};
+  assert.deepEqual(assessExitStrategy(page(repeatedRule), doubleExpected, now).reasons,
+    ['EXIT_CONDITION_POLICY_MISMATCH']);
+  const repeatedId = row(doubleExpected); repeatedId.condition_orders[1].cid = 'child-0';
+  assert.deepEqual(assessExitStrategy(page(repeatedId), doubleExpected, now).reasons,
+    ['EXIT_CONDITION_IDS_INVALID']);
+});
+
+test('允许一至八条止盈且恰好一条止损，拒绝无止损、多个止损、重复和超限预期', () => {
+  const profit = doubleExpected.policyConditions[0], loss = doubleExpected.policyConditions[1];
+  const profits = Array.from({length: 9}, (_, index) => ({...profit, price_scale: String((index + 1) * 100)}));
+  for (let count = 1; count <= 8; count++) {
+    const policy = {...expected, policyConditions: [...profits.slice(0, count), loss]};
+    const result = assessExitStrategy(page(row(policy)), policy, now);
+    assert.equal(result.policyMatched, true); assert.equal(result.terminal, true);
+    assert.equal(result.hasLiveStop, false);
+  }
+  for (const conditions of [[], [loss], [profit], profits.slice(0, 2), [profit, loss, {...loss, price_scale: '70'}],
+    [...profits, loss], [profit, {...profit}, loss], [profit, {...loss, sell_ratio: '0'}],
+    [profit, {...loss, sell_ratio: '101'}], [profit, {...loss, price_scale: '101'}], [profit, null]]) {
+    const policy = {...expected, policyConditions: conditions as ExpectedExitStrategy['policyConditions']};
+    const result = assessExitStrategy(page(), policy, now);
+    assert.equal(result.found, false); assert.equal(result.policyMatched, false);
+    assert.equal(result.terminal, false); assert.equal(result.hasLiveStop, false);
+    assert.deepEqual(result.reasons, ['EXIT_EXPECTATION_INVALID']);
+  }
+});
 
 test('只确认准确匹配的终止策略，余额仍须独立核对；策略终止不改买单', () => {
   const input = page(), before = structuredClone(input);

@@ -21,7 +21,7 @@ export class StrategyObservation {
       gain_1h REAL,gain_6h REAL,gain_24h REAL,PRIMARY KEY(chain,address));
       CREATE INDEX IF NOT EXISTS strategy_comparisons_active ON strategy_comparisons(ends_at,cohort);`);
   }
-  capture(report:Report,record:ScanRecord,now:Date):void {
+  capture(report:Report,record:ScanRecord,now:Date):boolean {
     const evaluated=Date.parse(report.evaluatedAt),at=now.toISOString();
     if(report.mode!=='live'||report.decision!=='WATCH'||report.buyEligible||report.provenance.status!=='pass'||
       report.provenance.facts.modeSupported===false||report.safety.status!=='pass'||report.flow?.status!=='unknown'||
@@ -29,20 +29,20 @@ export class StrategyObservation {
       report.reasons.some(r=>['SIGNAL_STALE','SIGNAL_TIME_IN_FUTURE','NARRATIVE_TOKEN_IDENTITY_CONFLICT',
         'WALLET_SETUP_SUPPORT_WITHDRAWN','LAUNCHPAD_MODE_NOT_SUPPORTED'].includes(r))||
       !Number.isFinite(evaluated)||evaluated>now.getTime()||now.getTime()-evaluated>60000||
-      !(Date.parse(report.validUntil)>now.getTime()))return;
+      !(Date.parse(report.validUntil)>now.getTime()))return false;
     if(this.db.prepare('SELECT 1 FROM strategy_comparisons WHERE chain=? AND address=?').get(record.chain,record.address)||
-      this.db.prepare('SELECT 1 FROM scan_summaries WHERE chain=? AND address=? AND eligible_at IS NOT NULL LIMIT 1').get(record.chain,record.address))return;
+      this.db.prepare('SELECT 1 FROM scan_summaries WHERE chain=? AND address=? AND eligible_at IS NOT NULL LIMIT 1').get(record.chain,record.address))return false;
     const n=record.wallets?.summary.qualifiedSmartFundingClusterCount??0;
     const group:ComparisonGroup=n===1?'one_smart_group':record.walletScreening?.setups.some(s=>s.status==='watch'&&s.priorityScore>0)?'profile_pending':'no_confirmed_group';
     // First arrivals per group, two concurrent tokens each. At one quote/minute this
     // leaves room inside the ten-minute horizon tolerance; outages remain missing.
-    if(Number(this.db.prepare('SELECT count(*) AS n FROM strategy_comparisons WHERE cohort=? AND ends_at>?').get(group,at)!.n)>=2)return;
+    if(Number(this.db.prepare('SELECT count(*) AS n FROM strategy_comparisons WHERE cohort=? AND ends_at>?').get(group,at)!.n)>=2)return false;
     const value:Comparison={chain:record.chain,address:record.address,scanId:record.id,registeredAt:at,
       endsAt:new Date(now.getTime()+86400000+600000).toISOString(),group,policyVersion:report.policyVersion,
       basis:{reasons:record.reasons,qualifiedGroups:n,walletStatus:record.checks.wallets.status,profileStatus:record.walletScreening?.status},
       performance:{samples:0,status:'waiting',points:[]},horizons:{},peakDrawdownPct:0};
-    this.db.prepare('INSERT INTO strategy_comparisons(chain,address,registered_at,ends_at,cohort,last_attempt_at,record) VALUES (?,?,?,?,?,?,?)')
-      .run(value.chain,value.address,at,value.endsAt,group,null,JSON.stringify(value));
+    return Number(this.db.prepare('INSERT INTO strategy_comparisons(chain,address,registered_at,ends_at,cohort,last_attempt_at,record) VALUES (?,?,?,?,?,?,?)')
+      .run(value.chain,value.address,at,value.endsAt,group,null,JSON.stringify(value)).changes)>0;
   }
   pending(now:Date,limit=12):ScanToken[] {
     return this.db.prepare(`SELECT chain,address FROM strategy_comparisons WHERE ends_at>?
@@ -54,17 +54,17 @@ export class StrategyObservation {
       .all(now.toISOString()).map(r=>({chain:r.chain as ScanToken['chain'],address:String(r.address),
         ...(typeof r.last_attempt_at==='string'?{lastAttemptAt:r.last_attempt_at}:{})}));
   }
-  price(price:ScanPrice,now:Date):void {
-    if(!['gmgn_token_info_sample','chain_pool_sample','dexscreener_token_pairs_sample','ave_price_stream_sample','debot_token_info_sample'].includes(price.source)||now.getTime()-Date.parse(price.observedAt)>120000)return;
+  price(price:ScanPrice,now:Date):boolean {
+    if(!['gmgn_token_info_sample','chain_pool_sample','dexscreener_token_pairs_sample','ave_price_stream_sample','debot_token_info_sample'].includes(price.source)||now.getTime()-Date.parse(price.observedAt)>120000)return false;
     const row=this.db.prepare('SELECT record,last_attempt_at FROM strategy_comparisons WHERE chain=? AND address=? AND ends_at>?')
-      .get(price.chain,price.address,now.toISOString());if(!row)return;
+      .get(price.chain,price.address,now.toISOString());if(!row)return false;
     const value=JSON.parse(String(row.record)) as Comparison,p=value.performance,at=price.observedAt,ms=Date.parse(at);
-    if(ms<=Date.parse(value.registeredAt)||p.latestAt&&at<=p.latestAt||row.last_attempt_at&&at<String(row.last_attempt_at))return;
+    if(ms<=Date.parse(value.registeredAt)||p.latestAt&&at<=p.latestAt||row.last_attempt_at&&at<String(row.last_attempt_at))return false;
     // Preserve bounded sampling even when a later eligible token receives frequent pool updates.
-    if(p.latestAt&&ms-Date.parse(p.latestAt)<30000)return;
+    if(p.latestAt&&ms-Date.parse(p.latestAt)<30000)return false;
     const base=p.baselinePriceUsd??price.priceUsd,gain=(price.priceUsd/base-1)*100;
     const peak=Math.max(p.peakPriceUsd??price.priceUsd,price.priceUsd),peakAt=peak===price.priceUsd?at:p.peakAt!;
-    if(!Number.isFinite(gain)||!Number.isFinite((peak/base-1)*100))return;
+    if(!Number.isFinite(gain)||!Number.isFinite((peak/base-1)*100))return false;
     const points=[...p.points,{at,priceUsd:price.priceUsd}];
     value.performance={...p,baselineAt:p.baselineAt??at,baselinePriceUsd:base,latestAt:at,latestPriceUsd:price.priceUsd,
       peakPriceUsd:peak,peakAt,maxGainPct:(peak/base-1)*100,currentGainPct:gain,samples:p.samples+1,source:price.source,
@@ -78,21 +78,22 @@ export class StrategyObservation {
         Date.parse(value.performance.baselineAt!)-Date.parse(value.registeredAt)<=600000)
         value.horizons[String(seconds)]={at,gainPct:gain,delaySec:delay};
     }
-    this.db.prepare('UPDATE strategy_comparisons SET record=?,last_attempt_at=?,samples=?,gain_1h=?,gain_6h=?,gain_24h=? WHERE chain=? AND address=?')
-      .run(JSON.stringify(value),at,value.performance.samples,...HORIZONS.map(seconds=>value.horizons[String(seconds)]?.gainPct??null),price.chain,price.address);
+    return Number(this.db.prepare('UPDATE strategy_comparisons SET record=?,last_attempt_at=?,samples=?,gain_1h=?,gain_6h=?,gain_24h=? WHERE chain=? AND address=?')
+      .run(JSON.stringify(value),at,value.performance.samples,...HORIZONS.map(seconds=>value.horizons[String(seconds)]?.gainPct??null),price.chain,price.address).changes)>0;
   }
-  error(token:ScanToken,reason:string,now:Date):void {
+  error(token:ScanToken,reason:string,now:Date):boolean {
     const at=now.toISOString(),row=this.db.prepare('SELECT record FROM strategy_comparisons WHERE chain=? AND address=? AND ends_at>? AND COALESCE(last_attempt_at,\'\')<=?')
-      .get(token.chain,token.address,at,at);if(!row)return;
+      .get(token.chain,token.address,at,at);if(!row)return false;
     const value=JSON.parse(String(row.record)) as Comparison;
     value.performance={...value.performance,status:'unavailable',error:reason,lastError:reason,lastErrorAt:at,
       errorCount:Math.min(1000000000,(value.performance.errorCount??0)+1)};
-    this.db.prepare('UPDATE strategy_comparisons SET record=?,last_attempt_at=? WHERE chain=? AND address=?')
-      .run(JSON.stringify(value),at,token.chain,token.address);
+    return Number(this.db.prepare('UPDATE strategy_comparisons SET record=?,last_attempt_at=? WHERE chain=? AND address=?')
+      .run(JSON.stringify(value),at,token.chain,token.address).changes)>0;
   }
-  prune(now:Date):void {
-    this.db.prepare('DELETE FROM strategy_comparisons WHERE registered_at<?').run(new Date(now.getTime()-30*86400000).toISOString());
-    this.db.exec('DELETE FROM strategy_comparisons WHERE rowid NOT IN (SELECT rowid FROM strategy_comparisons ORDER BY registered_at DESC LIMIT 1000)');
+  prune(now:Date):boolean {
+    const expired=this.db.prepare('DELETE FROM strategy_comparisons WHERE registered_at<?').run(new Date(now.getTime()-30*86400000).toISOString());
+    const overflow=this.db.prepare('DELETE FROM strategy_comparisons WHERE rowid NOT IN (SELECT rowid FROM strategy_comparisons ORDER BY registered_at DESC LIMIT 1000)').run();
+    return Number(expired.changes)+Number(overflow.changes)>0;
   }
   summary(now:Date) {
     const totals=this.db.prepare(`SELECT count(*) AS registered,SUM(ends_at>?) AS active,

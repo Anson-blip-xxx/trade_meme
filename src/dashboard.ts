@@ -43,6 +43,8 @@ export interface DashboardServices {
   overview:()=>unknown;
   home?:()=>unknown;
   orders:(options?:DashboardPageOptions)=>unknown;
+  signalCountingPage?:(options:{limit:number;offset:number})=>unknown;
+  signalCountingControl?:(action:'start'|'stop',actor:'web')=>unknown;
   protection?:(options?:DashboardPageOptions)=>unknown;
   dailyReview?:(options:ReviewPageOptions)=>unknown;
   chainStream?:()=>unknown;
@@ -147,6 +149,22 @@ export function buildDashboard(config:Config,services:DashboardServices,assetDir
         res.setHeader('set-cookie',`${cookieName}=; HttpOnly; SameSite=Strict; Path=/dashboard; Max-Age=0`);
         send(res,200,{ok:true});return;
       }
+      if(url.pathname==='/dashboard/api/signal-counting/control') {
+        if(req.method!=='POST'){send(res,405,{error:'POST_REQUIRED'});return;}
+        if(!services.signalCountingControl){send(res,503,{error:'SIGNAL_COUNTING_UNAVAILABLE',mode:'simulation',executionEnabled:false});return;}
+        if(!/^application\/json(?:\s*;|$)/i.test(req.headers['content-type']??'')){send(res,415,{error:'JSON_REQUIRED'});return;}
+        let size=0;const chunks:Buffer[]=[];
+        for await(const part of req){size+=part.length;if(size>256){send(res,413,{error:'BODY_TOO_LARGE'});return;}chunks.push(part);}
+        let input:unknown;
+        try{input=JSON.parse(Buffer.concat(chunks).toString('utf8'));}catch{send(res,400,{error:'INVALID_JSON'});return;}
+        if(!input||typeof input!=='object'||Array.isArray(input)||Object.keys(input).length!==1||
+          !('action' in input)||!['start','stop'].includes(String(input.action))||typeof input.action!=='string') {
+          send(res,400,{error:'SIGNAL_COUNTING_INPUT_INVALID'});return;
+        }
+        const result=await services.signalCountingControl(input.action as 'start'|'stop','web');
+        if(!result||typeof result!=='object'||Array.isArray(result)){send(res,503,{error:'SIGNAL_COUNTING_STATUS_UNAVAILABLE'});return;}
+        send(res,200,result);return;
+      }
       if(req.method==='GET'&&url.pathname==='/dashboard/api/debot/auth') {
         send(res,200,services.debotAuth?.getStatus()??{enabled:false,state:'unavailable',requiresTotp:true});return;
       }
@@ -176,9 +194,21 @@ export function buildDashboard(config:Config,services:DashboardServices,assetDir
         return;
       }
       if(req.method!=='GET') {send(res,405,{error:'READ_ONLY'});return;}
-      if(url.pathname==='/dashboard/api/session') {send(res,200,{authenticated:true,readOnly:true,authentication:proxyAuthenticated(req)?'proxy':'session'});return;}
+      if(url.pathname==='/dashboard/api/session') {send(res,200,{authenticated:true,readOnly:!services.signalCountingControl,
+        signalCountingControlEnabled:!!services.signalCountingControl,authentication:proxyAuthenticated(req)?'proxy':'session'});return;}
       if(url.pathname==='/dashboard/api/overview') {send(res,200,services.overview());return;}
       if(url.pathname==='/dashboard/api/home') {send(res,200,services.home?.()??{enabled:false});return;}
+      if(url.pathname==='/dashboard/api/signal-counting') {
+        if([...url.searchParams.keys()].some(key=>!['limit','offset'].includes(key))||
+          ['limit','offset'].some(key=>url.searchParams.getAll(key).length>1))throw new Error('INVALID_FILTER');
+        const {limit,offset}=pageOptions(url);
+        const result=await services.signalCountingPage?.({limit,offset});
+        const value=result&&typeof result==='object'&&!Array.isArray(result)?result:{status:{enabled:false,running:false,mode:'simulation',executionEnabled:false},
+          items:[],total:0,limit,offset,hasMore:false};
+        const status='status' in value&&value.status&&typeof value.status==='object'?value.status:undefined;
+        send(res,200,{...value,...(status&&'mode' in status?{mode:status.mode}:{}),
+          ...(status&&'executionEnabled' in status?{executionEnabled:status.executionEnabled}:{})});return;
+      }
       if(url.pathname==='/dashboard/api/jev/status') {send(res,200,services.jev?.status()??{enabled:false,mode:'shadow',available:false});return;}
       if(url.pathname==='/dashboard/api/jev') {
         const options=pageOptions(url);

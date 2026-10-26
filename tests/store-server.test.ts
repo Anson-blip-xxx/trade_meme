@@ -6,9 +6,45 @@ import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {DatabaseSync} from 'node:sqlite';
 import {Store,PROCESSING_LEASE_MS} from '../src/store.js';
+import {OrderStore} from '../src/orders.js';
 import {buildServer} from '../src/server.js';
+import {GmgnScanner} from '../src/scanner.js';
 import {evaluate} from '../src/engine.js';
 import {signal,config,providers,now} from './helpers.js';
+
+test('health and exit views report live counting separately from disabled research entry without implying proved protection',async()=>{
+  const c=config(),store=new Store(':memory:'),orders=new OrderStore(':memory:');
+  c.entryMode='off';c.thirdSignalExecutionMode='live';let countingRunning=false;
+  const server=buildServer(c,store,providers(),{orders,executionStatus:()=>({configuredEntryMode:c.entryMode,
+    configuredThirdSignalMode:c.thirdSignalExecutionMode,executionEnabled:countingRunning,countingRunning,executionReady:true})});
+  server.listen(0,'127.0.0.1');await once(server,'listening');
+  const base=`http://127.0.0.1:${(server.address() as {port:number}).port}`,headers={authorization:`Bearer ${c.ingestToken}`};
+  try {
+    assert.equal((await fetch(base+'/v1/exits')).status,401);
+    for(const running of [false,true,false]){
+      countingRunning=running;
+      for(const route of ['/health','/v1/exits']){
+        const value=await(await fetch(base+route,{headers})).json();
+        assert.equal(value.configuredEntryMode,'off');assert.equal(value.configuredThirdSignalMode,'live');
+        assert.equal(value.executionEnabled,running);assert.equal(value.countingRunning,running);
+        assert.equal(value.executionReady,true);assert.equal(value.executionStatusAvailable,true);
+        assert.equal(value.unattendedProtectionReady,false);
+        if(route==='/v1/exits'){assert.equal(value.execution,running?'live':'off');assert.deepEqual(value.orders,[]);}
+      }
+    }
+  }finally{server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));orders.close();store.close();}
+});
+
+test('health without runtime status does not infer active execution from live configuration',async()=>{
+  const c=config(),store=new Store(':memory:');c.entryMode='live';c.thirdSignalExecutionMode='live';
+  const server=buildServer(c,store,providers());server.listen(0,'127.0.0.1');await once(server,'listening');
+  try{
+    const value=await(await fetch(`http://127.0.0.1:${(server.address() as {port:number}).port}/health`)).json();
+    assert.equal(value.configuredEntryMode,'live');assert.equal(value.configuredThirdSignalMode,'live');
+    assert.equal(value.executionEnabled,false);assert.equal(value.executionStatusAvailable,false);
+    assert.equal(value.executionReady,false);assert.equal(value.unattendedProtectionReady,false);
+  }finally{server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));store.close();}
+});
 
 test('同源事件去重，原事件ID修改内容时报冲突',()=>{
   const store=new Store(':memory:');try {
@@ -147,4 +183,57 @@ test('HTTP认证、真实请求验证、重复投递和冲突',async()=>{
     assert.equal((await send({...s,safety:{status:'pass'}})).status,400);
     assert.equal((await fetch(base+'/v1/orders',{method:'POST',headers})).status,404);
   } finally {server.close();await once(server,'close');store.close();}
+});
+
+test('SOL-only API rejects paused-chain imports and retries without changing retained historical reports',async()=>{
+  const c=config(),store=new Store(':memory:');c.scannerChains=['solana'];
+  const prior=store.reserve(signal()).entry;
+  store.finish(prior.id,await evaluate(prior.signal,config(),providers(),{now:()=>now,id:prior.id}),prior.claimId!);
+  const before=store.get(prior.id),p=providers();let calls=0;
+  p.safety=async()=>{calls++;throw Error('disabled chain must not query');};
+  const server=buildServer(c,store,p);server.listen(0,'127.0.0.1');await once(server,'listening');
+  const base=`http://127.0.0.1:${(server.address() as {port:number}).port}`,
+    headers={authorization:`Bearer ${c.ingestToken}`,'content-type':'application/json'};
+  try {
+    for(const chain of ['bsc','robinhood'] as const) {
+      const s=signal({sourceEventId:'new-'+chain,token:{chain,address:signal().token.address},occurredAt:new Date().toISOString()});
+      for(const [path,body] of [['/v1/signals',s],['/v1/notifications',{source:s.source,chain,occurredAt:s.occurredAt,address:s.token.address,text:'CA '+s.token.address}]] as const) {
+        const response=await fetch(base+path,{method:'POST',headers,body:JSON.stringify(body)});
+        assert.equal(response.status,409);assert.equal((await response.json()).error,'SIGNAL_CHAIN_DISABLED');
+      }
+    }
+    const retry=await fetch(base+`/v1/signals/${prior.id}/retry`,{method:'POST',headers});
+    assert.equal(retry.status,409);assert.equal((await retry.json()).error,'SIGNAL_CHAIN_DISABLED');
+    assert.deepEqual(store.get(prior.id),before);assert.equal(store.list().length,1);assert.equal(calls,0);
+    assert.equal((await fetch(base+`/v1/signals/${prior.id}`,{headers})).status,200);
+    const sol=signal({sourceEventId:'allowed-sol',token:{chain:'solana',address:'So11111111111111111111111111111111111111112'},
+      occurredAt:new Date().toISOString()});
+    const accepted=await fetch(base+'/v1/signals',{method:'POST',headers,body:JSON.stringify(sol)});
+    assert.equal(accepted.status,201);assert.equal(calls,1);assert.equal(store.list().length,2);
+  }finally{server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));store.close();}
+});
+
+test('focused GMGN mode blocks authenticated manual market scans without issuing requests',async()=>{
+  for(const enabled of [false,true]){
+    const c=config();c.gmgnBackgroundResearchEnabled=enabled;
+    const store=new Store(':memory:');let requests=0;
+    const scanner=new GmgnScanner({client:{get:async()=>{requests++;return {list:[]};}},chains:['bsc'],
+      intervalMs:60000,maxAgeSec:600,onSignal:()=>{throw Error('UNEXPECTED_SIGNAL');}});
+    const server=buildServer(c,store,providers(),{scanner});server.listen(0,'127.0.0.1');await once(server,'listening');
+    const base=`http://127.0.0.1:${(server.address() as {port:number}).port}`,headers={authorization:`Bearer ${c.ingestToken}`};
+    try{
+      assert.equal((await fetch(base+'/v1/scanner/run',{method:'POST'})).status,401);
+      assert.equal(requests,0);
+      const response=await fetch(base+'/v1/scanner/run',{method:'POST',headers}),body=await response.json();
+      const status=await(await fetch(base+'/v1/scanner',{headers})).json();
+      if(!enabled){
+        assert.equal(response.status,409);assert.equal(body.error,'GMGN_BACKGROUND_RESEARCH_DISABLED');
+        assert.equal(status.enabled,false);assert.equal(status.pausedReason,'GMGN_BACKGROUND_RESEARCH_DISABLED');
+        assert.equal(requests,0);
+      }else{
+        assert.equal(response.status,200);assert.equal(body.status,'ok');assert.equal(requests,2);
+        assert.equal(status.pausedReason,undefined);
+      }
+    }finally{scanner.stop();server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));store.close();}
+  }
 });

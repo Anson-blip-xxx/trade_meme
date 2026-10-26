@@ -109,7 +109,7 @@ function splitStats(rows:OutcomeRecord[],feature:FollowupFeature,seconds:number)
 export class SignalFollowup {
   private cachedSummary?:{at:number;value:ReturnType<SignalFollowup['buildSummary']>};
   private lastPruneAt?:number;
-  constructor(private readonly db:DatabaseSync) {
+  constructor(private readonly db:DatabaseSync,private readonly options:{persistedReviewReads?:boolean}={}) {
     db.exec(`CREATE TABLE IF NOT EXISTS signal_followups (
       chain TEXT NOT NULL,address TEXT NOT NULL,registered_at TEXT NOT NULL,ends_at TEXT NOT NULL,
       decision TEXT NOT NULL,policy_version TEXT NOT NULL,selected INTEGER NOT NULL,last_attempt_at TEXT,
@@ -340,6 +340,31 @@ export class SignalFollowup {
     if(this.cachedSummary&&now.getTime()>=this.cachedSummary.at&&now.getTime()-this.cachedSummary.at<60000)return this.cachedSummary.value;
     const value=this.buildSummary(now);this.cachedSummary={at:now.getTime(),value};return value;
   }
+  /** Dashboard readers use the compact review produced by the maintenance worker.
+   * They never rebuild all historical outcomes on the HTTP / stream event loop. */
+  private review(now:Date):ReturnType<SignalFollowup['buildSummary']> {
+    if(!this.options.persistedReviewReads)return this.aggregate(now);
+    const empty=this.emptySummary(now),row=this.db.prepare("SELECT value FROM signal_followup_meta WHERE key='last_review'").get();
+    if(!row)return empty;
+    try {
+      const value=JSON.parse(String(row.value)) as Partial<ReturnType<SignalFollowup['buildSummary']>>;
+      if(!value||typeof value!=='object'||!Array.isArray(value.groups)||!Array.isArray(value.learning)||
+        typeof value.computedAt!=='string'||!Number.isFinite(Date.parse(value.computedAt)))return empty;
+      return {...empty,...value,groups:value.groups,learning:value.learning};
+    }catch{return empty;}
+  }
+  private emptySummary(now:Date):ReturnType<SignalFollowup['buildSummary']> {
+    const at=now.toISOString();
+    return {enabled:true,version:'signal-followup-v2',now:at,computedAt:'',updatedAt:'',refreshIntervalSec:60,
+      scope:'observational_correlation',mode:'observation_only',selection:'scheduled_first_arrivals_and_opportunistic_same_pool_prices',
+      startedAt:this.db.prepare("SELECT value FROM signal_followup_meta WHERE key='started_at'").get()?.value??null,
+      retentionDays:90,maxRecords:20000,maxActiveComparisonsPerDecision:3,total:0,selected:0,scheduled:0,
+      passivelySampled:0,observed:0,missing:0,
+      coverageBasis:'all_registered_tokens; missing=no_observed_price; horizon_missing=mature_without_valid_horizon',
+      active:0,sampled:0,capacitySkipped:0,lastSampleAt:null,groups:[],learning:[],
+      limitations:['SAMPLED_QUOTES_NOT_REALIZED_RETURNS','CAPACITY_LIMITED_NON_RANDOM_COHORT','PASSIVE_OBSERVATION_COVERAGE_IS_OPPORTUNISTIC','CORRELATION_NOT_CAUSATION',
+        'WALLET_IDENTITY_AND_SOCIAL_ENDORSEMENT_UNPROVEN','MISSING_HORIZONS_ARE_NOT_ZERO','NO_AUTOMATIC_POLICY_CHANGE']};
+  }
   /** Legacy internal summary. Dashboard lists use separate bounded SQL pages. */
   summary(now:Date) {
     const rows=this.db.prepare(`SELECT record FROM signal_followups ORDER BY
@@ -349,7 +374,7 @@ export class SignalFollowup {
     })};
   }
   dashboardSummary(now:Date) {
-    const {groups,learning,...summary}=this.aggregate(now);
+    const {groups,learning,...summary}=this.review(now);
     return {...structuredClone(summary),groupsTotal:groups.length,learningTotal:learning.length};
   }
   private page(options:FollowupListOptions,now:Date) {
@@ -384,13 +409,13 @@ export class SignalFollowup {
     return {now:now.toISOString(),asOf,total,limit,offset,hasMore:offset+items.length<total,items};
   }
   groups(options:FollowupListOptions={},now=new Date()) {
-    const {limit,offset}=this.page(options,now),summary=this.aggregate(now);
+    const {limit,offset}=this.page(options,now),summary=this.review(now);
     const rows=summary.groups.filter(r=>(!options.chain||r.chain===options.chain)&&(!options.decision||r.decision===options.decision));
     return {now:now.toISOString(),computedAt:summary.computedAt,total:rows.length,limit,offset,hasMore:offset+limit<rows.length,
       items:structuredClone(rows.slice(offset,offset+limit))};
   }
   learning(options:FollowupListOptions={},now=new Date()) {
-    const {limit,offset}=this.page(options,now),summary=this.aggregate(now);
+    const {limit,offset}=this.page(options,now),summary=this.review(now);
     const rank={consistent_association:0,needs_validation:1,not_replicated:2,collecting:3};
     const rows=summary.learning.filter(r=>(!options.chain||r.chain===options.chain)&&(!options.decision||r.decision===options.decision)&&
       (!options.status||r.status===options.status)).sort((a,b)=>rank[a.status]-rank[b.status]||a.chain.localeCompare(b.chain)||
@@ -403,11 +428,7 @@ export class SignalFollowup {
     const summary=this.aggregate(now);
     const previous=this.db.prepare("SELECT value FROM signal_followup_meta WHERE key='last_review_at'").get()?.value;
     if(previous===summary.computedAt)return;
-    const review={version:summary.version,computedAt:summary.computedAt,total:summary.total,selected:summary.selected,
-      sampled:summary.sampled,capacitySkipped:summary.capacitySkipped,active:summary.active,
-      scheduled:summary.scheduled,passivelySampled:summary.passivelySampled,observed:summary.observed,missing:summary.missing,
-      coverageBasis:summary.coverageBasis,
-      groups:summary.groups,learning:summary.learning,limitations:summary.limitations};
+    const review=summary;
     this.db.prepare("INSERT INTO signal_followup_meta(key,value) VALUES ('last_review',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(JSON.stringify(review));
     this.db.prepare("INSERT INTO signal_followup_meta(key,value) VALUES ('last_review_at',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(summary.computedAt);
   }

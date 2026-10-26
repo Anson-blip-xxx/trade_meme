@@ -1,6 +1,7 @@
 import {DatabaseSync} from 'node:sqlite';
 import {chmodSync,existsSync,mkdirSync,realpathSync,statSync} from 'node:fs';
 import {dirname,resolve} from 'node:path';
+import {pathToFileURL} from 'node:url';
 import {createHash} from 'node:crypto';
 import {isDeepStrictEqual} from 'node:util';
 import bs58 from 'bs58';
@@ -116,10 +117,13 @@ function pnl(row:Row,target:Token,now:string):{wallet:string;pnl:TokenRankPnl}|u
 function readonly(path:string):DatabaseSync {const db=new DatabaseSync(path,{readOnly:true});db.exec('PRAGMA busy_timeout=1000; PRAGMA query_only=ON');return db;}
 const bytes=(db:DatabaseSync)=>Number(db.prepare('PRAGMA page_count').get()!.page_count)*Number(db.prepare('PRAGMA page_size').get()!.page_size);
 const bounds=(v:unknown,fallback:number,max:number)=>typeof v==='number'&&Number.isSafeInteger(v)?Math.max(1,Math.min(max,v)):fallback;
+const walletPagePath=(database:string)=>database===':memory:'?undefined:`${database}.wallet-pages.sqlite`;
+const WALLET_PAGE_SCHEMA='1';
 
 /** Derived research only. Sources are opened read-only; runBatch belongs in a worker. */
 export class TokenRankResearch {
   private readonly history:DatabaseSync;private readonly db:DatabaseSync;private meme?:DatabaseSync;private signals?:DatabaseSync;
+  private walletPages?:DatabaseSync;
   private readonly now:()=>Date;private readonly maxBytes:number;private error?:string;private closed=false;
   constructor(private readonly options:TokenRankResearchOptions){
     this.now=options.now??(()=>new Date());this.maxBytes=options.maxBytes??256*1024*1024;
@@ -159,7 +163,7 @@ export class TokenRankResearch {
     }
     if(!this.meta('rank_history_total'))this.setMeta('rank_history_total',String(this.history.prepare(
       "SELECT count(*) AS n FROM wh_observations INDEXED BY wh_observations_kind WHERE kind='token_rank' AND rowid<=?").get(Number(this.meta('token_rank_ceiling')))!.n));
-    this.openOptional();
+    this.openOptional();this.openWalletPages();
   }
   private openOptional(){
     if(!this.meme&&this.options.memeDatabase&&existsSync(this.options.memeDatabase))this.meme=readonly(this.options.memeDatabase);
@@ -167,6 +171,73 @@ export class TokenRankResearch {
   }
   private meta(key:string){return String(this.db.prepare('SELECT value FROM tr_meta WHERE key=?').get(key)?.value??'');}
   private setMeta(key:string,value:string){this.db.prepare('INSERT INTO tr_meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key,value);}
+  private pageMeta(key:string){return String(this.walletPages?.prepare('SELECT value FROM tr_wallet_page_meta WHERE key=?').get(key)?.value??'');}
+  private setPageMeta(key:string,value:string){this.walletPages!.prepare('INSERT INTO tr_wallet_page_meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key,value);}
+  private sourceFingerprint(){
+    const row=this.db.prepare('SELECT id,chain,address,computed_at FROM tr_wallet_versions ORDER BY id LIMIT 1').get();
+    return row?hash([row.id,row.chain,row.address,row.computed_at]):'';
+  }
+  private openWalletPages(){
+    const path=walletPagePath(this.options.database);if(!path)return;
+    this.walletPages=new DatabaseSync(path);chmodSync(path,0o600);
+    this.walletPages.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=1000; PRAGMA wal_autocheckpoint=64;
+      CREATE TABLE IF NOT EXISTS tr_wallet_page_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS tr_wallet_latest(chain TEXT NOT NULL,address TEXT NOT NULL,version_id INTEGER NOT NULL,
+        computed_at TEXT NOT NULL,registered_at TEXT NOT NULL,early_count INTEGER,realized REAL,PRIMARY KEY(chain,address));
+      CREATE UNIQUE INDEX IF NOT EXISTS tr_wallet_latest_version ON tr_wallet_latest(version_id);
+      CREATE INDEX IF NOT EXISTS tr_wallet_latest_early ON tr_wallet_latest(early_count DESC,realized DESC,chain,address);
+      CREATE INDEX IF NOT EXISTS tr_wallet_latest_realized ON tr_wallet_latest(realized DESC,early_count DESC,chain,address);
+      CREATE INDEX IF NOT EXISTS tr_wallet_latest_chain_early ON tr_wallet_latest(chain,early_count DESC,realized DESC,address);
+      CREATE INDEX IF NOT EXISTS tr_wallet_latest_chain_realized ON tr_wallet_latest(chain,realized DESC,early_count DESC,address);
+      CREATE INDEX IF NOT EXISTS tr_wallet_latest_changed ON tr_wallet_latest(computed_at,chain,address);
+      CREATE INDEX IF NOT EXISTS tr_wallet_latest_chain_changed ON tr_wallet_latest(chain,computed_at,address);`);
+    this.syncWalletPages();
+  }
+  /**
+   * Keep the hot wallet leaderboard outside the append-only evidence database. The evidence file can be at its
+   * configured capacity; this rebuildable sidecar stores only one version id and the two sort keys per wallet.
+   * `published_at` advances in the same sidecar transaction as every row, so readers see either complete snapshot.
+   */
+  private syncWalletPages(){
+    const pages=this.walletPages;if(!pages)return;
+    const sourcePath=canonical(this.options.database),sourceFingerprint=this.sourceFingerprint(),
+      sourceMax=Number(this.db.prepare('SELECT max(id) AS n FROM tr_wallet_versions').get()!.n??0),published=this.meta('last_run_at');
+    const schema=this.pageMeta('schema_version'),indexed=Number(this.pageMeta('source_version_id')||0),
+      valid=schema===WALLET_PAGE_SCHEMA&&this.pageMeta('source_path')===sourcePath&&
+        this.pageMeta('source_fingerprint')===sourceFingerprint&&Number.isSafeInteger(indexed)&&indexed>=0&&indexed<=sourceMax;
+    pages.exec('BEGIN IMMEDIATE');
+    try {
+      if(!valid){
+        pages.exec('DELETE FROM tr_wallet_latest; DELETE FROM tr_wallet_page_meta');
+        // Resolve ids from the covering history index first, then read the selected table rows in id order. This
+        // avoids tens of thousands of cold random reads when migrating a large append-only evidence database.
+        const refs=this.db.prepare(`SELECT w.chain,w.address,w.registered_at,(SELECT x.id FROM tr_wallet_versions x
+            WHERE x.chain=w.chain AND x.address=w.address ORDER BY x.computed_at DESC,x.id DESC LIMIT 1) AS version_id
+          FROM tr_wallets w ORDER BY w.chain,w.address`).all().filter(row=>Number.isSafeInteger(Number(row.version_id)))
+          .sort((a,b)=>Number(a.version_id)-Number(b.version_id)),
+          insert=pages.prepare('INSERT INTO tr_wallet_latest VALUES(?,?,?,?,?,?,?)');
+        for(let offset=0;offset<refs.length;offset+=500){
+          const batch=refs.slice(offset,offset+500),byId=new Map(batch.map(row=>[Number(row.version_id),row])),
+            rows=this.db.prepare(`SELECT id,computed_at,early_count,realized FROM tr_wallet_versions
+              WHERE id IN (${batch.map(()=>'?').join(',')}) ORDER BY id`).all(...batch.map(row=>row.version_id));
+          for(const row of rows){const ref=byId.get(Number(row.id))!;
+            insert.run(ref.chain,ref.address,row.id,row.computed_at,ref.registered_at,row.early_count,row.realized);}
+        }
+      }else if(indexed<sourceMax){
+        const rows=this.db.prepare(`SELECT v.chain,v.address,v.id AS version_id,v.computed_at,w.registered_at,v.early_count,v.realized
+          FROM tr_wallet_versions v JOIN tr_wallets w ON w.chain=v.chain AND w.address=v.address WHERE v.id>? ORDER BY v.id`).all(indexed),
+          upsert=pages.prepare(`INSERT INTO tr_wallet_latest VALUES(?,?,?,?,?,?,?) ON CONFLICT(chain,address) DO UPDATE SET
+            version_id=excluded.version_id,computed_at=excluded.computed_at,registered_at=excluded.registered_at,
+            early_count=excluded.early_count,realized=excluded.realized
+            WHERE excluded.computed_at>tr_wallet_latest.computed_at OR
+              (excluded.computed_at=tr_wallet_latest.computed_at AND excluded.version_id>tr_wallet_latest.version_id)`);
+        for(const row of rows)upsert.run(row.chain,row.address,row.version_id,row.computed_at,row.registered_at,row.early_count,row.realized);
+      }
+      this.setPageMeta('schema_version',WALLET_PAGE_SCHEMA);this.setPageMeta('source_path',sourcePath);
+      this.setPageMeta('source_fingerprint',sourceFingerprint);this.setPageMeta('source_version_id',String(sourceMax));
+      this.setPageMeta('published_at',stamp(published)?published:'');pages.exec('COMMIT');
+    }catch(error){pages.exec('ROLLBACK');throw error;}
+  }
   runBatch(limit=500){
     if(this.closed)throw new Error('TOKEN_RANK_RESEARCH_CLOSED');if(this.error===CAPACITY)return this.status();
     this.openOptional();const now=this.now().toISOString(),n=bounds(limit,500,5000),perLane=Math.max(1,Math.floor(n/6));
@@ -253,7 +324,7 @@ export class TokenRankResearch {
         .run(committedAt,previousTokenVersion,previousToken);
       this.setMeta('last_run_at',committedAt);this.setMeta('processed',String(Number(this.meta('processed')||0)+targets.length));
       this.setMeta('changed',String(Number(this.meta('changed')||0)+changed));this.setMeta('error','');
-      this.db.exec('COMMIT');writing=false;this.error=undefined;
+      this.db.exec('COMMIT');writing=false;this.syncWalletPages();this.error=undefined;
     }catch(error){
       if(writing)this.db.exec('ROLLBACK');
       this.error=error instanceof Error&&(error.message===CAPACITY||/database or disk is full/.test(error.message))?CAPACITY:'TOKEN_RANK_RESEARCH_BATCH_FAILED';
@@ -433,7 +504,7 @@ export class TokenRankResearch {
         'NOT_ENTIRE_WALLET_RETURN_OR_WIN_RATE','NO_COMMON_OWNERSHIP_OR_PREDICTIVE_SKILL_PROVEN',...(rows.length>1000?['CROSS_TOKEN_SAMPLE_TRUNCATED']:[])]};
   }
   status(){return outputStatus(this.db,this.error,this.maxBytes);}
-  close(){if(this.closed)return;this.closed=true;this.history.close();this.meme?.close();this.signals?.close();this.db.close();}
+  close(){if(this.closed)return;this.closed=true;this.history.close();this.meme?.close();this.signals?.close();this.walletPages?.close();this.db.close();}
 }
 
 function outputStatus(db:DatabaseSync|undefined,error?:string,maxBytes?:number){
@@ -456,7 +527,7 @@ function outputStatus(db:DatabaseSync|undefined,error?:string,maxBytes?:number){
 
 /** Web/API reader: never opens source databases, never creates missing output files. */
 export class TokenRankResearchReader {
-  private db?:DatabaseSync;
+  private db?:DatabaseSync;private walletPagesAttached=false;
   constructor(private readonly database:string,private readonly now:()=>Date=()=>new Date()){}
   private ready(){
     if(this.db)return this.db;if(!existsSync(this.database))return;
@@ -464,6 +535,16 @@ export class TokenRankResearchReader {
       if(!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='tr_token_versions'").get()){db.close();return;}
       this.db=db;return db;
     }catch{db?.close();return;}
+  }
+  private attachWalletPages(db:DatabaseSync){
+    if(this.walletPagesAttached)return true;const path=walletPagePath(this.database);if(!path||!existsSync(path))return false;
+    try {
+      db.prepare('ATTACH DATABASE ? AS wallet_pages').run(`${pathToFileURL(resolve(path)).href}?mode=ro`);
+      if(!db.prepare("SELECT 1 FROM wallet_pages.sqlite_master WHERE type='table' AND name='tr_wallet_latest'").get()){
+        db.exec('DETACH DATABASE wallet_pages');return false;
+      }
+      this.walletPagesAttached=true;return true;
+    }catch{return false;}
   }
   private page(options:TokenRankResearchPage){
     const now=this.now().toISOString(),db=this.ready(),published=db?.prepare("SELECT value FROM tr_meta WHERE key='last_run_at'").get()?.value,
@@ -492,14 +573,50 @@ export class TokenRankResearchReader {
     return {...page,ready:!!db,token:parse(row?.data) as TokenRankToken|undefined,total:all.length,hasMore:page.offset+items.length<all.length,items};
   }
   wallets(options:TokenRankWalletPage={}){
-    const page=this.page(options),db=this.ready(),sort=options.sort??'early';if(!['early','realized'].includes(sort))throw new Error('INVALID_FILTER');
-    if(!db)return {...page,ready:false,total:0,hasMore:false,items:[] as TokenRankWalletSummary[]};
-    const join=`FROM tr_wallets w JOIN tr_wallet_versions v ON v.id=(SELECT x.id FROM tr_wallet_versions x
+    const sort=options.sort??'early';if(!['early','realized'].includes(sort))throw new Error('INVALID_FILTER');
+    const db=this.ready();if(!db){const page=this.page(options);return {...page,ready:false,total:0,hasMore:false,items:[] as TokenRankWalletSummary[]};}
+    if(!this.attachWalletPages(db))return this.legacyWallets(db,options,sort);
+    db.exec('BEGIN');
+    try {
+      const indexedPublished=String(db.prepare("SELECT value FROM wallet_pages.tr_wallet_page_meta WHERE key='published_at'").get()?.value??''),
+        page=this.page(options.asOf===undefined&&stamp(indexedPublished)?{...options,asOf:indexedPublished}:options),
+        order=sort==='early'?'s.early_count DESC,s.realized DESC NULLS LAST':'s.realized DESC NULLS LAST,s.early_count DESC';
+      if(!stamp(indexedPublished)||page.asOf>indexedPublished){db.exec('COMMIT');return this.legacyWallets(db,{...options,asOf:page.asOf},sort);}
+      let total:number,rows:Row[];
+      if(page.asOf===indexedPublished){
+        const where=options.chain?'WHERE l.chain=?':'',args=options.chain?[options.chain]:[];
+        total=Number(db.prepare(`SELECT count(*) AS n FROM wallet_pages.tr_wallet_latest l ${where}`).get(...args)!.n);
+        const selectedOrder=sort==='early'?'l.early_count DESC,l.realized DESC NULLS LAST':'l.realized DESC NULLS LAST,l.early_count DESC';
+        rows=db.prepare(`WITH selected AS MATERIALIZED (SELECT l.* FROM wallet_pages.tr_wallet_latest l ${where}
+            ORDER BY ${selectedOrder},l.chain,l.address LIMIT ? OFFSET ?)
+          SELECT v.data FROM selected s JOIN tr_wallet_versions v ON v.id=s.version_id ORDER BY ${order},s.chain,s.address`)
+          .all(...args,page.limit,page.offset);
+      }else{
+        const chain=options.chain?' AND l.chain=?':'',args=[page.asOf,page.asOf,...(options.chain?[options.chain]:[]),
+          page.asOf,page.asOf,page.asOf,...(options.chain?[options.chain]:[])],
+          snapshot=`WITH snapshot AS (
+            SELECT l.chain,l.address,l.version_id,l.early_count,l.realized FROM wallet_pages.tr_wallet_latest l
+              WHERE l.computed_at<=? AND l.registered_at<=?${chain}
+            UNION ALL
+            SELECT l.chain,l.address,v.id AS version_id,v.early_count,v.realized FROM wallet_pages.tr_wallet_latest l
+              JOIN tr_wallet_versions v ON v.id=(SELECT x.id FROM tr_wallet_versions x WHERE x.chain=l.chain AND x.address=l.address
+                AND x.computed_at<=? ORDER BY x.computed_at DESC,x.id DESC LIMIT 1)
+              WHERE l.computed_at>? AND l.registered_at<=?${chain})`;
+        total=Number(db.prepare(`${snapshot} SELECT count(*) AS n FROM snapshot`).get(...args)!.n);
+        rows=db.prepare(`${snapshot}, selected AS MATERIALIZED (SELECT * FROM snapshot s
+            ORDER BY ${order},s.chain,s.address LIMIT ? OFFSET ?)
+          SELECT v.data FROM selected s JOIN tr_wallet_versions v ON v.id=s.version_id ORDER BY ${order},s.chain,s.address`)
+          .all(...args,page.limit,page.offset);
+      }
+      db.exec('COMMIT');return {...page,ready:true,total,hasMore:page.offset+rows.length<total,items:rows.map(r=>parse(r.data) as TokenRankWalletSummary)};
+    }catch(error){try{db.exec('ROLLBACK');}catch{}throw error;}
+  }
+  private legacyWallets(db:DatabaseSync,options:TokenRankWalletPage,sort:'early'|'realized'){
+    const page=this.page(options),join=`FROM tr_wallets w JOIN tr_wallet_versions v ON v.id=(SELECT x.id FROM tr_wallet_versions x
       WHERE x.chain=w.chain AND x.address=w.address AND x.computed_at<=? ORDER BY x.computed_at DESC,x.id DESC LIMIT 1)
       WHERE w.registered_at<=?${options.chain?' AND w.chain=?':''}`,
       args=[page.asOf,page.asOf,...(options.chain?[options.chain]:[])],order=sort==='early'?'v.early_count DESC,v.realized DESC NULLS LAST':'v.realized DESC NULLS LAST,v.early_count DESC';
-    const total=Number(db.prepare(`SELECT count(*) AS n ${join}`).get(...args)!.n);
-    const rows=db.prepare(`SELECT v.data ${join} ORDER BY ${order},v.chain,v.address LIMIT ? OFFSET ?`).all(...args,page.limit,page.offset);
+    const total=Number(db.prepare(`SELECT count(*) AS n ${join}`).get(...args)!.n),rows=db.prepare(`SELECT v.data ${join} ORDER BY ${order},v.chain,v.address LIMIT ? OFFSET ?`).all(...args,page.limit,page.offset);
     return {...page,ready:true,total,hasMore:page.offset+rows.length<total,items:rows.map(r=>parse(r.data) as TokenRankWalletSummary)};
   }
   wallet(chain:Chain,value:string,options:TokenRankResearchPage={}){

@@ -45,6 +45,8 @@ type Row=Record<string,any>;
 const SOURCES:readonly CorroborationSource[]=['ave','debot','gmgn'];
 const RETENTION_DAYS=30,DEFAULT_MAX_EVENTS=100000,MAX_REFS=20,ASSESS_EVENTS_PER_SOURCE=64;
 const RETENTION_MS=RETENTION_DAYS*86400000;
+const STATUS_META_VERSION='1';
+const STATUS_META_KEYS={version:'status_version',events:'events',deliveries:'deliveries',latest:'latest_observed_at'} as const;
 const iso=(n:number)=>new Date(n).toISOString();
 function millis(value:unknown):number {
   return typeof value==='string'&&value.length<=40&&/^\d{4}-\d\d-\d\dT/.test(value)?Date.parse(value):NaN;
@@ -161,6 +163,7 @@ export function assessSourceCorroboration(input:AssessmentInput):SourceCorrobora
 /** Durable provider-notification ledger. No trading client, account credentials or order methods are accepted. */
 export class SourceCorroboration {
   private readonly db:DatabaseSync;private readonly now:()=>Date;private readonly windowSec:number;private readonly maxBytes:number;private readonly maxEvents:number;
+  private readonly pageSize:number;
   private closed=false;private error?:string;private rejected=0;private nextPrune=0;
   constructor(private readonly database:string,options:SourceCorroborationOptions={}){
     this.now=options.now??(()=>new Date());this.windowSec=windowSeconds(options.windowSec);this.maxBytes=options.maxBytes??256*1024*1024;
@@ -179,10 +182,12 @@ export class SourceCorroboration {
       CREATE INDEX IF NOT EXISTS source_notifications_token ON source_notifications(chain,address,source,first_observed_at DESC,event_id DESC);
       CREATE INDEX IF NOT EXISTS source_notifications_recorded ON source_notifications(recorded_at);
       CREATE INDEX IF NOT EXISTS source_notifications_history ON source_notifications(chain,address,recorded_at DESC,source,event_id);
+      CREATE INDEX IF NOT EXISTS source_notifications_first_observed ON source_notifications(first_observed_at DESC);
       CREATE TABLE IF NOT EXISTS source_corroboration_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
       INSERT OR IGNORE INTO source_corroboration_meta VALUES('pruned_events','0');`);
-    const pageSize=Number(this.db.prepare('PRAGMA page_size').get()!.page_size);
-    this.db.exec(`PRAGMA max_page_count=${Math.floor(this.maxBytes/pageSize)}`);
+    this.initializeStatusMetadata();
+    this.pageSize=Number(this.db.prepare('PRAGMA page_size').get()!.page_size);
+    this.db.exec(`PRAGMA max_page_count=${Math.floor(this.maxBytes/this.pageSize)}`);
     if(database!==':memory:')chmodSync(database,0o600);
     this.prune();
   }
@@ -211,7 +216,7 @@ export class SourceCorroboration {
           if(this.error!=='SOURCE_LEDGER_CAPACITY_REACHED')this.error=undefined;
           return {accepted:true,duplicate:true};
         }
-        if(Number(this.db.prepare('SELECT count(*) AS n FROM source_notifications').get()!.n)>=this.maxEvents){
+        if(this.metaNumber(STATUS_META_KEYS.events)>=this.maxEvents){
           this.db.exec('RELEASE source_notification_record');this.error='SOURCE_LEDGER_CAPACITY_REACHED';return reject(this.error);
         }
         const refs=references(metadata.txRefs,token);
@@ -306,12 +311,64 @@ export class SourceCorroboration {
   }
   status(){
     if(this.closed)return {enabled:false,closed:true,researchOnly:true,error:'SOURCE_LEDGER_CLOSED'};
-    const counts=this.db.prepare('SELECT count(*) AS events,COALESCE(sum(delivery_count),0) AS deliveries,max(first_observed_at) AS latest FROM source_notifications').get()!;
-    const pages=Number(this.db.prepare('PRAGMA page_count').get()!.page_count),pageSize=Number(this.db.prepare('PRAGMA page_size').get()!.page_size);
-    return {enabled:true,researchOnly:true,scoreEffect:0,windowSec:this.windowSec,events:Number(counts.events),deliveries:Number(counts.deliveries),
-      latestObservedAt:counts.latest??undefined,retentionDays:RETENTION_DAYS,maxEvents:this.maxEvents,maxBytes:this.maxBytes,bytes:pages*pageSize,
-      prunedEvents:Number(this.db.prepare("SELECT value FROM source_corroboration_meta WHERE key='pruned_events'").get()!.value),
+    const rows=this.db.prepare(`SELECT key,value FROM source_corroboration_meta WHERE key IN (?,?,?,?,?)`).all(
+      STATUS_META_KEYS.events,STATUS_META_KEYS.deliveries,STATUS_META_KEYS.latest,'pruned_events',STATUS_META_KEYS.version);
+    const meta=new Map(rows.map(row=>[String(row.key),String(row.value)]));
+    const pages=Number(this.db.prepare('PRAGMA page_count').get()!.page_count),latest=meta.get(STATUS_META_KEYS.latest);
+    return {enabled:true,researchOnly:true,scoreEffect:0,windowSec:this.windowSec,
+      events:Number(meta.get(STATUS_META_KEYS.events)),deliveries:Number(meta.get(STATUS_META_KEYS.deliveries)),
+      latestObservedAt:latest||undefined,retentionDays:RETENTION_DAYS,maxEvents:this.maxEvents,maxBytes:this.maxBytes,bytes:pages*this.pageSize,
+      prunedEvents:Number(meta.get('pruned_events')),
       rejected:this.rejected,error:this.error,scope:'source_notifications_not_independent_wallets'};
+  }
+  private metaNumber(key:string):number {
+    return Number(this.db.prepare('SELECT value FROM source_corroboration_meta WHERE key=?').get(key)!.value);
+  }
+  /**
+   * Backfill old databases once during schema migration. Dashboard/status reads
+   * never aggregate the notification table; all later changes maintain these
+   * rows in the same transaction as the notification mutation.
+   */
+  private initializeStatusMetadata():void {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const version=this.db.prepare('SELECT value FROM source_corroboration_meta WHERE key=?').get(STATUS_META_KEYS.version)?.value;
+      if(version!==STATUS_META_VERSION){
+        const row=this.db.prepare(`SELECT count(*) AS events,COALESCE(sum(delivery_count),0) AS deliveries,
+          COALESCE(max(first_observed_at),'') AS latest FROM source_notifications`).get()!;
+        const upsert=this.db.prepare('INSERT OR REPLACE INTO source_corroboration_meta(key,value) VALUES(?,?)');
+        upsert.run(STATUS_META_KEYS.events,String(row.events));
+        upsert.run(STATUS_META_KEYS.deliveries,String(row.deliveries));
+        upsert.run(STATUS_META_KEYS.latest,String(row.latest));
+        upsert.run(STATUS_META_KEYS.version,STATUS_META_VERSION);
+      }
+      this.db.exec(`
+        CREATE TRIGGER IF NOT EXISTS source_notifications_status_insert AFTER INSERT ON source_notifications BEGIN
+          UPDATE source_corroboration_meta SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='${STATUS_META_KEYS.events}';
+          UPDATE source_corroboration_meta SET value=CAST(CAST(value AS INTEGER)+NEW.delivery_count AS TEXT) WHERE key='${STATUS_META_KEYS.deliveries}';
+          UPDATE source_corroboration_meta SET value=CASE WHEN value='' OR NEW.first_observed_at>value THEN NEW.first_observed_at ELSE value END
+            WHERE key='${STATUS_META_KEYS.latest}';
+        END;
+        CREATE TRIGGER IF NOT EXISTS source_notifications_status_update AFTER UPDATE OF delivery_count,first_observed_at ON source_notifications BEGIN
+          UPDATE source_corroboration_meta SET value=CAST(MAX(0,CAST(value AS INTEGER)+NEW.delivery_count-OLD.delivery_count) AS TEXT)
+            WHERE key='${STATUS_META_KEYS.deliveries}';
+          UPDATE source_corroboration_meta SET value=CASE
+            WHEN NEW.first_observed_at>=value THEN NEW.first_observed_at
+            WHEN OLD.first_observed_at=value THEN COALESCE((SELECT max(first_observed_at) FROM source_notifications),'')
+            ELSE value END WHERE key='${STATUS_META_KEYS.latest}';
+        END;
+        CREATE TRIGGER IF NOT EXISTS source_notifications_status_delete AFTER DELETE ON source_notifications BEGIN
+          UPDATE source_corroboration_meta SET value=CAST(MAX(0,CAST(value AS INTEGER)-1) AS TEXT) WHERE key='${STATUS_META_KEYS.events}';
+          UPDATE source_corroboration_meta SET value=CAST(MAX(0,CAST(value AS INTEGER)-OLD.delivery_count) AS TEXT)
+            WHERE key='${STATUS_META_KEYS.deliveries}';
+          UPDATE source_corroboration_meta SET value=CASE WHEN OLD.first_observed_at=value
+            THEN COALESCE((SELECT max(first_observed_at) FROM source_notifications),'') ELSE value END WHERE key='${STATUS_META_KEYS.latest}';
+        END;`);
+      this.db.exec('COMMIT');
+    }catch(error){
+      try{this.db.exec('ROLLBACK');}catch{/* Already rolled back. */}
+      throw error;
+    }
   }
   private prune():void {
     const now=this.now().getTime();if(!Number.isFinite(now))throw new Error('SOURCE_LEDGER_CLOCK_INVALID');if(now<this.nextPrune)return;

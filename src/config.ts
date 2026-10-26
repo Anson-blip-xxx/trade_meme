@@ -2,7 +2,7 @@ import { z } from 'zod';
 import {readFileSync} from 'node:fs';
 import bs58 from 'bs58';
 import type { Chain } from './types.js';
-import {parseExitPolicy,type ExitPolicy} from './exit-policy.js';
+import {isCurrentExitPolicy,parseExitPolicy,type ExitPolicy} from './exit-policy.js';
 
 const schema = z.object({
   maxSignalAgeSec:z.coerce.number().int().min(10).max(86400).default(600),
@@ -12,6 +12,7 @@ const schema = z.object({
   xDataProvider:z.enum(['x_official','fxembed','twitterapi_io']).default('x_official'),
   narrativeProvider:z.enum(['vendor','openai']).default('vendor'),
   gmgnMinIntervalMs:z.coerce.number().int().min(100).max(10000).default(350),
+  gmgnBackgroundResearchEnabled:z.enum(['true','false']).default('true').transform(v=>v==='true'),
   walletMaxProfiles:z.coerce.number().int().min(1).max(5).default(3),
   minSmartWalletGroups:z.coerce.number().int().min(1).max(20).default(2),
   walletSupportRequired:z.enum(['true','false']).default('true').transform(v=>v==='true'),
@@ -26,6 +27,8 @@ const schema = z.object({
   researchCacheMax:z.coerce.number().int().min(10).max(10000).default(200),
   researchCacheTtlSec:z.coerce.number().int().min(60).max(86400).default(1800),
   entryMode:z.enum(['off','paper','live']).default('off'),
+  thirdSignalExecutionMode:z.enum(['simulation','live']).default('simulation'),
+  solanaExecutionProvider:z.enum(['gmgn','pump_native']).default('gmgn'),
   entrySizing:z.enum(['fixed','balance_cap']).default('fixed'),
   entrySlippagePct:z.coerce.number().int().min(0).max(50).default(5),
   entryMaxOpen:z.coerce.number().int().min(1).max(100).default(3),
@@ -43,7 +46,7 @@ export interface Config extends z.infer<typeof schema> {
   entryWallets:Partial<Record<Chain,string>>; entryAmounts:Partial<Record<Chain,string>>;
   entryInputTokens:Partial<Record<Chain,string>>;
   entryFeeReserves:Record<Chain,string>;
-  /** Optional per-chain native available-balance fraction, in basis points. Overrides fixed caps. */
+  /** Per-chain native total-balance fraction, in basis points. Overrides fixed caps. */
   entryBalanceBps?:Partial<Record<Chain,number>>;
   exitPolicy?:ExitPolicy;
   dashboard:{enabled:boolean;host:string;port:number;token?:string;origin?:string;archivePath:string;retentionDays:number;trackingHours:number;sampleIntervalSec:number};
@@ -61,25 +64,36 @@ export interface Config extends z.infer<typeof schema> {
   chainStream:{enabled:boolean;database:string;maxBytes:number;maxWallets:number;maxPools:number;
     endpoints:Partial<Record<Chain,{http:string;ws:string}>>;pinnedWallets?:Partial<Record<Chain,string[]>>};
   walletFast?:{enabled:boolean;database?:string;maxBytes?:number};
+  telegram?:{enabled:boolean;token?:string;chatId?:string;database:string;summaryIntervalMs:number};
+  nativeSolana?:{keypairFile?:string;rpcUrl?:string;wsUrl?:string;inventoryRpcUrl?:string;jitoUrl:string;journalPath:string;positionsPath:string;
+    tipLamports:string;priorityFeeLamports:string};
 }
 export function isPersistentOrderPath(value:string):boolean {
   return typeof value==='string'&&value.trim().length>0&&value.trim()!==':memory:'&&
     !/^file:/i.test(value.trim())&&!value.includes('\0');
 }
 export function readConfig(env:NodeJS.ProcessEnv=process.env): Config {
+  const telegramToken=env.TELEGRAM_BOT_TOKEN?.trim()||undefined;
+  const telegramChatId=env.TELEGRAM_CHAT_ID?.trim()||undefined;
+  // Do not include a rejected credential in schema diagnostics or server logs.
+  if(telegramToken&&!/^\d{5,20}:[A-Za-z0-9_-]{20,200}$/.test(telegramToken))throw new Error('TELEGRAM_TOKEN_INVALID');
+  if(telegramChatId&&!/^-?[1-9]\d{0,19}$/.test(telegramChatId))throw new Error('TELEGRAM_CHAT_ID_INVALID');
   const reserve=(raw:string|undefined,fallback:string,max:bigint):string=>{
     const value=raw??fallback;
     if(!/^(0|[1-9]\d{0,77})$/.test(value)||BigInt(value)>max) throw new Error('ENTRY_FEE_RESERVE_INVALID');
     return value;
   };
-  const balanceBps=(raw:string|undefined):number|undefined=>{
-    if(raw===undefined)return undefined;
+  const balanceBps=(raw:string|undefined):number=>{
+    if(raw===undefined)return 300;
     if(!/^[1-9]\d{0,4}$/.test(raw)||Number(raw)>10000)throw new Error('ENTRY_BALANCE_BPS_INVALID');
     return Number(raw);
   };
   let exitPolicy:ExitPolicy|undefined;
   if(env.EXIT_POLICY_PATH?.trim()) {
-    try {exitPolicy=parseExitPolicy(JSON.parse(readFileSync(env.EXIT_POLICY_PATH,'utf8')));}
+    try {
+      exitPolicy=parseExitPolicy(JSON.parse(readFileSync(env.EXIT_POLICY_PATH,'utf8')));
+      if(exitPolicy&&!isCurrentExitPolicy(exitPolicy))throw new Error('EXIT_POLICY_NOT_CURRENT');
+    }
     catch {throw new Error('EXIT_POLICY_CONFIG_INVALID');}
   }
   let gmgnPrivateKey=env.GMGN_PRIVATE_KEY?.trim();
@@ -114,15 +128,26 @@ export function readConfig(env:NodeJS.ProcessEnv=process.env): Config {
   return {
     ...schema.parse({maxSignalAgeSec:env.MAX_SIGNAL_AGE_SEC, maxEvidenceAgeSec:env.MAX_EVIDENCE_AGE_SEC,
       decisionTtlSec:env.DECISION_TTL_SEC,maxTaxRate:env.MAX_TAX_RATE,xDataProvider:env.X_DATA_PROVIDER,narrativeProvider:env.NARRATIVE_PROVIDER,
-      gmgnMinIntervalMs:env.GMGN_MIN_INTERVAL_MS,walletMaxProfiles:env.WALLET_MAX_PROFILES,minSmartWalletGroups:env.MIN_SMART_WALLET_GROUPS,walletSupportRequired:env.WALLET_SUPPORT_REQUIRED,
+      gmgnMinIntervalMs:env.GMGN_MIN_INTERVAL_MS,gmgnBackgroundResearchEnabled:env.GMGN_BACKGROUND_RESEARCH_ENABLED,
+      walletMaxProfiles:env.WALLET_MAX_PROFILES,minSmartWalletGroups:env.MIN_SMART_WALLET_GROUPS,walletSupportRequired:env.WALLET_SUPPORT_REQUIRED,
       scannerEnabled:env.SCANNER_ENABLED,scannerIntervalSec:env.SCANNER_INTERVAL_SEC,scannerMaxSignals:env.SCANNER_MAX_SIGNALS,
       debotScannerEnabled:env.DEBOT_SCANNER_ENABLED,debotScannerIntervalSec:env.DEBOT_SCANNER_INTERVAL_SEC,
       debotTransport:env.DEBOT_TRANSPORT,
       evaluationTimeoutMs:env.EVALUATION_TIMEOUT_MS,marketRiskRequired:env.MARKET_RISK_REQUIRED,
       researchCacheMax:env.RESEARCH_CACHE_MAX,researchCacheTtlSec:env.RESEARCH_CACHE_TTL_SEC,
-      entryMode:env.ENTRY_MODE,entrySizing:env.ENTRY_SIZING,entrySlippagePct:env.ENTRY_SLIPPAGE_PCT,entryMaxOpen:env.ENTRY_MAX_OPEN,
+      entryMode:env.ENTRY_MODE,thirdSignalExecutionMode:env.THIRD_SIGNAL_EXECUTION_MODE,solanaExecutionProvider:env.SOLANA_EXECUTION_PROVIDER,
+      entrySizing:env.ENTRY_SIZING,entrySlippagePct:env.ENTRY_SLIPPAGE_PCT,entryMaxOpen:env.ENTRY_MAX_OPEN,
       entryGasPriceBsc:env.ENTRY_GAS_PRICE_BSC_WEI,entryPriorityFeeSolana:env.ENTRY_PRIORITY_FEE_SOLANA,entryTipFeeSolana:env.ENTRY_TIP_FEE_SOLANA}),
     rpc:{bsc:env.BSC_RPC_URL,solana:env.SOLANA_RPC_URL,robinhood:env.ROBINHOOD_RPC_URL},
+    nativeSolana:{keypairFile:env.SOLANA_NATIVE_KEYPAIR_FILE?.trim()||undefined,
+      rpcUrl:env.SOLANA_NATIVE_RPC_URL?.trim()||env.SOLANA_STREAM_HTTP_URL||env.SOLANA_RPC_URL,
+      wsUrl:env.SOLANA_NATIVE_WS_URL?.trim()||env.SOLANA_STREAM_WS_URL,
+      inventoryRpcUrl:env.SOLANA_NATIVE_INVENTORY_RPC_URL?.trim()||'https://api.mainnet-beta.solana.com',
+      jitoUrl:env.SOLANA_NATIVE_JITO_URL?.trim()||'https://mainnet.block-engine.jito.wtf/api/v1/transactions',
+      journalPath:z.string().trim().refine(isPersistentOrderPath).parse(env.SOLANA_NATIVE_JOURNAL_PATH??'data/native-solana-transactions.sqlite'),
+      positionsPath:z.string().trim().refine(isPersistentOrderPath).parse(env.SOLANA_NATIVE_POSITIONS_PATH??'data/native-solana-positions.sqlite'),
+      tipLamports:reserve(env.SOLANA_NATIVE_TIP_LAMPORTS,'10000',10_000_000n),
+      priorityFeeLamports:reserve(env.SOLANA_NATIVE_PRIORITY_FEE_LAMPORTS,'10000',10_000_000n)},
     walletFast:{enabled:z.enum(['true','false']).default('false').parse(env.WALLET_FAST_ENABLED)==='true',
       database:z.string().trim().refine(isPersistentOrderPath).parse(env.WALLET_ACTIVITY_DATABASE_PATH??'data/wallet-activity.sqlite'),
       maxBytes:z.coerce.number().int().min(16).max(1024).parse(env.WALLET_ACTIVITY_MAX_MB??128)*1024*1024},
@@ -155,6 +180,9 @@ export function readConfig(env:NodeJS.ProcessEnv=process.env): Config {
       solana:reserve(env.ENTRY_FEE_RESERVE_SOLANA,'20000000',(1n<<64n)-1n),
       robinhood:reserve(env.ENTRY_FEE_RESERVE_ROBINHOOD,'2000000000000000',(1n<<256n)-1n)},
     host:env.HOST??'127.0.0.1',port:z.coerce.number().int().min(1).max(65535).parse(env.PORT??8787),
+    telegram:{enabled:z.enum(['true','false']).parse(env.TELEGRAM_ENABLED??'true')==='true',token:telegramToken,chatId:telegramChatId,
+      database:z.string().trim().refine(isPersistentOrderPath).parse(env.TELEGRAM_DATABASE_PATH??'data/telegram-notifications.sqlite'),
+      summaryIntervalMs:z.coerce.number().int().min(60).max(86400).parse(env.TELEGRAM_SUMMARY_INTERVAL_SEC??300)*1000},
     dashboard:{enabled:env.DASHBOARD_ENABLED==='true',host:env.DASHBOARD_HOST??'127.0.0.1',
       port:z.coerce.number().int().min(1).max(65535).parse(env.DASHBOARD_PORT??9528),
       token:env.DASHBOARD_ACCESS_TOKEN?.trim(),

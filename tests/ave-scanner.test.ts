@@ -20,6 +20,21 @@ class Socket implements AveSocket {
   removeEventListener(type:string,listener:(event:any)=>void){this.listeners.get(type)?.delete(listener);}
   emit(type:string,event:any={}){if(type==='open')this.readyState=1;for(const f of this.listeners.get(type)??[])f(event);}
 }
+/** The live Ave control proved pricev2 subscribe replaces all price topics.
+ * Treat unsubscribe conservatively as clearing the price channel, so the test
+ * also catches remove-only updates that fail to restore remaining holdings. */
+class ReplacingPriceSocket extends Socket {
+  priceTopics=new Set<string>();
+  override send(data:string){
+    super.send(data);const frame=JSON.parse(data);
+    if(frame.params?.[0]!=='pricev2')return;
+    if(frame.method==='subscribe')this.priceTopics=new Set(frame.params[1]);
+    if(frame.method==='unsubscribe')this.priceTopics.clear();
+  }
+  quote(token:string,at:number){
+    if(this.priceTopics.has(`${token}-bsc`))this.emit('message',{data:JSON.stringify(priceFrame([priceRow(token,at)]))});
+  }
+}
 function setup(extra:Partial<AveScannerOptions>={}){
   let now=base;const observations:AveSignalObservation[]=[],signals:Signal[]=[];
   const scanner=new AveScanner({database:':memory:',chains:['bsc','solana','robinhood'],now:()=>new Date(now),
@@ -27,6 +42,8 @@ function setup(extra:Partial<AveScannerOptions>={}){
   return {scanner,observations,signals,advance:(ms:number)=>{now+=ms;},time:()=>now};
 }
 const flush=()=>new Promise<void>(resolve=>setImmediate(resolve));
+const priceFrame=(rows:unknown[])=>({jsonrpc:'2.0',result:{status:'ok',data:{event:'pricev2',prices:rows}}});
+const priceRow=(token=ca,at=base,price=1)=>({chain:'bsc',token,target_token:token,is_main_pair:true,uprice:price,time:at/1000});
 
 test('observations persist immediately, duplicate refreshes never requeue or change first timestamp',async()=>{
   const {scanner,observations,signals,advance}=setup();try{
@@ -37,6 +54,20 @@ test('observations persist immediately, duplicate refreshes never requeue or cha
     await scanner.dispatchOnce();assert.equal(signals.length,1);assert.equal(scanner.list().items[0].state,'completed');
     scanner.acceptPage(page());await scanner.dispatchOnce();assert.equal(signals.length,1);
   }finally{await scanner.close();}
+});
+
+test('SOL-only restart leaves BSC history readable without dispatching old pending observations',async()=>{
+  const root=mkdtempSync(join(tmpdir(),'ave-chain-scope-')),database=join(root,'ave.sqlite');
+  const first=setup({database,chains:['bsc']});
+  try {
+    first.scanner.acceptPage(page());await first.scanner.close();
+    const resumed=setup({database,chains:['solana']});
+    try {
+      await resumed.scanner.dispatchOnce();assert.equal(resumed.signals.length,0);
+      assert.equal(resumed.scanner.list({chain:'bsc'}).total,1);
+      assert.equal(resumed.scanner.list().items[0].state,'pending');
+    }finally{await resumed.scanner.close();}
+  }finally{await first.scanner.close();rmSync(root,{recursive:true,force:true});}
 });
 
 test('new alarms of same CA coalesce while safety jobs are pending; newer time wins late arrivals',async()=>{
@@ -159,6 +190,139 @@ test('current-price subscriptions share signal socket, replace topics, and retai
     assert.equal(observations.length,0);await scanner.stop();
     socket.emit('message',{data:JSON.stringify(frame)});assert.equal(prices.length,1);
   }finally{await scanner.close();}
+});
+
+test('SOL-only new signals keep explicit BSC holding price topics alive',async()=>{
+  const socket=new Socket(),prices:unknown[]=[];
+  const {scanner}=setup({chains:['solana'],socketFactory:()=>socket,fetcher:async()=>Response.json({status:1,data:{list:[]}}),
+    onPriceFrame:raw=>{prices.push(raw);}});
+  try {
+    scanner.setPriceTokens([{chain:'bsc',address:ca}]);scanner.start();socket.emit('open');
+    assert.deepEqual(JSON.parse(socket.sent[0]).params,['signalsv2_public_monitor','solana']);
+    assert.deepEqual(JSON.parse(socket.sent[1]).params,['pricev2',[`${ca}-bsc`]]);
+    const frame={jsonrpc:'2.0',result:{status:'ok',data:{event:'pricev2',prices:[{chain:'bsc',token:ca,time:base/1000-1,uprice:1}]}}};
+    socket.emit('message',{data:JSON.stringify(frame)});assert.deepEqual(prices,[frame]);
+  }finally{await scanner.close();}
+});
+
+test('replacement-style pricev2 keeps existing holdings when adding topics, removing only, and clearing all',async()=>{
+  const socket=new ReplacingPriceSocket(),f=setup({socketFactory:()=>socket,fetcher:async()=>Response.json({status:1,data:{list:[]}})});
+  try{
+    f.scanner.setPriceTokens([], [{chain:'bsc',address:ca}]);f.scanner.start();socket.emit('open');socket.quote(ca,f.time());
+    assert.equal(f.scanner.getStatus().priceStream.priorityFreshTokens,1);
+    const initialClock=f.scanner.getStatus().priceStream.lastPriceAt;
+    f.advance(1000);f.scanner.setPriceTokens([{chain:'bsc',address:other}], [{chain:'bsc',address:ca}]);
+    assert.deepEqual([...socket.priceTopics],[`${ca}-bsc`,`${other}-bsc`]);
+    assert.equal(f.scanner.getStatus().priceStream.lastPriceAt,initialClock,'subscription changes must not fabricate a quote');
+    socket.quote(ca,f.time());socket.quote(other,f.time());assert.equal(f.scanner.getStatus().priceStream.freshTokens,2);
+    f.advance(1000);f.scanner.setPriceTokens([], [{chain:'bsc',address:ca}]);
+    assert.deepEqual([...socket.priceTopics],[`${ca}-bsc`]);
+    socket.quote(ca,f.time());assert.equal(f.scanner.getStatus().priceStream.lastPriceAt,new Date(f.time()).toISOString());
+    assert.equal(f.scanner.hasPriceSubscription({chain:'bsc',address:other}),false);
+    f.scanner.setPriceTokens([]);assert.equal(socket.priceTopics.size,0);
+    assert.equal(f.scanner.getStatus().priceStream.sentTokens,0);assert.equal(f.scanner.getStatus().priceStream.state,'inactive');
+    const sent=socket.sent.length;f.scanner.setPriceTokens([]);assert.equal(socket.sent.length,sent);
+  }finally{await f.scanner.close();}
+});
+
+test('explicit holdings have priority over a full research price-topic budget and overflow is visible',async()=>{
+  const socket=new Socket(),{scanner}=setup({chains:['solana'],socketFactory:()=>socket,
+    fetcher:async()=>Response.json({status:1,data:{list:[]}})});
+  try{
+    const research=Array.from({length:205},(_,i)=>({chain:'bsc' as const,address:'0x'+(i+1).toString(16).padStart(40,'0')}));
+    scanner.setPriceTokens(research,[{chain:'bsc',address:ca.toUpperCase().replace('0X','0x')},{chain:'bsc',address:ca},{chain:'bsc',address:other}]);
+    scanner.start();socket.emit('open');
+    const topics=JSON.parse(socket.sent[1]).params[1];
+    assert.equal(topics.length,200);assert.deepEqual(topics.slice(0,2),[`${ca}-bsc`,`${other}-bsc`]);
+    const status=scanner.getStatus().priceStream;
+    assert.equal(status.priorityTokens,2);assert.equal(status.desiredPriorityTokens,2);assert.equal(status.desiredTokens,207);
+    assert.equal(status.overflowTokens,7);assert.equal(status.sentTokens,200);assert.equal(status.subscriptionBasis,'request_sent');
+    assert.equal(status.subscriptionAcknowledged,false);assert.equal(status.observedTokens,0);assert.equal(status.state,'waiting');
+    const sent=socket.sent.length;scanner.setPriceTokens(research,[{chain:'bsc',address:ca},{chain:'bsc',address:other}]);assert.equal(socket.sent.length,sent);
+  }finally{await scanner.close();}
+});
+
+test('reconnect restores the latest desired price topics before waiting for new quotes, without stale listeners',async t=>{
+  t.mock.timers.enable({apis:['setTimeout']});t.mock.method(Math,'random',()=>0.5);
+  const sockets:Socket[]=[],received:unknown[]=[],f=setup({socketFactory:()=>{const s=new Socket();sockets.push(s);return s;},
+    fetcher:async()=>Response.json({status:1,data:{list:[]}}),onPriceFrame:frame=>received.push(frame)});
+  try{
+    f.scanner.setPriceTokens([{chain:'bsc',address:ca}],[{chain:'bsc',address:ca}]);f.scanner.start();sockets[0].emit('open');await flush();
+    sockets[0].emit('message',{data:JSON.stringify(priceFrame([priceRow()]))});assert.equal(f.scanner.getStatus().priceStream.state,'live');
+    sockets[0].emit('close');assert.equal(f.scanner.getStatus().priceStream.sentTokens,0);
+    assert.equal(f.scanner.getStatus().priceStream.state,'disconnected');
+    f.scanner.setPriceTokens([{chain:'bsc',address:other}],[{chain:'bsc',address:other}]);
+    f.advance(1000);t.mock.timers.tick(1000);await flush();assert.equal(sockets.length,2);sockets[1].emit('open');
+    assert.deepEqual(JSON.parse(sockets[1].sent[1]).params,['pricev2',[`${other}-bsc`]]);
+    assert.equal(f.scanner.getStatus().priceStream.state,'waiting');
+    sockets[0].emit('message',{data:JSON.stringify(priceFrame([priceRow(other,f.time())]))});assert.equal(received.length,1);
+    sockets[1].emit('message',{data:JSON.stringify(priceFrame([priceRow(other,f.time())]))});
+    assert.equal(received.length,2);assert.equal(f.scanner.getStatus().priceStream.state,'live');
+  }finally{await f.scanner.close();}
+});
+
+test('only valid main-pair prices for subscribed exact identities advance quote health; pongs and replays cannot freshen it',async()=>{
+  const socket=new Socket(),f=setup({socketFactory:()=>socket,fetcher:async()=>Response.json({status:1,data:{list:[]}})});
+  try{
+    f.scanner.setPriceTokens([{chain:'bsc',address:ca}],[{chain:'bsc',address:ca}]);f.scanner.start();socket.emit('open');
+    socket.emit('message',{data:'pong'});socket.emit('message',{data:JSON.stringify({jsonrpc:'2.0',id:11,result:{status:'ok'}})});
+    assert.equal(f.scanner.getStatus().priceStream.lastFrameAt,undefined);assert.equal(f.scanner.getStatus().priceStream.lastPriceAt,undefined);
+    const invalid=[priceRow(other),{...priceRow(),target_token:other},{...priceRow(),chain:'solana'},
+      {...priceRow(),is_main_pair:false},{...priceRow(),uprice:'1'},{...priceRow(),uprice:0},{...priceRow(),time:base/1000+1},
+      {...priceRow(),time:base/1000+0.1}];
+    socket.emit('message',{data:JSON.stringify(priceFrame(invalid))});
+    assert.equal(f.scanner.getStatus().priceStream.lastPriceAt,undefined);assert.equal(f.scanner.getStatus().priceStream.freshTokens,0);
+    socket.emit('message',{data:JSON.stringify(priceFrame([priceRow(ca,base-1000)]))});
+    const live=f.scanner.getStatus().priceStream;assert.equal(live.lastPriceAt,new Date(base-1000).toISOString());
+    assert.equal(live.lastPriceReceivedAt,new Date(base).toISOString());assert.equal(live.priorityFreshTokens,1);
+    f.advance(61_000);socket.emit('message',{data:'pong'});
+    socket.emit('message',{data:JSON.stringify(priceFrame([priceRow(ca,base-1000)]))});
+    const stale=f.scanner.getStatus().priceStream;assert.equal(stale.lastPriceReceivedAt,live.lastPriceReceivedAt);
+    assert.equal(stale.lastFrameAt,new Date(f.time()).toISOString());assert.equal(stale.state,'stale');assert.equal(stale.freshTokens,0);
+  }finally{await f.scanner.close();}
+});
+
+test('stalled holding recovery retains healthy holdings and research on replacement-style subscriptions without refreshing quote clocks',async t=>{
+  t.mock.timers.enable({apis:['setTimeout']});const socket=new ReplacingPriceSocket();let httpRequests=0;
+  const research='0x2222222222222222222222222222222222222222';
+  const f=setup({chains:['bsc'],socketFactory:()=>socket,fetcher:async()=>{httpRequests++;return Response.json({status:1,data:{list:[]}});}});
+  try{
+    f.scanner.setPriceTokens([{chain:'bsc',address:research}], [{chain:'bsc',address:ca},{chain:'bsc',address:other}]);
+    f.scanner.start();socket.emit('open');await flush();
+    const advance=async()=>{f.advance(15000);socket.emit('message',{data:'pong'});
+      socket.emit('message',{data:JSON.stringify(priceFrame([priceRow(other,f.time())]))});t.mock.timers.tick(15000);await flush();};
+    for(let i=0;i<4;i++)await advance();
+    const recovery=socket.sent.map(text=>JSON.parse(text)).filter(frame=>frame.method==='unsubscribe');
+    assert.deepEqual(recovery.map(frame=>frame.params),[['pricev2',[`${ca}-bsc`]]]);
+    assert.deepEqual([...socket.priceTopics],[`${ca}-bsc`,`${other}-bsc`,`${research}-bsc`]);
+    assert.equal(f.scanner.getStatus().priceStream.recoveries,1);assert.equal(f.scanner.getStatus().priceStream.state,'partial');
+    assert.equal(f.scanner.getStatus().priceStream.priorityFreshTokens,1);
+    for(let i=0;i<7;i++)await advance();assert.equal(f.scanner.getStatus().priceStream.recoveries,1);
+    await advance();assert.equal(f.scanner.getStatus().priceStream.recoveries,2);
+    assert.deepEqual(socket.sent.map(text=>JSON.parse(text)).filter(frame=>frame.method==='unsubscribe').map(frame=>frame.params),
+      [['pricev2',[`${ca}-bsc`]],['pricev2',[`${ca}-bsc`]]]);
+    assert.deepEqual([...socket.priceTopics],[`${ca}-bsc`,`${other}-bsc`,`${research}-bsc`]);
+    assert.equal(f.scanner.getStatus().priceStream.observedTokens,1,'resubscription cannot make the silent holding/research look observed');
+    assert.ok(httpRequests<=4,'recovery must not add HTTP requests beyond the preexisting one-minute signal poll');
+    socket.emit('message',{data:JSON.stringify(priceFrame([priceRow(ca,f.time())]))});
+    assert.equal(f.scanner.getStatus().priceStream.state,'live');assert.equal(f.scanner.getStatus().priceStream.lastError,undefined);
+    assert.equal(socket.closed,false);
+  }finally{await f.scanner.close();}
+});
+
+test('a fully silent transport reconnects at the heartbeat deadline and reports price subscription rejection safely',async t=>{
+  t.mock.timers.enable({apis:['setTimeout']});t.mock.method(Math,'random',()=>0.5);
+  const sockets:Socket[]=[],f=setup({socketFactory:()=>{const s=new Socket();sockets.push(s);return s;},fetcher:async()=>Response.json({status:1,data:{list:[]}})});
+  try{
+    f.scanner.setPriceTokens([{chain:'bsc',address:ca}]);f.scanner.start();sockets[0].emit('open');await flush();
+    for(let i=0;i<3;i++){f.advance(15000);t.mock.timers.tick(15000);await flush();}
+    assert.equal(sockets[0].closed,true);assert.equal(f.scanner.getStatus().lastError,'AVE_STREAM_HEARTBEAT_TIMEOUT');
+    f.advance(1000);t.mock.timers.tick(1000);await flush();sockets[1].emit('open');
+    const id=JSON.parse(sockets[1].sent[1]).id;
+    sockets[1].emit('message',{data:JSON.stringify({jsonrpc:'2.0',id,error:{code:-1,message:'secret response'}})});
+    assert.equal(f.scanner.getStatus().priceStream.lastError,'AVE_PRICE_SUBSCRIBE_REJECTED');
+    assert.equal(sockets[1].closed,true);assert.ok(!JSON.stringify(f.scanner.getStatus()).includes('secret response'));
+  }finally{await f.scanner.close();}
 });
 
 test('stop between queue claim and callback microtask never starts queued research',async()=>{

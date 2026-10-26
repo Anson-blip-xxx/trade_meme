@@ -96,8 +96,42 @@ test('as-of token and wallet pages stay fixed when later profit rows change orde
     assert.equal(r.wallets({sort:'realized',limit:1}).items[0].address,address(4));
     const second=r.wallets({sort:'realized',limit:1,offset:1,asOf:page.asOf});assert.equal(second.total,2);assert.equal(second.items[0].address,address(1));
     assert.equal(second.items[0].realizedProfitUsd,10);assert.equal(r.list({asOf:page.asOf}).total,1);
+    const pages=new DatabaseSync(`${f.out}.wallet-pages.sqlite`,{readOnly:true});
+    try {assert.equal(Number(pages.prepare('SELECT count(*) AS n FROM tr_wallet_latest WHERE computed_at>?').get(page.asOf)!.n),2,
+      'a pinned page only needs historical versions for wallets changed or added after its anchor');}finally{pages.close();}
     assert.deepEqual({...r.detail('bsc',address(900),{asOf:page.asOf}),now:old.now},old);
     const wallet=r.wallet('bsc',address(1),{asOf:page.asOf});assert.equal(wallet.total,1);assert.equal(wallet.items[0].pnl?.realizedProfitUsd,10);
+  }finally{f.close();}
+});
+
+test('wallet page index migrates from append-only versions and keeps current ordering indexable',()=>{
+  const f=fixture();try{
+    f.rank();for(const who of [1,2,3]){f.buy(who);f.profit(who,String(who*10));}
+    const first=f.create();first.runBatch();const published=f.reader().wallets({sort:'realized'}).asOf;first.close();
+    for(const suffix of ['', '-wal', '-shm'])rmSync(`${f.out}.wallet-pages.sqlite${suffix}`,{force:true});
+    const migrated=f.create(),r=f.reader(),page=r.wallets({sort:'realized'});
+    assert.equal(page.asOf,published);assert.deepEqual(page.items.map(item=>item.address),[address(3),address(2),address(1)]);
+    const firstPage=r.wallets({sort:'realized',limit:2}),secondPage=r.wallets({sort:'realized',limit:2,offset:2,asOf:firstPage.asOf});
+    assert.deepEqual([...firstPage.items,...secondPage.items].map(item=>item.address),[address(3),address(2),address(1)]);
+    const pages=new DatabaseSync(`${f.out}.wallet-pages.sqlite`,{readOnly:true});
+    try {
+      assert.equal(Number(pages.prepare('SELECT count(*) AS n FROM tr_wallet_latest').get()!.n),3);
+      assert.equal(pages.prepare("SELECT value FROM tr_wallet_page_meta WHERE key='published_at'").get()!.value,published);
+      const plan=pages.prepare(`EXPLAIN QUERY PLAN SELECT version_id FROM tr_wallet_latest INDEXED BY tr_wallet_latest_realized
+        ORDER BY realized DESC NULLS LAST,early_count DESC,chain,address LIMIT 20`).all().map(row=>String(row.detail));
+      assert.ok(plan.some(line=>line.includes('tr_wallet_latest_realized')));assert.ok(plan.every(line=>!line.includes('TEMP B-TREE')));
+    }finally{pages.close();}
+    const evidence=new DatabaseSync(f.out,{readOnly:true});
+    try {
+      evidence.prepare('ATTACH DATABASE ? AS wallet_pages').run(`${f.out}.wallet-pages.sqlite`);
+      const plan=evidence.prepare(`EXPLAIN QUERY PLAN WITH selected AS MATERIALIZED (
+          SELECT l.* FROM wallet_pages.tr_wallet_latest l ORDER BY l.realized DESC NULLS LAST,l.early_count DESC,l.chain,l.address LIMIT 20 OFFSET 1000)
+        SELECT v.data FROM selected s JOIN tr_wallet_versions v ON v.id=s.version_id
+        ORDER BY s.realized DESC NULLS LAST,s.early_count DESC,s.chain,s.address`).all().map(row=>String(row.detail));
+      assert.ok(plan.some(line=>line.includes('tr_wallet_latest_realized')));assert.ok(plan.some(line=>line.includes('INTEGER PRIMARY KEY')));
+    }finally{evidence.close();}
+    f.advance(130);f.profit(1,'100',null,'100',125);migrated.runBatch();
+    assert.equal(r.wallets({sort:'realized'}).items[0].address,address(1),'incremental publication updates ordering atomically');
   }finally{f.close();}
 });
 
@@ -241,6 +275,7 @@ test('source databases remain read-only and restart retains watermarks and froze
 test('reader never creates missing output and validates pagination before any query',()=>{
   const f=fixture();try{
     const r=f.reader();assert.equal(r.status().ready,false);assert.equal(r.list().total,0);assert.equal(r.wallets().total,0);assert.equal(existsSync(f.out),false);
+    assert.equal(existsSync(`${f.out}.wallet-pages.sqlite`),false);
     for(const options of [{limit:0},{limit:101},{offset:-1},{asOf:at(101)},{asOf:'bad'},{chain:'eth'}])assert.throws(()=>r.list(options as never),/INVALID_FILTER/);
     assert.throws(()=>r.wallets({sort:'roi' as never}),/INVALID_FILTER/);assert.throws(()=>r.detail('bsc','0x123'),/INVALID_FILTER/);
     f.rank();f.create().runBatch();assert.equal(r.status().ready,true);assert.equal(r.list().total,1);

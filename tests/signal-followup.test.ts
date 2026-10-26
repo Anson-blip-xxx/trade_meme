@@ -1,7 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {DatabaseSync} from 'node:sqlite';
+import {mkdtempSync,rmSync} from 'node:fs';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
 import {SignalFollowup} from '../src/signal-followup.js';
+import {FollowupReviewRunner} from '../src/followup-review-runner.js';
 import type {FollowupRecord} from '../src/signal-followup.js';
 import type {Report} from '../src/types.js';
 import type {ScanRecord,ScanPrice} from '../src/scan-archive.js';
@@ -61,6 +65,38 @@ test('dashboard summary and aggregate pages are independent, bounded and isolate
     for(const options of [{limit:0},{limit:101},{offset:-1},{offset:1000001},{chain:'eth'},{decision:'BUY'},{selected:'true'},{status:'invalid'},{asOf:'bad'}])
       assert.throws(()=>followup.list(options as any,date()),/INVALID_FILTER/);
   }finally{db.close();}
+});
+test('production dashboard readers use only the persisted review and never rebuild on a missing snapshot',()=>{
+  const db=new DatabaseSync(':memory:'),writer=new SignalFollowup(db),reader=new SignalFollowup(db,{persistedReviewReads:true});
+  try {
+    for(let n=1;n<=3;n++){const f=fixture(n);writer.capture(f.report,f.record,date());}
+    const preparing=reader.dashboardSummary(date());assert.equal(preparing.total,0);assert.equal(preparing.computedAt,'');
+    assert.equal(reader.groups({},date()).total,0);assert.equal(reader.learning({},date()).total,0);
+    writer.refresh(date());
+    const ready=reader.dashboardSummary(date());assert.equal(ready.total,3);assert.equal(ready.groupsTotal,1);assert.equal(ready.learningTotal,15);
+    assert.equal(ready.refreshIntervalSec,60);assert.equal(ready.mode,'observation_only');
+    const groups=reader.groups({},date());groups.items[0].count=999;
+    assert.equal(reader.groups({},date()).items[0].count,3);
+    const fourth=fixture(4,{},1000);writer.capture(fourth.report,fourth.record,date(1000));
+    assert.equal(reader.dashboardSummary(date(1000)).total,3,'new rows wait for the next persisted worker review');
+    writer.refresh(date(61000));assert.equal(reader.dashboardSummary(date(61000)).total,4);
+  }finally{db.close();}
+});
+
+test('followup review runner publishes the compact review from a worker',async()=>{
+  const dir=mkdtempSync(join(tmpdir(),'followup-review-worker-')),path=join(dir,'scans.sqlite');
+  const db=new DatabaseSync(path),followup=new SignalFollowup(db);
+  try {for(let n=1;n<=4;n++){const f=fixture(n);followup.capture(f.report,f.record,date());}}finally{db.close();}
+  const runner=new FollowupReviewRunner({database:path,intervalMs:1000});
+  try {
+    runner.start();const deadline=Date.now()+10000;
+    while(!runner.status().completedAt&&Date.now()<deadline)await new Promise(resolve=>setTimeout(resolve,20));
+    assert.ok(runner.status().completedAt);assert.equal(runner.status().error,undefined);
+    const check=new DatabaseSync(path,{readOnly:true});
+    try {const saved=JSON.parse(String(check.prepare("SELECT value FROM signal_followup_meta WHERE key='last_review'").get()!.value));
+      assert.equal(saved.total,4);assert.equal(saved.refreshIntervalSec,60);assert.equal(saved.groups.length,1);}
+    finally{check.close();}
+  }finally{await runner.stop();rmSync(dir,{recursive:true,force:true});}
 });
 test('freezes first verdict and features per chain/token, only fills missing display labels',()=>{
   const {db,followup,detail}=setup();try {

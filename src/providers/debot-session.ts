@@ -108,7 +108,7 @@ export class DebotSessionClient {
       const after=await handle.stat();
       if(stat.mtimeMs!==after.mtimeMs||stat.ctimeMs!==after.ctimeMs||stat.size!==after.size)throw failure('FILE_CHANGED');
       let data:unknown;try {data=JSON.parse(buffer.subarray(0,length).toString('utf8'));}catch {throw failure('FILE_INVALID');}
-      return {data:parseFile(data),fingerprint:[stat.dev,stat.ino,stat.mtimeMs,stat.ctimeMs,stat.size].join(':')};
+      return {data:parseFile(data),fingerprint:[stat.dev,stat.ino,stat.mtimeMs,stat.ctimeMs,stat.size,stat.mode&0o777].join(':')};
     } catch(error) {
       this.verified=undefined;
       if(error instanceof DebotSessionError)throw error;

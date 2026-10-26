@@ -130,6 +130,50 @@ test('共同资金来源排除公共服务/冲突，协同行为至少双方各�
   } finally {history.close();}
 });
 
+test('批量报告对重复资金来源只做一次关联失效且完整保存每个钱包证据',()=>{
+  const {history}=fixture(),internal=history as unknown as {associations:{
+    fundingChangedMany:(changes:Iterable<{chain:'bsc';wallet:string}>)=>void;
+    publicServiceChangedMany:(changes:Iterable<{chain:'bsc';funder:string}>)=>void;
+  }};
+  const fundingCalls:{wallets:string[][];funders:string[][]}={wallets:[],funders:[]};
+  const fundingChangedMany=internal.associations.fundingChangedMany.bind(internal.associations);
+  const publicServiceChangedMany=internal.associations.publicServiceChangedMany.bind(internal.associations);
+  internal.associations.fundingChangedMany=changes=>{const values=[...changes];fundingCalls.wallets.push(values.map(item=>item.wallet));fundingChangedMany(values);};
+  internal.associations.publicServiceChangedMany=changes=>{const values=[...changes];fundingCalls.funders.push(values.map(item=>item.funder));publicServiceChangedMany(values);};
+  try {
+    const wallets=Array.from({length:200},(_,index)=>{
+      const value=wallet(index+1,{enrichment:{status:'complete',reasons:[]}});
+      value.funding={...value.funding,sharedService:true};return value;
+    });
+    history.captureAnalysis(token,analysis(wallets),{source:'gmgn_analysis',observedAt:iso(100)});
+    assert.equal(history.stats().wallets,200);assert.equal(history.stats().fundingLinks,200);
+    assert.equal(fundingCalls.wallets.length,1);assert.equal(new Set(fundingCalls.wallets[0]).size,200);
+    assert.deepEqual(fundingCalls.funders,[[address(500)]]);
+    history.refreshCoordination(20);
+    assert.equal(history.getWallet('bsc',address(1))!.wallet.coordination.sharedFundingPeers,0);
+  } finally {history.close();}
+});
+
+test('200钱包报告在密集关联表上保持有界，不按钱包重复扫描全表',()=>{
+  const {history}=fixture(),db=(history as unknown as {db:DatabaseSync}).db;
+  try {
+    db.exec('BEGIN');
+    const insert=db.prepare(`INSERT INTO wh_assoc_relations(chain,leader,candidate,first_at,updated_at,token_count,forward_count,funding_count,dirty,data,funding_data)
+      VALUES ('bsc',?,?,?,?,1,0,0,0,'{}','[]')`);
+    for(let index=0;index<5_000;index++) insert.run(address(index%200+1),address(20_000+index),iso(1),iso(1));
+    db.exec('COMMIT');
+    const wallets=Array.from({length:200},(_,index)=>{
+      const value=wallet(index+1,{enrichment:{status:'complete',reasons:[]}});
+      value.funding={...value.funding,sharedService:true};return value;
+    });
+    const started=performance.now();
+    history.captureAnalysis(token,analysis(wallets),{source:'gmgn_analysis',observedAt:iso(100)});
+    const elapsed=performance.now()-started;
+    assert.ok(elapsed<1_500,`batch capture took ${elapsed.toFixed(1)}ms`);
+    assert.equal(Number(db.prepare('SELECT COUNT(*) AS n FROM wh_assoc_relations WHERE dirty=1').get()!.n),5_000);
+  } finally {history.close();}
+});
+
 test('coordination funding checks use covering scalar indexes and dirty queue selection does not sort all wallets',()=>{
   const {history}=fixture(),db=(history as unknown as {db:DatabaseSync}).db;
   const original=db.prepare.bind(db),captured:string[]=[];

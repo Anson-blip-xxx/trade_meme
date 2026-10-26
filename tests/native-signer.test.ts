@@ -1,0 +1,20 @@
+import test from 'node:test';import assert from 'node:assert/strict';
+import {mkdtempSync,writeFileSync,rmSync,chmodSync,symlinkSync} from 'node:fs';import {tmpdir} from 'node:os';import {join} from 'node:path';
+import {Keypair,TransactionMessage,VersionedTransaction,SystemProgram} from '@solana/web3.js';import {NativeSigner} from '../src/native-solana/signer.js';
+import {ed25519} from '@noble/curves/ed25519';
+const key=Keypair.fromSeed(new Uint8Array(32).fill(1)),other=Keypair.fromSeed(new Uint8Array(32).fill(2));
+function fixture(t:any){const dir=mkdtempSync(join(tmpdir(),'native-signer-'));t.after(()=>rmSync(dir,{recursive:true,force:true}));const path=join(dir,'key.json');
+ writeFileSync(path,JSON.stringify([...key.secretKey]),{mode:0o600});return {dir,path};}
+test('native signer loads only matching owner key and never exposes bytes in JSON',t=>{const f=fixture(t),signer=new NativeSigner(f.path,key.publicKey.toBase58());
+ const msg=new TransactionMessage({payerKey:key.publicKey,recentBlockhash:other.publicKey.toBase58(),instructions:[SystemProgram.transfer({fromPubkey:key.publicKey,toPubkey:other.publicKey,lamports:1})]}).compileToV0Message();
+ const tx=new VersionedTransaction(msg);signer.sign(tx);assert.ok(tx.signatures[0].some(v=>v!==0));
+ assert.equal(ed25519.verify(tx.signatures[0],tx.message.serialize(),key.publicKey.toBytes()),true);
+ assert.equal(JSON.stringify(signer),'{}');
+ assert.throws(()=>new NativeSigner(f.path,other.publicKey.toBase58()),/NATIVE_SIGNER_UNAVAILABLE/);
+});
+test('unsafe mode, symlink, malformed key and foreign fee payer are rejected with no key disclosure',t=>{const f=fixture(t);
+ chmodSync(f.path,0o644);assert.throws(()=>new NativeSigner(f.path,key.publicKey.toBase58()),/^Error: NATIVE_SIGNER_UNAVAILABLE$/);
+ chmodSync(f.path,0o600);symlinkSync(f.path,join(f.dir,'link'));assert.throws(()=>new NativeSigner(join(f.dir,'link'),key.publicKey.toBase58()));
+ const signer=new NativeSigner(f.path,key.publicKey.toBase58()),tx=new VersionedTransaction(new TransactionMessage({payerKey:other.publicKey,recentBlockhash:key.publicKey.toBase58(),instructions:[]}).compileToV0Message());
+ assert.throws(()=>signer.sign(tx),/PAYER_MISMATCH/);writeFileSync(f.path,'[1,2]');assert.throws(()=>new NativeSigner(f.path,key.publicKey.toBase58()),/NATIVE_SIGNER_UNAVAILABLE/);
+});

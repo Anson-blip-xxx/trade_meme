@@ -18,6 +18,8 @@ type Row=Record<string,any>;
 export interface MemePage {limit?:number;offset?:number;chain?:Chain;asOf?:string;}
 export interface MemeObserverOptions {
   database:string;now?:()=>Date;maxActive?:number;activeWindowSec?:number;maxBytes?:number;
+  /** Chains receiving new research work; historical observations remain readable. */
+  allowedChains?:Chain[];
   marketBatch:(tokens:(Token&{poolAddress?:string})[],signal:AbortSignal)=>Promise<MemeMarketSample[]>;
   marketFallback?:(token:Token,signal:AbortSignal)=>Promise<MemeMarketSample|undefined>;
   catalyst?:(signal:Signal,abort:AbortSignal,context?:GmgnTokenSnapshot)=>Promise<MemeCatalystSnapshot>;
@@ -48,6 +50,7 @@ const samplingFields="chain,address,last_signal_at,first_seen_at,market_attempt_
 export class MemeObserver {
   private readonly db:DatabaseSync;private readonly now:()=>Date;
   private readonly maxActive:number;private readonly windowMs:number;private readonly maxBytes:number;
+  private readonly chains:Chain[];
   private readonly samplingReader:ReviewSamplingPlanReader;
   private running=false;private closed=false;private marketWork?:Promise<void>;private catalystWork?:Promise<void>;
   private timer?:ReturnType<typeof setTimeout>;private socialTimer?:ReturnType<typeof setTimeout>;
@@ -59,8 +62,11 @@ export class MemeObserver {
     this.now=options.now??(()=>new Date());this.maxActive=options.maxActive??180;this.windowMs=(options.activeWindowSec??7200)*1000;
     this.samplingReader=new ReviewSamplingPlanReader(options.samplingPlanPath,{now:this.now});
     const maxBytes=options.maxBytes??1024*1024*1024;
-    if(!Number.isInteger(this.maxActive)||this.maxActive<1||this.maxActive>300||this.windowMs<60000||this.windowMs>86400000||maxBytes<1048576)
+    const chains=options.allowedChains??['bsc','solana','robinhood'];
+    if(!Array.isArray(chains)||!chains.length||chains.some(chain=>!['bsc','solana','robinhood'].includes(chain))||
+      !Number.isInteger(this.maxActive)||this.maxActive<1||this.maxActive>300||this.windowMs<60000||this.windowMs>86400000||maxBytes<1048576)
       throw new Error('MEME_OBSERVER_CONFIG_INVALID');
+    this.chains=[...new Set(chains)] as Chain[];
     this.maxBytes=maxBytes;
     if(options.database!==':memory:')mkdirSync(dirname(options.database),{recursive:true,mode:0o700});
     this.db=new DatabaseSync(options.database);
@@ -74,6 +80,9 @@ export class MemeObserver {
         sample_count INTEGER NOT NULL DEFAULT 0,market TEXT,assessment TEXT,catalyst TEXT,social_context TEXT,wallet_context TEXT,gate TEXT,error TEXT,
         PRIMARY KEY(chain,address));
       CREATE INDEX IF NOT EXISTS meme_tokens_active ON meme_tokens(last_signal_at DESC);
+      CREATE INDEX IF NOT EXISTS meme_tokens_chain_signal ON meme_tokens(chain,last_signal_at);
+      CREATE INDEX IF NOT EXISTS meme_tokens_first_seen ON meme_tokens(first_seen_at DESC,chain,address);
+      CREATE INDEX IF NOT EXISTS meme_tokens_chain_first_seen ON meme_tokens(chain,first_seen_at DESC,address);
       CREATE INDEX IF NOT EXISTS meme_tokens_sampling ON meme_tokens(last_signal_at DESC,chain,address,first_seen_at,
         market_attempt_at,last_sample_at,catalyst_attempt_at,fallback_attempt_at,json_extract(signal,'$.source'),
         json_extract(catalyst,'$.status'),json_extract(catalyst,'$.expiresAt'),catalyst IS NULL);
@@ -99,7 +108,7 @@ export class MemeObserver {
   register(signal:Signal,receivedAt=this.now().toISOString(),display:{name?:string;symbol?:string}={}):boolean {
     if(this.closed)return false;
     const token=validToken(signal.token),at=time(receivedAt),now=this.now().getTime(),eventAt=time(signal.occurredAt);
-    if(!token||!Number.isFinite(at)||at>now||!Number.isFinite(eventAt)||eventAt>now+30000||eventAt<now-this.windowMs)return false;
+    if(!token||!this.chains.includes(token.chain)||!Number.isFinite(at)||at>now||!Number.isFinite(eventAt)||eventAt>now+30000||eventAt<now-this.windowMs)return false;
     const key=hash([signal.source,signal.sourceEventId,token]);
     this.db.exec('SAVEPOINT meme_register');
     try {
@@ -118,8 +127,9 @@ export class MemeObserver {
   }
   captureReport(report:Report):void {
     if(this.closed||report.mode!=='live')return;
+    const token=validToken(report.signal.token);if(!token||!this.chains.includes(token.chain))return;
     this.register(report.signal,report.receivedAt);
-    const token=validToken(report.signal.token);if(!token||!this.row(token))return;
+    if(!this.row(token))return;
     const gate={decision:report.decision,checkedAt:report.evaluatedAt,validUntil:report.validUntil,
       safety:report.safety.status,provenance:report.provenance.status,reasons:report.reasons.slice(0,12),reportId:report.id};
     this.db.prepare('UPDATE meme_tokens SET gate=? WHERE chain=? AND address=?').run(JSON.stringify(gate),token.chain,token.address);
@@ -146,15 +156,18 @@ export class MemeObserver {
   private row(token:Token):Row|undefined {return this.db.prepare('SELECT * FROM meme_tokens WHERE chain=? AND address=?').get(token.chain,token.address);}
   private activeRows():Row[] {
     const plan=this.samplingReader.read().plan,cutoff=iso(this.now().getTime()-this.windowMs);
-    if(!plan)return this.db.prepare(`SELECT ${samplingFields} FROM meme_tokens INDEXED BY meme_tokens_sampling WHERE last_signal_at>=? ORDER BY last_signal_at DESC,chain,address LIMIT ?`)
-      .all(cutoff,this.maxActive);
+    // Filter before every bounded pool, so disabled-chain history cannot crowd
+    // active chains out of either fair rotation or deficit-priority research.
+    const where=`last_signal_at>=? AND chain IN (${this.chains.map(()=>'?').join(',')})`;
+    if(!plan)return this.db.prepare(`SELECT ${samplingFields} FROM meme_tokens INDEXED BY meme_tokens_sampling WHERE ${where} ORDER BY last_signal_at DESC,chain,address LIMIT ?`)
+      .all(cutoff,...this.chains,this.maxActive);
     // Two bounded pools: old attempts cannot be hidden by the latest maxActive
     // alerts, while a deficient cohort can enter even beyond the fair pool.
     const order="MAX(COALESCE(market_attempt_at,''),COALESCE(last_sample_at,'')),first_seen_at,chain,address";
-    const fair=this.db.prepare(`SELECT ${samplingFields} FROM meme_tokens INDEXED BY meme_tokens_sampling WHERE last_signal_at>=? ORDER BY ${order} LIMIT 600`).all(cutoff);
+    const fair=this.db.prepare(`SELECT ${samplingFields} FROM meme_tokens INDEXED BY meme_tokens_sampling WHERE ${where} ORDER BY ${order} LIMIT 600`).all(cutoff,...this.chains);
     const clauses=plan.cohorts.filter(c=>c.weight===2).map(c=>({cohort:c,deficit:c.missing/c.total}));
-    const priority=clauses.length?this.db.prepare(`SELECT ${samplingFields} FROM meme_tokens INDEXED BY meme_tokens_sampling WHERE last_signal_at>=? ORDER BY CASE ${clauses.map(()=>"WHEN chain=? AND json_extract(signal,'$.source')=? THEN ?").join(' ')} ELSE 0 END DESC,${order} LIMIT 600`)
-      .all(cutoff,...clauses.flatMap(({cohort,deficit})=>[cohort.chain,cohort.source,deficit])):[];
+    const priority=clauses.length?this.db.prepare(`SELECT ${samplingFields} FROM meme_tokens INDEXED BY meme_tokens_sampling WHERE ${where} ORDER BY CASE ${clauses.map(()=>"WHEN chain=? AND json_extract(signal,'$.source')=? THEN ?").join(' ')} ELSE 0 END DESC,${order} LIMIT 600`)
+      .all(cutoff,...this.chains,...clauses.flatMap(({cohort,deficit})=>[cohort.chain,cohort.source,deficit])):[];
     const source=(row:Row):ReviewSamplingSource|undefined=>row.sampling_source;
     const deficit=(row:Row)=>{const c=plan.cohorts.find(c=>c.chain===row.chain&&c.source===source(row));return c?.total?c.missing/c.total:0;};
     const seen=new Set<string>(),selected:Row[]=[];
@@ -297,13 +310,14 @@ export class MemeObserver {
     return {scope:'subsequent_observed_prices',notTradingReturn:true,items:result};
   }
   status(){
-    const recent=Number(this.db.prepare('SELECT count(*) AS n FROM meme_tokens WHERE last_signal_at>=?').get(iso(this.now().getTime()-this.windowMs))!.n);
+    const recent=Number(this.db.prepare(`SELECT count(*) AS n FROM meme_tokens WHERE last_signal_at>=? AND chain IN (${this.chains.map(()=>'?').join(',')})`)
+      .get(iso(this.now().getTime()-this.windowMs),...this.chains)!.n);
     const active=this.activeRows(),fresh=active.filter(row=>row.last_sample_at&&this.now().getTime()-time(row.last_sample_at)<=120000).length;
     const now=this.now().getTime();
     const catalystFresh=active.filter(row=>!row.sampling_catalyst_missing&&row.sampling_catalyst_status!=='unknown'&&time(row.sampling_catalyst_expires_at)>now).length;
     const catalystPending=active.filter(row=>row.sampling_catalyst_missing).length,catalystUnknown=active.filter(row=>row.sampling_catalyst_status==='unknown').length;
     const sampling=this.samplingReader.read();
-    return {enabled:true,running:this.running,active:active.length,waiting:Math.max(0,recent-active.length),fresh,stale:active.length-fresh,
+    return {enabled:true,running:this.running,activeChains:[...this.chains],active:active.length,waiting:Math.max(0,recent-active.length),fresh,stale:active.length-fresh,
       samplingPlan:{status:sampling.status,reason:sampling.reason,scope:'research_sampling_only',candidateLimit:1200,
         ...(sampling.plan?{id:sampling.plan.id,policyVersion:sampling.plan.policyVersion,effectiveAt:sampling.plan.effectiveAt,
           expiresAt:sampling.plan.expiresAt,fairShare:sampling.plan.fairShare,cohorts:sampling.plan.cohorts}:{})},

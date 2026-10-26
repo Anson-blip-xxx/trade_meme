@@ -5,6 +5,20 @@ import {unknown,parseSignal,type VendorNarrative} from '../src/types.js';
 import {analyzeVendorNarrative} from '../src/providers/vendor-narrative.js';
 import {signal,config,providers,now,pass,narrative} from './helpers.js';
 
+test('paused chains cannot invoke research providers or become eligible through direct decide',async()=>{
+  const c=config();c.scannerChains=['solana'];let calls=0;
+  const forbidden=async()=>{calls++;throw Error('must not call');};
+  const p={provenance:forbidden,safety:forbidden,evidence:forbidden,narrative:forbidden};
+  for(const chain of ['bsc','robinhood'] as const)for(const source of ['debot','ave','gmgn','wallet','manual'] as const) {
+    const s=signal({source,token:{chain,address:signal().token.address}});
+    const result=await evaluate(s,c,p,{now:()=>now});
+    assert.equal(result.buyEligible,false);assert.ok(result.reasons.includes('SIGNAL_CHAIN_DISABLED'));
+    const direct=decide(s,now.toISOString(),c,{...pass(),platform:'flap'},pass(),narrative(),now);
+    assert.equal(direct.buyEligible,false);assert.ok(direct.reasons.includes('SIGNAL_CHAIN_DISABLED'));
+  }
+  assert.equal(calls,0);
+});
+
 test('信号驱动：不要求买在底部，不设币龄或上涨幅度门槛',async()=>{
   const r=await evaluate(signal({text:'已经上涨，但有新的可验证催化'}),config(),providers(),{now:()=>now});
   assert.equal(r.decision,'BUY_CANDIDATE');assert.equal(r.buyEligible,true);assert.equal(r.executionEnabled,false);

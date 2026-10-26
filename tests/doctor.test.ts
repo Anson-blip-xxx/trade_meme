@@ -32,6 +32,19 @@ test('doctor 默认不联网；单独配齐 Solana 即可研究，但 DeBot/Robi
   assert.match(check(report,'model').message,/评分和负面意见仅供参考/);
 });
 
+test('doctor distinguishes live third-signal capability from disabled research entry without claiming active execution',async()=>{
+  let calls=0;
+  const report=await runDoctor(full({ENTRY_MODE:'off',THIRD_SIGNAL_EXECUTION_MODE:'live'}),
+    {fetcher:async()=>{calls++;throw new Error('must not run');}});
+  assert.equal(calls,0);assert.equal(report.executionDisabled,false);
+  assert.equal(report.executionStatusSource,'configuration_only');assert.equal(report.configuredEntryMode,'off');
+  assert.equal(report.configuredThirdSignalMode,'live');
+  assert.match(check(report,'execution').message,/研究筛选的开单入口关闭/);
+  assert.match(check(report,'execution.third_signal').message,/本人启动计数后/);
+  assert.match(check(report,'execution.third_signal').message,/未读取当前运行批次/);
+  assert.match(check(report,'execution.third_signal').message,/未验证买卖成交或自动保护触发/);
+});
+
 test('共同依赖缺失或空白不被当作就绪，Key 只能用于对应渠道',async()=>{
   for(const override of [{INGEST_TOKEN:'short'},{INGEST_TOKEN:' '.repeat(30)},
     {X_DATA_PROVIDER:'x_official',X_BEARER_TOKEN:''},

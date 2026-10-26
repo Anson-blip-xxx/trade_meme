@@ -54,6 +54,7 @@ export function liveProviders(config:Config,client=new GmgnClient({apiKey:config
 export function decide(signal:Signal,receivedAt:string,config:Config,provenance:Provenance,safety:Check,narrative:NarrativeReport,
   now:Date,mode:'live'|'demo'='live',id:string=randomUUID(),research?:GmgnResearch,walletScreening?:WalletScreeningReport,marketRisk?:Check):Report {
   const reasons:string[]=[];
+  if(!config.scannerChains.includes(signal.token.chain))reasons.push('SIGNAL_CHAIN_DISABLED');
   const flow=mergeWalletSupport(research?.flow,walletScreening,signal,now);
   const age=now.getTime()-Date.parse(signal.occurredAt);
   if(age< -30_000) reasons.push('SIGNAL_TIME_IN_FUTURE');
@@ -109,6 +110,10 @@ export async function evaluate(signal:Signal,config:Config,providers=liveProvide
   walletTargetsReady?:Promise<unknown>;onProgress?:(progress:EvaluationProgress)=>void;
 }={}):Promise<Report> {
   const clock=options.now??(()=>new Date()),start=clock(),receivedAt=options.receivedAt??start.toISOString();
+  if(!config.scannerChains.includes(signal.token.chain)) {
+    const skipped={...unknown('SIGNAL_CHAIN_DISABLED'),checkedAt:start.toISOString()};
+    return decide(signal,receivedAt,config,skipped,skipped,{...skipped,evidence:[]},start,options.mode,options.id);
+  }
   const age=start.getTime()-Date.parse(signal.occurredAt);
   const maxAgeSec=['debot','ave'].includes(signal.source)?Math.min(120,config.maxSignalAgeSec):config.maxSignalAgeSec;
   if(age>=maxAgeSec*1000||age< -30_000) {

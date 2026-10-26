@@ -290,3 +290,55 @@ test('fraction below one lamport, absent funding and invalid bps cannot create a
     assert.equal(store.reserve(input(),10,now,snapshot({balance:'20'}),{balanceBps:1000}).order?.inputAmount,'1');
   } finally {store.close();}
 });
+
+test('total-balance 3 percent floors uint64/uint256 exactly and caps by spendable funds',()=>{
+  for(const chain of ['solana','bsc','robinhood'] as const) {
+    const store=new OrderStore(':memory:');
+    try {
+      const balance=((1n<<(chain==='solana'?64n:256n))-1n).toString(),feeReserve='10';
+      const created=store.reserve({...input(),chain,inputAmount:'1'},10,now,
+        snapshot({balance,feeReserve}),{balanceBps:300,balanceBasis:'total'});
+      assert.equal(created.order?.inputAmount,(BigInt(balance)*300n/10000n).toString());
+      assert.equal((created.order!.details.funding as Record<string,unknown>).balanceBasis,'total');
+      assert.deepEqual(store.checkFunding(created.order!.id,snapshot({balance,feeReserve}),now),{ok:true});
+    } finally {store.close();}
+  }
+  const store=new OrderStore(':memory:');
+  try {
+    // 3% of 1000 is 30, but this wallet can safely spend only 10 after gas.
+    const order=store.reserve(input(),10,now,snapshot({balance:'1000',feeReserve:'990'}),
+      {balanceBps:300,balanceBasis:'total'}).order!;
+    assert.equal(order.inputAmount,'10');
+    assert.deepEqual(store.checkFunding(order.id,snapshot({balance:'1000',feeReserve:'991'}),now),
+      {ok:false,reason:'ENTRY_INSUFFICIENT_BALANCE'});
+  } finally {store.close();}
+});
+
+test('total-balance concurrent reservations preserve 3 percent target without overspending pending debits',()=>{
+  const dir=mkdtempSync(join(tmpdir(),'meme-total-fraction-')),path=join(dir,'orders.sqlite');
+  const a=new OrderStore(path),b=new OrderStore(path),funding=snapshot({balance:'1000',feeReserve:'300'});
+  try {
+    const first=a.reserve(input(),10,now,funding,{balanceBps:300,balanceBasis:'total'}).order!;
+    const second=b.reserve(input(2),10,now,funding,{balanceBps:300,balanceBasis:'total'}).order!;
+    const third=a.reserve(input(3),10,now,funding,{balanceBps:300,balanceBasis:'total'}).order!;
+    assert.deepEqual([first.inputAmount,second.inputAmount,third.inputAmount],['30','30','30']);
+    assert.equal((third.details.funding as Record<string,unknown>).reservedBefore,'660');
+    assert.deepEqual(a.checkFunding(first.id,funding,now),{ok:true});
+    assert.equal(b.reserve(input(4),10,now,funding,{balanceBps:300,balanceBasis:'total'}).reason,'ENTRY_INSUFFICIENT_BALANCE');
+    assert.deepEqual(a.checkFunding(first.id,snapshot({balance:'999',feeReserve:'300'}),now),
+      {ok:false,reason:'ENTRY_BALANCE_FRACTION_EXCEEDED'});
+    assert.equal(a.get(first.id)?.inputAmount,'30');
+  } finally {a.close();b.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('total-balance sizing rejects malformed basis and sub-unit targets without creating orders',()=>{
+  const store=new OrderStore(':memory:');
+  try {
+    for(const balanceBasis of ['unknown','',null,5] as unknown as ('available'|'total')[]) {
+      assert.equal(store.reserve(input(),10,now,snapshot(),{balanceBps:300,balanceBasis}).reason,'ENTRY_BALANCE_INVALID');
+    }
+    assert.equal(store.reserve(input(),10,now,snapshot({balance:'33',feeReserve:'0'}),
+      {balanceBps:300,balanceBasis:'total'}).reason,'ENTRY_INSUFFICIENT_BALANCE');
+    assert.equal(store.list().length,0);
+  } finally {store.close();}
+});

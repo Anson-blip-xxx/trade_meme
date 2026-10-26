@@ -11,7 +11,11 @@ export interface DoctorCheck {
 export interface DoctorReport {
   readyForResearch:boolean;
   readyByChain:Record<Chain,boolean>;
+  /** Configuration-only capability, not whether the user's live counting run is active. */
   executionDisabled:boolean;
+  executionStatusSource:'configuration_only';
+  configuredEntryMode:Config['entryMode'];
+  configuredThirdSignalMode:Config['thirdSignalExecutionMode'];
   mode:'configuration'|'live';
   checks:DoctorCheck[];
 }
@@ -79,14 +83,14 @@ export async function runDoctor(config:Config,options:{live?:boolean;fetcher?:Fe
   }
   const gmgnReady=present(config.gmgnApiKey)&&config.gmgnApiKey!.trim()!=='gmgn_solbscbaseethmonadtron';
   add('exits','warn',config.exitPolicy
-    ?'已配置剩余持仓止盈止损：+500%卖20%、+1000%卖10%、-40%卖100%。实际买单需附挂GMGN条件单；网页预设无公开自动继承保证。子单活跃状态尚待真实响应核对，未验证保护时暂停新买入。'
+    ?`已配置剩余持仓止盈止损：${config.exitPolicy.takeProfit.map(t=>`+${t.gainPct}%卖${t.sellPct}%`).join('、')}、-${config.exitPolicy.stopLoss.dropPct}%卖${config.exitPolicy.stopLoss.sellPct}%。实际买单需附挂GMGN条件单；网页预设无公开自动继承保证。子单活跃状态尚待真实响应核对，未验证保护时暂停新买入。`
     :'未配置退出策略；现有开单不会主动附挂止盈止损。');
   const entryMissing=CHAINS.filter(chain=>!config.entryWallets[chain]?.trim()||!config.entryInputTokens[chain]?.trim()||(config.entryBalanceBps?.[chain]===undefined&&!config.entryAmounts[chain]?.trim()));
   add('entry.configuration',entryMissing.length?'warn':'pass',entryMissing.length
     ?`以下链尚未配置完整的下单钱包、输入币和金额：${entryMissing.join('、')}；不会自动决定单笔金额。`
     :'各链已填写下单钱包、输入币和金额；仍需实际验证账户权限、报价和成交。');
   add('entry.sizing','pass',CHAINS.some(chain=>config.entryBalanceBps?.[chain]!==undefined)
-    ?`按链余额比例：${CHAINS.filter(chain=>config.entryBalanceBps?.[chain]!==undefined).map(chain=>`${chain} ${(config.entryBalanceBps![chain]!/100).toFixed(2)}%`).join('、')}；先扣手续费缓冲和未结算订单占用，再向下取整；提交前重新核验比例上限。其他链保持原金额规则。`
+    ?`按链原生币总余额比例：${CHAINS.filter(chain=>config.entryBalanceBps?.[chain]!==undefined).map(chain=>`${chain} ${(config.entryBalanceBps![chain]!/100).toFixed(2)}%`).join('、')}；本金按总余额乘比例向下取整，并受扣除手续费缓冲和未结算订单后的可用额度限制；提交前重新核验。`
     :config.entrySizing==='balance_cap'
     ?'按原生币余额与单笔本金上限动态计算金额，并扣除费用缓冲及尚未覆盖的订单占用；余额未知时不买入。'
     :'当前使用固定输入金额；未启用余额上限动态计算。');
@@ -124,9 +128,12 @@ export async function runDoctor(config:Config,options:{live?:boolean;fetcher?:Fe
     '钱包研究已启用：归档已接收的买卖页与研究钱包样本，并定时探索涨幅榜、获利交易者；供应商采样不等于完整链上历史。':
     '钱包历史归档已启用，但缺个人 GMGN Key，额外发现任务不能联网采集。');
   add('execution',config.entryMode==='live'?'warn':'pass',config.entryMode==='off'
-    ?'ENTRY_MODE=off：开单模块关闭；筛选流程只读。'
-    :config.entryMode==='paper'?'ENTRY_MODE=paper：只记录报价模拟开单，不提交交易。'
-      :'ENTRY_MODE=live：满足规则及配置后会提交真实开单；未在本次预检中交易或验证成交。');
+    ?'ENTRY_MODE=off：研究筛选的开单入口关闭；独立第三次通知策略的实盘能力与运行状态另行判断。'
+    :config.entryMode==='paper'?'ENTRY_MODE=paper：研究筛选仅记录报价模拟开单；不代表独立第三次通知策略的模式。'
+      :'ENTRY_MODE=live：研究筛选满足规则及配置后会提交真实开单；未在本次预检中交易或验证成交。');
+  add('execution.third_signal',config.thirdSignalExecutionMode==='live'?'warn':'pass',config.thirdSignalExecutionMode==='live'
+    ?'第三次通知策略配置为实盘：本人启动计数后，新的达标信号才进入实盘买入流程。本预检未读取当前运行批次，也未验证买卖成交或自动保护触发。'
+    :'第三次通知策略配置为模拟，达标不会提交实盘买单。');
 
   if(live) {
     // At most one read-only identity call per configured chain; no fallback to a different RPC.
@@ -168,7 +175,9 @@ export async function runDoctor(config:Config,options:{live?:boolean;fetcher?:Fe
   for(const chain of CHAINS) add(`research.${chain}`,readyByChain[chain]?'pass':'warn',readyByChain[chain]
     ?`${chain} 的完整研究所需配置已齐；仍需用真实信号验证来源、安全及叙事结果，不是买入许可。`
     :`${chain} 尚未达到完整研究就绪条件；查看该链及共同依赖的诊断，不影响已就绪的其他链。`);
-  return {readyForResearch:readyByChain.bsc||readyByChain.solana,readyByChain,executionDisabled:config.entryMode!=='live',
+  return {readyForResearch:readyByChain.bsc||readyByChain.solana,readyByChain,
+    executionDisabled:config.entryMode!=='live'&&config.thirdSignalExecutionMode!=='live',executionStatusSource:'configuration_only',
+    configuredEntryMode:config.entryMode,configuredThirdSignalMode:config.thirdSignalExecutionMode,
     mode:live?'live':'configuration',checks};
 }
 

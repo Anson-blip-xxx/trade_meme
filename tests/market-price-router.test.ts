@@ -15,6 +15,38 @@ const ave=(rows:unknown[])=>({jsonrpc:'2.0',result:{status:'ok',data:{event:'pri
 const aveRow=(t:ScanToken,price=1,time=epoch/1000)=>({chain:t.chain,token:t.address,target_token:t.address,pair:token(254,t.chain).address,is_main_pair:true,uprice:price,last_price:999999,time});
 const fetcher=(fn:(url:URL,signal?:AbortSignal|null)=>Promise<Response>):Fetcher=>((input,init)=>fn(new URL(String(input)),init?.signal)) as Fetcher;
 
+test('websocket-first reads send no HTTP while matched push prices are fresh; stale pushes use bounded fallback',async()=>{
+  let time=epoch,calls=0;
+  const router=new MarketPriceRouter({now:()=>new Date(time),preferStreams:true,minHttpIntervalMs:30000,
+    maxDebotPerBatch:0,maxGmgnPerBatch:0,fetcher:fetcher(async()=>{calls++;return json([pair(token())]);})});
+  router.ingestAvePriceFrame(ave([aveRow(token())]),iso());
+  assert.equal((await router.read([token()])).samples[0].source,'ave_price_stream_sample');assert.equal(calls,0);
+  time+=31000;assert.equal((await router.read([token()])).samples[0].source,'dexscreener_token_pairs_sample');assert.equal(calls,1);
+  time+=5000;await router.read([token()]);assert.equal(calls,1);
+  assert.equal(router.latestStream(token())?.observedAt,iso(),'HTTP must not renew the stream timestamp');
+  router.ingestAvePriceFrame(ave([aveRow(token(),1,time/1000)]),new Date(time).toISOString());
+  await router.read([token()]);assert.equal(calls,1);
+  time+=31000;await router.read([token()]);assert.equal(calls,2);router.close();
+});
+
+test('overlapping monitor loops reserve a single HTTP fallback attempt per token',async()=>{
+  let calls=0,release!:()=>void;const ready=new Promise<void>(resolve=>release=resolve);
+  const router=new MarketPriceRouter({now:()=>new Date(epoch),preferStreams:true,minHttpIntervalMs:30000,
+    maxDebotPerBatch:0,maxGmgnPerBatch:0,fetcher:fetcher(async()=>{calls++;await ready;return json([pair(token())]);})});
+  const first=router.read([token()]);await router.read([token()]);assert.equal(calls,1);
+  release();await first;assert.equal(router.latest(token()).status,'available');router.close();
+});
+
+test('one healthy streamed token does not suppress fallback for a different missing holding',async()=>{
+  const requested:string[]=[];
+  const router=new MarketPriceRouter({now:()=>new Date(epoch),preferStreams:true,minHttpIntervalMs:30000,
+    maxDebotPerBatch:0,maxGmgnPerBatch:0,fetcher:fetcher(async url=>{requested.push(url.pathname);return json([pair(token(2))]);})});
+  router.ingestAvePriceFrame(ave([aveRow(token())]),iso());
+  const batch=await router.read([token(),token(2)]);assert.equal(batch.samples.length,2);
+  assert.equal(requested.length,1);assert.ok(requested[0].endsWith(token(2).address));assert.equal(requested[0].includes(token().address),false);
+  router.close();
+});
+
 test('GMGN shared cooldown does not block independent batch spot prices or DeBot fallback',async()=>{
   const calls:string[]=[],samples:MarketPriceSample[]=[];
   const router=new MarketPriceRouter({now:()=>new Date(epoch),client:{cooldownUntil:epoch+180_000,async get(){throw new Error('must not call');}},

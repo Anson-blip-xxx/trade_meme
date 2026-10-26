@@ -1,4 +1,4 @@
-import {DatabaseSync} from 'node:sqlite';
+import {DatabaseSync,type StatementSync} from 'node:sqlite';
 import {mkdirSync,chmodSync} from 'node:fs';
 import {dirname} from 'node:path';
 import bs58 from 'bs58';
@@ -35,6 +35,99 @@ export interface DebotRiskProgress {
 export interface DebotSignalListOptions {
   limit?:number;offset?:number;chain?:Chain;state?:string;asOf?:string;
 }
+const SIGNAL_STATES=['pending','dispatching','completed','failed','interrupted','ignored'] as const;
+const STATUS_DB_FACTS_TTL_MS=5_000;
+interface StatusDbFacts {
+  stored:number;pending:number;dispatched:number;ignored:number;failed:number;interrupted:number;
+  lastObservedAt?:string;detailsReceived:number;detailsFailed:number;lastAnalysisQueueDelayMs?:number;
+}
+const TOKEN_SUMMARY_COLUMNS=`chain,address,latest_observed_at,latest_observed_count,latest_seq,analysis_count,
+  display_id,display_state,display_priority,display_observed_at,display_seq,
+  review_id,review_state,review_reason,review_rank,review_observed_at,review_seq`;
+const tokenSummarySelect=(scope='')=>`SELECT ranked.chain,ranked.address,ranked.latest_observed_at,
+  (SELECT count(*) FROM debot_signals c WHERE c.chain=ranked.chain AND c.address=ranked.address
+    AND c.observed_at=ranked.latest_observed_at AND (c.reason IS NULL OR c.reason!='DEBOT_SIGNAL_STALE')) AS latest_observed_count,
+  ranked.latest_seq,ranked.analysis_count,ranked.display_id,ranked.display_state,ranked.display_priority,
+  ranked.display_observed_at,ranked.display_seq,ranked.review_id,ranked.review_state,ranked.review_reason,
+  ranked.review_rank,ranked.review_observed_at,ranked.review_seq FROM (
+    SELECT s.chain,s.address,
+      MAX(s.observed_at) OVER (PARTITION BY s.chain,s.address) AS latest_observed_at,
+      MAX(s.rowid) OVER (PARTITION BY s.chain,s.address) AS latest_seq,
+      SUM(s.analyzed) OVER (PARTITION BY s.chain,s.address) AS analysis_count,
+      FIRST_VALUE(s.id) OVER (PARTITION BY s.chain,s.address ORDER BY
+        CASE WHEN s.state='dispatching' THEN 0 WHEN s.analyzed=1 OR s.verdict IS NOT NULL THEN 1 WHEN s.state='pending' THEN 2 ELSE 3 END,
+        s.observed_at DESC,s.rowid DESC) AS display_id,
+      FIRST_VALUE(s.state) OVER (PARTITION BY s.chain,s.address ORDER BY
+        CASE WHEN s.state='dispatching' THEN 0 WHEN s.analyzed=1 OR s.verdict IS NOT NULL THEN 1 WHEN s.state='pending' THEN 2 ELSE 3 END,
+        s.observed_at DESC,s.rowid DESC) AS display_state,
+      FIRST_VALUE(CASE WHEN s.state='dispatching' THEN 0 WHEN s.analyzed=1 OR s.verdict IS NOT NULL THEN 1 WHEN s.state='pending' THEN 2 ELSE 3 END)
+        OVER (PARTITION BY s.chain,s.address ORDER BY CASE WHEN s.state='dispatching' THEN 0 WHEN s.analyzed=1 OR s.verdict IS NOT NULL THEN 1 WHEN s.state='pending' THEN 2 ELSE 3 END,
+          s.observed_at DESC,s.rowid DESC) AS display_priority,
+      FIRST_VALUE(s.observed_at) OVER (PARTITION BY s.chain,s.address ORDER BY
+        CASE WHEN s.state='dispatching' THEN 0 WHEN s.analyzed=1 OR s.verdict IS NOT NULL THEN 1 WHEN s.state='pending' THEN 2 ELSE 3 END,
+        s.observed_at DESC,s.rowid DESC) AS display_observed_at,
+      FIRST_VALUE(s.rowid) OVER (PARTITION BY s.chain,s.address ORDER BY
+        CASE WHEN s.state='dispatching' THEN 0 WHEN s.analyzed=1 OR s.verdict IS NOT NULL THEN 1 WHEN s.state='pending' THEN 2 ELSE 3 END,
+        s.observed_at DESC,s.rowid DESC) AS display_seq,
+      FIRST_VALUE(s.id) OVER (PARTITION BY s.chain,s.address ORDER BY
+        CASE WHEN s.state='dispatching' THEN 0 WHEN s.state='pending' THEN 1 ELSE 2 END,
+        s.observed_at DESC,s.rowid DESC) AS review_id,
+      FIRST_VALUE(s.state) OVER (PARTITION BY s.chain,s.address ORDER BY
+        CASE WHEN s.state='dispatching' THEN 0 WHEN s.state='pending' THEN 1 ELSE 2 END,
+        s.observed_at DESC,s.rowid DESC) AS review_state,
+      FIRST_VALUE(s.reason) OVER (PARTITION BY s.chain,s.address ORDER BY
+        CASE WHEN s.state='dispatching' THEN 0 WHEN s.state='pending' THEN 1 ELSE 2 END,
+        s.observed_at DESC,s.rowid DESC) AS review_reason,
+      FIRST_VALUE(CASE WHEN s.state='dispatching' THEN 0 WHEN s.state='pending' THEN 1 ELSE 2 END)
+        OVER (PARTITION BY s.chain,s.address ORDER BY CASE WHEN s.state='dispatching' THEN 0 WHEN s.state='pending' THEN 1 ELSE 2 END,
+          s.observed_at DESC,s.rowid DESC) AS review_rank,
+      FIRST_VALUE(s.observed_at) OVER (PARTITION BY s.chain,s.address ORDER BY
+        CASE WHEN s.state='dispatching' THEN 0 WHEN s.state='pending' THEN 1 ELSE 2 END,
+        s.observed_at DESC,s.rowid DESC) AS review_observed_at,
+      FIRST_VALUE(s.rowid) OVER (PARTITION BY s.chain,s.address ORDER BY
+        CASE WHEN s.state='dispatching' THEN 0 WHEN s.state='pending' THEN 1 ELSE 2 END,
+        s.observed_at DESC,s.rowid DESC) AS review_seq,
+      ROW_NUMBER() OVER (PARTITION BY s.chain,s.address ORDER BY
+        CASE WHEN s.state='dispatching' THEN 0 WHEN s.analyzed=1 OR s.verdict IS NOT NULL THEN 1 WHEN s.state='pending' THEN 2 ELSE 3 END,
+        s.observed_at DESC,s.rowid DESC) AS display_position
+    FROM debot_signals s WHERE (s.reason IS NULL OR s.reason!='DEBOT_SIGNAL_STALE') ${scope}
+  ) ranked WHERE display_position=1`;
+const tokenSummaryUpsert=(scope:string)=>`INSERT INTO debot_signal_tokens(${TOKEN_SUMMARY_COLUMNS}) ${tokenSummarySelect(scope)}
+  ON CONFLICT(chain,address) DO UPDATE SET latest_observed_at=excluded.latest_observed_at,latest_seq=excluded.latest_seq,
+    latest_observed_count=excluded.latest_observed_count,analysis_count=excluded.analysis_count,
+    display_id=excluded.display_id,display_state=excluded.display_state,display_priority=excluded.display_priority,
+    display_observed_at=excluded.display_observed_at,display_seq=excluded.display_seq,
+    review_id=excluded.review_id,review_state=excluded.review_state,review_reason=excluded.review_reason,
+    review_rank=excluded.review_rank,review_observed_at=excluded.review_observed_at,review_seq=excluded.review_seq`;
+const DISPLAY_WINS=`excluded.display_priority<debot_signal_tokens.display_priority OR
+  (excluded.display_priority=debot_signal_tokens.display_priority AND (excluded.display_observed_at>debot_signal_tokens.display_observed_at OR
+    (excluded.display_observed_at=debot_signal_tokens.display_observed_at AND excluded.display_seq>debot_signal_tokens.display_seq)))`;
+const REVIEW_WINS=`excluded.review_rank<debot_signal_tokens.review_rank OR
+  (excluded.review_rank=debot_signal_tokens.review_rank AND (excluded.review_observed_at>debot_signal_tokens.review_observed_at OR
+    (excluded.review_observed_at=debot_signal_tokens.review_observed_at AND excluded.review_seq>debot_signal_tokens.review_seq)))`;
+const tokenSummaryInsert=`INSERT INTO debot_signal_tokens(${TOKEN_SUMMARY_COLUMNS})
+  SELECT NEW.chain,NEW.address,NEW.observed_at,1,NEW.rowid,NEW.analyzed,
+    NEW.id,NEW.state,CASE WHEN NEW.state='dispatching' THEN 0 WHEN NEW.analyzed=1 OR NEW.verdict IS NOT NULL THEN 1 WHEN NEW.state='pending' THEN 2 ELSE 3 END,NEW.observed_at,NEW.rowid,
+    NEW.id,NEW.state,NEW.reason,CASE WHEN NEW.state='dispatching' THEN 0 WHEN NEW.state='pending' THEN 1 ELSE 2 END,NEW.observed_at,NEW.rowid
+  WHERE NEW.reason IS NULL OR NEW.reason!='DEBOT_SIGNAL_STALE'
+  ON CONFLICT(chain,address) DO UPDATE SET
+    latest_observed_count=CASE WHEN excluded.latest_observed_at>debot_signal_tokens.latest_observed_at THEN 1
+      WHEN excluded.latest_observed_at=debot_signal_tokens.latest_observed_at THEN debot_signal_tokens.latest_observed_count+1
+      ELSE debot_signal_tokens.latest_observed_count END,
+    latest_observed_at=MAX(debot_signal_tokens.latest_observed_at,excluded.latest_observed_at),
+    latest_seq=MAX(debot_signal_tokens.latest_seq,excluded.latest_seq),
+    analysis_count=debot_signal_tokens.analysis_count+excluded.analysis_count,
+    display_id=CASE WHEN ${DISPLAY_WINS} THEN excluded.display_id ELSE debot_signal_tokens.display_id END,
+    display_state=CASE WHEN ${DISPLAY_WINS} THEN excluded.display_state ELSE debot_signal_tokens.display_state END,
+    display_priority=CASE WHEN ${DISPLAY_WINS} THEN excluded.display_priority ELSE debot_signal_tokens.display_priority END,
+    display_observed_at=CASE WHEN ${DISPLAY_WINS} THEN excluded.display_observed_at ELSE debot_signal_tokens.display_observed_at END,
+    display_seq=CASE WHEN ${DISPLAY_WINS} THEN excluded.display_seq ELSE debot_signal_tokens.display_seq END,
+    review_id=CASE WHEN ${REVIEW_WINS} THEN excluded.review_id ELSE debot_signal_tokens.review_id END,
+    review_state=CASE WHEN ${REVIEW_WINS} THEN excluded.review_state ELSE debot_signal_tokens.review_state END,
+    review_reason=CASE WHEN ${REVIEW_WINS} THEN excluded.review_reason ELSE debot_signal_tokens.review_reason END,
+    review_rank=CASE WHEN ${REVIEW_WINS} THEN excluded.review_rank ELSE debot_signal_tokens.review_rank END,
+    review_observed_at=CASE WHEN ${REVIEW_WINS} THEN excluded.review_observed_at ELSE debot_signal_tokens.review_observed_at END,
+    review_seq=CASE WHEN ${REVIEW_WINS} THEN excluded.review_seq ELSE debot_signal_tokens.review_seq END`;
 const reasonCodes=(value:unknown)=>Array.isArray(value)?value.filter((v):v is string=>typeof v==='string'&&/^[A-Z][A-Z0-9_]{0,99}$/.test(v)).slice(0,24):[];
 const object=(value:unknown):value is Record<string,unknown>=>value!==null&&typeof value==='object'&&!Array.isArray(value);
 function walletAddress(value:unknown,chain:Chain):string|undefined {
@@ -73,6 +166,9 @@ export class DebotScanner {
   private readonly notifications:DebotNotificationLedger;
   private nextRiskCheckAt=0;
   private readonly performance:VendorPerformanceLedger;private vendorPerformanceError?:string;
+  private readonly pendingProbe:StatementSync;
+  private readonly pendingSelector:StatementSync;
+  private cachedStatusDbFacts?:{at:number;value:StatusDbFacts};
 
   constructor(private readonly options:DebotScannerOptions) {
     this.now=options.now??(()=>new Date());this.intervalSec=options.intervalSec??30;
@@ -116,7 +212,20 @@ export class DebotScanner {
     // First-delivery qualification is immutable. Old rows, revisions and future
     // timestamps cannot become fresh notifications after a restart or clock catch-up.
     if(!columns.has('fresh_notification'))this.db.exec('ALTER TABLE debot_signals ADD COLUMN fresh_notification INTEGER NOT NULL DEFAULT 0');
-    this.db.exec('CREATE INDEX IF NOT EXISTS debot_signals_notification ON debot_signals(notification_key)');
+    this.db.exec(`CREATE INDEX IF NOT EXISTS debot_signals_notification ON debot_signals(notification_key);
+      CREATE INDEX IF NOT EXISTS debot_signals_pending_chain ON debot_signals(chain) WHERE state='pending';
+      CREATE INDEX IF NOT EXISTS debot_signals_pending_dispatch ON debot_signals(review_priority DESC,occurred_at DESC,id,chain,address,review_after,hint_kind) WHERE state='pending';
+      CREATE INDEX IF NOT EXISTS debot_signals_dispatching_token ON debot_signals(chain,address) WHERE state='dispatching';
+      CREATE INDEX IF NOT EXISTS debot_signals_analyzed_token ON debot_signals(chain,address,dispatched_at DESC) WHERE analyzed=1;
+      CREATE INDEX IF NOT EXISTS debot_signals_token_observed ON debot_signals(chain,address,observed_at DESC);
+      CREATE INDEX IF NOT EXISTS debot_signals_dispatched_latest ON debot_signals(dispatched_at DESC) WHERE dispatched_at IS NOT NULL;`);
+    this.initializeTokenSummary();
+    const chainSlots=this.chains.map(()=>'?').join(',');
+    this.pendingProbe=this.db.prepare(`SELECT 1 FROM debot_signals INDEXED BY debot_signals_pending_chain WHERE state='pending' AND chain IN (${chainSlots}) LIMIT 1`);
+    this.pendingSelector=this.db.prepare(`SELECT * FROM debot_signals AS p INDEXED BY debot_signals_pending_dispatch WHERE state='pending' AND p.chain IN (${chainSlots}) AND (review_after IS NULL OR review_after<=?)
+      AND NOT EXISTS (SELECT 1 FROM debot_signals a WHERE a.state='dispatching' AND a.chain=p.chain AND a.address=p.address)
+      ORDER BY review_priority DESC,CASE WHEN NOT EXISTS (SELECT 1 FROM debot_signals b WHERE b.chain=p.chain AND b.address=p.address AND b.analyzed=1) THEN 0 ELSE 1 END,
+        CASE WHEN hint_kind='first' THEN 0 ELSE 1 END,occurred_at DESC,id LIMIT 1`);
     this.notifications=new DebotNotificationLedger(this.db,this.now);
     this.performance=new VendorPerformanceLedger(this.db,this.now);
     if(options.database!==':memory:')chmodSync(options.database,0o600);
@@ -134,6 +243,66 @@ export class DebotScanner {
           this.storeDisplay(String(row.id),String(row.chain),String(row.address),display);
       }catch {/* Missing historical labels cannot stop live capture. */}
     }
+  }
+
+  private initializeTokenSummary():void {
+    const current=tokenSummaryUpsert('AND s.chain=NEW.chain AND s.address=NEW.address');
+    const previous=tokenSummaryUpsert('AND s.chain=OLD.chain AND s.address=OLD.address');
+    this.db.exec(`CREATE TABLE IF NOT EXISTS debot_signal_tokens (
+        chain TEXT NOT NULL,address TEXT NOT NULL,latest_observed_at TEXT NOT NULL,latest_observed_count INTEGER NOT NULL,
+        latest_seq INTEGER NOT NULL,analysis_count INTEGER NOT NULL,
+        display_id TEXT NOT NULL,display_state TEXT NOT NULL,display_priority INTEGER NOT NULL,
+        display_observed_at TEXT NOT NULL,display_seq INTEGER NOT NULL,
+        review_id TEXT NOT NULL,review_state TEXT NOT NULL,review_reason TEXT,review_rank INTEGER NOT NULL,
+        review_observed_at TEXT NOT NULL,review_seq INTEGER NOT NULL,PRIMARY KEY(chain,address)
+      );
+      CREATE INDEX IF NOT EXISTS debot_signal_tokens_latest ON debot_signal_tokens(latest_observed_at DESC,latest_seq DESC,chain,address);
+      CREATE INDEX IF NOT EXISTS debot_signal_tokens_chain_latest ON debot_signal_tokens(chain,latest_observed_at DESC,latest_seq DESC,address);
+      CREATE INDEX IF NOT EXISTS debot_signal_tokens_state_latest ON debot_signal_tokens(display_state,latest_observed_at DESC,latest_seq DESC,chain,address);
+      CREATE INDEX IF NOT EXISTS debot_signal_tokens_chain_state_latest ON debot_signal_tokens(chain,display_state,latest_observed_at DESC,latest_seq DESC,address);
+      CREATE TABLE IF NOT EXISTS debot_scanner_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);`);
+    const columns=new Set(this.db.prepare('PRAGMA table_info(debot_signal_tokens)').all().map(row=>String(row.name)));
+    const additions:{name:string;sql:string}[]=[
+      {name:'latest_observed_count',sql:'INTEGER NOT NULL DEFAULT 1'},
+      {name:'display_priority',sql:'INTEGER NOT NULL DEFAULT 3'},
+      {name:'display_observed_at',sql:"TEXT NOT NULL DEFAULT ''"},
+      {name:'display_seq',sql:'INTEGER NOT NULL DEFAULT 0'},
+      {name:'review_rank',sql:'INTEGER NOT NULL DEFAULT 2'},
+      {name:'review_observed_at',sql:"TEXT NOT NULL DEFAULT ''"},
+      {name:'review_seq',sql:'INTEGER NOT NULL DEFAULT 0'},
+    ];
+    for(const column of additions)if(!columns.has(column.name))this.db.exec(`ALTER TABLE debot_signal_tokens ADD COLUMN ${column.name} ${column.sql}`);
+    const triggers=(guard='')=>`
+      CREATE TRIGGER ${guard}debot_signal_tokens_insert AFTER INSERT ON debot_signals BEGIN ${tokenSummaryInsert}; END;
+      CREATE TRIGGER ${guard}debot_signal_tokens_update AFTER UPDATE OF observed_at,state,reason,analyzed,verdict ON debot_signals BEGIN
+        DELETE FROM debot_signal_tokens WHERE chain=NEW.chain AND address=NEW.address AND NOT EXISTS
+          (SELECT 1 FROM debot_signals WHERE chain=NEW.chain AND address=NEW.address AND (reason IS NULL OR reason!='DEBOT_SIGNAL_STALE'));
+        ${current};
+      END;
+      CREATE TRIGGER ${guard}debot_signal_tokens_identity AFTER UPDATE OF chain,address ON debot_signals BEGIN
+        DELETE FROM debot_signal_tokens WHERE chain=OLD.chain AND address=OLD.address AND NOT EXISTS
+          (SELECT 1 FROM debot_signals WHERE chain=OLD.chain AND address=OLD.address AND (reason IS NULL OR reason!='DEBOT_SIGNAL_STALE'));
+        ${previous};${current};
+      END;
+      CREATE TRIGGER ${guard}debot_signal_tokens_delete AFTER DELETE ON debot_signals BEGIN
+        DELETE FROM debot_signal_tokens WHERE chain=OLD.chain AND address=OLD.address AND NOT EXISTS
+          (SELECT 1 FROM debot_signals WHERE chain=OLD.chain AND address=OLD.address AND (reason IS NULL OR reason!='DEBOT_SIGNAL_STALE'));
+        ${previous};
+      END;`;
+    if(this.db.prepare("SELECT 1 FROM debot_scanner_meta WHERE key='token_summary_v2'").get()){
+      this.db.exec(triggers('IF NOT EXISTS '));return;
+    }
+    this.db.exec(`DROP TRIGGER IF EXISTS debot_signal_tokens_insert;
+      DROP TRIGGER IF EXISTS debot_signal_tokens_update;
+      DROP TRIGGER IF EXISTS debot_signal_tokens_identity;
+      DROP TRIGGER IF EXISTS debot_signal_tokens_delete;${triggers()}`);
+    this.db.exec('SAVEPOINT debot_token_summary_migration');
+    try {
+      this.db.exec('DELETE FROM debot_signal_tokens');
+      this.db.exec(`INSERT INTO debot_signal_tokens(${TOKEN_SUMMARY_COLUMNS}) ${tokenSummarySelect()}`);
+      this.db.prepare("INSERT OR REPLACE INTO debot_scanner_meta(key,value) VALUES('token_summary_v2',?)").run(this.now().toISOString());
+      this.db.exec('RELEASE debot_token_summary_migration');
+    }catch(error){this.db.exec('ROLLBACK TO debot_token_summary_migration; RELEASE debot_token_summary_migration');throw error;}
   }
 
   private storeDisplay(id:string,chain:string,address:string,value:{name?:unknown;symbol?:unknown}):void {
@@ -185,13 +354,17 @@ export class DebotScanner {
     if(!Number.isInteger(limit)||limit<1||limit>50)throw new Error('DEBOT_SIGNAL_LIMIT_INVALID');
     const {now,items}=this.eventList({limit});return {now,items};
   }
-  private eventList(options:DebotSignalListOptions={}) {
+  private pageOptions(options:DebotSignalListOptions={}) {
     const limit=options.limit??20,offset=options.offset??0;
     if(!Number.isInteger(limit)||limit<1||limit>100||!Number.isInteger(offset)||offset<0||offset>1000000||
       options.chain&&!['bsc','solana','robinhood'].includes(options.chain)||
-      options.state&&!['pending','dispatching','completed','failed','interrupted','ignored'].includes(options.state)||
+      options.state&&!SIGNAL_STATES.includes(options.state as typeof SIGNAL_STATES[number])||
       options.asOf&&(!/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(options.asOf)||!Number.isFinite(Date.parse(options.asOf))||new Date(options.asOf).toISOString()!==options.asOf))
       throw new Error('INVALID_FILTER');
+    return {limit,offset};
+  }
+  private eventList(options:DebotSignalListOptions={}) {
+    const {limit,offset}=this.pageOptions(options);
     const now=this.now();
     const asOf=options.asOf??now.toISOString(),clauses=["(reason IS NULL OR reason NOT IN ('DEBOT_SIGNAL_STALE','DEBOT_DUPLICATE_TOKEN_ALERT'))",'observed_at<=?'];
     const values:(string|number)[]=[asOf];
@@ -220,29 +393,67 @@ export class DebotScanner {
   }
   /** One row per chain + CA. Display updates never replace an actual risk verdict. */
   list(options:DebotSignalListOptions={}) {
-    const {limit=20,offset=0}=options;
-    if(!Number.isInteger(limit)||limit<1||limit>100||!Number.isInteger(offset)||offset<0||offset>1000000)throw new Error('INVALID_FILTER');
-    // Reuse public filter validation without materializing any event payloads.
-    this.eventList({...options,limit:1,offset:0});
-    const now=this.now(),asOf=options.asOf??now.toISOString(),args:(string|number)[]=[asOf];
-    const chain=options.chain?'AND chain=?':'';if(options.chain)args.push(options.chain);
-    const cte=`WITH visible AS (SELECT rowid AS seq,id,chain,address,observed_at,occurred_at,state,reason,analyzed,
-      report_id,token_name,token_symbol,dispatched_at,completed_at,progress,verdict FROM debot_signals WHERE observed_at<=? ${chain}
-      AND (reason IS NULL OR reason!='DEBOT_SIGNAL_STALE')),
-      ranked AS (SELECT *,MAX(observed_at) OVER (PARTITION BY chain,address) AS latest,
-        SUM(analyzed) OVER (PARTITION BY chain,address) AS analyses,MAX(seq) OVER (PARTITION BY chain,address) AS latest_seq,
-        FIRST_VALUE(state) OVER (PARTITION BY chain,address ORDER BY
-          CASE WHEN state='dispatching' THEN 0 WHEN state='pending' THEN 1 ELSE 2 END,observed_at DESC,seq DESC) AS review_state,
-        FIRST_VALUE(reason) OVER (PARTITION BY chain,address ORDER BY
-          CASE WHEN state='dispatching' THEN 0 WHEN state='pending' THEN 1 ELSE 2 END,observed_at DESC,seq DESC) AS review_reason,
-        ROW_NUMBER() OVER (PARTITION BY chain,address ORDER BY
-          CASE WHEN state='dispatching' THEN 0 WHEN analyzed=1 OR verdict IS NOT NULL THEN 1 WHEN state='pending' THEN 2 ELSE 3 END,
-          observed_at DESC,seq DESC) AS position FROM visible)
-      `;
-    const filter=options.state?' AND state=?':'';if(options.state)args.push(options.state);
-    const total=Number(this.db.prepare(cte+`SELECT count(*) AS n FROM ranked WHERE position=1${filter}`).get(...args)!.n);
-    const rows=this.db.prepare(cte+`SELECT * FROM ranked WHERE position=1${filter} ORDER BY latest DESC,latest_seq DESC,chain,address LIMIT ? OFFSET ?`)
-      .all(...args,limit,offset);
+    const {limit,offset}=this.pageOptions(options);
+    const now=this.now(),asOf=options.asOf??now.toISOString();
+    const futureArgs:(string|number)[]=[asOf];let futureWhere='latest_observed_at>?';
+    if(options.chain){futureWhere+=' AND chain=?';futureArgs.push(options.chain);}
+    if(!this.db.prepare(`SELECT 1 FROM debot_signal_tokens WHERE ${futureWhere} LIMIT 1`).get(...futureArgs)){
+      const clauses=['t.latest_observed_at<=?'],args:(string|number)[]=[asOf];
+      if(options.chain){clauses.push('t.chain=?');args.push(options.chain);}
+      if(options.state){clauses.push('t.display_state=?');args.push(options.state);}
+      const where=clauses.join(' AND ');
+      const total=Number(this.db.prepare(`SELECT count(*) AS n FROM debot_signal_tokens t WHERE ${where}`).get(...args)!.n);
+      const rows=this.db.prepare(`SELECT s.*,t.latest_observed_at AS latest,t.latest_seq,t.analysis_count AS analyses,
+        t.review_state,t.review_reason FROM debot_signal_tokens t JOIN debot_signals s ON s.id=t.display_id
+        WHERE ${where} ORDER BY t.latest_observed_at DESC,t.latest_seq DESC,t.chain,t.address LIMIT ? OFFSET ?`)
+        .all(...args,limit,offset);
+      return this.projectTokenPage(rows,total,limit,offset,asOf,now);
+    }
+    // Only tokens changed after a pinned anchor need reconstruction. The rest
+    // stay on the materialized summary, so one new push cannot re-window the inbox.
+    const affectedChain=options.chain?' AND chain=?':'',summaryChain=options.chain?' AND t.chain=?':'';
+    const args:(string|number)[]=[asOf,...(options.chain?[options.chain]:[]),asOf,asOf,...(options.chain?[options.chain]:[])];
+    const cte=`WITH affected AS MATERIALIZED (
+        SELECT chain,address FROM debot_signal_tokens WHERE latest_observed_at>?${affectedChain}
+      ), historical AS (
+        SELECT s.chain,s.address,
+          MAX(s.observed_at) OVER (PARTITION BY s.chain,s.address) AS latest,
+          MAX(s.rowid) OVER (PARTITION BY s.chain,s.address) AS latest_seq,
+          SUM(s.analyzed) OVER (PARTITION BY s.chain,s.address) AS analyses,
+          FIRST_VALUE(s.id) OVER (PARTITION BY s.chain,s.address ORDER BY
+            CASE WHEN s.state='dispatching' THEN 0 WHEN s.analyzed=1 OR s.verdict IS NOT NULL THEN 1 WHEN s.state='pending' THEN 2 ELSE 3 END,
+            s.observed_at DESC,s.rowid DESC) AS display_id,
+          FIRST_VALUE(s.state) OVER (PARTITION BY s.chain,s.address ORDER BY
+            CASE WHEN s.state='dispatching' THEN 0 WHEN s.analyzed=1 OR s.verdict IS NOT NULL THEN 1 WHEN s.state='pending' THEN 2 ELSE 3 END,
+            s.observed_at DESC,s.rowid DESC) AS display_state,
+          FIRST_VALUE(s.state) OVER (PARTITION BY s.chain,s.address ORDER BY
+            CASE WHEN s.state='dispatching' THEN 0 WHEN s.state='pending' THEN 1 ELSE 2 END,
+            s.observed_at DESC,s.rowid DESC) AS review_state,
+          FIRST_VALUE(s.reason) OVER (PARTITION BY s.chain,s.address ORDER BY
+            CASE WHEN s.state='dispatching' THEN 0 WHEN s.state='pending' THEN 1 ELSE 2 END,
+            s.observed_at DESC,s.rowid DESC) AS review_reason,
+          ROW_NUMBER() OVER (PARTITION BY s.chain,s.address ORDER BY
+            CASE WHEN s.state='dispatching' THEN 0 WHEN s.analyzed=1 OR s.verdict IS NOT NULL THEN 1 WHEN s.state='pending' THEN 2 ELSE 3 END,
+            s.observed_at DESC,s.rowid DESC) AS position
+        FROM affected a JOIN debot_signals AS s INDEXED BY debot_signals_token_observed
+          ON s.chain=a.chain AND s.address=a.address
+        WHERE s.observed_at<=? AND (s.reason IS NULL OR s.reason!='DEBOT_SIGNAL_STALE')
+      ), tokens AS (
+        SELECT t.chain,t.address,t.latest_observed_at AS latest,t.latest_seq,t.analysis_count AS analyses,
+          t.display_id,t.display_state,t.review_state,t.review_reason
+        FROM debot_signal_tokens t WHERE t.latest_observed_at<=?${summaryChain}
+        UNION ALL
+        SELECT chain,address,latest,latest_seq,analyses,display_id,display_state,review_state,review_reason
+        FROM historical WHERE position=1
+      ) `;
+    const filter=options.state?' WHERE display_state=?':'';if(options.state)args.push(options.state);
+    const total=Number(this.db.prepare(cte+`SELECT count(*) AS n FROM tokens${filter}`).get(...args)!.n);
+    const rows=this.db.prepare(cte+`SELECT s.*,t.latest,t.latest_seq,t.analyses,t.review_state,t.review_reason
+      FROM tokens t JOIN debot_signals s ON s.id=t.display_id${filter}
+      ORDER BY t.latest DESC,t.latest_seq DESC,t.chain,t.address LIMIT ? OFFSET ?`).all(...args,limit,offset);
+    return this.projectTokenPage(rows,total,limit,offset,asOf,now);
+  }
+  private projectTokenPage(rows:Record<string,any>[],total:number,limit:number,offset:number,asOf:string,now:Date) {
     return {now:now.toISOString(),asOf,total,limit,offset,hasMore:offset+rows.length<total,items:rows.map(row=>({
       ...this.project(row,now),aggregation:{...this.notificationSummary(row.chain as Chain,String(row.address)),
         analysisCount:Number(row.analyses),reviewState:row.review_state,reviewReason:row.review_reason??undefined}}))};
@@ -259,22 +470,31 @@ export class DebotScanner {
   }
   private dispatchIntervalMs():number {return this.options.mode==='authenticated_stream'?0:60_000;}
   private maxAgeSec():number {return this.options.mode==='authenticated_stream'?Math.min(120,this.options.maxAgeSec):this.options.maxAgeSec;}
+  private invalidateStatusDbFacts():void {this.cachedStatusDbFacts=undefined;}
+  private statusDbFacts(nowMs:number):StatusDbFacts {
+    const cached=this.cachedStatusDbFacts;
+    if(cached&&nowMs>=cached.at&&nowMs-cached.at<STATUS_DB_FACTS_TTL_MS)return cached.value;
+    const row=this.db.prepare(`SELECT count(*) AS stored,
+      SUM(state='pending') AS pending,SUM(state='dispatching') AS dispatching,SUM(state='completed') AS completed,
+      SUM(state='ignored') AS ignored,SUM(state='failed') AS failed,SUM(state='interrupted') AS interrupted,
+      MAX(observed_at) AS latest,count(details) AS details_received,count(details_error) AS details_failed
+      FROM debot_signals`).get()!;
+    const latestDispatch=this.db.prepare(`SELECT observed_at,dispatched_at FROM debot_signals
+      WHERE dispatched_at IS NOT NULL ORDER BY dispatched_at DESC LIMIT 1`).get() as {observed_at:string;dispatched_at:string}|undefined;
+    const value:StatusDbFacts={stored:Number(row.stored),pending:Number(row.pending??0)+Number(row.dispatching??0),
+      dispatched:Number(row.completed??0),ignored:Number(row.ignored??0),failed:Number(row.failed??0),interrupted:Number(row.interrupted??0),
+      lastObservedAt:typeof row.latest==='string'?row.latest:undefined,detailsReceived:Number(row.details_received),detailsFailed:Number(row.details_failed),
+      lastAnalysisQueueDelayMs:latestDispatch?Math.max(0,Date.parse(latestDispatch.dispatched_at)-Date.parse(latestDispatch.observed_at)):undefined};
+    this.cachedStatusDbFacts={at:nowMs,value};return value;
+  }
 
   getStatus() {
-    const rows=this.db.prepare('SELECT state,count(*) AS n FROM debot_signals GROUP BY state').all() as {state:string;n:number}[];
-    const counts=Object.fromEntries(rows.map(row=>[row.state,Number(row.n)]));
-    const latest=this.db.prepare('SELECT max(observed_at) AS at FROM debot_signals').get() as {at:string|null};
-    const detailStats=this.db.prepare('SELECT count(details) AS received,count(details_error) AS failed FROM debot_signals').get() as {received:number;failed:number};
-    const latestDispatch=this.db.prepare('SELECT observed_at,dispatched_at FROM debot_signals WHERE dispatched_at IS NOT NULL ORDER BY dispatched_at DESC LIMIT 1').get() as {observed_at:string;dispatched_at:string}|undefined;
+    const nowMs=this.now().getTime(),facts=this.statusDbFacts(nowMs);
     return {enabled:true,running:this.running,inFlight:!!this.collecting||!!this.dispatching,mode:this.options.mode??'anonymous_poll',
       maxBytes:this.maxBytes,dbBytes:Number(this.db.prepare('PRAGMA page_count').get()!.page_count)*this.pageSize,
-      intervalSec:this.intervalSec,stored:rows.reduce((n,r)=>n+Number(r.n),0),pending:(counts.pending??0)+(counts.dispatching??0),
-      dispatched:counts.completed??0,ignored:counts.ignored??0,failed:counts.failed??0,interrupted:counts.interrupted??0,
-      lastObservedAt:latest.at??undefined,lastCycle:this.lastCycle?structuredClone(this.lastCycle):undefined,
+      intervalSec:this.intervalSec,...facts,lastCycle:this.lastCycle?structuredClone(this.lastCycle):undefined,
       lastError:this.lastError,deferredReason:this.deferredReason,vendorPerformanceError:this.vendorPerformanceError,
-      detailsReceived:Number(detailStats.received),detailsFailed:Number(detailStats.failed),
-      lastAnalysisQueueDelayMs:latestDispatch?Math.max(0,Date.parse(latestDispatch.dispatched_at)-Date.parse(latestDispatch.observed_at)):undefined,
-      cooldownUntil:this.cooldownUntil>this.now().getTime()?new Date(this.cooldownUntil).toISOString():undefined};
+      cooldownUntil:this.cooldownUntil>nowMs?new Date(this.cooldownUntil).toISOString():undefined};
   }
 
   start():void {
@@ -288,7 +508,7 @@ export class DebotScanner {
   acceptPage(page:Page):void {
     if(this.stopped||this.closed)return;
     if(page.reason&&page.reason!=='DEBOT_SIGNAL_RECORDS_REJECTED')throw new Error('DEBOT_SIGNAL_RESPONSE_INVALID');
-    try {for(const observation of page.observations)this.record(observation);}
+    try {for(const observation of [...page.observations].sort((a,b)=>a.signal.occurredAt.localeCompare(b.signal.occurredAt)||a.id.localeCompare(b.id)))this.record(observation);}
     catch(error){this.lastError=persistReason(error);throw new Error(this.lastError);}
     finally {if(this.running)void this.dispatchOnce();}
   }
@@ -390,8 +610,9 @@ export class DebotScanner {
     const cycle:Cycle={startedAt:at,completedAt:at,requests:0,received:0,added:0,errors:0,reasons:[],diagnostics:[]};
     this.lastError=undefined;
     // Thirty-day retention, 10k events, and the configured SQLite page ceiling.
-    this.db.prepare("DELETE FROM debot_signals WHERE state NOT IN ('pending','dispatching') AND observed_at<?")
+    const pruned=this.db.prepare("DELETE FROM debot_signals WHERE state NOT IN ('pending','dispatching') AND observed_at<?")
       .run(new Date(this.now().getTime()-30*86400_000).toISOString());
+    if(pruned.changes)this.invalidateStatusDbFacts();
     this.expire();
     const offset=this.cursor++%this.chains.length;
     for(let i=0;i<this.chains.length&&!this.interrupted(generation);i++) {
@@ -407,7 +628,7 @@ export class DebotScanner {
           cycle.diagnostics.push({chain,status:'invalid_response',received:page.received,reason:page.reason});
           if(page.reason!=='DEBOT_SIGNAL_RECORDS_REJECTED')continue;
         }
-        for(const observation of page.observations)cycle.added+=this.record(observation);
+        for(const observation of [...page.observations].sort((a,b)=>a.signal.occurredAt.localeCompare(b.signal.occurredAt)||a.id.localeCompare(b.id)))cycle.added+=this.record(observation);
         if(!page.reason)cycle.diagnostics.push({chain,status:'ok',received:page.received});
       } catch(error) {
         const reason=error instanceof DebotSignalError?error.reason:
@@ -425,9 +646,10 @@ export class DebotScanner {
   }
 
   private record(observation:DebotSignalObservation):number {
+    if(!this.chains.includes(observation.signal.token.chain))return 0;
     this.db.exec('SAVEPOINT debot_inbox_record');
     let result:number;
-    try {result=this.recordAtomic(observation);this.db.exec('RELEASE debot_inbox_record');}
+    try {result=this.recordAtomic(observation);this.db.exec('RELEASE debot_inbox_record');this.invalidateStatusDbFacts();}
     catch(error){
       // SQLITE_FULL may already have rolled back the savepoint. Keep its capacity reason.
       try{this.db.exec('ROLLBACK TO debot_inbox_record; RELEASE debot_inbox_record');}catch{/* Already rolled back. */}
@@ -529,7 +751,8 @@ export class DebotScanner {
     const expiry=`state='pending' AND (observed_at<? OR (occurred_at<? AND NOT EXISTS
       (SELECT 1 FROM debot_signals prior WHERE prior.chain=debot_signals.chain AND prior.address=debot_signals.address AND prior.analyzed=1)))`;
     const expired=this.db.prepare(`SELECT notification_key FROM debot_signals WHERE ${expiry}`).all(cutoff,cutoff);
-    this.db.prepare(`UPDATE debot_signals SET state='ignored',reason='DEBOT_SIGNAL_STALE' WHERE ${expiry}`).run(cutoff,cutoff);
+    const changed=this.db.prepare(`UPDATE debot_signals SET state='ignored',reason='DEBOT_SIGNAL_STALE' WHERE ${expiry}`).run(cutoff,cutoff);
+    if(changed.changes)this.invalidateStatusDbFacts();
     for(const row of expired)if(row.notification_key)this.notifications.mark(String(row.notification_key),{classification:'stale',reasons:['DEBOT_SIGNAL_STALE']});
   }
 
@@ -557,7 +780,12 @@ export class DebotScanner {
 
   private async dispatch(generation:number):Promise<boolean> {
     if(this.interrupted(generation))return false;
-    this.expire();this.deferredReason=undefined;
+    this.deferredReason=undefined;
+    // The stream loop is normally idle. This indexed probe avoids expiry,
+    // promotion and correlated queue queries when no subscribed chain has work.
+    if(!this.pendingProbe.get(...this.chains))return false;
+    this.expire();
+    if(!this.pendingProbe.get(...this.chains))return false;
     if(this.nextDispatchAt>this.now().getTime())return false;
     this.deferredReason=this.options.shouldDefer?.();
     if(this.deferredReason)return false;
@@ -569,11 +797,7 @@ export class DebotScanner {
         this.repeatCheck(JSON.parse(String(row.payload)),previous)});
       if(result.reason)this.lastError=result.reason;
     }
-    const row=this.db.prepare(`SELECT * FROM debot_signals p WHERE state='pending' AND (review_after IS NULL OR review_after<=?)
-      AND NOT EXISTS (SELECT 1 FROM debot_signals a WHERE a.state='dispatching' AND a.chain=p.chain AND a.address=p.address)
-      ORDER BY review_priority DESC,CASE WHEN NOT EXISTS (SELECT 1 FROM debot_signals b WHERE b.chain=p.chain AND b.address=p.address AND b.analyzed=1) THEN 0 ELSE 1 END,
-        CASE WHEN hint_kind='first' THEN 0 ELSE 1 END,occurred_at DESC,id LIMIT 1`)
-      .get(this.now().toISOString()) as Record<string,any>|undefined;
+    const row=this.pendingSelector.get(...this.chains,this.now().toISOString()) as Record<string,any>|undefined;
     if(!row)return false;
     const observation=JSON.parse(row.payload) as DebotSignalObservation;
     const previous=this.db.prepare('SELECT * FROM debot_signals WHERE chain=? AND address=? AND analyzed=1 ORDER BY dispatched_at DESC,rowid DESC LIMIT 1')
@@ -582,7 +806,8 @@ export class DebotScanner {
       if(row.notification_key)this.notifications.mark(row.notification_key,{classification,reasons,evidence});
     };
     const ignore=(reason:string,classification:string,evidence?:unknown,reasons=[reason])=>{
-      this.db.prepare("UPDATE debot_signals SET state='ignored',reason=? WHERE id=?").run(reason,row.id);mark(classification,reasons,evidence);
+      this.db.prepare("UPDATE debot_signals SET state='ignored',reason=? WHERE id=?").run(reason,row.id);
+      this.invalidateStatusDbFacts();mark(classification,reasons,evidence);
     };
     let incremental=previous?this.repeatCheck(observation,previous):undefined;
     let freshNotification=!!previous&&this.freshNotification(row,previous);
@@ -602,11 +827,12 @@ export class DebotScanner {
     const changed=this.db.prepare("UPDATE debot_signals SET state='dispatching',dispatched_at=?,reason=NULL WHERE id=? AND state='pending'")
       .run(at,row.id);
     if(!changed.changes)return false;
+    this.invalidateStatusDbFacts();
     this.nextDispatchAt=this.now().getTime()+this.dispatchIntervalMs();
     const fetched:DebotWalletDetails[]=[];
     let detailsFailed=0;
     const detailsReady=(async()=>{
-      if(this.options.fetchDetails){
+      try {if(this.options.fetchDetails){
         try {
           this.db.prepare('UPDATE debot_signals SET probed_at=? WHERE id=?').run(this.now().toISOString(),row.id);
           const merged:DebotSignalObservation[]=row.merged_payloads?JSON.parse(row.merged_payloads):[];
@@ -622,7 +848,7 @@ export class DebotScanner {
           if(details)this.db.prepare('UPDATE debot_signals SET details=?,details_error=? WHERE id=?')
             .run(JSON.stringify(details),detailsFailed?'DEBOT_DETAILS_PARTIAL':details.reason??null,row.id);
         }catch {detailsFailed++;this.db.prepare("UPDATE debot_signals SET details_error='DEBOT_DETAILS_UNAVAILABLE' WHERE id=?").run(row.id);}
-      }
+      }}finally{this.invalidateStatusDbFacts();}
     })();
     try {
       if(!this.options.parallelDetails||previous&&!incremental?.material)await detailsReady;
@@ -685,7 +911,7 @@ export class DebotScanner {
         .run(this.now().toISOString(),row.id);
       mark('failed',['DEBOT_SIGNAL_DISPATCH_FAILED']);
       this.lastError='DEBOT_SIGNAL_DISPATCH_FAILED';
-    }finally{await detailsReady;}
+    }finally{await detailsReady;this.invalidateStatusDbFacts();}
     return true;
   }
 }

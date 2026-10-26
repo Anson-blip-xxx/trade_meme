@@ -84,6 +84,8 @@ export class WalletSetupLedger {
         closed_at TEXT,review_withdrawn INTEGER NOT NULL DEFAULT 0,data TEXT NOT NULL,evidence TEXT NOT NULL DEFAULT '[]');
       CREATE INDEX IF NOT EXISTS wsl_due ON wsl_setups(closed_at,last_checked_at,registered_at,id);
       CREATE INDEX IF NOT EXISTS wsl_token ON wsl_setups(chain,address,registered_at DESC);
+      CREATE INDEX IF NOT EXISTS wsl_status_counts ON wsl_setups(closed_at,review_withdrawn);
+      CREATE INDEX IF NOT EXISTS wsl_status_state ON wsl_setups(state);
       CREATE TABLE IF NOT EXISTS wsl_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);`);
     if(!this.db.prepare('PRAGMA table_info(wsl_setups)').all().some(row=>row.name==='check_seq'))this.db.exec('ALTER TABLE wsl_setups ADD COLUMN check_seq INTEGER NOT NULL DEFAULT 0');
     const pageSize=Number(this.db.prepare('PRAGMA page_size').get()!.page_size);

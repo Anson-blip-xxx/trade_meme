@@ -9,6 +9,7 @@ import {dashboardOrders} from '../src/dashboard-data.js';
 import {ExitShadow} from '../src/exit-shadow.js';
 import {readConfig} from '../src/config.js';
 import {createRuntime} from '../src/runtime.js';
+import {assessEntryHolderRiskValues} from '../src/entry-holder-risk.js';
 
 test('order dashboard pages retain all rows and filter by chain without exposing provider details',()=>{
   const store=new OrderStore(':memory:');
@@ -24,6 +25,27 @@ test('order dashboard pages retain all rows and filter by chain without exposing
     assert.equal(bsc.total,22);assert.equal(bsc.items.length,2);assert.ok(bsc.items.every(row=>row.chain==='bsc'));
     assert.doesNotMatch(JSON.stringify(first),/secret-marker|private-wallet|privateProviderPayload/);
     assert.equal(store.list(100).length,45);
+  }finally{store.close();}
+});
+
+test('order pages project exact holder-risk evidence and token display without leaking raw provider rows',()=>{
+  const store=new OrderStore(':memory:'),mint='So11111111111111111111111111111111111111112',at=new Date('2026-10-25T00:00:00Z');
+  const risk=assessEntryHolderRiskValues({provider:'gmgn',chain:'solana',address:mint,checkedAt:at.toISOString(),values:{
+    top10:{value:'0.26',sourceField:'security.top_10_holder_rate'},
+    bundler:{value:'0.41',sourceField:'holders.bundler.holding_ratio',coverage:'complete'},
+    ratTrader:{value:undefined,sourceField:'holders.rat_trader.holding_ratio',coverage:'lower_bound',lowerBound:'0.1'},
+  }},at);
+  try {
+    const result=store.reserve({eventKey:'holder-risk',chain:'solana',tokenAddress:mint,mode:'live',wallet:'private-wallet',inputToken:mint,
+      inputAmount:'30000000',slippagePct:1,details:{token:{chain:'solana',address:mint,name:'风险测试币',symbol:'RISK',secret:'private-token-data'},
+        entryHolderRisk:{...risk,raw:'private-vendor-data',metrics:{...risk.metrics,top10:{...risk.metrics.top10,wallets:['private-wallet-data']}}}}},5,at);
+    store.update(result.order!.id,['prepared'],{status:'failed',failureReason:'ENTRY_HOLDER_RISK_TOP10_EXCEEDED'},at);
+    const page=dashboardOrders(store,{limit:20}),item=page.items[0];
+    assert.equal(item.entryHolderRiskBlocked,true);assert.deepEqual(item.entryHolderRisk,risk);assert.equal(item.name,'风险测试币');
+    assert.equal(item.entryHolderRisk!.metrics.ratTrader.status,'missing');assert.equal(item.entryHolderRisk!.metrics.ratTrader.lowerBoundPercentageText,'10');
+    assert.doesNotMatch(JSON.stringify(page),/private-|wallets|secret/);
+    store.update(result.order!.id,['failed'],{details:{entryHolderRisk:{...risk,address:'11111111111111111111111111111111'}}},at);
+    assert.equal(dashboardOrders(store,{limit:20}).items[0].entryHolderRisk,undefined);
   }finally{store.close();}
 });
 

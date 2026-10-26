@@ -43,7 +43,7 @@ function setup(t: {after: (fn: () => void) => void}, options: {
   walletEvidence?:(report:Report,now:Date)=>Check;
 } = {}) {
   const apiKey = `entry-test-${randomUUID()}`;
-  const config: Config = {...readConfig({}), entryMode: options.mode ?? 'paper',
+  const config: Config = {...readConfig({}), entryBalanceBps: {}, entryMode: options.mode ?? 'paper',
     gmgnApiKey: apiKey, gmgnPrivateKey: pem, gmgnMinIntervalMs: 0,
     entryWallets: {bsc: wallet}, entryAmounts: {bsc: '1000000000000000'}, entryInputTokens: {bsc: inputToken},
     ...options.config};

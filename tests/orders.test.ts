@@ -14,7 +14,7 @@ const input=(key='event-1')=>({eventKey:key,chain:'bsc' as const,tokenAddress:to
   wallet:'0x'+'2'.repeat(40),inputToken:'0x'+'0'.repeat(40),inputAmount:'100000000000000000000',slippagePct:5,
   details:{reasonCodes:['SYNTHETIC_TEST_ONLY']}});
 
-test('订单数据库仅有开单表，重启幂等和同币/持仓上限跨连接原子生效',()=>{
+test('订单数据库仅有开单及永久防重表，重启幂等和同币/持仓上限跨连接原子生效',()=>{
   const dir=mkdtempSync(join(tmpdir(),'meme-orders-')),path=join(dir,'orders.sqlite');
   const a=new OrderStore(path),b=new OrderStore(path);
   try {
@@ -26,7 +26,7 @@ test('订单数据库仅有开单表，重启幂等和同币/持仓上限跨连�
     assert.equal(first.order?.inputAmount,'100000000000000000000');
     const db=new DatabaseSync(path,{readOnly:true});
     const tables=db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map(row=>row.name);
-    assert.deepEqual(tables,['opening_orders']);db.close();
+    assert.deepEqual(tables,['opening_orders','opening_identity_claims']);db.close();
     assert.equal(statSync(path).mode&0o777,0o600);
   } finally {a.close();b.close();rmSync(dir,{recursive:true,force:true});}
 });

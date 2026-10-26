@@ -1,6 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {once} from 'node:events';
+import {mkdtempSync,rmSync} from 'node:fs';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+import {DatabaseSync} from 'node:sqlite';
 import {decide,evaluate,effectiveReport,mergeWalletSupport} from '../src/engine.js';
 import {compactWalletScreening} from '../src/wallet-screening-summary.js';
 import {ScanArchive} from '../src/scan-archive.js';
@@ -99,4 +103,21 @@ test('ledger dashboard is authenticated, read only, bound to token filters and r
     const empty=await (await fetch(base+'?chain=robinhood&address='+signal().token.address,{headers})).json() as {items:unknown[]};assert.equal(empty.items.length,0);
     assert.equal((await fetch(base+'/status',{headers})).status,200);
   }finally{server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));ledger.close();archive.close();}
+});
+
+test('ledger status aggregates stay on compact covering indexes',()=>{
+  const directory=mkdtempSync(join(tmpdir(),'wallet-setup-status-')),database=join(directory,'ledger.sqlite');
+  const ledger=new WalletSetupLedger(database,{now:()=>now});
+  try {
+    ledger.record(screening());assert.equal(ledger.status().records,1);ledger.close();
+    const db=new DatabaseSync(database,{readOnly:true});try {
+      const totals=db.prepare(`EXPLAIN QUERY PLAN SELECT count(*) AS records,sum(closed_at IS NULL) AS pending,
+        sum(review_withdrawn) AS withdrawn FROM wsl_setups`).all().map(row=>String(row.detail)).join(' ');
+      const states=db.prepare('EXPLAIN QUERY PLAN SELECT state,count(*) AS n FROM wsl_setups GROUP BY state')
+        .all().map(row=>String(row.detail)).join(' ');
+      assert.match(totals,/USING COVERING INDEX wsl_status_counts/);
+      assert.match(states,/USING COVERING INDEX wsl_status_state/);
+      assert.doesNotMatch(states,/USE TEMP B-TREE/);
+    }finally{db.close();}
+  }finally{try{ledger.close();}catch{}rmSync(directory,{recursive:true,force:true});}
 });

@@ -28,7 +28,7 @@ const candidate=(source:Signal['source']='debot',event='new-notification'):Repor
   validUntil:new Date(now.getTime()+60_000).toISOString(),decision:'BUY_CANDIDATE',buyEligible:true,executionEnabled:false,reasons:[],
   provenance:{...pass(),platform:'flap'},safety:pass(),flow:pass(),narrative:narrative()});
 function fixture(mode:Config['entryMode']='paper') {
-  const config:Config={...readConfig({}),entryMode:mode,entrySizing:'fixed',gmgnApiKey:'synthetic-repeat-key',gmgnMinIntervalMs:0,
+  const config:Config={...readConfig({}),entryBalanceBps:{},entryMode:mode,entrySizing:'fixed',gmgnApiKey:'synthetic-repeat-key',gmgnMinIntervalMs:0,
     entryWallets:{bsc:wallet},entryAmounts:{bsc:'1000'},entryInputTokens:{bsc:spend},entrySlippagePct:5,entryMaxOpen:10};
   let requests=0;
   const client=new GmgnClient({apiKey:config.gmgnApiKey!,minIntervalMs:0,now:()=>now.getTime(),fetcher:async()=>{

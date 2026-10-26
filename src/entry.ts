@@ -5,7 +5,9 @@ import {OrderStore, type OpeningOrder, type OpeningStatus,type ExitTracking,type
 import {parseSignal,narrativeIdentityConflict, type Check, type Report, type Chain} from './types.js';
 import {GmgnClient, GmgnError} from './providers/gmgn-client.js';
 import {buildExitConditions,parseExitPolicy} from './exit-policy.js';
-import {assessExitStrategy} from './exit-tracking.js';
+import {assessExitStrategy,assessObservedExitStrategy,validThirdSignalFill,type ThirdSignalFill,type ExitAssessment,type ObservedExitExpectation} from './exit-tracking.js';
+import {ControlledSolanaReader} from './controlled-test/solana.js';
+import {rpc} from './http.js';
 import {readPositionBalance} from './position-balance.js';
 import {readNativeBalance,nativeBalanceCoversOrder,NATIVE_INPUT_TOKENS} from './native-balance.js';
 import {compactWalletScreening} from './wallet-screening-summary.js';
@@ -168,6 +170,7 @@ export class EntryController {
   }
 
   private checkEligibility(report:Report):string|undefined {
+    if(!this.config.scannerChains.includes(report.signal.token.chain))return 'SIGNAL_CHAIN_DISABLED';
     const now=this.now(),ineligible=eligibility(report,this.config,now);if(ineligible)return ineligible;
     if(!this.walletEvidence)return report.flow?.reasons.includes('PROFILED_WALLET_SETUP_SUPPORTED')?'ENTRY_WALLET_EVIDENCE_UNAVAILABLE':undefined;
     let check:Check;
@@ -197,6 +200,7 @@ export class EntryController {
     let report: Report;
     try { report = structuredClone(input); report.signal = parseSignal(report.signal); }
     catch { return {status: 'blocked', reason: 'ENTRY_REPORT_INVALID'}; }
+    if(!this.config.scannerChains.includes(report.signal.token.chain))return {status:'skipped',reason:'SIGNAL_CHAIN_DISABLED'};
     if(report.signal.source==='wallet')return {status:'blocked',reason:'ENTRY_WALLET_STREAM_RESEARCH_ONLY'};
     let ineligible: string | undefined;
     try { ineligible = this.checkEligibility(report); }
@@ -245,7 +249,7 @@ export class EntryController {
       // Fraction sizing is computed atomically in reserve; this placeholder is never quoted.
       inputAmount: balanceBps===undefined?amount!:'0',
       slippagePct: this.config.entrySlippagePct, details,...(exit?{exit}:{})}, this.config.entryMaxOpen, this.now(),funding,
-      {preventReentry:report.signal.source==='debot',balanceBps});
+      {preventReentry:report.signal.source==='debot',balanceBps,...(balanceBps===undefined?{}:{balanceBasis:'total' as const})});
     if (!reservation.created) return reservation.order ? {status: 'existing', order: reservation.order} :
       {status: 'blocked', reason: reservation.reason};
     let order = reservation.order!;
@@ -310,15 +314,22 @@ export class EntryController {
     if (!order.providerOrderId) return {status: 'blocked', reason: 'ENTRY_ORDER_ID_MISSING_NO_RESUBMIT', order};
     try {
       let updated=order;
-      if(ACTIVE.includes(order.status)||needsFillDetails||order.exit&&!order.exit.strategyOrderId) {
+      const third=order.chain==='solana'&&order.details.executionStrategy==='third_signal_v1';
+      const needsThirdFill=third&&!this.thirdSignalFill(order);
+      if(ACTIVE.includes(order.status)||needsFillDetails||order.exit&&!order.exit.strategyOrderId||needsThirdFill) {
         const raw = await this.signedRequest('GET', '/v1/trade/query_order',
           {chain: chainName(order.chain), order_id: order.providerOrderId}, null, this.signingKey());
         updated=this.applyExecution(order,raw);
+        if(third&&updated.status==='confirmed'&&!this.thirdSignalFill(updated))updated=await this.captureThirdSignalFill(updated,raw);
       }
       if(updated.status==='confirmed'&&updated.exit&&!updated.exit.positionClosed) updated=await this.reconcileExit(updated);
       return {status: 'existing', order: updated};
     } catch (error) {
       // A failed read is not evidence that a previously accepted order failed.
+      // It does withdraw an older provider observation before another third-signal entry.
+      const current=this.orders.get(id);
+      if(current?.details.executionStrategy==='third_signal_v1'&&current.exit&&!current.exit.positionClosed)
+        this.orders.updateExit(id,current.exit,{...current.exit,state:'unverified',reasons:[reason(error)],checkedAt:this.now().toISOString()},this.now());
       return {status: 'blocked', reason: reason(error), order: this.orders.get(id)};
     }
   }
@@ -372,7 +383,103 @@ export class EntryController {
     return {...balance,balance:balance.amount,feeReserve:this.config.entryFeeReserves[chain],coveredOrderIds};
   }
 
+  private thirdSignalFill(order:OpeningOrder):ThirdSignalFill|undefined {
+    const fill=order.details.thirdSignalFill;
+    return validThirdSignalFill(fill,{chain:order.chain,wallet:order.wallet,tokenAddress:order.tokenAddress,inputToken:order.inputToken,
+      openingTransactionHash:order.transactionHash},this.now())&&fill.inputAmount===order.actualInputAmount&&fill.outputAmount===order.outputAmount?fill:undefined;
+  }
+
+  private async captureThirdSignalFill(order:OpeningOrder,raw:unknown):Promise<OpeningOrder> {
+    if(order.chain!=='solana'||!order.transactionHash||!order.actualInputAmount||!order.outputAmount||!this.config.rpc.solana||
+      !object(raw)||raw.order_id!==order.providerOrderId||raw.hash!==order.transactionHash||!object(raw.report)||
+      !(raw.status==='confirmed'&&(raw.state===undefined||raw.state===30)||raw.status==='successful'&&raw.state===30))
+      throw new EntryError('EXIT_FILL_REPORT_UNVERIFIED');
+    const report=raw.report;
+    if(report.input_token!==order.inputToken||report.output_token!==order.tokenAddress||report.input_amount!==order.actualInputAmount||
+      report.output_amount!==order.outputAmount)throw new EntryError('EXIT_FILL_REPORT_UNVERIFIED');
+    const fee=object(order.details.funding)?order.details.funding.feeReserve:undefined;
+    if(typeof fee!=='string'||!/^\d{1,20}$/.test(fee))throw new EntryError('EXIT_FILL_FUNDING_UNVERIFIED');
+    const fact=await new ControlledSolanaReader(this.config.rpc.solana,{fetcher:this.fetcher}).verifyTransaction({
+      signature:order.transactionHash,wallet:order.wallet,mint:order.tokenAddress,side:'buy',expectedTokenAmount:order.outputAmount,
+      maxNativeDebitLamports:(BigInt(order.inputAmount)+BigInt(fee)).toString()});
+    for(const [key,expected] of Object.entries({input_token_decimals:9,output_token_decimals:fact.decimals,
+      quote_token:order.inputToken,quote_decimals:9,quote_amount:order.actualInputAmount,base_token:order.tokenAddress,
+      base_decimals:fact.decimals,base_amount:order.outputAmount,height:fact.slot,swap_mode:'ExactIn'}))
+      if(Object.hasOwn(report,key)&&report[key]!==expected)throw new EntryError('EXIT_FILL_REPORT_CONFLICT');
+    const blockTime=await rpc(this.config.rpc.solana,'getBlockTime',[fact.slot],this.fetcher);
+    if(typeof blockTime!=='number'||!Number.isSafeInteger(blockTime)||blockTime<1_000_000_000||
+      blockTime*1000>this.now().getTime()+5000||blockTime*1000<Date.parse(order.createdAt)-120000)
+      throw new EntryError('EXIT_FILL_TIME_UNVERIFIED');
+    const fill:ThirdSignalFill={source:'solana_finalized',transactionHash:order.transactionHash,wallet:order.wallet,tokenAddress:order.tokenAddress,
+      inputAmount:order.actualInputAmount,outputAmount:order.outputAmount,tokenDecimals:fact.decimals,buySlot:fact.slot,
+      confirmedAt:new Date(blockTime*1000).toISOString(),observedAt:this.now().toISOString()};
+    const priceSol=Number(order.actualInputAmount)*10**fact.decimals/(Number(order.outputAmount)*1e9),price=Number(report.price),usd=Number(report.price_usd);
+    if(report.input_token_decimals===9&&report.output_token_decimals===fact.decimals&&report.swap_mode==='ExactIn'&&
+      ['string','number'].includes(typeof report.price)&&['string','number'].includes(typeof report.price_usd)&&
+      Number.isFinite(priceSol)&&priceSol>0&&Number.isFinite(price)&&price>0&&Math.abs(price-priceSol)<=priceSol*0.000001&&Number.isFinite(usd)&&usd>0)
+      fill.priceUsd=usd;
+    const current=this.orders.get(order.id);if(!current||current.status!=='confirmed')throw new EntryError('EXIT_FILL_ORDER_CHANGED');
+    const existing=this.thirdSignalFill(current);if(existing)return current;
+    return this.orders.update(order.id,['confirmed'],{details:{...current.details,thirdSignalFill:fill}},this.now())??this.orders.get(order.id)!;
+  }
+
+  private async thirdSignalStrategyPages(order:OpeningOrder):Promise<Record<string,unknown>[]> {
+    const rows:Record<string,unknown>[]=[],seen=new Set<string>();
+    for(const type of ['open','history']){
+      let pageToken:string|undefined;let totalInType=0;const seenPages=new Set<string>();let complete=false;
+      for(let page=0;page<5;page++){
+        const raw=await this.signedRequest('GET','/v1/trade/strategy/orders',{chain:'sol',group_tag:'STMix',type,from_address:order.wallet,
+          base_token:order.tokenAddress,limit:'100',...(pageToken?{page_token:pageToken}:{})},null,this.signingKey());
+        if(!object(raw)||!Array.isArray(raw.list)||raw.list.length>100||raw.total!==undefined&&(!Number.isSafeInteger(raw.total)||Number(raw.total)<0))
+          throw new EntryError('EXIT_OBSERVATION_PAGE_INVALID');
+        for(const row of raw.list){
+          if(!object(row)||!orderId(row.order_id)||seen.has(row.order_id)||row.chain!=='sol'||row.wallet_address!==order.wallet||row.base_token!==order.tokenAddress)
+            throw new EntryError('EXIT_OBSERVATION_RESPONSE_IDENTITY_INVALID');
+          seen.add(row.order_id);rows.push(row);totalInType++;
+        }
+        if(raw.next_page_token===undefined||raw.next_page_token===null||raw.next_page_token===''){
+          if(typeof raw.total==='number'&&raw.total>totalInType)throw new EntryError('EXIT_OBSERVATION_PAGE_INCOMPLETE');complete=true;break;
+        }
+        if(typeof raw.next_page_token!=='string'||raw.next_page_token.length>4096||seenPages.has(raw.next_page_token))
+          throw new EntryError('EXIT_OBSERVATION_PAGE_INVALID');
+        pageToken=raw.next_page_token;seenPages.add(pageToken);
+      }
+      if(!complete)throw new EntryError('EXIT_OBSERVATION_PAGE_INCOMPLETE');
+    }
+    return rows;
+  }
+
+  private async reconcileThirdSignalExit(order:OpeningOrder):Promise<OpeningOrder> {
+    const previous=order.exit!;
+    const save=(next:ExitTracking)=>this.orders.updateExit(order.id,previous,next,this.now())??this.orders.get(order.id)!;
+    const failed=(code:string,assessment?:ExitAssessment)=>save({...previous,state:'unverified',reasons:[code],
+      ...(assessment?{assessment}:{}),checkedAt:this.now().toISOString()});
+    try {
+      const fill=this.thirdSignalFill(order);if(!fill)return failed('EXIT_FILL_EVIDENCE_UNAVAILABLE');
+      const expected:ObservedExitExpectation={chain:order.chain,wallet:order.wallet,tokenAddress:order.tokenAddress,inputToken:order.inputToken,
+        openingTransactionHash:order.transactionHash,sellRatioType:previous.policy.sellRatioType,policyConditions:buildExitConditions(previous.policy),
+        strategyOrderId:previous.strategyOrderId,fill};
+      const first=await this.thirdSignalStrategyPages(order);
+      let assessment=assessObservedExitStrategy({list:first,total:first.length,next_page_token:''},expected,this.now());
+      if(!assessment.strategyOrderId||!assessment.parentFingerprint||!assessment.policyMatched)return failed(assessment.reasons[0]??'EXIT_OBSERVATION_PARENT_NOT_OBSERVED',assessment);
+      if(previous.assessment?.parentFingerprint&&previous.assessment.parentFingerprint!==assessment.parentFingerprint)
+        return failed('EXIT_OBSERVATION_PARENT_FIELDS_CHANGED');
+      // Read the same parent back independently. Repeated pages, changed fields and another exact candidate all fail closed.
+      const second=await this.thirdSignalStrategyPages(order);
+      const refreshed=assessObservedExitStrategy({list:second,total:second.length,next_page_token:''},expected,this.now());
+      if(refreshed.strategyOrderId!==assessment.strategyOrderId||refreshed.parentFingerprint!==assessment.parentFingerprint)
+        return failed('EXIT_OBSERVATION_READBACK_CHANGED',refreshed);
+      assessment=refreshed;
+      const balance=await readPositionBalance(order,this.config,this.fetcher);
+      const closed=assessment.terminal&&balance.status==='verified'&&balance.amount==='0';
+      return save({...previous,strategyOrderId:assessment.strategyOrderId,assessment,balance,positionClosed:closed,
+        state:closed?'closed':assessment.observedLiveStop?'monitoring':assessment.terminal||assessment.status==='degraded'?'attention':'unverified',
+        reasons:closed?['EXIT_POSITION_CLOSED']:assessment.reasons,checkedAt:this.now().toISOString()});
+    }catch(error){return failed(reason(error));}
+  }
+
   private async reconcileExit(order:OpeningOrder):Promise<OpeningOrder> {
+    if(order.chain==='solana'&&order.details.executionStrategy==='third_signal_v1')return this.reconcileThirdSignalExit(order);
     const previous=order.exit!;
     const save=(next:ExitTracking)=>this.orders.updateExit(order.id,previous,next,this.now())??this.orders.get(order.id)!;
     if(!previous.strategyOrderId) return save({...previous,state:'attention',reasons:['EXIT_STRATEGY_ID_MISSING'],checkedAt:this.now().toISOString()});

@@ -1,0 +1,42 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {mkdtempSync,rmSync} from 'node:fs';
+import {join} from 'node:path';
+import {tmpdir} from 'node:os';
+import {WalletHistory,type WalletTradeObservation} from '../src/wallet-history.js';
+import {WalletIndexRunner} from '../src/wallet-index-runner.js';
+
+const address=(n:number)=>'0x'+n.toString(16).padStart(40,'0');
+const hash=(n:number)=>'0x'+n.toString(16).padStart(64,'0');
+const waitFor=async(check:()=>boolean,timeoutMs=8_000)=>{
+  const deadline=Date.now()+timeoutMs;
+  while(!check()&&Date.now()<deadline)await new Promise(resolve=>setTimeout(resolve,20));
+  assert.equal(check(),true,'timed out waiting for wallet-index worker');
+};
+
+test('wallet-index worker completes the coordination and association quotas on a small database',async()=>{
+  const directory=mkdtempSync(join(tmpdir(),'wallet-index-worker-')),database=join(directory,'history.sqlite');
+  const now=Date.now(),iso=(offset:number)=>new Date(now+offset).toISOString();
+  const candidate=address(1),leader=address(2),token=address(100);
+  const base:WalletTradeObservation={chain:'bsc',wallet:candidate,tokenAddress:token,txHash:hash(1),side:'buy',
+    eventAt:iso(-60_000),observedAt:iso(-50_000),source:'gmgn_smartmoney_feed'};
+  let history=new WalletHistory(database);
+  history.recordTrade(base);
+  history.recordTrade({...base,wallet:leader,txHash:hash(2),eventAt:iso(-20_000),observedAt:iso(-10_000),source:'gmgn_kol_feed'});
+  assert.ok(history.stats().coordinationPending>0);assert.ok(history.associationStats().pending>0);history.close();
+
+  const runner=new WalletIndexRunner({database,maxBytes:512*1024*1024,intervalMs:1_000});
+  try {
+    runner.start();await waitFor(()=>!!runner.snapshot().completedAt);
+    const status=runner.snapshot();
+    assert.equal(status.coordinationError,undefined);assert.equal(status.associationError,undefined);
+    assert.ok(status.coordinationMs>=0);assert.ok(status.associationMs>=0);
+  } finally {await runner.stop();}
+
+  history=new WalletHistory(database);
+  try {
+    assert.equal(history.stats().coordinationPending,0);
+    assert.equal(history.associationStats().pending,0);
+    assert.equal(history.listAssociations().total,1);
+  } finally {history.close();rmSync(directory,{recursive:true,force:true});}
+});

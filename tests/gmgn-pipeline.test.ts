@@ -38,7 +38,7 @@ test('real-shaped GMGN research → candidate → durable paper order; replay ne
     activity: 'RAW_ACTIVITY_PAYLOAD_MUST_STAY_IN_MEMORY',
   };
   const config: Config = {...readConfig({}), gmgnApiKey: apiKey, gmgnMinIntervalMs: 0,
-    entryMode: 'paper', gmgnPrivateKey: undefined, walletSupportRequired: true,
+    entryMode: 'paper', entrySizing: 'fixed', entryBalanceBps: {}, gmgnPrivateKey: undefined, walletSupportRequired: true,
     minSmartWalletGroups: 2, walletMaxProfiles: 2, entryWallets: {bsc: account},
     entryInputTokens: {bsc: inputToken}, entryAmounts: {bsc: amount}};
   const incoming = signal({sourceEventId: `pipeline-${randomUUID()}`, text: markers.signal});
@@ -179,7 +179,8 @@ test('real-shaped GMGN research → candidate → durable paper order; replay ne
 
   const disk = new DatabaseSync(path, {readOnly: true});
   try {
-    assert.deepEqual(disk.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map(row => row.name), ['opening_orders']);
+    assert.deepEqual(disk.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map(row => row.name),
+      ['opening_orders', 'opening_identity_claims']);
     const persistedRows = disk.prepare('SELECT * FROM opening_orders').all();
     assert.equal(persistedRows.length, 1);
     const persisted = JSON.stringify(persistedRows);

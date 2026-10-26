@@ -72,6 +72,15 @@ test('chain-verified buys persist before dispatch; quote-token notification does
   assert.equal(signals.length,1);assert.equal(signals[0].source,'wallet');assert.equal(signals[0].token.address,token);assert.equal(trades.length,1);
   worker.enqueue(preview());await worker.runOnce();assert.equal(signals.length,1);
 });
+
+test('paused-chain wallet events never consume receipt requests or record new classifications',async t=>{
+  let calls=0,signals=0,records=0;
+  const worker=new WalletFastResearch({allowedChains:['solana'],now:()=>at+1000,ready:()=>true,
+    verify:async e=>{calls++;return verified(e);},onClassification:()=>{records++;return true;},onTrades:()=>{records++;},
+    onSignal:async()=>{signals++;}});
+  t.after(()=>worker.stop());worker.start();worker.enqueue(preview());worker.enqueue({...preview(),chain:'robinhood'});
+  await worker.runOnce();assert.equal(worker.status().queued,0);assert.equal(calls,0);assert.equal(signals,0);assert.equal(records,0);
+});
 test('transfers, failures and unknown unsupported actions do not enter trade metrics or repeat vendor queries',async t=>{
   for(const kind of ['received_purchase','distribution','transfer','self_transfer','approval','liquidity','wrap','failed','no_change','unknown'] as const){
     let signals=0,now=at+1000,calls=0,records=0;const worker=new WalletFastResearch({now:()=>now,ready:()=>true,verify:async e=>{calls++;return verified(e,kind);},onClassification:()=>true,onTrades:()=>{records++;},onSignal:async()=>{signals++;}});

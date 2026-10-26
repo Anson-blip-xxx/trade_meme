@@ -141,7 +141,9 @@ test('real runtime router keeps Dex observations flowing into archive and shadow
     const report=candidate(runtime);target=report.signal.token.address;
     runtime.client.get=async()=>{getCalls++;throw new GmgnError('GMGN_RATE_LIMITED',Date.now()+60000);};
     const failed=await runtime.tracking!.runOnce();assert.ok(failed.errors>0);assert.equal(getCalls,1);
-    withDex=true;t.mock.timers.setTime(Date.now()+1000);
+    // The runtime deliberately throttles repeated Dex HTTP reads for one token to 30 seconds.
+    // Advance beyond that window so this cycle exercises recovery instead of the expected cache gap.
+    withDex=true;t.mock.timers.setTime(Date.now()+31000);
     const recovered=await runtime.tracking!.runOnce();assert.equal(recovered.recorded,1);assert.equal(getCalls,1);
     assert.equal(runtime.archive!.get(report.id)?.performance?.baselinePriceUsd,2);
     const row=runtime.exitShadow!.list().items[0];assert.equal(row.baselinePriceUsd,2);assert.equal(row.priceSource,'dexscreener_token_pairs_sample');

@@ -1,11 +1,12 @@
 import {createHash} from 'node:crypto';
 import type {FastWalletEvent} from './wallet-fast.js';
 import {activityResult,type WalletActivity} from './wallet-activity.js';
-import type {Signal} from './types.js';
+import type {Chain,Signal} from './types.js';
 import type {WalletTradeObservation} from './wallet-history.js';
 
 interface Work {event:FastWalletEvent;attempts:number;due:number;cancelled:boolean;}
 export interface FastResearchOptions {
+  allowedChains?:Chain[];
   ready:()=>boolean;verify:(event:FastWalletEvent)=>Promise<WalletActivity>;
   onClassification:(result:WalletActivity)=>boolean;
   onTrades:(trades:WalletTradeObservation[])=>void;
@@ -23,6 +24,7 @@ export class WalletFastResearch {
   private key(event:FastWalletEvent){return `${event.chain}:${event.wallet}:${event.txHash}`;}
   enqueue(event:FastWalletEvent){
     if(!this.running)return;const key=this.key(event);
+    if(this.options.allowedChains&&!this.options.allowedChains.includes(event.chain))return;
     if(event.removed){const w=this.queue.get(key);if(w)w.cancelled=true;this.pendingAnalysis.delete(key);this.counts.retracted++;
       const result=activityResult(event,this.now(),'retracted',['CHAIN_EVENT_RETRACTED']);this.record(result);this.seen.set(key,this.now());return;}
     if(event.verdict==='blocked_cached_risk')return;

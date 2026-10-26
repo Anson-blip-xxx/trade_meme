@@ -13,6 +13,8 @@
     "retry": "node --env-file-if-exists=.env --import tsx src/cli.ts --retry",
     "report": "node --env-file-if-exists=.env --import tsx src/report-cli.ts",
     "orders": "node --env-file-if-exists=.env --import tsx src/orders-cli.ts",
+    "trade-interface-check": "node --env-file-if-exists=.env --import tsx scripts/trade-interface-check.ts",
+    "test-trade": "node --env-file-if-exists=.env --import tsx scripts/controlled-trade-test.ts",
     "setup": "node --import tsx scripts/setup.ts",
     "doctor": "node --env-file-if-exists=.env --import tsx src/doctor.ts",
     "demo": "node --import tsx scripts/demo.ts",
@@ -24,13 +26,19 @@
   },
   "type": "module",
   "dependencies": {
+    "@pump-fun/pump-sdk": "4.1.0",
+    "@pump-fun/pump-swap-sdk": "2.1.0",
     "@solana/addresses": "^8.4.0",
+    "@solana/spl-token": "0.4.14",
+    "@solana/web3.js": "1.99.0",
+    "bn.js": "5.2.5",
     "bs58": "^6.0.0",
     "socket.io-client": "4.8.4",
     "viem": "^2.57.3",
-    "zod": "^4.6.5"
+    "zod": "4.6.6"
   },
   "devDependencies": {
+    "@types/bn.js": "5.2.0",
     "@types/node": "^26.6.4",
     "tsx": "^4.23.15",
     "typescript": "^5.9.3"

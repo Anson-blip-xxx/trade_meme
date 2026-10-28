@@ -166,17 +166,17 @@ test('runtime tracks remainder beyond archive expiry and exits on actual price r
     await runtime.tracking!.runOnce();const id=runtime.exitShadow!.list().items[0].id;
     t.mock.timers.setTime(started+60000);current=6;await runtime.tracking!.runOnce();
     t.mock.timers.setTime(started+120000);current=11;await runtime.tracking!.runOnce();
-    assert.equal(runtime.exitShadow!.detail(id)?.item.remainingPct,72);
+    assert.equal(runtime.exitShadow!.detail(id)?.item.remainingPct,36);
     available=false;t.mock.timers.setTime(started+6*3600_000);assert.equal(runtime.exitShadow!.tick().created,0);
     await runtime.tracking!.runOnce();assert.equal(runtime.exitShadow!.detail(id)?.item.phase,'tracking');
-    assert.equal(runtime.exitShadow!.detail(id)?.item.remainingPct,72);assert.equal(runtime.dashboardOrders().items.length,0);
+    assert.equal(runtime.exitShadow!.detail(id)?.item.remainingPct,36);assert.equal(runtime.dashboardOrders().items.length,0);
     t.mock.timers.setTime(started+2*86400_000);assert.equal(runtime.archive!.pendingTokens(200,new Date()).length,0);
     available=true;current=12;await runtime.tracking!.runOnce();
-    const ongoing=runtime.exitShadow!.detail(id)!;assert.equal(ongoing.item.phase,'tracking');assert.equal(ongoing.item.remainingPct,72);
+    const ongoing=runtime.exitShadow!.detail(id)!;assert.equal(ongoing.item.phase,'tracking');assert.equal(ongoing.item.remainingPct,36);
     assert.equal(ongoing.item.exitPlan.timeExitEnabled,false);assert.equal(ongoing.item.exitPlan.intent,undefined);
-    t.mock.timers.setTime(started+2*86400_000+60000);current=0.5;await runtime.tracking!.runOnce();
+    t.mock.timers.setTime(started+2*86400_000+60000);current=0.3;await runtime.tracking!.runOnce();
     const detail=runtime.exitShadow!.detail(id)!;assert.equal(detail.item.phase,'triggered');assert.equal(detail.item.remainingPct,0);
-    assert.equal(detail.item.lastEvent?.priceUsd,0.5);assert.equal(detail.item.lastEvent?.reason,'HARD_STOP_OBSERVED');assert.equal(detail.item.liveReady,false);
+    assert.equal(detail.item.lastEvent?.priceUsd,0.3);assert.equal(detail.item.lastEvent?.reason,'HARD_STOP_OBSERVED');assert.equal(detail.item.liveReady,false);
     assert.equal(runtime.dashboardOrders().items.length,0);assert.equal(runtime.dashboardOverview().entryMode,'off');
     assert.ok(paths.filter(url=>url.includes(`/tokens/v1/bsc/${target}`)).length>=5);
   }finally{await runtime.close();rmSync(dir,{recursive:true,force:true});}

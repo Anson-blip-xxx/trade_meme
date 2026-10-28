@@ -35,7 +35,7 @@ test('shadow validates capacity settings and marks its persistent database priva
   const ctx=setup(t);
   assert.equal(statSync(ctx.path).mode&0o777,0o600);
   const summary=ctx.store.summary();
-  assert.equal(summary.policyVersion,'adaptive-shadow-v3');assert.equal(summary.mode,'shadow');assert.equal(summary.liveReady,false);
+  assert.equal(summary.policyVersion,'adaptive-shadow-v4');assert.equal(summary.mode,'shadow');assert.equal(summary.liveReady,false);
   assert.equal(summary.status.execution,'observation_only');
   assert.equal(summary.status.liveBlockReason,'ENTRY_UNATTENDED_PROTECTION_UNVERIFIED');
 });
@@ -88,16 +88,16 @@ test('restart preserves baseline, raised protection and partial stages without r
   const ctx=setup(t);let store=ctx.store;
   store.recordPrice(price(start),seed());ctx.clock.time+=60_000;store.recordPrice(price(ctx.clock.time,600),undefined);
   const first=store.list().items[0],id=first.id;
-  assert.equal(first.remainingPct,80);assert.equal(first.protectionActive,true);
+  assert.equal(first.remainingPct,40);assert.equal(first.protectionActive,true);
   store.close();store=ctx.open();
   assert.equal(store.summary().status.startedAt,iso(start));assert.equal(store.detail(id)?.item.protectionPriceUsd,first.protectionPriceUsd);
   store.recordPrice(price(ctx.clock.time,600),seed());
   ctx.clock.time+=60_000;store.recordPrice(price(ctx.clock.time,1100),undefined);
-  assert.equal(store.detail(id)?.sampleCount,3);assert.equal(store.detail(id)?.item.remainingPct,72);
+  assert.equal(store.detail(id)?.sampleCount,3);assert.equal(store.detail(id)?.item.remainingPct,36);
   assert.equal(store.page().items[0].returns.status,'open');
-  assert.equal(store.detail(id)?.item.returns.realizedGainPct,180);
-  assert.equal(store.detail(id)?.item.returns.unrealizedGainPct,720);
-  assert.equal(store.detail(id)?.item.returns.totalGainPct,900);
+  assert.equal(store.detail(id)?.item.returns.realizedGainPct,340);
+  assert.equal(store.detail(id)?.item.returns.unrealizedGainPct,360);
+  assert.equal(store.detail(id)?.item.returns.totalGainPct,700);
   assert.equal(ctx.query("SELECT id FROM exit_shadow_events WHERE json_extract(data,'$.kind')='initialized'").length,1);
   assert.equal(ctx.query("SELECT id FROM exit_shadow_events WHERE json_extract(data,'$.kind')='partial_exit'").length,2);
 });
@@ -152,14 +152,14 @@ test('the global last sample time is monotonic across tokens whose observed time
 test('observation expiry never closes an open position or resets it to a new candidate baseline',t=>{
   const ctx=setup(t),store=ctx.store,oldSeed=seed({endsAt:iso(start+300_000)});
   store.recordPrice(price(start),oldSeed);const oldId=store.list().items[0].id;
-  ctx.clock.time=start+300_000;store.recordPrice(price(ctx.clock.time,200),oldSeed);
+  ctx.clock.time=start+300_000;store.recordPrice(price(ctx.clock.time,180),oldSeed);
   assert.equal(store.detail(oldId)?.sampleCount,2);assert.equal(store.detail(oldId)?.item.phase,'tracking');
   assert.equal(store.detail(oldId)?.item.remainingPct,100);assert.equal(store.detail(oldId)?.item.exitPlan.scheduledExitAt,undefined);
   ctx.clock.time+=1000;
   const later=seed({candidateId:'candidate-2',eligibleAt:iso(ctx.clock.time),endsAt:iso(start+600_000)});
   store.recordPrice(price(ctx.clock.time,210),later);
   assert.equal(store.summary().status.positions,1);assert.equal(store.detail(oldId)?.item.baselinePriceUsd,100);
-  ctx.clock.time+=1000;store.recordPrice(price(ctx.clock.time,50),later);
+  ctx.clock.time+=1000;store.recordPrice(price(ctx.clock.time,30),later);
   assert.equal(store.detail(oldId)?.item.phase,'triggered');assert.equal(store.detail(oldId)?.item.lastEvent?.reason,'HARD_STOP_OBSERVED');
   ctx.clock.time+=1000;store.recordPrice(price(ctx.clock.time,60),later);
   const newItem=store.list().items.find(item=>item.id!==oldId)!;
@@ -169,7 +169,7 @@ test('observation expiry never closes an open position or resets it to a new can
 
 test('a triggered shadow episode keeps comparison samples after restart but never emits a second full exit',t=>{
   const ctx=setup(t);let store=ctx.store;
-  store.recordPrice(price(start),seed());ctx.clock.time+=60_000;store.recordPrice(price(ctx.clock.time,50),undefined);
+  store.recordPrice(price(start),seed());ctx.clock.time+=60_000;store.recordPrice(price(ctx.clock.time,30),undefined);
   const id=store.list().items[0].id;
   assert.equal(store.detail(id)?.item.phase,'triggered');assert.equal(store.detail(id)?.item.remainingPct,0);
   ctx.clock.time+=60_000;store.recordPrice(price(ctx.clock.time,1000),undefined);
@@ -177,9 +177,9 @@ test('a triggered shadow episode keeps comparison samples after restart but neve
   const detail=store.detail(id)!;
   assert.equal(detail.sampleCount,4);assert.equal(detail.item.latestPriceUsd,2);assert.equal(detail.item.remainingPct,0);
   assert.equal(detail.item.peakGainPct,900);assert.equal(detail.item.triggerPeakGainPct,0);
-  assert.equal(detail.item.lastEvent?.kind,'full_exit');assert.equal(detail.item.lastEvent?.priceUsd,50);
-  assert.equal(detail.item.returns.finalGainPct,-50);assert.equal(detail.item.returns.closedAt,iso(start+60_000));
-  assert.equal(store.page().items[0].returns.finalGainPct,-50);
+  assert.equal(detail.item.lastEvent?.kind,'full_exit');assert.equal(detail.item.lastEvent?.priceUsd,30);
+  assert.equal(detail.item.returns.finalGainPct,-70);assert.equal(detail.item.returns.closedAt,iso(start+60_000));
+  assert.equal(store.page().items[0].returns.finalGainPct,-70);
   assert.equal(ctx.query("SELECT id FROM exit_shadow_events WHERE json_extract(data,'$.kind')='full_exit'").length,1);
   ctx.clock.time+=600_000;store.recordPrice(price(ctx.clock.time,3),undefined);
   assert.equal(store.detail(id)?.item.maxGapSec,600);assert.equal(store.detail(id)?.sampleCount,5);
@@ -260,12 +260,12 @@ test('shadow performs zero network/order operations and persists normalized evid
 });
 
 
-test('elapsed days and missing quotes never liquidate the 72 percent remainder, including across restart',t=>{
+test('elapsed days and missing quotes never liquidate the 36 percent remainder, including across restart',t=>{
   const ctx=setup(t);let store=ctx.store;
   store.recordPrice(price(start,1),seed());ctx.clock.time+=60_000;store.recordPrice(price(ctx.clock.time,6),undefined);
   ctx.clock.time+=60_000;store.recordPrice(price(ctx.clock.time,11),undefined);const id=store.list().items[0].id;
   ctx.clock.time=start+6*3600_000;assert.deepEqual(store.tick(),{created:0,pending:0});store.recordError(token,'ALL_PRICE_SOURCES_UNAVAILABLE');
-  const waiting=store.detail(id)!;assert.equal(waiting.item.phase,'tracking');assert.equal(waiting.item.remainingPct,72);
+  const waiting=store.detail(id)!;assert.equal(waiting.item.phase,'tracking');assert.equal(waiting.item.remainingPct,36);
   assert.equal(waiting.item.health,'unavailable');assert.equal(waiting.item.exitPlan.status,'tracking');
   assert.equal(waiting.item.exitPlan.intent,undefined);assert.equal(waiting.item.exitPlan.timeExitEnabled,false);
   assert.equal(waiting.item.exitPlan.maxHoldingAt,undefined);assert.equal(waiting.item.exitPlan.scheduledExitAt,undefined);
@@ -274,14 +274,14 @@ test('elapsed days and missing quotes never liquidate the 72 percent remainder, 
   store.close();store=ctx.open();ctx.clock.time+=86400_000;assert.deepEqual(store.tick(),{created:0,pending:0});
   assert.equal(store.trackingTokens().length,1);assert.equal(store.summary().status.active,1);assert.equal(store.summary().status.stale,1);
   store.recordPrice(price(ctx.clock.time-300_000,500),undefined);store.recordPrice({...price(ctx.clock.time,500),source:'historical_ath'},undefined);
-  assert.equal(store.detail(id)?.item.remainingPct,72);
-  store.recordPrice(price(ctx.clock.time,12),undefined);assert.equal(store.detail(id)?.item.remainingPct,72);
+  assert.equal(store.detail(id)?.item.remainingPct,36);
+  store.recordPrice(price(ctx.clock.time,12),undefined);assert.equal(store.detail(id)?.item.remainingPct,36);
   assert.equal(store.detail(id)?.item.phase,'tracking');assert.equal(store.summary().status.stale,0);
-  ctx.clock.time+=60_000;store.recordPrice(price(ctx.clock.time,0.5),undefined);const closed=store.detail(id)!;
+  ctx.clock.time+=60_000;store.recordPrice(price(ctx.clock.time,0.3),undefined);const closed=store.detail(id)!;
   assert.equal(closed.item.remainingPct,0);assert.equal(closed.item.phase,'triggered');assert.equal(closed.item.exitPlan.status,'observed_closed');
   assert.equal(closed.item.exitPlan.intent,undefined);assert.equal(closed.item.lastEvent?.reason,'HARD_STOP_OBSERVED');
-  assert.equal(closed.item.lastEvent?.priceUsd,0.5);assert.equal(closed.item.lastEvent?.sellPct,100);assert.equal(store.trackingTokens().length,0);
-  store.recordPrice(price(ctx.clock.time,0.5),undefined);assert.equal(ctx.query("SELECT id FROM exit_shadow_events WHERE json_extract(data,'$.kind')='full_exit'").length,1);
+  assert.equal(closed.item.lastEvent?.priceUsd,0.3);assert.equal(closed.item.lastEvent?.sellPct,100);assert.equal(store.trackingTokens().length,0);
+  store.recordPrice(price(ctx.clock.time,0.3),undefined);assert.equal(ctx.query("SELECT id FROM exit_shadow_events WHERE json_extract(data,'$.kind')='full_exit'").length,1);
 });
 
 test('explicit active v1 migration records prior state and only applies future policy; expired legacy remainder is never falsely closed',t=>{
@@ -366,7 +366,7 @@ test('migration leaves a previously closed V2 time-exit episode and its observed
 
 test('closed comparison capture is sampled at most once per minute without deleting old observations',t=>{
   const ctx=setup(t),store=ctx.store;store.recordPrice(price(start),seed());ctx.clock.time+=1000;
-  store.recordPrice(price(ctx.clock.time,50),undefined);const id=store.list().items[0].id;
+  store.recordPrice(price(ctx.clock.time,30),undefined);const id=store.list().items[0].id;
   for(let n=1;n<=59;n++){ctx.clock.time=start+1000+n*1000;store.recordPrice(price(ctx.clock.time,100+n),undefined);}
   assert.equal(store.detail(id)?.sampleCount,2);ctx.clock.time=start+61_000;store.recordPrice(price(ctx.clock.time,200),undefined);
   assert.equal(store.detail(id)?.sampleCount,3);assert.equal(Reflect.get(store.detail(id)!.samples[0],'priceUsd'),100);

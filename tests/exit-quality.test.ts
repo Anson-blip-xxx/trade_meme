@@ -91,14 +91,15 @@ test('read-only review selects actual closures within the persisted time window 
   const dir=mkdtempSync(join(tmpdir(),'meme-exit-quality-')),path=join(dir,'shadow.sqlite');let now=start;
   const store=new ExitShadow(path,{now:()=>new Date(now)});
   t.after(()=>{store.close();rmSync(dir,{recursive:true,force:true});});
-  for(const [index,priceUsd] of [100,600,1100,800].entries()){
+  for(const [index,priceUsd] of [100,600,1100,800,790].entries()){
     now=start+index*60_000;
     store.recordPrice({chain:'bsc',address,priceUsd,observedAt:iso(now),source:'gmgn_token_info_sample',market:{poolAddress:pool.toUpperCase().replace('0X','0x')}},
       index===0?{candidateId:'first',eligibleAt:iso(start),endsAt:iso(start+86400_000)}:undefined);
   }
   const closedAt=now,id=store.list().items[0].id;
   now=closedAt+300_000;store.recordPrice({chain:'bsc',address,priceUsd:900,observedAt:iso(now),source:'gmgn_token_info_sample',market:{poolAddress:pool}},undefined);
-  const detail=store.detail(id)!;assert.equal(detail.quality.equityPeak.givebackPct,216);assert.equal(detail.quality.afterExit[0].impactOnInitialPrincipalPct,72);
+  const detail=store.detail(id)!;assert.ok(Math.abs(detail.quality.equityPeak.givebackPct!-111.6)<1e-8);
+  assert.ok(Math.abs(detail.quality.afterExit[0].impactOnInitialPrincipalPct!-39.6)<1e-8);
   for(const [index,priceUsd] of [100,45].entries()){
     now=closedAt+400_000+index*60_000;
     store.recordPrice({chain:'bsc',address:otherPool,priceUsd,observedAt:iso(now),source:'gmgn_token_info_sample'},

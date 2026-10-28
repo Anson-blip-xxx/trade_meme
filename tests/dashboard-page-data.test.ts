@@ -57,7 +57,7 @@ test('exit display metrics migrate history and throttle closed comparison sample
   const quote=(value:number,chain:'bsc'|'robinhood'='bsc')=>({chain,address,priceUsd:value,observedAt:now().toISOString(),source:'gmgn_token_info_sample'});
   const seed={candidateId:'first',eligibleAt:now().toISOString(),endsAt:new Date(at+86400000).toISOString()};
   try {
-    shadow.recordPrice(quote(100),seed);at+=60000;shadow.recordPrice(quote(50),seed);
+    shadow.recordPrice(quote(100),seed);at+=60000;shadow.recordPrice(quote(30),seed);
     at+=60000;shadow.recordPrice(quote(1000),seed);at+=600000;shadow.recordPrice(quote(200),seed);
     const before=shadow.list().items[0];assert.equal(before.phase,'triggered');
     assert.equal(before.peakGainPct,900);assert.equal(before.maxGapSec,600);

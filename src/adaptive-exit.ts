@@ -33,6 +33,10 @@ export interface AdaptiveExitPolicy {
   readonly momentumMinimumSamples?:number;
   readonly momentumMaxChangePct?:number;
   readonly momentumMinDrawdownPct?:number;
+  /** V4 only: a realized profit stage starts the independently protected runner. */
+  readonly runnerActivationGainPct?:number;
+  /** V4 only: fresh, consecutive breach samples required to close the runner. */
+  readonly protectionExitConfirmations?:number;
   readonly partialExits: readonly Readonly<{gainPct: number; sellPctRemaining: number}>[];
 }
 
@@ -68,11 +72,24 @@ export const ADAPTIVE_SHADOW_V3:AdaptiveExitPolicy=(()=>{
   const {maxHoldingMs:_retiredHoldingDeadline,...behavior}=ADAPTIVE_SHADOW_V2;
   return Object.freeze({...behavior,version:'adaptive-shadow-v3'});
 })();
+/**
+ * New shadow episodes only. V4 keeps V3 unchanged until the first +100% profit
+ * stage, then protects an independent runner. It has no elapsed-time exit.
+ */
+export const ADAPTIVE_SHADOW_V4:AdaptiveExitPolicy=Object.freeze({...ADAPTIVE_SHADOW_V3,
+  version:'adaptive-shadow-v4',runnerActivationGainPct:100,protectionExitConfirmations:2,
+  partialExits:Object.freeze([
+    Object.freeze({gainPct:100,sellPctRemaining:50}),
+    Object.freeze({gainPct:500,sellPctRemaining:20}),
+    Object.freeze({gainPct:1000,sellPctRemaining:10}),
+  ]),
+});
 export function adaptiveExitPolicy(version:string):AdaptiveExitPolicy|undefined {
   return version===ADAPTIVE_SHADOW_V1.version?ADAPTIVE_SHADOW_V1:version===ADAPTIVE_SHADOW_V2.version?ADAPTIVE_SHADOW_V2:
-    version===ADAPTIVE_SHADOW_V3.version?ADAPTIVE_SHADOW_V3:undefined;
+    version===ADAPTIVE_SHADOW_V3.version?ADAPTIVE_SHADOW_V3:version===ADAPTIVE_SHADOW_V4.version?ADAPTIVE_SHADOW_V4:undefined;
 }
-const momentumPolicy=(policy:AdaptiveExitPolicy)=>policy.version===ADAPTIVE_SHADOW_V2.version||policy.version===ADAPTIVE_SHADOW_V3.version;
+const momentumPolicy=(policy:AdaptiveExitPolicy)=>policy.version===ADAPTIVE_SHADOW_V2.version||policy.version===ADAPTIVE_SHADOW_V3.version||policy.version===ADAPTIVE_SHADOW_V4.version;
+const runnerPolicy=(policy:AdaptiveExitPolicy)=>policy.version===ADAPTIVE_SHADOW_V4.version;
 export interface AdaptiveExitDeadline {dueAt:string;reason:'MAX_HOLDING_TIME_OBSERVED'|'OBSERVATION_WINDOW_END_OBSERVED';}
 
 export interface PriceObservation {
@@ -162,6 +179,18 @@ export interface AdaptiveExitState {
   /** Historical v2 audit field; never an exit deadline under v3. */
   observationEndsAt?:string;
   momentumObservations?:{observedAt:string;priceUsd:number}[];
+  /** V4 runner state. It starts only after the configured profit stage has actually reduced exposure. */
+  runnerProtection?:{
+    activatedAt:string;
+    activationStageGainPct:number;
+    /** Peak/protection for the runner cycle; peakPriceUsd above remains the all-time audit peak. */
+    cyclePeakPriceUsd:number;
+    cyclePeakAt:string;
+    cycleProtectionPriceUsd:number;
+    /** Breaches after activation; the activation sample itself is deliberately excluded. */
+    consecutiveBreaches:number;
+    confirmingSince?:string;
+  };
 }
 
 export type AdaptiveExitReason = 'HARD_STOP_OBSERVED' | 'DYNAMIC_PROTECTION_OBSERVED' |
@@ -284,7 +313,7 @@ function validState(state: AdaptiveExitState, policy: AdaptiveExitPolicy): boole
     if (Math.abs(remaining - state.remainingPctOfInitial) > 1e-9) return false;
   }
   if(momentumPolicy(policy)){
-    const effective=time(state.policyEffectiveAt),momentumEffective=policy.version===ADAPTIVE_SHADOW_V3.version?time(state.momentumEffectiveAt):effective;
+    const effective=time(state.policyEffectiveAt),momentumEffective=policy.version===ADAPTIVE_SHADOW_V2.version?effective:time(state.momentumEffectiveAt);
     if(!Number.isFinite(effective)||effective<baseline||effective>evaluated||
       !Number.isFinite(momentumEffective)||momentumEffective<baseline||momentumEffective>effective||
       state.observationEndsAt!==undefined&&(!Number.isFinite(time(state.observationEndsAt))||
@@ -294,6 +323,26 @@ function validState(state: AdaptiveExitState, policy: AdaptiveExitPolicy): boole
     for(const sample of state.momentumObservations){const at=time(sample.observedAt);
       if(!positive(sample.priceUsd)||!Number.isFinite(at)||at<momentumEffective||at>last||at<=previous)return false;previous=at;}
   }
+  if(runnerPolicy(policy)){
+    const runner=state.runnerProtection;
+    if(state.suggestedStages.includes(policy.runnerActivationGainPct!) !== (runner !== undefined))return false;
+    if(runner!==undefined){
+      if(!object(runner)||runner.activationStageGainPct!==policy.runnerActivationGainPct||
+        !state.suggestedStages.includes(runner.activationStageGainPct)||
+        !positive(runner.cyclePeakPriceUsd)||runner.cyclePeakPriceUsd>state.peakPriceUsd||
+        runner.cyclePeakPriceUsd<state.lastPriceUsd||!positive(runner.cycleProtectionPriceUsd)||
+        runner.cycleProtectionPriceUsd!==state.protectionPriceUsd||
+        runner.cycleProtectionPriceUsd<state.hardStopPriceUsd||runner.cycleProtectionPriceUsd>runner.cyclePeakPriceUsd||
+        !integer(runner.consecutiveBreaches)||
+        runner.consecutiveBreaches>policy.protectionExitConfirmations!||
+        !state.shadowClosed&&runner.consecutiveBreaches>=policy.protectionExitConfirmations!)return false;
+      const activated=time(runner.activatedAt),cyclePeakAt=time(runner.cyclePeakAt),confirming=time(runner.confirmingSince);
+      if(!Number.isFinite(activated)||activated<=baseline||activated>last||
+        !Number.isFinite(cyclePeakAt)||cyclePeakAt<activated||cyclePeakAt>last||
+        (runner.consecutiveBreaches===0)!==(runner.confirmingSince===undefined)||
+        runner.consecutiveBreaches>0&&(!Number.isFinite(confirming)||confirming<=activated||confirming>last))return false;
+    }
+  }else if(state.runnerProtection!==undefined)return false;
   return true;
 }
 
@@ -317,7 +366,7 @@ export function migrateAdaptiveExitV1(state:AdaptiveExitState,effectiveAt:string
 /** Preserve learned price state and prior v2 momentum, but accept only new quotations after activation. */
 export function migrateAdaptiveExitToV3(state:AdaptiveExitState,effectiveAt:string):AdaptiveExitState|undefined {
   const policy=adaptiveExitPolicy(state?.policyVersion),effective=time(effectiveAt);
-  if(!policy||policy.version===ADAPTIVE_SHADOW_V3.version||!validState(state,policy)||state.shadowClosed||
+  if(!policy||![ADAPTIVE_SHADOW_V1.version,ADAPTIVE_SHADOW_V2.version].includes(policy.version)||!validState(state,policy)||state.shadowClosed||
     !Number.isFinite(effective)||effective<time(state.lastEvaluatedAt))return;
   const hasMomentum=policy.version===ADAPTIVE_SHADOW_V2.version;
   return {...state,policyVersion:ADAPTIVE_SHADOW_V3.version,policyEffectiveAt:new Date(effective).toISOString(),
@@ -438,11 +487,18 @@ export function stepAdaptiveExit(
   const drawdown = clamp(policy.baseDrawdownPct + Math.min(policy.maxVolatilityWideningPct,
     volatility * policy.volatilityDrawdownMultiplier) - gainTightening - walletTightening,
     policy.minDrawdownPct, policy.maxDrawdownPct);
-  const protection = Math.max(state.protectionPriceUsd, state.hardStopPriceUsd, active ? peak * (1 - drawdown / 100) : 0);
+  const runnerCyclePeak=state.runnerProtection?Math.max(state.runnerProtection.cyclePeakPriceUsd,observation.priceUsd):undefined;
+  const protection = state.runnerProtection
+    ? Math.max(state.runnerProtection.cycleProtectionPriceUsd,state.hardStopPriceUsd,
+      active?runnerCyclePeak!*(1-drawdown/100):0)
+    : Math.max(state.protectionPriceUsd, state.hardStopPriceUsd, active ? peak * (1 - drawdown / 100) : 0);
   const drawdownWithoutWallet = clamp(policy.baseDrawdownPct + Math.min(policy.maxVolatilityWideningPct,
     volatility * policy.volatilityDrawdownMultiplier) - gainTightening, policy.minDrawdownPct, policy.maxDrawdownPct);
-  const protectionWithoutWallet = Math.max(state.protectionPriceUsd, state.hardStopPriceUsd,
-    active ? peak * (1 - drawdownWithoutWallet / 100) : 0);
+  const protectionWithoutWallet = state.runnerProtection
+    ? Math.max(state.runnerProtection.cycleProtectionPriceUsd,state.hardStopPriceUsd,
+      active?runnerCyclePeak!*(1-drawdownWithoutWallet/100):0)
+    : Math.max(state.protectionPriceUsd, state.hardStopPriceUsd,
+      active ? peak * (1 - drawdownWithoutWallet / 100) : 0);
   if (!positive(protection)) return ignore('ARITHMETIC_INVALID');
   const next: AdaptiveExitState = {...state, lastPriceUsd: observation.priceUsd,
     lastObservedAt: observation.observedAt, lastEvaluatedAt: observation.evaluatedAt,
@@ -451,6 +507,11 @@ export function stepAdaptiveExit(
     volatilityPctPerMinute: volatility, volatilityReturns: returns, lastSampleGapMs: gap,
     maxSampleGapMs: Math.max(state.maxSampleGapMs, gap), gapCount: state.gapCount + (longGap ? 1 : 0), samples: state.samples + 1,
     suggestedStages: [...state.suggestedStages], walletPressure: wallet.summary};
+  if(state.runnerProtection){
+    next.runnerProtection={...state.runnerProtection,cyclePeakPriceUsd:runnerCyclePeak!,
+      cyclePeakAt:observation.priceUsd>state.runnerProtection.cyclePeakPriceUsd?observation.observedAt:state.runnerProtection.cyclePeakAt,
+      cycleProtectionPriceUsd:protection};
+  }
   let momentumStalled=false;
   if(momentumPolicy(policy)){
     const samples=longGap?[]:[...(state.momentumObservations??[])].filter(p=>time(p.observedAt)>=observed-policy.momentumWindowMs!);
@@ -460,22 +521,44 @@ export function stepAdaptiveExit(
     next.momentumObservations=samples.slice(-32);
     const first=next.momentumObservations[0],span=observed-time(first.observedAt);
     const windowChangePct=(observation.priceUsd/first.priceUsd-1)*100;
-    momentumStalled=observed-time(policy.version===ADAPTIVE_SHADOW_V3.version?state.momentumEffectiveAt:state.policyEffectiveAt)>=policy.momentumMinimumHoldMs!&&
+    momentumStalled=observed-time(policy.version===ADAPTIVE_SHADOW_V2.version?state.policyEffectiveAt:state.momentumEffectiveAt)>=policy.momentumMinimumHoldMs!&&
       observed-time(next.peakAt)>=policy.momentumPeakQuietMs!&&next.momentumObservations.length>=policy.momentumMinimumSamples!&&
       span>=policy.momentumMinimumSpanMs!&&peakGain>=policy.minActivationGainPct&&
       (1-observation.priceUsd/peak)*100>=policy.momentumMinDrawdownPct!&&
       Math.abs(windowChangePct)<=policy.momentumMaxChangePct!&&
       // V3 lets a recovery keep running, even when it remains below an earlier peak.
-      (policy.version!==ADAPTIVE_SHADOW_V3.version||windowChangePct<=0);
+      (policy.version===ADAPTIVE_SHADOW_V2.version||windowChangePct<=0);
+    // Once V4 has banked the +100% stage, its independent runner is governed
+    // by observed price protection rather than the older momentum close.
+    if(runnerPolicy(policy)&&state.runnerProtection)momentumStalled=false;
   }
   const deadline=adaptiveExitDeadline(next),deadlineReached=!!deadline&&observed>=time(deadline.dueAt);
   const hardStop = observation.priceUsd <= state.hardStopPriceUsd;
   const protectionHit = active && observation.priceUsd <= protection;
   const stages = policy.partialExits.filter(stage => gain >= stage.gainPct && !state.suggestedStages.includes(stage.gainPct));
-  if (!hardStop && !protectionHit && !deadlineReached && !momentumStalled && !stages.length) return {status: 'observed', state: next, ...common};
+  let confirmedRunnerExit=false,runnerAwaitingConfirmation=false;
+  if(runnerPolicy(policy)&&state.runnerProtection){
+    if(protectionHit){
+      const continuing=!longGap&&state.runnerProtection.consecutiveBreaches>0;
+      const consecutiveBreaches=continuing?state.runnerProtection.consecutiveBreaches+1:1;
+      next.runnerProtection={...next.runnerProtection!,consecutiveBreaches,
+        confirmingSince:continuing?state.runnerProtection.confirmingSince:observation.observedAt};
+      confirmedRunnerExit=consecutiveBreaches>=policy.protectionExitConfirmations!;
+      runnerAwaitingConfirmation=!confirmedRunnerExit;
+    }else{
+      const {confirmingSince:_cleared,...runner}=next.runnerProtection!;
+      next.runnerProtection={...runner,consecutiveBreaches:0};
+    }
+  }
+  // Once the +100% stage has started a runner, an isolated breach advances
+  // persisted confirmation state without selling it.
+  // A profit stage on that sample still executes; a hard stop still exits immediately.
+  if(runnerAwaitingConfirmation&&!hardStop&&!stages.length)return {status:'observed',state:next,...common};
+  const protectionAction=runnerPolicy(policy)&&state.runnerProtection?confirmedRunnerExit:protectionHit;
+  if (!hardStop && !protectionAction && !deadlineReached && !momentumStalled && !stages.length) return {status: 'observed', state: next, ...common};
   const reasons: AdaptiveExitReason[] = [];
-  let sellPctRemaining: number;
-  if (hardStop || protectionHit || deadlineReached || momentumStalled) {
+  let sellPctRemaining: number,stageGainsPct:number[]=[];
+  if (hardStop || protectionAction || deadlineReached || momentumStalled) {
     reasons.push(hardStop ? 'HARD_STOP_OBSERVED' : protectionHit ? 'DYNAMIC_PROTECTION_OBSERVED' : deadlineReached ? deadline!.reason : 'MOMENTUM_STALLED_OBSERVED');
     sellPctRemaining = 100; next.remainingPctOfInitial = 0; next.shadowClosed = true;
   } else {
@@ -484,13 +567,21 @@ export function stepAdaptiveExit(
     for (const stage of stages) {retained *= 1 - stage.sellPctRemaining / 100; next.suggestedStages.push(stage.gainPct);}
     sellPctRemaining = Number(((1 - retained) * 100).toFixed(10));
     next.remainingPctOfInitial = Number((next.remainingPctOfInitial * retained).toFixed(10));
+    stageGainsPct=stages.map(stage=>stage.gainPct);
+    if(runnerPolicy(policy)&&!state.runnerProtection&&stageGainsPct.includes(policy.runnerActivationGainPct!)){
+      const cycleProtection=Math.max(state.hardStopPriceUsd,observation.priceUsd*(1-drawdown/100));
+      next.protectionPriceUsd=cycleProtection;
+      next.runnerProtection={activatedAt:observation.observedAt,activationStageGainPct:policy.runnerActivationGainPct!,
+        cyclePeakPriceUsd:observation.priceUsd,cyclePeakAt:observation.observedAt,
+        cycleProtectionPriceUsd:cycleProtection,consecutiveBreaches:0};
+    }
   }
   if (!hardStop && protection > protectionWithoutWallet) reasons.push('WALLET_NET_SELLING_TIGHTENED');
   const event: AdaptiveExitEvent = {policyVersion: policy.version, mode: 'shadow', execution: 'observation_only',
     kind: next.shadowClosed ? 'full_exit' : 'partial_exit', observedAt: observation.observedAt, evaluatedAt: observation.evaluatedAt,
     observedPriceUsd: observation.priceUsd, baselinePriceUsd: state.baselinePriceUsd, observedGainPct: gain,
     peakPriceUsd: peak, protectionPriceUsd: protection, sellRatioType: 'remaining_holding', sellPctRemaining,
-    remainingPctOfInitial: next.remainingPctOfInitial, reasons, stageGainsPct: next.shadowClosed ? [] : stages.map(stage => stage.gainPct),
+    remainingPctOfInitial: next.remainingPctOfInitial, reasons, stageGainsPct,
     ...(wallet.summary ? {walletPressure: wallet.summary} : {})};
   return {status: 'observed', state: next, event, ...common};
 }

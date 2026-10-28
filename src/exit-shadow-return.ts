@@ -35,6 +35,7 @@ export function shadowReturn(state:AdaptiveExitState,events:readonly ExitEvent[]
   // partial event before a full exit, whose recorded remaining percentage is 0.
   let expectedPartialRemaining=100;
   for(const stage of policy.partialExits)if(state.suggestedStages.includes(stage.gainPct))expectedPartialRemaining*=1-stage.sellPctRemaining/100;
+  if(state.runnerProtection!==undefined&&policy.version!=='adaptive-shadow-v4')return invalid('RETURN_HISTORY_INVALID');
   let remaining=100,realized=0,previousAt=baselineAt,fullExit:ShadowReturnExit|undefined;
   const exits:ShadowReturnExit[]=[],seen=new Map<string,string>();
   for(const event of events){

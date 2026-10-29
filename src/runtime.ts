@@ -53,9 +53,9 @@ import {MarketPriceRouter} from './market-price-router.js';
 import type {Fetcher} from './http.js';
 import {WalletFastRunner} from './wallet-fast-runner.js';
 import {WalletFastResearch} from './wallet-fast-research.js';
-import {WalletActivityVerifier} from './wallet-activity.js';
+import {WalletActivityVerifier,type WalletActivity} from './wallet-activity.js';
 import {WalletActivityStore} from './wallet-activity-store.js';
-import {WalletFastTargets,mergePinnedWallets,type FastWalletSnapshot,type FastWalletTarget,type FastTokenCheck} from './wallet-fast.js';
+import {WalletFastTargets,mergePinnedWallets,type FastWalletEvent,type FastWalletSnapshot,type FastWalletTarget,type FastTokenCheck} from './wallet-fast.js';
 import {JevShadow,type JevShadowOptions} from './jev-shadow.js';
 import {JevStatusRunner} from './jev-status.js';
 import {buildJevInput} from './jev-input.js';
@@ -82,7 +82,8 @@ import {LatestWorkQueue} from './latest-work-queue.js';
 import {SourceObservationRunner,type SourceResearchObservation} from './source-observation-runner.js';
 
 export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;jevInvoke?:JevShadowOptions['invoke'];telegramFetcher?:typeof fetch;
-  heldFetcher?:typeof fetch;entryFetcher?:typeof fetch;gmgnFetcher?:typeof fetch}={}) {
+  heldFetcher?:typeof fetch;entryFetcher?:typeof fetch;gmgnFetcher?:typeof fetch;
+  walletActivityVerify?:(event:FastWalletEvent)=>Promise<WalletActivity>}={}) {
   const acceptsChain=(chain:Signal['token']['chain'])=>config.scannerChains.includes(chain);
   const backgroundGmgnEnabled=config.gmgnBackgroundResearchEnabled!==false;
   const backgroundGmgnPausedReason=backgroundGmgnEnabled?undefined:'GMGN_BACKGROUND_RESEARCH_DISABLED';
@@ -802,9 +803,19 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
         else recordPriceError(price,route.reason??'PRICE_SOURCE_CONFLICT');
       }
     }}):undefined;
+  const walletTriggeredResearchReady=()=>!closed&&active<2&&!!config.gmgnApiKey?.trim()&&
+    client.cooldownUntil<=Date.now()&&!scanner.getStatus().inFlight;
   const chainStreamStatus=()=>{try{return {...(chainMonitor?.getStatus()??{enabled:false,running:false,mode:'observation_only',chains:[],recentEvents:[]}),
     walletFast:walletFast?{...walletFast.status(),research:{...walletFastResearch?.status(),
-      fullResearchEnabled:backgroundGmgnEnabled,pausedReason:backgroundGmgnPausedReason},activity:walletActivity?.status()}:{enabled:false}};}
+      // Compatibility fields describe broad background discovery only. The
+      // explicit on-demand fields below report the verified-buy path.
+      fullResearchEnabled:backgroundGmgnEnabled,pausedReason:backgroundGmgnPausedReason,
+      broadBackgroundResearchEnabled:backgroundGmgnEnabled,broadBackgroundPausedReason:backgroundGmgnPausedReason,
+      walletTriggeredOnDemandResearchEnabled:true,walletTriggeredOnDemandResearchReady:walletTriggeredResearchReady(),
+      walletTriggeredOnDemandResearchBlockedReason:walletTriggeredResearchReady()?undefined:closed?'SERVICE_STOPPING':
+        !config.gmgnApiKey?.trim()?'GMGN_API_KEY_MISSING':client.cooldownUntil>Date.now()?'GMGN_RATE_LIMITED':
+          active>=2?'RESEARCH_BUSY':scanner.getStatus().inFlight?'SCANNER_BUSY':'WALLET_ON_DEMAND_RESEARCH_UNAVAILABLE'},
+      activity:walletActivity?.status()}:{enabled:false}};}
     catch{return {enabled:config.chainStream.enabled,mode:'observation_only',captureError:'CHAIN_STATUS_READ_FAILED',chains:[],recentEvents:[]};}};
   const tracking=archive?new PriceTracker({archive:{
     pendingTokens:(limit,now)=>mergeTokens(positionPriceTokens(),(exitShadow?.trackingTokens(180,now)??[]).filter(t=>acceptsChain(t.chain)),
@@ -864,9 +875,10 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
     walletFastResearch=new WalletFastResearch({
       allowedChains:config.scannerChains,
       // Chain receipt classification and durable buy/sell observations continue
-      // independently; only the optional full GMGN research dispatch is paused.
-      ready:()=>backgroundGmgnEnabled&&!closed&&active<2&&!!config.gmgnApiKey?.trim()&&client.cooldownUntil<=Date.now()&&!scanner.getStatus().inFlight,
-      verify:event=>walletVerifier!.verify(event),onClassification:result=>walletActivity!.record(result),
+      // independently. A confirmed buy is an explicit on-demand trigger even
+      // when broad GMGN discovery is paused by focused mode.
+      ready:walletTriggeredResearchReady,
+      verify:dependencies.walletActivityVerify??(event=>walletVerifier!.verify(event)),onClassification:result=>walletActivity!.record(result),
       onTrades:trades=>walletHistory.recordTrades(trades),onSignal});
     walletFast=new WalletFastRunner({endpoints:Object.fromEntries(Object.entries(config.chainStream.endpoints).filter(([chain])=>acceptsChain(chain as Signal['token']['chain']))),maxWallets:streamWalletCapacity,
       onEvent:event=>walletFastResearch?.enqueue(event),snapshot:()=>{
@@ -1061,7 +1073,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
     }catch{priceTargetError='PRICE_STREAM_TARGET_REFRESH_FAILED';}
   };
   sourceObservation?.start();
-  return {client,providers,store,orders,entry,dailyReview,scanner,debotScanner,debotStream,debotAuth,archive,followupReview,tracking,priceRouter,walletHistory,walletIndexRunner,walletObserver,walletResearchStatus,walletAssociationsStatus,walletProfiles,walletProfilesStatus,walletScreening,watchRechecker,exitShadow,chainMonitor,chainStreamStatus,memeObserver,sourceEvidence,sourceObservation,aveScanner,aveSession,tokenRankResearch,jevShadow,telegram,tradeNotifications,telegramStatus,heldMonitor,heldTracking,
+  return {client,providers,store,orders,entry,dailyReview,scanner,debotScanner,debotStream,debotAuth,archive,followupReview,tracking,priceRouter,walletHistory,walletIndexRunner,walletObserver,walletResearchStatus,walletAssociationsStatus,walletProfiles,walletProfilesStatus,walletScreening,watchRechecker,exitShadow,chainMonitor,chainStreamStatus,walletFastResearch,memeObserver,sourceEvidence,sourceObservation,aveScanner,aveSession,tokenRankResearch,jevShadow,telegram,tradeNotifications,telegramStatus,heldMonitor,heldTracking,
     signalCounting,telegramControls,telegramPositions,manualClose,directSell,manualNativeBuy,telegramTokenCard,
     executionStatus:()=>{const counting=signalCounting.status();return {
       configuredEntryMode:config.entryMode,configuredThirdSignalMode:config.thirdSignalExecutionMode,
@@ -1110,9 +1122,9 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       gmgnUsage:{mode:backgroundGmgnEnabled?'full_research':'trade_and_on_demand',backgroundResearchEnabled:backgroundGmgnEnabled,
         label:backgroundGmgnEnabled?'行情研究与交易':'交易与按需查询',pausedReason:backgroundGmgnPausedReason,
         pausedTasks:backgroundGmgnEnabled?[]:['market_scanner','wallet_enrichment_polling','meme_gmgn_sampling',
-          'wallet_discovery_research','wallet_fast_full_research','watch_rechecks'],
+          'wallet_discovery_research','watch_rechecks'],
         retainedTasks:['signal_details_and_safety','positions','price_fallback','trading',
-          'debot_ave_signals','chain_trade_classification','local_wallet_profiles_and_indexes']},
+          'debot_ave_signals','chain_trade_classification','wallet_verified_buy_on_demand_research','local_wallet_profiles_and_indexes']},
       scanner:{...scanner.getStatus(),enabled:backgroundGmgnEnabled&&config.scannerEnabled,pausedReason:backgroundGmgnPausedReason},
       debotScanner:debotScanner?.getStatus()??{enabled:false,running:false},
       debotStream:debotStream?.getStatus(),

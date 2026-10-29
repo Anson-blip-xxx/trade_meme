@@ -1594,7 +1594,12 @@
     node.append(kv('名单数量 / 名单状态',`${count(data.targets)} / ${data.snapshotFresh?'有效':'已过期，暂停预判'}`),kv('送达研究线程 P99',ms(data.mainThreadHandoff?.p99Ms)),kv('监听事件循环延迟 P99',ms(data.eventLoopP99Ms)),kv('拥塞丢弃事件',count(data.droppedEvents)));
     if(data.error||data.droppedEvents||!data.snapshotFresh||data.statusStale)node.append(el('p','notice warning',`监听存在异常或覆盖缺口：${scalar(data.error,'请查看名单时效、拥塞数量与连接状态')}。不保证完整捕获。`));
     const chains=el('div','price-router-tags');for(const c of data.chains||[])chains.append(badge(`${chainName(c.chain)} · ${c.identityVerified&&c.activeSubscriptions===c.desiredSubscriptions?'已连接':'连接待恢复'} · ${count(c.watchedWallets)} 钱包 · 订阅 ${count(c.activeSubscriptions)}/${count(c.desiredSubscriptions)}`,c.identityVerified&&c.activeSubscriptions===c.desiredSubscriptions?'neutral':'watch'));node.append(chains);
-    const research=data.research||{};node.append(el('p','',`链上核验排队 ${count(research.queued)} · 分析排队 ${count(research.analysisQueued)} · 已核验买入 ${count(research.counts?.matchedBuys)} / 卖出 ${count(research.counts?.verifiedSells)} · 排除非交易活动 ${count(research.counts?.filtered)} · 待确认 ${count(research.counts?.unknown)}。`));
+    const research=data.research||{};
+    const broad=research.broadBackgroundResearchEnabled===false?'广泛 GMGN 后台发现已暂停':'广泛 GMGN 后台发现已启用';
+    const onDemand=research.walletTriggeredOnDemandResearchReady?'RPC 核验买入的按需完整研究可用':
+      `RPC 核验买入的按需完整研究暂不可用（${reasonNames[research.walletTriggeredOnDemandResearchBlockedReason]||scalar(research.walletTriggeredOnDemandResearchBlockedReason,'等待服务恢复')}）`;
+    node.append(el('p','detail-small',`${broad}；${onDemand}。`));
+    node.append(el('p','',`链上核验排队 ${count(research.queued)} · 分析排队 ${count(research.analysisQueued)} · 已核验买入 ${count(research.counts?.matchedBuys)} / 卖出 ${count(research.counts?.verifiedSells)} · 排除非交易活动 ${count(research.counts?.filtered)} · 待确认 ${count(research.counts?.unknown)}。`));
     node.append(el('p','detail-small',`已完成完整分析 ${count(research.counts?.dispatched)} · 过期 ${count(research.counts?.expired)} · 总队列丢弃 ${count(research.counts?.dropped)} · 单钱包拥塞丢弃 ${count(research.counts?.perWalletDropped)} · 分析队列丢弃 ${count(research.counts?.analysisDropped)}。链上核验最多每分钟 ${count(research.requestLimitPerMinute)} 笔，独立于 GMGN 限流；完整分析最多每分钟 ${count(research.analysisLimitPerMinute)} 笔。`));
     node.append(el('p','detail-small','快速预判后，继续核对确认回执、支持的交易协议和钱包资产变化。转账、空投、授权、包裹币与加减流动性不计买入；不支持或证据不足保留待确认。此通道只触发研究，暂不下单。'));
     renderWalletActivity(node,data.activity,research,openFolds.length===3&&openFolds[0]);

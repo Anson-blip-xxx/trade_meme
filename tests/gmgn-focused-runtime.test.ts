@@ -4,6 +4,7 @@ import {mkdtempSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
+import bs58 from 'bs58';
 import {readConfig} from '../src/config.js';
 import {createRuntime} from '../src/runtime.js';
 import {GmgnError} from '../src/providers/gmgn-client.js';
@@ -35,7 +36,8 @@ function fixture(extra:Record<string,string>={}){
     AVE_SIGNALS_DATABASE_PATH:join(dir,'ave.sqlite'),AVE_SESSION_PATH:join(dir,'ave-session.json'),
     SOURCE_EVIDENCE_DATABASE_PATH:join(dir,'sources.sqlite'),MEME_DATABASE_PATH:join(dir,'meme.sqlite'),
     WALLET_HISTORY_DATABASE_PATH:join(dir,'history.sqlite'),WALLET_PROFILES_DATABASE_PATH:join(dir,'profiles.sqlite'),
-    WALLET_SCREENING_DATABASE_PATH:join(dir,'screening.sqlite'),TOKEN_RANK_RESEARCH_DATABASE_PATH:join(dir,'rank.sqlite'),...extra};
+    WALLET_SCREENING_DATABASE_PATH:join(dir,'screening.sqlite'),TOKEN_RANK_RESEARCH_DATABASE_PATH:join(dir,'rank.sqlite'),
+    CHAIN_STREAM_DATABASE_PATH:join(dir,'chain.sqlite'),WALLET_ACTIVITY_DATABASE_PATH:join(dir,'activity.sqlite'),...extra};
   return {dir,config:readConfig(env)};
 }
 function pages(){
@@ -79,6 +81,52 @@ test('focused startup pauses GMGN discovery and watch polling while retaining so
     assert.equal(status.walletResearch.observer.running,false);
     assert.equal(status.watchRecheck.enabled,false);
     assert.equal(status.entryMode,'off');assert.equal(runtime.dashboardOrders().total,0);
+  }finally{await runtime.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('focused runtime sends an RPC-verified wallet buy through on-demand research without enabling trading',async()=>{
+  const observedWallet=bs58.encode(new Uint8Array(32).fill(7));
+  const token=bs58.encode(new Uint8Array(32).fill(8));
+  const txHash=bs58.encode(new Uint8Array(64).fill(9));
+  const {dir,config}=fixture({SCANNER_CHAINS:'solana',CHAIN_STREAM_ENABLED:'true',WALLET_FAST_ENABLED:'true',
+    SOLANA_STREAM_HTTP_URL:'https://rpc.example.test',SOLANA_STREAM_WS_URL:'wss://rpc.example.test'});
+  const runtime=createRuntime(config,{walletActivityVerify:async event=>({version:1,chain:'solana',wallet:event.wallet,txHash:event.txHash,
+    receivedAt:event.receivedAt,checkedAt:new Date().toISOString(),eventAt:event.receivedAt,classification:'buy',
+    reasons:['SUPPORTED_SWAP_AND_WALLET_FLOW_CONFIRMED'],trades:[{tokenAddress:token,side:'buy',amountAtomic:'1000',protocol:'pump_swap'}],
+    retryable:false,confirmation:'confirmed',slot:123,transferCount:2,tradingEnabled:false})});
+  try{
+    runtime.providers.provenance=async()=>unknown('TEST_ORIGIN_UNKNOWN');
+    runtime.providers.safety=async()=>unknown('TEST_SAFETY_UNKNOWN');
+    runtime.providers.evidence=async()=>[];
+    runtime.providers.narrative=async()=>({...unknown('TEST_NARRATIVE_UNKNOWN'),evidence:[]});
+    runtime.providers.research=undefined;runtime.providers.walletScreening=undefined;
+    const research=runtime.walletFastResearch!;research.start();
+    const receivedAt=new Date().toISOString();
+    research.enqueue({id:`solana:${observedWallet}:${txHash}`,chain:'solana',wallet:observedWallet,txHash,slot:123,
+      receivedAt,judgedAt:receivedAt,processingMs:0,kind:'wallet_mention',verdict:'priority_review',groups:['forward_validated'],
+      profileFresh:true,cachedSafety:'unknown',commitment:'processed',removed:false,buyVerified:false,tradingEnabled:false});
+    await research.runOnce();
+    const reports=runtime.store.list().filter(item=>item.report?.signal.source==='wallet');
+    assert.equal(reports.length,1);assert.equal(reports[0].report!.signal.token.address,token);
+    assert.equal(reports[0].report!.executionEnabled,false);assert.equal(reports[0].report!.buyEligible,false);
+    assert.equal(runtime.archive!.trackingTokens(20,new Date()).some(item=>item.chain==='solana'&&item.address===token),true);
+    assert.equal(research.status().counts.dispatched,1);assert.equal(runtime.dashboardOrders().total,0);
+    assert.equal(runtime.signalCounting.status().candidates,0);
+    const overview=runtime.dashboardOverview(),stream=overview.chainStream;
+    if(!('walletFast' in stream)||!('research' in stream.walletFast))assert.fail('wallet fast status unavailable');
+    const fast=stream.walletFast.research;
+    assert.equal(overview.gmgnUsage.backgroundResearchEnabled,false);
+    assert.equal(overview.gmgnUsage.pausedTasks.includes('wallet_fast_full_research'),false);
+    assert.equal(overview.gmgnUsage.retainedTasks.includes('wallet_verified_buy_on_demand_research'),true);
+    assert.equal(fast.fullResearchEnabled,false);assert.equal(fast.pausedReason,'GMGN_BACKGROUND_RESEARCH_DISABLED');
+    assert.equal(fast.broadBackgroundResearchEnabled,false);
+    assert.equal(fast.walletTriggeredOnDemandResearchEnabled,true);
+    assert.equal(fast.walletTriggeredOnDemandResearchReady,true);
+    runtime.client.recordRateLimit(new Headers({'retry-after':'60'}));
+    const cooled=runtime.chainStreamStatus();
+    if(!('walletFast' in cooled)||!('research' in cooled.walletFast))assert.fail('wallet fast cooldown status unavailable');
+    assert.equal(cooled.walletFast.research.walletTriggeredOnDemandResearchReady,false);
+    assert.equal(cooled.walletFast.research.walletTriggeredOnDemandResearchBlockedReason,'GMGN_RATE_LIMITED');
   }finally{await runtime.close();rmSync(dir,{recursive:true,force:true});}
 });
 

@@ -4,7 +4,7 @@ import {constants, generateKeyPairSync, randomUUID, verify} from 'node:crypto';
 import {readConfig, type Config} from '../src/config.js';
 import {EntryController, type LiveProtectionProvider} from '../src/entry.js';
 import {OrderStore} from '../src/orders.js';
-import {GmgnClient} from '../src/providers/gmgn-client.js';
+import {GmgnClient,type GmgnScheduleOptions} from '../src/providers/gmgn-client.js';
 import {combineSafety} from '../src/research.js';
 import type {Report,Check} from '../src/types.js';
 import {signal, token, pass, narrative} from './helpers.js';
@@ -118,6 +118,17 @@ test('paper simulation never requests live capability evidence', async t => {
   const ctx=setup(t,{mode:'paper',liveProtection:()=>{throw new Error('PAPER_MUST_NOT_ASK_FOR_LIVE_PROTECTION');}});
   assert.equal((await ctx.controller.consider(candidate())).order?.status,'paper_open');
   assert.equal(ctx.signedCalls.length,0);
+});
+
+test('live GMGN quote and opening POST both use the live-entry scheduler lane',async t=>{
+  const ctx=setup(t,{mode:'live'}),scheduled:GmgnScheduleOptions[]=[];
+  const schedule=ctx.client.scheduleRequest.bind(ctx.client);
+  ctx.client.scheduleRequest=async<T>(weight:number,execute:()=>Promise<T>,options:GmgnScheduleOptions={},interrupt?:()=>void)=>{
+    scheduled.push({...options});return schedule(weight,execute,options,interrupt);
+  };
+  const result=await ctx.controller.consider(candidate());
+  assert.equal(result.order?.status,'submitted');assert.equal(ctx.readCalls.length,1);assert.equal(ctx.signedCalls.length,1);
+  assert.deepEqual(scheduled.map(options=>options.priority),['live_entry','live_entry']);
 });
 
 test('profile-supported entry rechecks its own expiry after a quote and refuses missing or withdrawn evidence',async t=>{

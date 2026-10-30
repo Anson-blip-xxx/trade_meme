@@ -258,7 +258,8 @@ export class EntryController {
       if (order.mode === 'live') this.requireLiveProtection(chain, order.wallet, 'before_quote');
       const beforeQuote=this.checkEligibility(report);if(beforeQuote)throw new EntryError(beforeQuote);
       const raw = await this.client.get('/v1/trade/quote', {chain: chainName(chain), from_address: order.wallet,
-        input_token: order.inputToken, output_token: target, input_amount: order.inputAmount, slippage: order.slippagePct}, 10);
+        input_token: order.inputToken, output_token: target, input_amount: order.inputAmount, slippage: order.slippagePct}, 10,
+        {priority:'live_entry'});
       const quote = quoteSummary(raw, order, this.now());
       const expired = this.checkEligibility(report);
       if (expired) throw new EntryError(expired);
@@ -569,7 +570,7 @@ export class EntryController {
           throw new EntryError('ENTRY_REQUEST_TIMEOUT');
         throw new EntryError('ENTRY_REQUEST_FAILED');
       } finally { clearTimeout(timer!); }
-    });
+    },method==='POST'?{priority:'live_entry'}:{});
   }
 
   private applyExecution(order: OpeningOrder, raw: unknown): OpeningOrder {

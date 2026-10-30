@@ -80,6 +80,16 @@ test('real third source candidate reserves 3% total SOL and attaches +100/50 and
   assert.equal(f.swaps[0].sell_ratio_type,'hold_amount');assert.equal(f.config.entryMode,'off');
 });
 
+test('third-signal GMGN quote and opening POST both use the live-entry scheduler lane',async t=>{
+  const priorities:(string|undefined)[]=[];
+  const f=fixture(t,{scheduleRequest:async(_weight,perform,scheduling)=>{
+    priorities.push(scheduling?.priority);return perform();
+  }});
+  const result=await f.controller.consider(f.candidate());
+  assert.equal(result.order?.status,'confirmed');assert.equal(f.state.quotes,1);assert.equal(f.state.posts,1);
+  assert.deepEqual(priorities,['live_entry','live_entry']);
+});
+
 test('disabled, stopped, simulated, wrong chain/source/count/cap and stale candidates never request funds or quote',async t=>{
   for(const patch of [{mode:'simulation',executionEnabled:false,phase:'simulation_candidate'},{source:'wallet'},{chain:'bsc'},
     {count:2},{count:4},{marketCapUsd:100001},{marketCapUsd:0},{marketCapUsd:NaN},{address:SOL},{eventId:''}]){

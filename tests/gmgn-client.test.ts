@@ -76,6 +76,39 @@ test('all instances serialize requests and same-key instances share pacing', asy
   assert.ok(starts[1] - starts[0] >= 45, `weighted pacing gap: ${starts[1] - starts[0]}`);
 });
 
+test('same-key clients retain conservative pacing across observed GMGN tiers', async () => {
+  const apiKey = key(), starts: number[] = [];
+  let calls = 0;
+  const fetcher: typeof fetch = async () => {
+    starts.push(Date.now());
+    calls++;
+    const limit = calls === 1 ? '5' : calls === 2 ? '20' : undefined;
+    return response({code: 0, data: calls}, 200, limit ? {'x-ratelimit-limit': limit} : {});
+  };
+  const a = new GmgnClient({apiKey, minIntervalMs: 350, fetcher});
+  const b = new GmgnClient({apiKey, minIntervalMs: 350, fetcher});
+  assert.equal(await a.get(route, query), 1);
+  assert.equal(await b.get(route, query), 2);
+  assert.equal(await a.get(route, query), 3);
+  const downgradedGap = starts[1] - starts[0];
+  const upgradedGap = starts[2] - starts[1];
+  assert.ok(downgradedGap >= 340, `Free-tier pacing gap: ${downgradedGap}`);
+  assert.ok(upgradedGap >= 330 && upgradedGap < 900, `recovered Plus-tier pacing gap: ${upgradedGap}`);
+});
+
+test('malformed rate-limit headers do not change credential pacing', async () => {
+  for (const limit of ['0', '5.5', 'Infinity', '5,20', '1000']) {
+    const starts: number[] = [];
+    const client = new GmgnClient({apiKey: key(), minIntervalMs: 0, fetcher: async () => {
+      starts.push(Date.now());
+      return response({code: 0, data: {}}, 200, {'x-ratelimit-limit': limit});
+    }});
+    await client.get(route, query);
+    await client.get(route, query);
+    assert.ok(starts[1] - starts[0] < 250, `invalid ${limit} changed pacing by ${starts[1] - starts[0]}ms`);
+  }
+});
+
 test('live-entry work passes queued normal work without bypassing the global in-flight request', async () => {
   const entered = deferred<void>(), release = deferred<void>(), order: string[] = [];
   const client = new GmgnClient({apiKey: key(), minIntervalMs: 0, fetcher: async input => {
@@ -90,6 +123,34 @@ test('live-entry work passes queued normal work without bypassing the global in-
   await Promise.all([inFlight, ...normal, live]);
   assert.equal(order.length, 34);
   assert.deepEqual(order.slice(0, 2), ['in-flight', 'live-entry']);
+});
+
+test('live-entry quote interrupts an in-flight archive request and passes the normal backlog', async () => {
+  const entered = deferred<void>(), order: string[] = [];
+  const client = new GmgnClient({apiKey: key(), minIntervalMs: 0, fetcher: async (input, init) => {
+    const url = new URL(String(input));
+    if (url.pathname === '/v1/market/token_signal') {
+      order.push('archive-start'); entered.resolve();
+      await new Promise<void>((_resolve, reject) => {
+        const signal = init?.signal;
+        const abort = () => {order.push('archive-abort'); reject(new Error('ARCHIVE_ABORTED'));};
+        if (signal?.aborted) abort(); else signal?.addEventListener('abort', abort, {once: true});
+      });
+    }
+    const marker = url.searchParams.get('marker') ?? url.pathname;
+    order.push(marker);
+    return response({code: 0, data: marker});
+  }});
+  const archive = client.getMemeMarketSignals('sol');
+  await entered.promise;
+  const archiveRejected = assert.rejects(archive, rejects('GMGN_REQUEST_ABORTED'));
+  const normal = Array.from({length: 4}, (_, index) => client.get(route, {...query, marker: `normal-${index}`}));
+  const quote = client.get('/v1/trade/quote', {chain:'sol',marker:'live-quote'}, 10, {priority:'live_entry'});
+  await archiveRejected;
+  assert.equal(await quote, 'live-quote');
+  await Promise.all(normal);
+  assert.deepEqual(order.slice(0, 3), ['archive-start', 'archive-abort', 'live-quote']);
+  assert.deepEqual(order.slice(3), ['normal-0', 'normal-1', 'normal-2', 'normal-3']);
 });
 
 test('expired live-entry work is removed and never consumes a later request slot', async () => {

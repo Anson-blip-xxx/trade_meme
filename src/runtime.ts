@@ -80,6 +80,7 @@ import {canonicalSolanaTokenAddress,TelegramTokenCardService} from './telegram-t
 import type {TelegramNotificationButtons} from './telegram-format.js';
 import {LatestWorkQueue} from './latest-work-queue.js';
 import {SourceObservationRunner,type SourceResearchObservation} from './source-observation-runner.js';
+import {GmgnPlusArchive,GmgnPlusArchiveRunner} from './gmgn-plus-archive.js';
 
 export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;jevInvoke?:JevShadowOptions['invoke'];telegramFetcher?:typeof fetch;
   heldFetcher?:typeof fetch;entryFetcher?:typeof fetch;gmgnFetcher?:typeof fetch;
@@ -104,7 +105,8 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
   if(config.debotScannerEnabled&&[config.ordersDatabase,config.dashboard.archivePath,config.walletResearch.database,
     config.walletProfiles.database,config.walletScreening.database,config.chainStream.database,config.exitShadow.database,
     config.debotSignalsDatabase].some(path=>sameDatabase(path,config.debotSessionPath)))throw new Error('DEBOT_SESSION_PATH_CONFLICT');
-  const client=new GmgnClient({apiKey:config.gmgnApiKey,minIntervalMs:config.gmgnMinIntervalMs,fetcher:dependencies.gmgnFetcher});
+  const client=new GmgnClient({apiKey:config.gmgnApiKey,privateKeyPem:config.gmgnPrivateKey,
+    minIntervalMs:config.gmgnMinIntervalMs,fetcher:dependencies.gmgnFetcher});
   const entryHolderReader=new GmgnEntryHolderReader(client);
   if(config.meme?.enabled&&[config.ordersDatabase,config.dashboard.archivePath,config.walletResearch.database,
     config.walletProfiles.database,config.walletScreening.database,config.chainStream.database,config.exitShadow.database,
@@ -113,6 +115,17 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
   const protectedPaths=[config.ordersDatabase,config.dashboard.archivePath,config.walletResearch.database,config.walletProfiles.database,
     config.walletScreening.database,config.chainStream.database,config.exitShadow.database,config.debotSignalsDatabase,config.debotSessionPath,
     ...(config.meme?.enabled?[config.meme.database]:[])];
+  const gmgnPlusConflicts=[...protectedPaths,'.env',config.ave?.database,config.ave?.sessionPath,config.corroboration?.database,
+    config.jev?.database,config.tokenRankResearch?.database,config.walletFast?.database].filter((path):path is string=>!!path);
+  if(config.gmgnPlusArchive?.enabled&&gmgnPlusConflicts.some(path=>sameDatabase(path,config.gmgnPlusArchive!.database)))
+    throw new Error('GMGN_PLUS_ARCHIVE_DATABASE_MUST_BE_SEPARATE');
+  const gmgnPlusArchive=config.gmgnPlusArchive?.enabled?new GmgnPlusArchive({path:config.gmgnPlusArchive.database,
+    maxBytes:config.gmgnPlusArchive.maxBytes,maxCandidates:config.gmgnPlusArchive.maxCandidates}):undefined;
+  if(config.gmgnPlusArchive?.enabled)protectedPaths.push(config.gmgnPlusArchive.database);
+  const gmgnPlusRunner=gmgnPlusArchive&&config.gmgnApiKey?.trim()?new GmgnPlusArchiveRunner({archive:gmgnPlusArchive,client,
+    chains:config.gmgnPlusArchive!.chains,intervalMs:config.gmgnPlusArchive!.intervalSec*1000}):undefined;
+  const gmgnPlusStatus=()=>gmgnPlusRunner?.status()??(gmgnPlusArchive?{...gmgnPlusArchive.status(),running:false,
+    pausedReason:'GMGN_API_KEY_MISSING'}:{enabled:false});
   if(config.telegram?.enabled&&config.telegram.token&&config.telegram.chatId&&
     [...protectedPaths,'.env',config.ave?.database,config.ave?.sessionPath,config.corroboration?.database,
       config.jev?.database,config.tokenRankResearch?.database,config.walletFast?.database].filter((path):path is string=>!!path)
@@ -840,7 +853,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
     ...(config.solanaExecutionProvider==='pump_native'?{native:{
       readiness:()=>nativeTrading?.readiness()??{ready:false,reason:nativeTradingError??'NATIVE_EXECUTOR_UNAVAILABLE'},
       execute:(order,guard)=>{if(!nativeTrading)throw Error('NATIVE_EXECUTOR_UNAVAILABLE');return nativeTrading.execute(order,guard);}}}:{}),
-    scheduleRequest:(weight,execute)=>client.scheduleRequest(weight,execute),
+    scheduleRequest:(weight,execute,scheduling)=>client.scheduleRequest(weight,execute,scheduling),
     recordRateLimit:(headers,payload)=>client.recordRateLimit(headers,payload)});
   thirdEntry.recoverPrepared();
   const reconciler=new OrderReconciler(orders,entry);
@@ -1125,6 +1138,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
           'wallet_discovery_research','watch_rechecks'],
         retainedTasks:['signal_details_and_safety','positions','price_fallback','trading',
           'debot_ave_signals','chain_trade_classification','wallet_verified_buy_on_demand_research','local_wallet_profiles_and_indexes']},
+      gmgnPlusArchive:gmgnPlusStatus(),
       scanner:{...scanner.getStatus(),enabled:backgroundGmgnEnabled&&config.scannerEnabled,pausedReason:backgroundGmgnPausedReason},
       debotScanner:debotScanner?.getStatus()??{enabled:false,running:false},
       debotStream:debotStream?.getStatus(),
@@ -1140,6 +1154,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
     start(){
       if(closed) return;
       walletStatsRunner?.start();
+      gmgnPlusRunner?.start();
       setResearchLivePriority(signalCounting.status().running);
       walletIndexRunner?.start();
       followupReview?.start();
@@ -1222,6 +1237,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       await Promise.all([chainMonitor?.stop(),tracking?.stop(),balances?.stop(),walletObserver?.stop(),system?.stop(),watchRechecker?.stop()]);
       await walletExitPressure?.stop();
       await walletIndexRunner?.stop();
+      if(gmgnPlusRunner)await gmgnPlusRunner.stop();else gmgnPlusArchive?.close();
       await followupReview?.stop();
       await reconciler.stop();
       // Stop means no new work. Await current callback before closing its stores.

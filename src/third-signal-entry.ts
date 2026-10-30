@@ -5,6 +5,7 @@ import type {EntryResult} from './entry.js';
 import {OrderStore, type ExitTracking, type FundingSnapshot, type OpeningOrder} from './orders.js';
 import {buildExitConditions,isCurrentExitPolicy,parseExitPolicy} from './exit-policy.js';
 import {GmgnTestClient, GmgnTestError} from './controlled-test/gmgn.js';
+import type {GmgnScheduleOptions} from './providers/gmgn-client.js';
 import {readNativeBalance, nativeBalanceCoversOrder, NATIVE_INPUT_TOKENS} from './native-balance.js';
 import {inspectTestQuote} from './trade-interface-check.js';
 import type {ThirdSignalCandidate} from './third-signal-strategy.js';
@@ -29,7 +30,7 @@ export interface ThirdSignalEntryOptions {
   fetcher?:typeof fetch;
   now?:()=>Date;
   /** Shares the existing credential's pacing with all other GMGN users. */
-  scheduleRequest?:<T>(weight:number,execute:()=>Promise<T>)=>Promise<T>;
+  scheduleRequest?:<T>(weight:number,execute:()=>Promise<T>,scheduling?:GmgnScheduleOptions)=>Promise<T>;
   recordRateLimit?:(headers:Headers,payload?:unknown)=>void;
   /** Trusted normalized holding ratios, fetched through the shared GMGN read client. */
   readHolderRisk?:(address:string)=>Promise<EntryHolderRiskValues>;
@@ -168,7 +169,7 @@ export class ThirdSignalEntryController {
           if(response.status===429)this.options.recordRateLimit?.(response.headers);
           return response;
         };
-        return this.options.scheduleRequest?this.options.scheduleRequest(10,perform):perform();
+        return this.options.scheduleRequest?this.options.scheduleRequest(10,perform,{priority:'live_entry'}):perform();
       }});
     return this.client;
   }

@@ -8,6 +8,9 @@ const MAX_QUEUE_WAIT_MS = 45_000;
 const MAX_LIVE_ENTRY_QUEUE = 16;
 const MAX_NORMAL_QUEUE = 128;
 const MAX_BACKGROUND_QUEUE = 16;
+// A busy normal lane still yields one bounded opportunity to its own archive
+// work. This is per credential: unrelated API keys retain independent lanes.
+const BACKGROUND_FAIRNESS_INTERVAL_MS = 5_000;
 // GMGN documents the plan bucket as weight units refilled per second
 // (Free 5/5, Plus 20/20, Pro 50/50). The 350 ms floor is intentionally
 // conservative enough for Free even when a route carries multiple units.
@@ -56,6 +59,7 @@ interface RateState {
   observedIntervalMs: number;
   lastStartedAt?: number;
   lastCost?: number;
+  lastBackgroundStartedAt?: number;
 }
 export type GmgnRequestPriority = 'background' | 'normal' | 'live_entry';
 export interface GmgnScheduleOptions {
@@ -129,6 +133,21 @@ function nextReady(queue: ScheduledRequest<unknown>[]): {job?: ScheduledRequest<
   }
   return {wait};
 }
+function nextReadyBackground(now: number): {job?: ScheduledRequest<unknown>; wait: number; contended: boolean} {
+  let wait = Number.POSITIVE_INFINITY;
+  for (const job of backgroundQueue) {
+    if (activeLanes.has(job.lane)) continue;
+    const pacingWait = Math.max(0, job.waitMs());
+    if (pacingWait > 0) { wait = Math.min(wait, pacingWait); continue; }
+    const contended = normalQueue.some(normal => normal.lane === job.lane);
+    if (!contended) return {job, wait: 0, contended: false};
+    const fairAt = (job.lane.lastBackgroundStartedAt ?? Number.NEGATIVE_INFINITY) + BACKGROUND_FAIRNESS_INTERVAL_MS;
+    const fairnessWait = Math.max(0, fairAt - now);
+    if (fairnessWait === 0) return {job, wait: 0, contended: true};
+    wait = Math.min(wait, fairnessWait);
+  }
+  return {wait, contended: false};
+}
 async function drainScheduler(): Promise<void> {
   if (schedulerActive) return;
   schedulerActive = true;
@@ -138,14 +157,18 @@ async function drainScheduler(): Promise<void> {
       pruneQueue(liveEntryQueue, now); pruneQueue(normalQueue, now); pruneQueue(backgroundQueue, now);
       const live = nextReady(liveEntryQueue);
       const normal = live.job ? {wait: Number.POSITIVE_INFINITY} : nextReady(normalQueue);
-      const background = live.job || normal.job ? {wait: Number.POSITIVE_INFINITY} : nextReady(backgroundQueue);
-      const selected = live.job ?? normal.job ?? background.job;
+      const background = live.job ? {wait: Number.POSITIVE_INFINITY, contended: false} : nextReadyBackground(now);
+      // A contended background job is selected only at its per-credential
+      // fairness boundary. Uncontended background work remains below normal
+      // priority; the loop can start it concurrently once other lanes are busy.
+      const selected = live.job ?? (background.contended ? background.job : normal.job ?? background.job);
       if (!selected) {
         const wait = Math.min(live.wait, normal.wait, background.wait);
         if (Number.isFinite(wait)) schedulerWake = setTimeout(() => {schedulerWake = undefined; kickScheduler();}, wait);
         return;
       }
       removeScheduled(selected); selected.started = true; cleanupScheduled(selected); activeLanes.add(selected.lane);
+      if (selected.priority === 'background') selected.lane.lastBackgroundStartedAt = now;
       activeRequests.set(selected.lane,selected);
       void (async () => {
         try {

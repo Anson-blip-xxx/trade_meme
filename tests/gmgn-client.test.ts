@@ -153,6 +153,76 @@ test('live-entry quote interrupts an in-flight archive request and passes the no
   assert.deepEqual(order.slice(3), ['normal-0', 'normal-1', 'normal-2', 'normal-3']);
 });
 
+test('a normal flood yields a bounded per-credential opportunity to queued background work', async () => {
+  const entered = deferred<void>(), release = deferred<void>(), order: string[] = [];
+  const client = new GmgnClient({apiKey: key(), minIntervalMs: 0, fetcher: async input => {
+    const marker = new URL(String(input)).searchParams.get('marker')!;
+    order.push(marker);
+    if (marker === 'blocker') {entered.resolve(); await release.promise;}
+    return response({code: 0, data: marker});
+  }});
+  const blocker = client.get(route, {...query, marker: 'blocker'}); await entered.promise;
+  const background = client.get(route, {...query, marker: 'background'}, 1,
+    {priority: 'background', queueTimeoutMs: 1_000});
+  const normal = Array.from({length: 32}, (_, index) =>
+    client.get(route, {...query, marker: `normal-${index}`}));
+  release.resolve();
+  await Promise.all([blocker, background, ...normal]);
+  assert.deepEqual(order.slice(0, 3), ['blocker', 'background', 'normal-0']);
+});
+
+test('live entry remains ahead of a fair background opportunity', async () => {
+  const entered = deferred<void>(), release = deferred<void>(), order: string[] = [];
+  const client = new GmgnClient({apiKey: key(), minIntervalMs: 0, fetcher: async input => {
+    const marker = new URL(String(input)).searchParams.get('marker')!;
+    order.push(marker);
+    if (marker === 'blocker') {entered.resolve(); await release.promise;}
+    return response({code: 0, data: marker});
+  }});
+  const blocker = client.get(route, {...query, marker: 'blocker'}); await entered.promise;
+  const background = client.get(route, {...query, marker: 'background'}, 1, {priority: 'background'});
+  const normal = client.get(route, {...query, marker: 'normal'});
+  const live = client.get(route, {...query, marker: 'live'}, 1, {priority: 'live_entry'});
+  release.resolve();
+  await Promise.all([blocker, background, normal, live]);
+  assert.deepEqual(order, ['blocker', 'live', 'background', 'normal']);
+});
+
+test('fairness never promotes multiple background jobs in a burst', async () => {
+  const entered = deferred<void>(), release = deferred<void>(), order: string[] = [];
+  const client = new GmgnClient({apiKey: key(), minIntervalMs: 0, fetcher: async input => {
+    const marker = new URL(String(input)).searchParams.get('marker')!;
+    order.push(marker);
+    if (marker === 'blocker') {entered.resolve(); await release.promise;}
+    return response({code: 0, data: marker});
+  }});
+  const blocker = client.get(route, {...query, marker: 'blocker'}); await entered.promise;
+  const backgrounds = ['background-0', 'background-1'].map(marker =>
+    client.get(route, {...query, marker}, 1, {priority: 'background'}));
+  const normal = ['normal-0', 'normal-1'].map(marker => client.get(route, {...query, marker}));
+  release.resolve();
+  await Promise.all([blocker, ...backgrounds, ...normal]);
+  assert.deepEqual(order, ['blocker', 'background-0', 'normal-0', 'normal-1', 'background-1']);
+});
+
+test('normal traffic on one credential cannot delay background work on another', async () => {
+  const entered = deferred<void>(), release = deferred<void>(), backgroundStarted = deferred<void>();
+  const busy = new GmgnClient({apiKey: key(), minIntervalMs: 0, fetcher: async () => {
+    entered.resolve(); await release.promise;
+    return response({code: 0, data: 'normal'});
+  }});
+  const independent = new GmgnClient({apiKey: key(), minIntervalMs: 0, fetcher: async () => {
+    backgroundStarted.resolve();
+    return response({code: 0, data: 'background'});
+  }});
+  const blocker = busy.get(route, query); await entered.promise;
+  const normal = Array.from({length: 16}, () => busy.get(route, query));
+  const background = independent.get(route, query, 1, {priority: 'background'});
+  await backgroundStarted.promise;
+  assert.equal(await background, 'background');
+  release.resolve(); await blocker; await Promise.all(normal);
+});
+
 test('expired live-entry work is removed and never consumes a later request slot', async () => {
   const entered = deferred<void>(), release = deferred<void>(); let calls = 0;
   const client = new GmgnClient({apiKey: key(), minIntervalMs: 0, fetcher: async () => {

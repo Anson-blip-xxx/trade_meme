@@ -10,6 +10,7 @@ import {SourceCorroboration} from '../src/source-corroboration.js';
 import {buildReviewSamplingPlan,writeReviewSamplingPlan} from '../src/review-sampling.js';
 import type {MemeMarketSample,MemeAssessment,MemeCatalystSnapshot} from '../src/meme-assessment.js';
 import type {Signal,Report,Check} from '../src/types.js';
+import type {ThirdSignalNotificationSnapshot} from '../src/third-signal-strategy.js';
 
 const origin=Date.parse('2026-10-16T09:00:00.000Z'),at=(sec=0)=>new Date(origin+sec*1000).toISOString();
 const address=(n=1)=>`0x${n.toString(16).padStart(40,'0')}`,token=(n=1,chain:Signal['token']['chain']='bsc')=>({chain,address:address(n)});
@@ -23,6 +24,16 @@ function catalyst(target=token(),sec=0):MemeCatalystSnapshot {
     diffusion:{status:'unknown',coverage:'sampled',windowStart:at(sec-600),windowEnd:at(sec),postCount:0,independentAuthorCount:0,caPostCount:0,caAuthorCount:0,recent5m:{postCount:0,authorCount:0},previous5m:{postCount:0,authorCount:0}},
     celebrities:{status:'unknown',signals:[],endorsementVerified:false,accountIdentityCoverage:'unverified'},
     evidence:{requestedPostCount:0,retrievedPostCount:0,diagnostics:[],narrativeStatus:'unknown',narrativeReasons:[],limitations:[]}};
+}
+function forwardSnapshot(target=token(),sec=0,ordinal:3|4=3):ThirdSignalNotificationSnapshot {
+  return {version:'third-signal-notification-v1',runId:'live-run',windowId:'live-window',source:'debot',chain:target.chain,
+    address:target.address,eventId:`forward-${ordinal}-${sec}`,ordinal,occurredAt:at(sec),receivedAt:at(sec),capturedAt:at(sec),token:{},
+    market:{price:{status:'unavailable',reason:'SOURCE_NOTIFICATION_FIELD_UNAVAILABLE'},
+      marketCap:{status:'unavailable',reason:'SOURCE_NOTIFICATION_FIELD_UNAVAILABLE'},
+      liquidity:{status:'unavailable',reason:'SOURCE_NOTIFICATION_FIELD_UNAVAILABLE'},
+      pool:{status:'unavailable',reason:'SOURCE_NOTIFICATION_FIELD_UNAVAILABLE'}},
+    safety:{status:'unavailable',reason:'NOT_AVAILABLE_ON_NOTIFICATION_FAST_PATH'},
+    wallets:{status:'unavailable',verification:'none',observations:[],reason:'SOURCE_NOTIFICATION_FIELD_UNAVAILABLE'}};
 }
 function report(sec=0):Report {
   const check:Check={status:'fail',reasons:['TEST_SAFETY_FAILED'],checkedAt:at(sec),facts:{}};
@@ -79,8 +90,12 @@ test('status recent-window count uses the chain and signal-time covering index',
 
 test('runtime status remains a database-free scalar snapshot for HTTP composition',async()=>{
   const f=fixture();try {
-    const observer=f.create();observer.register(signal());await observer.close();
+    const observer=f.create();observer.register(signal());
+    assert.equal(observer.status().storage.maintenance?.running,true,'every persistent observer delegates maintenance from startup');
+    await observer.close();
     const status=observer.runtimeStatus();assert.equal(status.enabled,true);assert.equal(status.maxActive,180);
+    assert.equal(status.priceArchiveCapacity.plannedRows,3_628_800);
+    assert.equal(status.priceArchiveCapacity.status,'insufficient','direct small test stores expose capacity without production preflight');
     assert.equal(status.samplingPlan.reason,'DASHBOARD_QUERY_PENDING');
     assert.throws(()=>observer.status());
   }finally{await f.close();}
@@ -149,6 +164,23 @@ test('market callback receives only committed sanitized new samples and cannot r
   }finally{await f.close();}
 });
 
+test('validated pool prices share the snapshot transaction with the compact archive',async()=>{
+  const f=fixture();try {
+    const observer=f.create();observer.register(signal());
+    assert.equal(observer.recordMarket(market()),true);
+    assert.deepEqual(f.rows('meme_price_archive').map(({chain,address:ca,observed_at,source,pool_address,price_usd})=>
+      ({chain,address:ca,observed_at,source,pool_address,price_usd})),[{
+        chain:'bsc',address:address(),observed_at:at(),source:'dexscreener_pair',pool_address:address(1000),price_usd:1,
+      }]);
+    f.advance(6);assert.equal(observer.recordMarket(market(token(),6,2,{poolAddress:undefined})),true);
+    assert.equal(f.rows().length,2);assert.equal(f.rows('meme_price_archive').length,1,'pool-less samples stay out of the comparable-price ledger');
+    const db=new DatabaseSync(f.options.database);db.exec("CREATE TRIGGER fail_compact BEFORE INSERT ON meme_price_archive BEGIN SELECT RAISE(ABORT,'test'); END");db.close();
+    f.advance(12);assert.throws(()=>observer.recordMarket(market(token(),12,3)));
+    assert.equal(f.rows().length,2,'the full snapshot rolls back with a failed compact write');
+    assert.equal(observer.list().items[0].sampleCount,2);
+  }finally{await f.close();}
+});
+
 test('signals enter independent observation before any eligible report; replay freezes first seen and does not renew TTL',async()=>{
   const f=fixture({activeWindowSec:60});try {
     const observer=f.create();assert.equal(observer.register(signal(),at(),{name:'First name'}),true);
@@ -157,6 +189,38 @@ test('signals enter independent observation before any eligible report; replay f
     f.advance(61);await observer.runOnce();assert.equal(f.calls.length,1);assert.equal(observer.list().items[0].observationState,'expired');
     assert.equal(observer.register(signal(1,61,'bsc','fresh-event'),at(61)),true);await observer.runOnce();
     assert.equal(observer.list().items[0].firstSeenAt,at());assert.equal(observer.list().items[0].lastSignalAt,at(61));assert.equal(f.calls.length,2);
+  }finally{await f.close();}
+});
+
+test('live ordinal targets are idempotent, outrank ordinary tokens, and expire exactly after six hours',async()=>{
+  const requests:Signal['token'][][]=[];const f=fixture({activeWindowSec:60,maxActive:1,marketBatch:async tokens=>{requests.push(tokens);return [];}});
+  try {
+    const observer=f.create();
+    const frozen=forwardSnapshot(token(1));
+    assert.deepEqual(observer.trackForwardTarget(frozen),{created:true,active:true});
+    assert.deepEqual(observer.trackForwardTarget(frozen),{created:false,active:true});
+    assert.equal(f.rows('meme_forward_targets').length,1);
+    assert.equal(f.rows('meme_tokens').length,1,'the fast-path target does not depend on the later research handoff');
+    f.advance(61);observer.register(signal(2,61));await observer.runOnce();
+    assert.deepEqual(requests[0].map(({chain,address:ca})=>({chain,address:ca})),[token(1)]);
+    const active=observer.status();assert.equal(active.forwardTargets.active,1);assert.equal(active.forwardTargets.selected,1);
+    assert.equal(active.activeWindowSec,60);assert.equal(active.marketBatchLimit,30);
+    f.advance(6*60*60);observer.register(signal(2,6*60*60,'bsc','ordinary-renewed'));await observer.runOnce();
+    assert.equal(requests.length,2);assert.equal(requests[1][0].address,token(2).address,'ordinary active token resumes after target expiry');
+    assert.equal(observer.status().forwardTargets.active,0);
+  }finally{await f.close();}
+});
+
+test('forward target capacity accounts for chain-separated batches and the request deadline',async()=>{
+  const f=fixture();try {
+    const observer=f.create();
+    for(let i=1;i<=4;i++)observer.trackForwardTarget(forwardSnapshot(token(i,'bsc')));
+    for(let i=5;i<=8;i++)observer.trackForwardTarget(forwardSnapshot(token(i,'robinhood')));
+    assert.equal(observer.status().forwardTargets.projectedRoundSec,30,'normal mode needs one worst-case batch per chain');
+    observer.setLivePriority(true);
+    const live=observer.status().forwardTargets;
+    assert.equal(live.projectedRoundSec,60,'live mode needs two three-token batches per chain');
+    assert.equal(live.selected,8);assert.equal(live.waiting,0);assert.equal(live.alert,undefined);
   }finally{await f.close();}
 });
 
@@ -171,17 +235,17 @@ test('batch observation covers bounded chain groups fairly and enforces 30 secon
   }finally{await f.close();}
 });
 
-test('live counting priority keeps registration, samples one token per turn, and pauses only catalyst research',async()=>{
+test('live counting priority keeps registration, samples three tokens per turn, and pauses only catalyst research',async()=>{
   const catalysts:Signal['token'][]=[];const f=fixture({catalyst:async input=>{catalysts.push(input.token);return catalyst(input.token,f.now());}});
   try {
     const observer=f.create();[1,2,3].forEach(i=>observer.register(signal(i)));
     observer.setLivePriority(true);
-    const priority=observer.status();assert.equal(priority.livePriority,true);assert.equal(priority.marketBatchLimit,1);
+    const priority=observer.status();assert.equal(priority.livePriority,true);assert.equal(priority.marketBatchLimit,3);
     assert.equal(priority.catalystPaused,true);assert.equal(priority.signalRegistrationPaused,false);
-    await observer.runOnce();await observer.runCatalystOnce();assert.deepEqual(f.calls.map(batch=>batch.length),[1]);assert.equal(catalysts.length,0);
+    await observer.runOnce();await observer.runCatalystOnce();assert.deepEqual(f.calls.map(batch=>batch.length),[3]);assert.equal(catalysts.length,0);
     f.advance(1);assert.equal(observer.register(signal(4,1)),true);assert.equal(observer.list().total,4);
     observer.setLivePriority(false);await observer.runOnce();await observer.runCatalystOnce();
-    assert.deepEqual(f.calls.map(batch=>batch.length),[1,3]);assert.equal(catalysts.length,1);
+    assert.deepEqual(f.calls.map(batch=>batch.length),[3,1]);assert.equal(catalysts.length,1);
     assert.equal(observer.status().researchMode,'normal');assert.equal(observer.status().catalystPaused,false);
   }finally{await f.close();}
 });

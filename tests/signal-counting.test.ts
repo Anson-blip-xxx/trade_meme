@@ -69,6 +69,66 @@ test('unverified DeBot cap stays unknown and a fourth alert cannot repair the th
  }finally{s.close();f.close();}
 });
 
+test('source notification snapshots preserve DeBot and Ave receipt-time facts separately',()=>{
+ const f=fixture(),s=new SignalCounting(f.options);try {
+   s.control('start','web');s.observe(observation('debot'));
+   const debot={...observation('debot'),alertPriceUsd:0.00012,alertMarketCapUsd:88000,marketCapTiming:'unverified' as const,
+     marketSnapshotAt:new Date().toISOString(),walletCount:3,addressCount:1,
+     vendorWallets:[{address:ca,alias:'vendor-smart',volumeUsd:123,priceUsd:0.00011}]};
+   assert.equal(s.observe(debot)?.count,2);
+   s.observe(observation('ave'));const ave={...observation('ave'),currentPriceUsd:0.0002,alertMarketCapUsd:91000,
+     vendorWalletCount:2,vendorWallets:[{address:ca,alias:'ave-wallet',side:'buy' as const,volumeUsd:55}]};
+   assert.equal(s.observe(ave)?.count,2);
+   const snapshots=s.strategy.notificationSnapshots().items;
+   assert.equal(snapshots.length,2);
+   const d=snapshots.find(item=>item.source==='debot')!,a=snapshots.find(item=>item.source==='ave')!;
+   assert.equal(d.market.price.status,'observed');if(d.market.price.status==='observed'){
+     assert.equal(d.market.price.value,0.00012);assert.equal(d.market.price.timing,'unverified');
+   }
+   assert.equal(d.market.marketCap.status,'observed');assert.equal(d.wallets.reportedCount,3);
+   assert.equal(d.wallets.identifiedAddressCount,1);assert.equal(d.wallets.observations[0].address,ca);
+   assert.equal(a.market.price.status,'observed');if(a.market.price.status==='observed'){
+     assert.equal(a.market.price.value,0.0002);assert.equal(a.market.price.timing,'receipt_snapshot');
+   }
+   assert.equal(a.market.marketCap.status,'observed');assert.equal(a.wallets.reportedCount,2);
+   assert.equal(a.wallets.observations[0].side,'buy');
+ }finally{s.close();f.close();}
+});
+
+test('live N3/N4 target delivery is post-commit, retries failures, and never changes the counted ACK',async()=>{
+ const f=fixture(),delivered:number[]=[];let fail=true;
+ const s=new SignalCounting({...f.options,executionMode:'live',onCandidate:async()=>{},
+   onForwardTarget:async snapshot=>{if(fail){fail=false;throw Error('temporary observer write');}delivered.push(snapshot.ordinal);}});
+ try {
+   s.control('start','web');s.observePriority(observation());s.observePriority(observation());
+   const result=s.observePriority(observation());assert.equal(result?.status,'candidate');assert.equal(s.status().events,3);
+   await s.waitForDispatches();assert.deepEqual(delivered,[]);assert.equal(s.status().forwardTargetError,'SIGNAL_FORWARD_TARGET_SYNC_FAILED');
+   s.tick();await s.waitForDispatches();assert.deepEqual(delivered,[3]);assert.equal(s.status().forwardTargetError,undefined);
+   assert.equal(s.observePriority(observation())?.count,4);await s.waitForDispatches();assert.deepEqual(delivered,[3,4]);
+   s.tick();await s.waitForDispatches();assert.deepEqual(delivered,[3,4],'idempotent reconciliation does not redeliver');
+ }finally{s.close();f.close();}
+});
+
+test('restart compensates an unprojected live target from frozen snapshots',async()=>{
+ const f=fixture();let first=new SignalCounting({...f.options,executionMode:'live',onCandidate:async()=>{},
+   onForwardTarget:async()=>{throw Error('observer unavailable');}});
+ try {
+   first.control('start','web');first.observe(observation());first.observe(observation());first.observe(observation());
+   await first.waitForDispatches();assert.equal(first.status().events,3);first.close();
+   const delivered:number[]=[];const recovered=new SignalCounting({...f.options,executionMode:'live',onCandidate:async()=>{},
+     onForwardTarget:snapshot=>{delivered.push(snapshot.ordinal);}});first=recovered;
+   await recovered.waitForDispatches();assert.deepEqual(delivered,[3]);
+ }finally{first.close();f.close();}
+});
+
+test('simulation ordinals never enter the live forward-target bridge',async()=>{
+ const f=fixture(),delivered:number[]=[];const s=new SignalCounting({...f.options,onForwardTarget:snapshot=>{delivered.push(snapshot.ordinal);}});
+ try {
+   s.control('start','web');s.observe(observation('ave'));s.observe(observation('ave'));s.observe(observation('ave'));
+   await s.waitForDispatches();assert.deepEqual(delivered,[]);
+ }finally{s.close();f.close();}
+});
+
 test('priority observation only acknowledges a durable strategy write',()=>{
  const f=fixture(),s=new SignalCounting(f.options);try {
    s.control('start','web');const event=observation();
@@ -218,7 +278,7 @@ test('runtime source callbacks feed simulation before research while existing en
    assert.equal(runtime.walletProfiles?.status().livePriority,true);
    assert.equal(runtime.tokenRankResearch?.status().livePriority,true);
    assert.equal(runtime.memeObserver?.status().livePriority,true);
-   assert.equal(runtime.memeObserver?.status().marketBatchLimit,1);
+   assert.equal(runtime.memeObserver?.status().marketBatchLimit,3);
    for(let i=0;i<3;i++){
      runtime.debotScanner!.acceptPage({observations:[observation()],received:1,rejected:0});
      runtime.aveScanner!.acceptPage({observations:[observation('ave')],received:1,rejected:0});
@@ -253,7 +313,7 @@ test('runtime restart restores research pause before workers process a persisted
    runtime=createRuntime(config);assert.equal(runtime.signalCounting.status().running,true);
    runtime.start();
    assert.equal(runtime.memeObserver?.status().livePriority,true);
-   assert.equal(runtime.memeObserver?.status().marketBatchLimit,1);
+   assert.equal(runtime.memeObserver?.status().marketBatchLimit,3);
    const deadline=Date.now()+15_000;
    while(runtime.walletIndexRunner?.snapshot().workerLivePriority!==true||
      runtime.walletProfiles?.status().workerLivePriority!==true||runtime.tokenRankResearch?.status().workerLivePriority!==true){

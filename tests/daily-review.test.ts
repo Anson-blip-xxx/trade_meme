@@ -26,13 +26,14 @@ test('Shanghai calendar windows and 09:00 next run cross year boundaries precise
   assert.throws(()=>buildDailyReview(input({asOf:'2026-10-15T15:59:59.999Z'})),/REVIEW_PERIOD_NOT_CLOSED/);
   assert.throws(()=>buildDailyReview(input({asOf:'bad'})),/REVIEW_PERIOD_NOT_CLOSED/);
 });
-test('event replays deduplicate, independent providers retain evidence, and each chain/CA contributes one cohort unit',()=>{
+test('event replays deduplicate and learning cohorts count each provider independently',()=>{
   const notifications=[notify(),notify(),notify({id:'event-2',receivedAt:at(1)}),notify({source:'ave',receivedAt:at(2)}),
     notify({chain:'robinhood',source:'ave'}),notify({id:'future',receivedAt:'2026-10-17T00:00:00.000Z'})];
   const review=buildDailyReview(input({notifications}));
-  assert.equal(review.counts.signals,4);assert.equal(review.counts.tokens,2);assert.equal(review.learning.priorities.reduce((n,c)=>n+c.total,0),2);
+  assert.equal(review.counts.signals,4);assert.equal(review.counts.tokens,2);assert.equal(review.learning.priorities.reduce((n,c)=>n+c.total,0),3);
   const bsc=review.items.find(i=>i.chain==='bsc')!;assert.equal(bsc.signalCount,3);assert.deepEqual(bsc.sources,['debot','ave']);
-  assert.equal(review.learning.priorities.find(c=>c.chain==='bsc')!.total,1);
+  assert.equal(review.learning.priorities.find(c=>c.chain==='bsc'&&c.source==='debot')!.total,1);
+  assert.equal(review.learning.priorities.find(c=>c.chain==='bsc'&&c.source==='ave')!.total,1);
 });
 test('local flat prices do not hide a supplier 900 percent report; the two evidence scopes stay distinct',()=>{
   const review=buildDailyReview(input({prices:[price(1,1),price(2,1)],vendor:[{...token(),source:'debot',reportedAt:at(3),firstSignalAt:at(-60),maxGainPct:900,scope:'vendor_reported_retrospective'}]}));
@@ -72,6 +73,14 @@ test('future and pre-reception quotes, malformed values and future evaluations c
   assert.equal(review.items[0].localPerformance?.baselineAt,at(1));assert.equal(review.items[0].localPerformance?.maxGainPct,0);
   assert.equal(review.items[0].localPerformance?.samples,2);assert.equal(review.items[0].firstDecision,undefined);assert.equal(review.items[0].eligibility.observedEligible,false);
   assert.equal(review.items[0].localPerformance?.lastSampleAt,at(2));assert.equal(review.items[0].localPerformance?.trailingGapSec,(Date.parse(cutoff)-Date.parse(at(2)))/1000);
+});
+test('the builder rejects prices after the closed day plus 24 hours even when generated later',()=>{
+  const later='2026-10-17T01:00:00.000Z',inside=at(2399),outside=at(2401);
+  const review=buildDailyReview(input({asOf:later,prices:[price(1,1),price(2399,2),price(2401,1000)]}));
+  assert.equal(review.items[0].localPerformance?.lastSampleAt,inside);
+  assert.equal(review.items[0].localPerformance?.maxGainPct,100);
+  assert.equal(review.items[0].localPerformance?.samples,2);
+  assert.notEqual(review.items[0].localPerformance?.lastSampleAt,outside);
 });
 test('execution audit must match both scan ID and exact evaluated decision time',()=>{
   const d=decision({decision:'BUY_CANDIDATE',buyEligible:true,reasons:[]});
@@ -175,7 +184,9 @@ test('missing expected source tables and exhausted scan read capacity mark the d
 test('a source prune watermark intersecting the report day prevents complete-denominator learning',()=>{
   const f=databases();try{
     f.notifyDb();f.debot.exec('CREATE TABLE review_retention_watermarks(source TEXT PRIMARY KEY,pruned_through TEXT NOT NULL)');
-    f.debot.prepare('INSERT INTO review_retention_watermarks VALUES(?,?)').run('debot',at(-1));
+    // Sliding six-hour notification sessions require evidence from six hours
+    // before the report boundary, so a watermark one hour before it is unsafe.
+    f.debot.prepare('INSERT INTO review_retention_watermarks VALUES(?,?)').run('debot',at(-540));
     const raw=f.read();assert.equal(raw.datasetComplete,false);assert.ok(raw.limitations.some(s=>s.includes('debot源库已修剪')));
     f.debot.prepare('UPDATE review_retention_watermarks SET pruned_through=?').run('2026-10-13T00:00:00.000Z');
     assert.equal(f.read().datasetComplete,true);
@@ -187,11 +198,36 @@ test('price reads are bounded to the report window and only that window can exha
     f.meme.exec(`WITH digits(value) AS (VALUES(0),(1),(2),(3),(4),(5),(6),(7),(8),(9))
       INSERT INTO meme_snapshots(chain,address,observed_at,source,market,assessment)
       SELECT 'bsc','${address(1)}','${at(-1000)}','dexscreener_pair','{}','{}'
-      FROM digits a,digits b,digits c,digits d,digits e,digits g LIMIT 250001`);
+      FROM digits a,digits b,digits c,digits d,digits e,digits g LIMIT 50001`);
     let raw=f.read();
     assert.equal(raw.datasetComplete,true);assert.deepEqual(raw.prices.map(p=>p.at).sort(),[at(1),at(2)]);
     f.meme.prepare("UPDATE meme_snapshots SET observed_at=? WHERE market='{}'").run(at(3));
     raw=f.read();assert.equal(raw.datasetComplete,false);
-    assert.ok(raw.limitations.some(s=>s.includes('独立价格样本达到读取上限')));
+    assert.ok(raw.limitations.some(s=>s.includes('独立行情明细已达到保留上限')));
+  }finally{f.close();}
+});
+test('legacy fallback uses the shared full-snapshot cap conservatively when compact prices are absent',()=>{
+  const f=databases();try{
+    f.notifyDb();f.quote(1,1,1);f.quote(1,2,2);
+    f.meme.exec(`WITH RECURSIVE rows(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM rows WHERE n<48998)
+      INSERT INTO meme_snapshots(chain,address,observed_at,source,market,assessment)
+      SELECT 'bsc','${address(999)}','${at(3)}','dexscreener_pair','{}','{}' FROM rows`);
+    const raw=f.read();assert.equal(raw.datasetComplete,false);
+    assert.ok(raw.limitations.some(value=>value.includes('独立行情明细已达到保留上限')));
+    assert.deepEqual(raw.prices.map(row=>row.price),[1,2]);
+  }finally{f.close();}
+});
+test('read adapter prefers the compact price archive and honors its conservative continuity watermark',()=>{
+  const f=databases();try{
+    f.notifyDb();f.quote(1,1,999);f.meme.exec(`CREATE TABLE meme_price_archive(id INTEGER PRIMARY KEY,chain TEXT,address TEXT,observed_at TEXT,source TEXT,pool_address TEXT,price_usd REAL);
+      CREATE TABLE meme_price_archive_state(singleton INTEGER PRIMARY KEY,continuous_from_at TEXT);
+      CREATE TABLE review_retention_watermarks(source TEXT PRIMARY KEY,pruned_through TEXT)`);
+    f.meme.prepare('INSERT INTO meme_price_archive_state VALUES(1,?)').run(reviewWindow('2026-10-15').start);
+    const insert=f.meme.prepare('INSERT INTO meme_price_archive(chain,address,observed_at,source,pool_address,price_usd) VALUES(?,?,?,?,?,?)');
+    insert.run('bsc',address(1),at(1),'dexscreener_pair',poolA,1);insert.run('bsc',address(1),at(2),'dexscreener_pair',poolA,3);
+    let raw=f.read();assert.equal(raw.datasetComplete,true);assert.deepEqual(raw.prices.map(row=>row.price),[1,3]);
+    assert.equal(buildDailyReview(raw).items[0].localPerformance?.maxGainPct,200);
+    f.meme.prepare('INSERT INTO review_retention_watermarks VALUES(?,?)').run('meme_price_archive',reviewWindow('2026-10-15').start);
+    raw=f.read();assert.equal(raw.datasetComplete,false);assert.match(raw.limitations.join('\n'),/紧凑行情归档/);
   }finally{f.close();}
 });

@@ -12,6 +12,7 @@ import {OrderStore} from '../src/orders.js';
 import {GmgnClient} from '../src/providers/gmgn-client.js';
 import type {Report} from '../src/types.js';
 import {summarizeExitQuality,type ExitQualityReview} from '../src/exit-quality.js';
+import type {NotificationTriggerOutcome} from '../src/notification-outcomes.js';
 
 const address='0x'+'a'.repeat(40),at='2026-10-16T01:00:00.000Z';
 const input:ReviewInput={date:'2026-10-15',asOf:at,entryMode:'off',notifications:[],decisions:[],prices:[],vendor:[],orders:[],executions:[],limitations:[]};
@@ -65,6 +66,43 @@ test('daily report publication is immutable and pinned pagination survives anoth
   assert.throws(()=>store.page({date:'2026-02-30'}),/REVIEW_DATE_INVALID/);
   assert.throws(()=>store.page({runId:report.id,date:'2026-10-14'}),/REVIEW_DATE_INVALID/);
   assert.equal(statSync(path).mode&0o777,0o600);
+});
+test('notification learning uses only the latest revision and an incomplete correction invalidates earlier evidence',t=>{
+  const {store}=fixture(t),outcome=(event:string,gain:number):NotificationTriggerOutcome=>({source:'debot',chain:'bsc',address,
+    sessionFirstReceivedAt:'2026-10-15T01:00:00.000Z',sessionExpiresAt:'2026-10-15T07:00:00.000Z',notificationNumber:3,
+    triggerEventId:event,triggerAt:'2026-10-15T01:02:00.000Z',triggerOrderAmbiguous:false,horizons:[{seconds:21600,
+      endsAt:'2026-10-15T07:02:00.000Z',mature:true,status:'covered',maxGainPct:gain,sampledBarrierOrder:'neither'}]});
+  const base=buildDailyReview({...input,notifications:[{id:'n',chain:'bsc',address,source:'debot',receivedAt:'2026-10-15T01:00:00.000Z',occurredAt:'2026-10-15T01:00:00.000Z'}]});
+  const complete={...base,id:'d'.repeat(24),generatedAt:'2026-10-16T02:00:00.000Z',items:base.items.map(item=>({...item,notificationOutcomes:[outcome('complete',25)]}))};
+  const incomplete={...base,id:'e'.repeat(24),generatedAt:'2026-10-16T03:00:00.000Z',datasetComplete:false,items:base.items.map(item=>({...item,notificationOutcomes:[outcome('incomplete',999)]}))};
+  store.save(complete);store.save(incomplete);
+  assert.deepEqual(store.notificationOutcomes(),[]);
+});
+test('notification outcome expansion fails explicitly instead of truncating inside a report item',t=>{
+  const {store}=fixture(t),base=buildDailyReview({...input,notifications:[{id:'n',chain:'bsc',address,source:'debot',receivedAt:'2026-10-15T01:00:00.000Z',occurredAt:'2026-10-15T01:00:00.000Z'}]});
+  const common={source:'debot' as const,chain:'bsc' as const,address,sessionFirstReceivedAt:'2026-10-15T01:00:00.000Z',
+    sessionExpiresAt:'2026-10-15T07:00:00.000Z',triggerOrderAmbiguous:false,horizons:[]};
+  const outcomes:NotificationTriggerOutcome[]=[{...common,notificationNumber:3,triggerEventId:'three',triggerAt:'2026-10-15T01:02:00.000Z'},
+    {...common,notificationNumber:4,triggerEventId:'four',triggerAt:'2026-10-15T01:03:00.000Z'}];
+  store.save({...base,id:'f'.repeat(24),items:base.items.map(item=>({...item,notificationOutcomes:outcomes}))});
+  assert.throws(()=>store.notificationOutcomes(1),/REVIEW_NOTIFICATION_OUTCOME_LIMIT_EXCEEDED/);
+  assert.equal(store.notificationOutcomes(2).length,2);
+});
+test('dashboard page exposes only the newest global revision for each candidate scope and parameter',t=>{
+  const {store,path}=fixture(t),older={id:'older',generatorVersion:'notification-trigger-shadow-v2',generatedAt:'2026-10-16T01:00:00.000Z',
+    scope:{source:'debot',chain:'solana'},change:{parameter:'signal.trigger_count'},status:'collecting'},
+    candidate={...older,id:'candidate',generatedAt:'2026-10-16T02:00:00.000Z',status:'shadow_ready'},
+    legacy={id:'legacy',generatorVersion:'daily-shadow-policy-v1',generatedAt:'2026-10-16T03:00:00.000Z',
+      scope:{source:'debot',chain:'solana',basePolicyVersion:'entry-v1'},change:{parameter:'entry.require_social_link'},status:'shadow_ready'};
+  const writer=new DatabaseSync(path);try{
+    writer.exec(`CREATE TABLE review_shadow_policy_candidates(id TEXT PRIMARY KEY,generated_at TEXT,chain TEXT,base_policy_version TEXT,parameter TEXT,status TEXT,data TEXT);
+      CREATE TABLE review_shadow_policy_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)`);
+    const insert=writer.prepare('INSERT INTO review_shadow_policy_candidates VALUES(?,?,?,?,?,?,?)');
+    for(const value of [older,candidate,legacy])insert.run(value.id,value.generatedAt,'solana','scope',value.change.parameter,value.status,JSON.stringify(value));
+    writer.prepare('INSERT INTO review_shadow_policy_meta VALUES(?,?)').run('last_generated_at','2026-10-16T02:00:00.000Z');
+  }finally{writer.close();}
+  const page=store.page();assert.deepEqual(page.shadowPolicies.items,[candidate]);
+  assert.equal(page.shadowPolicies.status.last_generated_at,'2026-10-16T02:00:00.000Z');
 });
 test('entry-off result is audited without network or raw report secrets; sink failure does not alter execution',async t=>{
   const {store,path}=fixture(t),orders=new OrderStore(':memory:');t.after(()=>orders.close());

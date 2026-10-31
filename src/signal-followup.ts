@@ -26,9 +26,12 @@ export interface FollowupPerformance {
   source?:string;error?:string;errorCount?:number;lastErrorAt?:string;points:ScanPricePoint[];
   baselineMarket?:ScanPrice['market'];latestMarket?:ScanPrice['market'];liquidityChangePct?:number;holderChangePct?:number;
   baselineMarketAt?:string;latestMarketAt?:string;
+  /** True only while every sampled price since baseline retained the same,
+   * explicit pool identity. Once false it never becomes true retroactively. */
+  fixedPoolPath?:boolean;
   marketLimitations?:string[];
 }
-export interface FollowupHorizon {at:string;gainPct:number;delaySec:number;}
+export interface FollowupHorizon {at:string;gainPct:number;delaySec:number;fixedPoolComparable?:true;}
 export interface FollowupTimeline {
   kind:'baseline'|'gain_50'|'gain_100'|'drawdown_30'|'horizon_1h'|'horizon_6h'|'horizon_24h'|'wallet_sample';
   at:string;priceUsd:number;gainPct:number;drawdownPct:number;
@@ -64,8 +67,8 @@ export type FollowupListRecord=Omit<FollowupRecord,'initial'|'performance'|'time
 };
 interface OutcomeRecord {
   chain:ScanToken['chain'];registeredAt:string;endsAt:string;selected:boolean;
-  initial:Pick<FollowupInitial,'decision'|'policyVersion'|'features'>;
-  performance:Pick<FollowupPerformance,'samples'|'latestAt'|'baselineAt'|'baselineDelayed'|'passiveSamples'|'collection'>;horizons:FollowupRecord['horizons'];
+  initial:Pick<FollowupInitial,'source'|'decision'|'policyVersion'|'features'>;
+  performance:Pick<FollowupPerformance,'samples'|'latestAt'|'baselineAt'|'baselineDelayed'|'passiveSamples'|'collection'|'fixedPoolPath'>;horizons:FollowupRecord['horizons'];
 }
 
 const HORIZONS=[3600,21600,86400];
@@ -127,12 +130,20 @@ export class SignalFollowup {
       const record=JSON.parse(String(row.record)) as FollowupRecord;
       db.prepare('UPDATE signal_followups SET summary_record=? WHERE rowid=?').run(this.metric(record),row.rowid!);
     }
+    // The source is immutable first-observation evidence. Backfill summaries
+    // created before source-aware research cohorts without deriving anything
+    // from later observations.
+    db.exec(`UPDATE signal_followups SET summary_record=json_set(summary_record,'$.initial.source',json_extract(record,'$.initial.source'))
+      WHERE json_valid(summary_record) AND json_valid(record)
+        AND json_extract(summary_record,'$.initial.source') IS NULL
+        AND json_extract(record,'$.initial.source') IN ('debot','gmgn','ave','wallet','manual')`);
   }
   private metric(r:FollowupRecord):string {
     const value:OutcomeRecord={chain:r.chain,registeredAt:r.registeredAt,endsAt:r.endsAt,selected:r.selected,
-      initial:{decision:r.initial.decision,policyVersion:r.initial.policyVersion,features:r.initial.features},
+      initial:{source:r.initial.source,decision:r.initial.decision,policyVersion:r.initial.policyVersion,features:r.initial.features},
       performance:{samples:r.performance.samples,latestAt:r.performance.latestAt,baselineAt:r.performance.baselineAt,
-        baselineDelayed:r.performance.baselineDelayed,passiveSamples:r.performance.passiveSamples,collection:r.performance.collection},horizons:r.horizons};
+        baselineDelayed:r.performance.baselineDelayed,passiveSamples:r.performance.passiveSamples,collection:r.performance.collection,
+        fixedPoolPath:r.performance.fixedPoolPath},horizons:r.horizons};
     return JSON.stringify(value);
   }
   capture(report:Report,record:ScanRecord,now:Date):void {
@@ -236,6 +247,7 @@ export class SignalFollowup {
     const points=[...p.points,{at,priceUsd:price.priceUsd}];
     const baselineMarket=p.baselineMarket??(!p.baselineAt?market:undefined);
     const samePool=!!market?.poolAddress&&market.poolAddress===baselineMarket?.poolAddress;
+    const fixedPoolPath=(p.fixedPoolPath??!p.baselineAt)&&!!market?.poolAddress&&(!p.baselineAt||samePool);
     const liquidityComparable=samePool&&market?.liquidityUsd!==undefined&&!!baselineMarket?.liquidityUsd;
     value.performance={...p,status:'tracking',samples:p.samples+1,collection:passive?'passive_same_pool':'scheduled',
       ...(passive?{passiveSamples:(p.passiveSamples??0)+1}:{}),baselineAt:p.baselineAt??at,baselinePriceUsd:base,
@@ -244,6 +256,7 @@ export class SignalFollowup {
       maxSampleGapSec:Math.max(p.maxSampleGapSec??0,p.latestAt?(ms-Date.parse(p.latestAt))/1000:(ms-registered)/1000),
       source:price.source,error:undefined,baselineMarket,latestMarket:market??p.latestMarket,
       baselineMarketAt:p.baselineMarketAt??(!p.baselineAt&&market?at:undefined),latestMarketAt:market?at:p.latestMarketAt,
+      fixedPoolPath,
       liquidityChangePct:liquidityComparable&&Number.isFinite((market!.liquidityUsd!/baselineMarket!.liquidityUsd!-1)*100)
         ?(market!.liquidityUsd!/baselineMarket!.liquidityUsd!-1)*100:market?undefined:p.liquidityChangePct,
       marketLimitations:market?market.liquidityUsd!==undefined&&!samePool?
@@ -259,7 +272,7 @@ export class SignalFollowup {
     for(const seconds of HORIZONS) {
       const delay=(ms-registered)/1000-seconds;
       if(!value.horizons[String(seconds)]&&delay>=0&&delay<=TOLERANCE/1000&&!value.performance.baselineDelayed) {
-        value.horizons[String(seconds)]={at,gainPct:gain,delaySec:delay};
+        value.horizons[String(seconds)]={at,gainPct:gain,delaySec:delay,...(fixedPoolPath?{fixedPoolComparable:true as const}:{})};
         events.push(`horizon_${seconds/3600}h` as FollowupTimeline['kind']);
       }
     }

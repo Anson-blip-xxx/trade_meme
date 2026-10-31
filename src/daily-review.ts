@@ -6,11 +6,15 @@ import {chainAddress} from './chain-stream-store.js';
 import type {Chain,Signal} from './types.js';
 import type {FollowupRecord} from './signal-followup.js';
 import type {ScanRecord} from './scan-archive.js';
+import {buildNotificationOutcomes,type NotificationTriggerOutcome} from './notification-outcomes.js';
+import {MEME_FULL_SNAPSHOT_MAX_ROWS} from './meme-price-archive.js';
 
 type Source=Signal['source'];
 type Check={status:string;reasons:string[]};
 export interface ReviewDecision {decision:string;at:string;policyVersion:string;buyEligible:boolean;reasons:string[];checks:Record<string,Check>;frozen:boolean;scanId?:string;}
-export interface ReviewNotification {chain:Chain;address:string;id:string;source:Source;receivedAt:string;occurredAt:string;name?:string;symbol?:string;state?:string;reason?:string;}
+export interface ReviewNotification {chain:Chain;address:string;id:string;source:Source;receivedAt:string;occurredAt:string;name?:string;symbol?:string;state?:string;reason?:string;
+  alertPriceUsd?:number;currentPriceUsd?:number;alertMarketCapUsd?:number;marketSnapshotAt?:string;
+  marketCapTiming?:'event_snapshot'|'unverified';reportedWalletCount?:number;identifiedWalletCount?:number;}
 export interface ReviewPrice {chain:Chain;address:string;at:string;price:number;source:string;pool?:string;stage?:string;score?:number;assessedAt?:string;}
 export interface ReviewVendorPerformance {source:'ave'|'debot';reportedAt:string;firstSignalAt?:string;maxGainPct?:number;maxGainValue?:number;maxGainUnit?:'fractional_return'|'provider_display_ratio';display?:string;scope:'vendor_reported_retrospective';}
 export interface ReviewExecution {chain:Chain;address:string;at:string;mode:string;status:string;reason?:string;scanId?:string;decisionAt?:string;}
@@ -28,12 +32,17 @@ export interface ReviewItem {
   eligibility:{observedEligible:boolean;firstEligibleAt?:string;beforeObservedPeak?:boolean};
   highGain:{localObserved:boolean;vendorReported:boolean};
   funnel:{stage:string;reasonCodes:string[];explanation:string;hasOrder:boolean;execution?:Omit<ReviewExecution,'chain'|'address'>&{verified:true}};
-  evidence:string[];
+  notificationOutcomes?:NotificationTriggerOutcome[];evidence:string[];
+}
+export interface ReviewNotificationLearningGroup {
+  source:'debot'|'ave';chain:Chain;notificationNumber:number;triggers:number;mature:number;covered:number;dense:number;
+  coveragePct:number;doubleFirst:number;stopFirst:number;neither:number;unknown:number;
 }
 export interface DailyReview {
   id:string;date:string;generatedAt:string;windowStartAt:string;windowEndAt:string;entryMode:string;
   counts:{signals:number;tokens:number;withPerformance:number;highGainers:number;missedHighGainers:number;entered:number};
   findings:Array<{code:string;count:number;text:string}>;
+  notificationLearning:{version:'notification-forward-v1';scope:'source_separated_forward_observation';groups:ReviewNotificationLearningGroup[];notes:string[]};
   learning:{status:'collecting'|'research_plan_applied'|'unavailable';planId?:string;priorities:Array<{chain:Chain;source:Source;total:number;covered:number;missing:number;weight:1|2}>;notes:string[]};
   limitations:string[];datasetComplete:boolean;items:ReviewItem[];
 }
@@ -41,6 +50,8 @@ const DAY=86400_000,OFFSET=8*3600_000;
 const key=(v:{chain:string;address:string})=>`${v.chain}:${v.address}`;
 const validTime=(s:unknown):s is string=>typeof s==='string'&&/^\d{4}-\d\d-\d\dT/.test(s)&&Number.isFinite(Date.parse(s));
 const safe=(s:unknown,max=160):string|undefined=>typeof s==='string'?s.replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g,' ').trim().slice(0,max)||undefined:undefined;
+const positive=(value:unknown):number|undefined=>typeof value==='number'&&Number.isFinite(value)&&value>0?value:undefined;
+const nonnegativeInteger=(value:unknown):number|undefined=>typeof value==='number'&&Number.isSafeInteger(value)&&value>=0?value:undefined;
 const codes=(value:unknown):string[]=>Array.isArray(value)?[...new Set(value.filter((v):v is string=>typeof v==='string'&&/^[A-Z][A-Z0-9_]{0,99}$/.test(v)))].slice(0,48):[];
 function token(v:{chain:string;address:string}):{chain:Chain;address:string}|undefined {
   if(!['bsc','solana','robinhood'].includes(v.chain))return;
@@ -60,7 +71,8 @@ export function reviewSchedule(now=new Date()) {
 }
 export const reviewDatabasePath=(archivePath:string)=>`${archivePath}.daily-review.sqlite`;
 export const reviewSamplingPath=(archivePath:string)=>`${archivePath}.review-sampling.json`;
-export const reviewRunId=(date:string,asOf:string)=>createHash('sha256').update(`${date}/${shanghaiDate(new Date(asOf))}`).digest('hex').slice(0,24);
+const REVIEW_SCHEMA_VERSION='daily-review-forward-v4';
+export const reviewRunId=(date:string,asOf:string)=>createHash('sha256').update(`${REVIEW_SCHEMA_VERSION}/${date}/${shanghaiDate(new Date(asOf))}`).digest('hex').slice(0,24);
 
 const explanations:Record<string,string>={
   entered:'已进入订单流程；订单记录不等同于确认成交或盈利。',
@@ -97,17 +109,44 @@ function funnel(decision:ReviewDecision|undefined,notifications:ReviewNotificati
     ...(execution?{execution:{at:execution.at,mode:execution.mode,status:execution.status,reason:execution.reason,scanId:execution.scanId,decisionAt:execution.decisionAt,verified:true as const}}:{})};
 }
 
+function notificationLearning(outcomes:readonly NotificationTriggerOutcome[]):DailyReview['notificationLearning'] {
+  const groups=new Map<string,ReviewNotificationLearningGroup>();
+  for(const outcome of outcomes){
+    if(outcome.source!=='debot'&&outcome.source!=='ave')continue;
+    const horizon=outcome.horizons.find(value=>value.seconds===21600);if(!horizon)continue;
+    const id=`${outcome.source}:${outcome.chain}:${outcome.notificationNumber}`,current=groups.get(id)??{
+      source:outcome.source,chain:outcome.chain,notificationNumber:outcome.notificationNumber,triggers:0,mature:0,covered:0,dense:0,
+      coveragePct:0,doubleFirst:0,stopFirst:0,neither:0,unknown:0};
+    current.triggers++;
+    if(horizon.mature)current.mature++;
+    if(horizon.status==='covered'){
+      current.covered++;if(horizon.coverage?.dense)current.dense++;
+      if(horizon.sampledBarrierOrder==='double_first')current.doubleFirst++;
+      else if(horizon.sampledBarrierOrder==='stop_first')current.stopFirst++;
+      else current.neither++;
+    }else if(horizon.mature)current.unknown++;
+    groups.set(id,current);
+  }
+  const values=[...groups.values()].map(value=>({...value,coveragePct:value.mature?Math.round(value.covered/value.mature*10000)/100:0}))
+    .sort((a,b)=>a.source.localeCompare(b.source)||a.chain.localeCompare(b.chain)||a.notificationNumber-b.notificationNumber);
+  return {version:'notification-forward-v1',scope:'source_separated_forward_observation',groups:values,notes:[
+    'DeBot 与 Ave 分别按链、CA 和六小时续期窗口计数；第 2/3/4 次不会合并来源。',
+    '六小时结果从触发后首个有效报价固定池开始；缺价、池冲突、未成熟和稀疏覆盖保持未知。',
+    '翻倍与 -60% 止损的先后只代表本地采样先观察到哪一档，不等于链上可成交顺序。']};
+}
+
 /** Complete local signal cohort, not a winners-only backtest. All dates in saved output are UTC. */
 export function buildDailyReview(input:ReviewInput):DailyReview {
   const window=reviewWindow(input.date),asOf=Date.parse(input.asOf);
   if(!validTime(input.asOf)||Date.parse(window.end)>asOf)throw new Error('REVIEW_PERIOD_NOT_CLOSED');
+  const priceEvidenceEnd=Math.min(asOf,Date.parse(window.end)+DAY);
   const all=new Map<string,ReviewNotification[]>(),seen=new Set<string>();
   for(const n of input.notifications){const t=token(n);if(!t||!['debot','ave','gmgn','wallet','manual'].includes(n.source)||!validTime(n.receivedAt)||Date.parse(n.receivedAt)>asOf)continue;
     const id=`${n.source}:${n.id}:${key(t)}`;if(seen.has(id))continue;seen.add(id);
     const rows=all.get(key(t))??[];rows.push({...n,...t,receivedAt:new Date(n.receivedAt).toISOString()});all.set(key(t),rows);
   }
   const byPrice=new Map<string,ReviewPrice[]>(),byDecision=new Map<string,ReviewInput['decisions']>();
-  for(const p of input.prices){const t=token(p);if(!t||!validTime(p.at)||Date.parse(p.at)>asOf||!Number.isFinite(p.price)||p.price<=0||
+  for(const p of input.prices){const t=token(p);if(!t||!validTime(p.at)||Date.parse(p.at)>priceEvidenceEnd||!Number.isFinite(p.price)||p.price<=0||
     !['gmgn_token_info','dexscreener_pair','trusted_followup'].includes(p.source))continue;
     const k=key(t),rows=byPrice.get(k)??[];rows.push({...p,...t,at:new Date(p.at).toISOString()});byPrice.set(k,rows);
   }
@@ -119,6 +158,11 @@ export function buildDailyReview(input:ReviewInput):DailyReview {
       const k=key(t),values=grouped.get(k)??[];values.push({...row,...t});grouped.set(k,values);}return grouped;
   };
   const byVendor=groupTimed(input.vendor,v=>v.reportedAt),byOrder=groupTimed(input.orders,o=>o.at),byExecution=groupTimed(input.executions,e=>e.at);
+  const outcomes=buildNotificationOutcomes([...all.values()].flat().filter(n=>n.source==='debot'||n.source==='ave'),[...byPrice.values()].flat(),
+    {asOf:input.asOf,notificationNumbers:[2,3,4],horizonsSec:[3600,21600,86400]})
+    .filter(value=>value.triggerAt>=window.start&&value.triggerAt<window.end);
+  const byOutcome=new Map<string,NotificationTriggerOutcome[]>();
+  for(const outcome of outcomes){const values=byOutcome.get(key(outcome))??[];values.push(outcome);byOutcome.set(key(outcome),values);}
   const items:ReviewItem[]=[],cohorts=new Map<string,{chain:Chain;source:Source;total:number;covered:number}>();
   let notificationsCount=0;
   for(const [k,events] of all){events.sort((a,b)=>a.receivedAt.localeCompare(b.receivedAt)||a.id.localeCompare(b.id));
@@ -138,7 +182,7 @@ export function buildDailyReview(input:ReviewInput):DailyReview {
     let localPerformance:ReviewItem['localPerformance'];
     if(base&&last&&distinct.length>=2){const peak=distinct.reduce((a,b)=>b.price>a.price?b:a),maxGainPct=(peak.price/base.price-1)*100,currentGainPct=(last.price/base.price-1)*100;
       if(Number.isFinite(maxGainPct)&&Number.isFinite(currentGainPct))localPerformance={maxGainPct,currentGainPct,baselineAt:base.at,peakAt:peak.at,
-        lastSampleAt:last.at,trailingGapSec:Math.max(0,(asOf-Date.parse(last.at))/1000),samples:distinct.length,baselineDelayed:Date.parse(base.at)-Date.parse(firstReceivedAt)>600000,
+        lastSampleAt:last.at,trailingGapSec:Math.max(0,(priceEvidenceEnd-Date.parse(last.at))/1000),samples:distinct.length,baselineDelayed:Date.parse(base.at)-Date.parse(firstReceivedAt)>600000,
         maxGapSec:distinct.slice(1).reduce((max,p,i)=>Math.max(max,(Date.parse(p.at)-Date.parse(distinct[i].at))/1000),0),poolAddress:base.pool,source:base.source};}
     const vendorPerformance=[...new Map((byVendor.get(k)??[])
       .sort((a,b)=>a.reportedAt.localeCompare(b.reportedAt)).map(v=>[v.source,{source:v.source,reportedAt:v.reportedAt,firstSignalAt:v.firstSignalAt,
@@ -165,10 +209,14 @@ export function buildDailyReview(input:ReviewInput):DailyReview {
       sources:[...new Set(today.map(n=>n.source))],firstReceivedAt,signalCount:today.length,localPerformance,vendorPerformance,firstDecision,latestDecision,
       eligibility:{observedEligible:!!firstEligible,firstEligibleAt:firstEligible?.at,beforeObservedPeak:firstEligible&&peakAt?firstEligible.at<=peakAt:undefined},
       highGain:{localObserved:(localPerformance?.maxGainPct??-Infinity)>=100,vendorReported:vendorPerformance.some(v=>(v.maxGainPct??-Infinity)>=100||v.source==='ave'&&v.maxGainUnit==='provider_display_ratio'&&(v.maxGainValue??0)>=2)},
-      funnel:outcome,evidence};items.push(item);
-    // A token is one independent sampling unit even when multiple vendors repeat it.
-    const cohortKey=`${first.chain}:${today[0].source}`,c=cohorts.get(cohortKey)??{chain:first.chain,source:today[0].source,total:0,covered:0};
-    c.total++;if(localPerformance&&!localPerformance.baselineDelayed)c.covered++;cohorts.set(cohortKey,c);
+      funnel:outcome,...(byOutcome.get(k)?.length?{notificationOutcomes:byOutcome.get(k)}:{}),evidence};items.push(item);
+    // Sampling deficits are source-specific: the same CA observed by DeBot and
+    // Ave contributes once to each source cohort, never whichever source happened
+    // to be sorted first. Token-level report counts above remain deduplicated.
+    for(const source of new Set(today.map(notification=>notification.source))){
+      const cohortKey=`${first.chain}:${source}`,c=cohorts.get(cohortKey)??{chain:first.chain,source,total:0,covered:0};
+      c.total++;if(localPerformance&&!localPerformance.baselineDelayed)c.covered++;cohorts.set(cohortKey,c);
+    }
   }
   const gain=(r:ReviewItem)=>Math.max(r.localPerformance?.maxGainPct??-Infinity,...r.vendorPerformance.map(v=>v.maxGainPct??-Infinity));
   const isHigh=(r:ReviewItem)=>r.highGain.localObserved||r.highGain.vendorReported;
@@ -181,6 +229,7 @@ export function buildDailyReview(input:ReviewInput):DailyReview {
   return {id,date:input.date,generatedAt:input.asOf,windowStartAt:window.start,windowEndAt:window.end,entryMode:input.entryMode,
     counts:{signals:notificationsCount,tokens:items.length,withPerformance:items.filter(i=>i.localPerformance).length,highGainers:high.length,missedHighGainers:missed.length,entered:items.filter(i=>i.funnel.hasOrder).length},
     findings:[...groups].sort((a,b)=>b[1]-a[1]).map(([code,count])=>({code,count,text:explanations[code]})),
+    notificationLearning:notificationLearning(outcomes),
     learning:{status:'collecting',priorities:[...cohorts.values()].map(c=>({...c,missing:c.total-c.covered,weight:c.covered<c.total?2:1})),notes:[
       '学习分母包括全部去重信号，含亏损、未选入与缺价；涨幅靠前的案例仅用于定位漏点。',
       '自动调整前向研究采样优先级，保留一半公平采样；不按事后赢家补加开仓分数。',
@@ -206,19 +255,37 @@ export function readDailyReviewInput(config:Config,date:string,asOf:string,revie
     const db=new DatabaseSync(path,{readOnly:true});try{db.exec('PRAGMA busy_timeout=1500; BEGIN');read(db);}finally{db.close();}
   };
   const table=(db:DatabaseSync,name:string)=>!!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name);
-  const retained=(db:DatabaseSync,name:string,column:string,source:string,capacity:number)=>{
+  const retained=(db:DatabaseSync,name:string,column:string,source:string,capacity:number,requiredFrom=reportWindow.start)=>{
     const pruned=table(db,'review_retention_watermarks')?db.prepare('SELECT pruned_through FROM review_retention_watermarks WHERE source=?').get(source)?.pruned_through:undefined;
     const coverage=db.prepare(`SELECT count(*) n,min(${column}) oldest FROM ${name}`).get()!;
-    if(typeof pruned==='string'&&pruned>=reportWindow.start||Number(coverage.n)>=capacity&&typeof coverage.oldest==='string'&&coverage.oldest>reportWindow.start){
+    if(typeof pruned==='string'&&pruned>=requiredFrom||Number(coverage.n)>=capacity&&typeof coverage.oldest==='string'&&coverage.oldest>requiredFrom){
       out.datasetComplete=false;out.limitations.push(`${source}源库已修剪或达到容量且缺少日报早段覆盖；暂停以完整分母发布采样计划。`);
     }
   };
+  // A session continues when each successive notice arrives within six hours.
+  // Keep the pre-midnight tail so the first notice inside this report is not
+  // silently renumbered from N3/N4 to N1.
+  const notificationHistoryFrom=new Date(Date.parse(reportWindow.start)-21600_000).toISOString();
   for(const [provider,path] of [['debot',config.debotSignalsDatabase],['ave',config.ave?.database]] as const)withDb(path,provider,db=>{
     const name=provider+'_signals';if(!table(db,name)){out.datasetComplete=false;out.limitations.push(`${provider}通知表不可用。`);return;}
-    retained(db,name,'observed_at',provider,10000);
-    const rows=db.prepare(`SELECT id,chain,address,occurred_at,observed_at,state,reason,json_extract(payload,'$.name') name,json_extract(payload,'$.symbol') symbol FROM ${name} WHERE observed_at<=? ORDER BY observed_at DESC LIMIT 50001`).all(asOf);
+    retained(db,name,'observed_at',provider,10000,notificationHistoryFrom);
+    const rows=db.prepare(`SELECT id,chain,address,occurred_at,observed_at,state,reason,
+      json_extract(payload,'$.name') name,json_extract(payload,'$.symbol') symbol,
+      json_extract(payload,'$.alertPriceUsd') alert_price,json_extract(payload,'$.currentPriceUsd') current_price,
+      json_extract(payload,'$.alertMarketCapUsd') alert_market_cap,json_extract(payload,'$.marketSnapshotAt') market_snapshot_at,
+      json_extract(payload,'$.marketCapTiming') market_cap_timing,json_extract(payload,'$.walletCount') wallet_count,
+      json_extract(payload,'$.addressCount') address_count,json_extract(payload,'$.vendorWalletCount') vendor_wallet_count
+      FROM ${name} WHERE observed_at<=? ORDER BY observed_at DESC LIMIT 50001`).all(asOf);
     if(rows.length>50000){out.datasetComplete=false;out.limitations.push(`${provider}通知读取达到上限，报告覆盖不完整。`);}
-    for(const r of rows.slice(0,50000))out.notifications.push({chain:r.chain as Chain,address:String(r.address),source:provider,id:String(r.id),receivedAt:String(r.observed_at),occurredAt:String(r.occurred_at),state:String(r.state),reason:safe(r.reason),name:safe(r.name),symbol:safe(r.symbol)});
+    for(const r of rows.slice(0,50000))out.notifications.push({chain:r.chain as Chain,address:String(r.address),source:provider,id:String(r.id),receivedAt:String(r.observed_at),occurredAt:String(r.occurred_at),state:String(r.state),reason:safe(r.reason),name:safe(r.name),symbol:safe(r.symbol),
+      ...(positive(r.alert_price)!==undefined?{alertPriceUsd:positive(r.alert_price)}:{}),
+      ...(positive(r.current_price)!==undefined?{currentPriceUsd:positive(r.current_price)}:{}),
+      ...(positive(r.alert_market_cap)!==undefined?{alertMarketCapUsd:positive(r.alert_market_cap)}:{}),
+      ...(validTime(r.market_snapshot_at)?{marketSnapshotAt:r.market_snapshot_at}:{}),
+      ...(r.market_cap_timing==='event_snapshot'||r.market_cap_timing==='unverified'?{marketCapTiming:r.market_cap_timing}:{}),
+      ...(nonnegativeInteger(provider==='debot'?r.wallet_count:r.vendor_wallet_count)!==undefined?
+        {reportedWalletCount:nonnegativeInteger(provider==='debot'?r.wallet_count:r.vendor_wallet_count)}:{}),
+      ...(nonnegativeInteger(r.address_count)!==undefined?{identifiedWalletCount:nonnegativeInteger(r.address_count)}:{})});
     if(table(db,'vendor_performance_snapshots'))for(const r of db.prepare('SELECT provider,chain,address,reported_at,data FROM vendor_performance_snapshots WHERE reported_at<=? ORDER BY reported_at,id LIMIT 20001').iterate(asOf)){
       const v=parse<Record<string,any>>(r.data);if(!v)continue;
       out.vendor.push({chain:r.chain as Chain,address:String(r.address),source:provider,reportedAt:String(r.reported_at),scope:'vendor_reported_retrospective',firstSignalAt:v.firstSignalAt,maxGainPct:typeof v.maxGainPct==='number'?v.maxGainPct:undefined,maxGainValue:typeof v.maxGainValue==='number'?v.maxGainValue:undefined,maxGainUnit:v.maxGainUnit,display:safe(v.maxGainDisplay)});
@@ -243,13 +310,48 @@ export function readDailyReviewInput(config:Config,date:string,asOf:string,revie
     }
   });
   withDb(config.meme?.database,'独立行情观察库',db=>{
-    if(!table(db,'meme_snapshots')){out.datasetComplete=false;out.limitations.push('独立价格表不可用。');return;}
-    const rows=db.prepare(`SELECT chain,address,observed_at,source,json_extract(market,'$.priceUsd') price,json_extract(market,'$.poolAddress') pool,
-      json_extract(market,'$.token.chain') market_chain,json_extract(market,'$.token.address') market_address,json_extract(market,'$.observedAt') market_at,
-      json_extract(assessment,'$.assessedAt') assessed_at,json_extract(assessment,'$.stage') stage,json_extract(assessment,'$.score') score FROM meme_snapshots
-      WHERE observed_at>=? AND observed_at<=? AND market IS NOT NULL ORDER BY observed_at DESC LIMIT 250001`).iterate(reportWindow.start,asOf);
-    let priceCount=0;for(const r of rows){if(++priceCount>250000){out.datasetComplete=false;out.limitations.push('独立价格样本达到读取上限，保留覆盖不足标记。');break;}if(r.market_chain!==r.chain||r.market_address!==r.address||r.market_at!==r.observed_at)continue;
-      out.prices.push({chain:r.chain as Chain,address:String(r.address),at:String(r.observed_at),price:Number(r.price),source:String(r.source),pool:safe(r.pool,90),assessedAt:validTime(r.assessed_at)&&r.assessed_at<=asOf?r.assessed_at:undefined,stage:validTime(r.assessed_at)&&r.assessed_at<=asOf?safe(r.stage,30):undefined,score:validTime(r.assessed_at)&&r.assessed_at<=asOf&&typeof r.score==='number'?r.score:undefined});}
+    const targets=new Map<string,{chain:Chain;address:string}>();
+    for(const notification of out.notifications){
+      if(notification.receivedAt<reportWindow.start||notification.receivedAt>=reportWindow.end)continue;
+      const normalized=token(notification);if(normalized)targets.set(key(normalized),normalized);
+    }
+    // Read only tokens that actually entered this report. A global newest-first cap can
+    // silently discard the first post-signal quote and turn a forward review into hindsight.
+    const priceEnd=new Date(Math.min(Date.parse(asOf),Date.parse(reportWindow.end)+DAY)).toISOString(),compact=table(db,'meme_price_archive');
+    if(!compact&&!table(db,'meme_snapshots')){out.datasetComplete=false;out.limitations.push('独立价格表不可用。');return;}
+    if(compact){
+      const state=table(db,'meme_price_archive_state')?db.prepare('SELECT continuous_from_at FROM meme_price_archive_state WHERE singleton=1').get():undefined;
+      const watermark=table(db,'review_retention_watermarks')?db.prepare('SELECT pruned_through FROM review_retention_watermarks WHERE source=?').get('meme_price_archive')?.pruned_through:undefined;
+      if(!validTime(state?.continuous_from_at)||state.continuous_from_at>reportWindow.start||typeof watermark==='string'&&watermark>=reportWindow.start){
+        out.datasetComplete=false;out.limitations.push('紧凑行情归档尚未连续覆盖日报起点或该时段已修剪；相关收益保持未知，不发布策略候选。');
+      }
+    }else{
+      const priceCoverage=db.prepare('SELECT count(*) n,min(observed_at) oldest FROM meme_snapshots').get()!;
+      if(Number(priceCoverage.n)>=MEME_FULL_SNAPSHOT_MAX_ROWS-1000&&typeof priceCoverage.oldest==='string'&&priceCoverage.oldest>reportWindow.start){
+        out.datasetComplete=false;out.limitations.push('独立行情明细已达到保留上限且早段报价被修剪；相关收益保持未知，不发布策略候选。');
+      }
+    }
+    const read=compact?db.prepare(`SELECT chain,address,observed_at,source,price_usd price,pool_address pool
+      FROM meme_price_archive WHERE chain=? AND address=? AND observed_at>=? AND observed_at<=?
+      ORDER BY observed_at,source LIMIT 50001`):db.prepare(`SELECT chain,address,observed_at,source,
+      json_extract(market,'$.priceUsd') price,json_extract(market,'$.poolAddress') pool,
+      json_extract(market,'$.token.chain') market_chain,json_extract(market,'$.token.address') market_address,
+      json_extract(market,'$.observedAt') market_at,json_extract(assessment,'$.assessedAt') assessed_at,
+      json_extract(assessment,'$.stage') stage,json_extract(assessment,'$.score') score FROM meme_snapshots
+      WHERE chain=? AND address=? AND observed_at>=? AND observed_at<=? AND market IS NOT NULL
+      ORDER BY observed_at,rowid LIMIT 50001`);
+    let priceCount=0,capped=false;
+    for(const target of targets.values()){
+      if(priceCount>=500000){capped=true;break;}
+      const rows=read.all(target.chain,target.address,reportWindow.start,priceEnd);
+      if(rows.length>50000)capped=true;
+      for(const r of rows.slice(0,Math.min(50000,500000-priceCount))){
+        priceCount++;
+        if(!compact&&(r.market_chain!==r.chain||r.market_address!==r.address||r.market_at!==r.observed_at))continue;
+        out.prices.push({chain:r.chain as Chain,address:String(r.address),at:String(r.observed_at),price:Number(r.price),source:String(r.source),pool:safe(r.pool,90),assessedAt:validTime(r.assessed_at)&&r.assessed_at<=asOf?r.assessed_at:undefined,stage:validTime(r.assessed_at)&&r.assessed_at<=asOf?safe(r.stage,30):undefined,score:validTime(r.assessed_at)&&r.assessed_at<=asOf&&typeof r.score==='number'?r.score:undefined});
+      }
+    }
+    if(capped){out.datasetComplete=false;out.limitations.push('独立价格样本达到读取上限，保留覆盖不足标记。');}
   });
   withDb(config.ordersDatabase,'订单库',db=>{if(!table(db,'opening_orders')){out.limitations.push('订单表不可用，不能排除已有订单。');return;}
     const rows=db.prepare('SELECT chain,token_address,created_at,status,mode FROM opening_orders WHERE created_at<=? ORDER BY created_at DESC LIMIT 100001').all(asOf);

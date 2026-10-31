@@ -1746,6 +1746,17 @@
     const detail=el('div','daily-review-detail'),performance=item.localPerformance,funnel=item.funnel||{};
     const timing=el('section');timing.append(el('h3','','信号与涨幅基准'),kv('本地首次收到',dailyTime(item.firstReceivedAt)),kv('收到的通知数',count(item.signalCount)),kv('来源',Array.isArray(item.sources)?item.sources.map(dailySource).join(' / '):'—'),kv('本地价格基准',dailyTime(performance?.baselineAt)),kv('本地峰值采样',dailyTime(performance?.peakAt)),kv('最后采样',dailyTime(performance?.lastSampleAt)),kv('最后样本距报告截止',finite(performance?.trailingGapSec)?`${count(performance.trailingGapSec)} 秒`:'旧报告未保留此字段'),kv('采样数量',count(performance?.samples)),kv('最大采样间隔',finite(performance?.maxGapSec)?`${count(performance.maxGapSec)} 秒`:'未知'));
     timing.append(el('p','',performance?.baselineDelayed===true?'首个价格基准存在延迟，不能代表刚收到信号时的可买价格。':performance?.baselineDelayed===false?'已记录首个价格基准；本地涨幅只覆盖此后的实际样本。':'基准延迟是否存在尚未确认。'),dailyVendorPerformance(item,true));detail.append(timing);
+    const notificationOutcomes=Array.isArray(item.notificationOutcomes)?item.notificationOutcomes:[];
+    if(notificationOutcomes.length){const forward=el('section','daily-review-priorities');forward.append(el('h3','','重复通知后的前向表现'));
+      for(const outcome of notificationOutcomes){const horizon=Array.isArray(outcome.horizons)?outcome.horizons.find(value=>value.seconds===21600):undefined;
+        if(!horizon)continue;const status=horizon.status==='covered'?(horizon.coverage?.dense?'连续报价可核算':'可核算 · 报价稀疏'):horizon.status==='immature'?'尚未满 6 小时':'行情证据不足';
+        const order={double_first:'先到 +100%',stop_first:'先到 -60%',neither:'两档均未到',unknown:'先后未知'}[horizon.sampledBarrierOrder]||'先后未知',line=el('div');
+        line.append(el('strong','',`${dailySource(outcome.source)} · 第 ${count(outcome.notificationNumber)} 次`),el('span','',`触发 ${dailyTime(outcome.triggerAt)} · ${status}`));
+        if(horizon.status==='covered')line.append(el('span','',`最高 ${percent(numeric(horizon.maxGainPct))} · 最低 ${percent(numeric(horizon.minGainPct))} · 6 小时末 ${percent(numeric(horizon.endGainPct))} · ${order}`));
+        else if(horizon.unknownReason)line.append(el('span','',`缺口：${scalar(horizon.unknownReason)}`));forward.append(line);
+      }
+      forward.append(el('p','daily-review-basis','这是固定首个报价池的本地采样结果；稀疏报价不会作为策略达标证据。'));detail.append(forward);
+    }
     const initial=el('section');initial.append(el('h3','','已留存判断与核验证据'),dailyDecisionEvidence('初次留存判断',item.firstDecision));
     if(dailyHasLaterDecision(item)){const later=el('details','daily-review-later-decision');later.append(el('summary','','展开截至报告的最新判断'),dailyDecisionEvidence('截至报告的最新判断',item.latestDecision));initial.append(later);}
     initial.append(dailyEligibility(item),el('p','daily-review-basis','初次判断和后续变化分别保留；事后通过不回填为最初已通过。'));detail.append(initial);
@@ -1767,7 +1778,8 @@
     if(page.date&&!seen.has(page.date)){const option=el('option','',page.date);option.value=page.date;dates.append(option);}dates.value=page.date;$('dailyReview-chain').value=page.chain;
     $('dailyReview-warning').hidden=!state.resourceErrors.dailyReview&&!generationError&&!incomplete;text('dailyReview-warning',state.resourceErrors.dailyReview?(state.dailyReviewLoaded?'本次读取失败，当前仍显示上次成功读取的报告与筛选；可点击刷新重试。':'每日复盘暂时无法读取，可点击刷新重试。'):generationError?'最近一次日报生成未完成；当前仅展示已成功保存的报告，请结合生成时间查看。':'本轮数据集读取不完整，报告仅供核查，未发布新的研究采样计划。');
     const meta=$('dailyReview-report-meta');meta.replaceChildren();const counts=$('dailyReview-counts');counts.replaceChildren();
-    if(report){meta.append(el('strong','',`${scalar(report.date)} 复盘`),el('span','',`信号接收区间 ${dailyTime(report.windowStartAt)} 至 ${dailyTime(report.windowEndAt)} · 北京时间`),el('span','',`生成 ${dailyTime(report.generatedAt)} · 价格证据截至生成时刻 · 报告生成时${entryModeLabel(report.entryMode)}`),el('span','','概览与研究调整覆盖整份日报；网络筛选仅作用于下方名单。'));
+    if(report){const generated=validDate(report.generatedAt)?.getTime(),windowEnd=validDate(report.windowEndAt)?.getTime(),priceEvidenceEnd=generated&&windowEnd?new Date(Math.min(generated,windowEnd+86400_000)).toISOString():report.generatedAt;
+      meta.append(el('strong','',`${scalar(report.date)} 复盘`),el('span','',`信号接收区间 ${dailyTime(report.windowStartAt)} 至 ${dailyTime(report.windowEndAt)} · 北京时间`),el('span','',`生成 ${dailyTime(report.generatedAt)} · 价格证据最多截至 ${dailyTime(priceEvidenceEnd)} · 报告生成时${entryModeLabel(report.entryMode)}`),el('span','','概览与研究调整覆盖整份日报；网络筛选仅作用于下方名单。'));
       for(const [key,label,hint] of [['signals','通知记录','含同币重复通知'],['tokens','不同代币','按链与完整 CA 区分'],['withPerformance','有本地价格样本','未覆盖不按零计算'],['highGainers','重点涨幅样本','本地 ≥100% / 平台 ≥100% 或 ≥2x'],['missedHighGainers','未进入的重点涨幅样本','不等于当时应放行'],['entered','已有订单记录','记录不等于真实成交']]){const card=el('div','daily-review-count');card.append(el('span','',label),el('strong','',count(report.counts?.[key])),el('small','',hint));counts.append(card);}
     }else meta.append(el('p','',data?.enabled===false?'服务端尚未启用每日复盘。':'报告生成后会显示覆盖时段、全量名单和研究调整。'));
     $('dailyReview-learning-panel').hidden=!report;const learning=$('dailyReview-learning');learning.replaceChildren();
@@ -1775,6 +1787,18 @@
       for(const finding of findings){const line=el('p','daily-review-finding');line.append(el('span','',scalar(finding.text,'发现说明待补全')));if(finite(finding.count))line.append(el('strong','',`${count(finding.count)} 项`));found.append(line);}if(!findings.length)found.append(el('p','','本次没有已生成的发现说明。'));learning.append(found);
       text('dailyReview-learning-status',incomplete?'覆盖不完整 · 未发布新计划':{research_plan_applied:'研究采样计划已调整',collecting:'继续积累样本',unavailable:'研究计划暂不可用'}[report.learning?.status]||'研究计划状态未知');
       const notes=dailyTextList('研究调整',report.learning?.notes);notes.append(el('p','daily-review-basis','这里调整的是研究采样与证据补全，不表示策略盈利已验证，也不改变安全检查或开启实盘。'));if(report.learning?.planId&&!incomplete)notes.append(kv('研究计划',report.learning.planId));learning.append(notes);
+      const notificationGroups=Array.isArray(report.notificationLearning?.groups)?report.notificationLearning.groups:[];
+      if(notificationGroups.length){const section=el('section','daily-review-priorities');section.append(el('h3','','第 N 次通知前向结果'));
+        for(const item of notificationGroups){const line=el('div');line.append(el('strong','',`${dailySource(item.source)} · ${chainName(item.chain)} · 第 ${count(item.notificationNumber)} 次`),el('span','',`成熟 ${count(item.mature)} / 触发 ${count(item.triggers)} · 有效报价 ${count(item.covered)}（${percent(numeric(item.coveragePct))}）`),el('span','',`先翻倍 ${count(item.doubleFirst)} · 先到 -60% ${count(item.stopFirst)} · 两者均未到 ${count(item.neither)} · 未知 ${count(item.unknown)}`),badge(`连续覆盖 ${count(item.dense)}`,'neutral'));section.append(line);}
+        section.append(el('p','daily-review-basis','DeBot 与 Ave 分开计数；同一 CA 的第 3 次和第 4 次只使用各自触发后的固定池前向报价。'));learning.append(section);
+      }
+      const candidates=Array.isArray(data?.shadowPolicies?.items)?data.shadowPolicies.items:[];
+      if(candidates.length){const section=el('section','daily-review-priorities');section.append(el('h3','','当前全局影子策略候选'));
+        for(const item of candidates){const trigger=typeof item.generatorVersion==='string'&&item.generatorVersion.startsWith('notification-trigger-shadow-'),scope=trigger?`${dailySource(item.scope?.source)} · ${chainName(item.scope?.chain)}`:`${dailySource(item.scope?.source)} · ${chainName(item.scope?.chain)} · ${scalar(item.scope?.basePolicyVersion,'策略版本未知')}`;
+          const status={collecting:'继续积累',not_replicated:'验证未复现',shadow_ready:'达到影子观察门槛'}[item.status]||'状态未知',sample=trigger?(item.evidence?.matureN3??item.evidence?.maturePairs):item.evidence?.mature;
+          const line=el('div');line.append(el('strong','',`${scope} · ${trigger?'第 3 次 → 第 4 次':scalar(item.change?.parameter)}`),el('span','',`成熟样本 ${count(sample)} · 生成 ${dailyTime(item.generatedAt)} · ${status}`),badge(status,item.status==='shadow_ready'?'pass':item.status==='not_replicated'?'watch':'neutral'));section.append(line);}
+        section.append(el('p','daily-review-basis','这里显示研究账本中各范围的最新全局候选，与当前选择的历史日报日期无关；候选不会自动修改实盘触发次数、风控或仓位。'));learning.append(section);
+      }
       const priorities=Array.isArray(report.learning?.priorities)?report.learning.priorities:[];if(priorities.length){const section=el('section','daily-review-priorities');section.append(el('h3','',incomplete?'覆盖缺口草案 · 本轮未发布':'后续研究覆盖优先级'));for(const item of priorities){const line=el('div');line.append(el('strong','',`${chainName(item.chain)} · ${dailySource(item.source)}`),el('span','',`已覆盖 ${count(item.covered)} / ${count(item.total)} · 缺失 ${count(item.missing)}`),badge(incomplete?'仅供核查':item.weight===2?'优先补充样本':'常规积累','neutral'));section.append(line);}learning.append(section);}
       if(report.limitations?.length)learning.append(dailyTextList('报告覆盖限制',report.limitations,'daily-review-limitations'));
     }

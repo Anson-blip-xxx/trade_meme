@@ -26,9 +26,9 @@ export class ShadowPolicyCandidateStore {
     this.db.exec('BEGIN IMMEDIATE');try{
       const insert=this.db.prepare('INSERT OR IGNORE INTO review_shadow_policy_candidates VALUES(?,?,?,?,?,?,?)');let saved=0;
       for(const value of candidates){
-        const entry=value.generatorVersion==='daily-shadow-policy-v1';
+        const entry=value.generatorVersion==='daily-shadow-policy-v2';
         if(entry?!validateShadowPolicyCandidate(value):!validateNotificationTriggerCandidate(value as NotificationTriggerCandidate))throw new Error('SHADOW_POLICY_STORE_INVALID');
-        const scopeKey=entry?value.scope.basePolicyVersion:`${String(value.scope.source)}:trigger-count-3`;
+        const scopeKey=entry?`${String(value.scope.source)}:${value.scope.basePolicyVersion}`:`${String(value.scope.source)}:trigger-count-3`;
         saved+=Number(insert.run(value.id,value.generatedAt,value.scope.chain,scopeKey,value.change.parameter,value.status,JSON.stringify(value)).changes);
       }
       if(candidates.length){this.db.prepare("INSERT OR REPLACE INTO review_shadow_policy_meta VALUES('last_generated_at',?)").run(candidates[0].generatedAt);
@@ -42,7 +42,15 @@ export class ShadowPolicyCandidateStore {
   }
   latest(limit=20):{items:StoredShadowPolicyCandidate[];status:Record<string,string>} {
     const take=Number.isInteger(limit)?Math.max(1,Math.min(100,limit)):20;
-    const items=this.db.prepare('SELECT data FROM review_shadow_policy_candidates ORDER BY generated_at DESC,id LIMIT ?').all(take)
+    const items=this.db.prepare(`WITH ranked AS (
+      SELECT data,generated_at,id,ROW_NUMBER() OVER(PARTITION BY
+        json_extract(data,'$.generatorVersion'),json_extract(data,'$.scope.chain'),
+        COALESCE(json_extract(data,'$.scope.source'),''),COALESCE(json_extract(data,'$.scope.basePolicyVersion'),''),
+        COALESCE(json_extract(data,'$.scope.decision'),''),COALESCE(json_extract(data,'$.scope.horizonSec'),0),
+        json_extract(data,'$.change.parameter') ORDER BY generated_at DESC,id DESC) position
+      FROM review_shadow_policy_candidates
+      WHERE json_extract(data,'$.generatorVersion') IN ('daily-shadow-policy-v2','notification-trigger-shadow-v2')
+    ) SELECT data FROM ranked WHERE position=1 ORDER BY generated_at DESC,id LIMIT ?`).all(take)
       .map(row=>JSON.parse(String(row.data)) as StoredShadowPolicyCandidate);
     const status=Object.fromEntries(this.db.prepare('SELECT key,value FROM review_shadow_policy_meta').all().map(row=>[String(row.key),String(row.value)]));
     return {items,status};

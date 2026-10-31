@@ -217,7 +217,7 @@ export function readConfig(env:NodeJS.ProcessEnv=process.env): Config {
       clientPath:z.string().trim().min(1).max(512).parse(env.JEV_CLIENT_PATH??'/home/ubuntu/shared/jev/node/index.mjs')},
     meme:{enabled:z.enum(['true','false']).parse(env.MEME_OBSERVER_ENABLED??(env.DEBOT_SCANNER_ENABLED==='true'||env.AVE_SCANNER_ENABLED==='true'?'true':'false'))==='true',
       database:z.string().trim().refine(isPersistentOrderPath).parse(env.MEME_DATABASE_PATH??'data/meme-observations.sqlite'),
-      maxBytes:z.coerce.number().int().min(16).max(4096).parse(env.MEME_MAX_MB??1024)*1024*1024,
+      maxBytes:z.coerce.number().int().min(16).max(4096).parse(env.MEME_MAX_MB??2048)*1024*1024,
       maxActive:z.coerce.number().int().min(1).max(300).parse(env.MEME_MAX_ACTIVE??180),
       activeWindowSec:z.coerce.number().int().min(60).max(86400).parse(env.MEME_ACTIVE_WINDOW_SEC??7200)},
     walletScreening:{enabled:z.enum(['true','false']).parse(env.WALLET_SCREENING_ENABLED??env.WALLET_PROFILES_ENABLED??env.WALLET_RESEARCH_ENABLED??'false')==='true',

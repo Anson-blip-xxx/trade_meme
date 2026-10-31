@@ -37,7 +37,11 @@ test('dashboard query worker preserves MemeObserver list and detail projections'
     memeAllowedChains:['bsc'],corroborationDatabase:sourceDatabase,timeoutMs:5_000});
   try {
     runner.start();
-    assert.deepEqual(await runner.listMeme({limit:20,offset:0,asOf:memeAt},{now:memeAt,status}),observer.list({limit:20,offset:0,asOf:memeAt}));
+    const expected=observer.list({limit:20,offset:0,asOf:memeAt});
+    // Maintenance runs independently; compare the worker against the exact
+    // status snapshot supplied to it rather than a later asynchronous update.
+    expected.status=status;
+    assert.deepEqual(await runner.listMeme({limit:20,offset:0,asOf:memeAt},{now:memeAt,status}),expected);
     assert.deepEqual(await runner.getMeme('bsc',address,{limit:20,offset:0,asOf:memeAt},{now:memeAt}),
       observer.detail({chain:'bsc',address},{limit:20,offset:0,asOf:memeAt}));
     assert.deepEqual(await runner.getMemeStatus({now:memeAt,status:observer.runtimeStatus()}),observer.status());

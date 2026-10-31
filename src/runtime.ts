@@ -42,6 +42,7 @@ import {researchProvider} from './research.js';
 import type {DashboardPageOptions} from './dashboard.js';
 import {assessDebotRepeatEvidence} from './debot-repeat-evidence.js';
 import {MemeObserver} from './meme-observer.js';
+import {assertMemePriceArchiveCapacity} from './meme-price-archive.js';
 import {normalizeMemeMarket} from './meme-assessment.js';
 import {collectMemeCatalyst} from './meme-catalyst.js';
 import {fetchMemeMarkets} from './meme-market-provider.js';
@@ -190,6 +191,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
   const sourceEvidence=config.corroboration&&(config.meme?.enabled||config.ave?.enabled)
     ?new SourceCorroboration(config.corroboration.database,{maxBytes:config.corroboration.maxBytes,maxEvents:config.corroboration.maxEvents}):undefined;
   let backgroundGmgnAbort:AbortController|undefined;
+  if(config.meme?.enabled)assertMemePriceArchiveCapacity(config.meme.maxActive,config.meme.maxBytes);
   const memeObserver=config.meme?.enabled?new MemeObserver({...config.meme,allowedChains:config.scannerChains,samplingPlanPath:reviewSamplingPath(config.dashboard.archivePath),
     marketBatch:(tokens,signal)=>fetchMemeMarkets(tokens.filter(t=>acceptsChain(t.chain)),signal),
     // Reuse a committed fresh market observation for research only. This path
@@ -342,6 +344,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
   let thirdEntry:ThirdSignalEntryController|undefined;
   const signalCounting=new SignalCounting({database:signalCountingPath,controlledJournal,orders,allowedChains:config.scannerChains,
     executionMode:config.thirdSignalExecutionMode,
+    onForwardTarget:memeObserver?snapshot=>{memeObserver.trackForwardTarget(snapshot);}:undefined,
     // Let each available live position slot begin its asynchronous preflight.
     // ThirdSignalEntry still performs the durable capacity and re-entry checks.
     dispatchConcurrency:Math.max(1,Math.min(3,config.entryMaxOpen)),dispatchCapacity:32,

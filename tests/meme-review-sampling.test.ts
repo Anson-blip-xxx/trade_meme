@@ -114,6 +114,10 @@ test('byte-pressure recovery frees reusable pages before the row cap and allows 
     while(used()<maxBytes*0.85){insert.run(address(9000),at(seeded/100),`pressure-${seeded}`,JSON.stringify({padding:'X'.repeat(1800)}));seeded++;}
     assert.ok(seeded<250000);const initialPages=Number(db.prepare('PRAGMA page_count').get()!.page_count);
     observer.register(signal(1),at());await observer.runOnce();
+    const deadline=Date.now()+5000;
+    while(Date.now()<deadline&&!((observer.runtimeStatus().storage.maintenance?.value?.reclaimedSnapshots??0)>0))
+      await new Promise(resolve=>setTimeout(resolve,20));
+    await observer.runOnce();
     assert.equal(observer.status().storage.pressure,false);assert.ok(observer.status().storage.reclaimedSnapshots>0);
     assert.ok(observer.status().storage.usedBytes<=maxBytes*0.7);assert.equal(observer.status().fresh,1);
     assert.equal(Number(db.prepare('PRAGMA page_count').get()!.page_count),initialPages);

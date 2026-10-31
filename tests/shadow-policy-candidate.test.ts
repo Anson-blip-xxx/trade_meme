@@ -10,10 +10,10 @@ import {buildNotificationTriggerCandidates} from '../src/notification-trigger-ca
 import type {NotificationTriggerOutcome} from '../src/notification-outcomes.js';
 
 const origin=Date.parse('2026-01-01T00:00:00.000Z'),iso=(ms:number)=>new Date(origin+ms).toISOString();
-function sample(n:number,options:{spacingHours?:number;covered?:boolean;reverseValidation?:boolean}={}):ShadowPolicySample {
+function sample(n:number,options:{spacingHours?:number;covered?:boolean;reverseValidation?:boolean;source?:ShadowPolicySample['source']}={}):ShadowPolicySample {
   const spacing=(options.spacingHours??8)*3600_000,registered=origin+n*spacing,feature=n%2===0;
-  const late=options.reverseValidation&&n>=240,gain=feature?(late?-50:50):0;
-  return {id:`sample-${n}`,chain:'solana',decision:'BUY_CANDIDATE',policyVersion:'entry-v1',registeredAt:new Date(registered).toISOString(),
+  const late=options.reverseValidation&&n>=240,gain=feature?(late?-50:50):(late?20:-20);
+  return {id:`sample-${n}`,source:options.source??'debot',chain:'solana',decision:'BUY_CANDIDATE',policyVersion:'entry-v1',registeredAt:new Date(registered).toISOString(),
     matureAt:new Date(registered+(21600+600)*1000).toISOString(),
     ...(options.covered===false?{}:{outcomeAt:new Date(registered+21600_000).toISOString(),gainPct:gain}),
     features:{two_wallet_groups:feature,positive_net_buy:feature,social_link:feature,precursor_setup:feature,public_entry_setup:feature}};
@@ -24,12 +24,15 @@ test('a versioned candidate uses mature forward samples, a chronological holdout
   const rows=Array.from({length:300},(_,n)=>sample(n,{covered:n%20!==0}));
   const candidates=buildShadowPolicyCandidates({asOf:asOf(rows),samples:rows});
   const value=candidates.find(candidate=>candidate.change.parameter==='entry.require_positive_net_buy')!;
-  assert.equal(candidates.length,4);assert.equal(value.status,'shadow_ready');assert.equal(value.evidence.mature,300);
+  assert.equal(candidates.length,4);assert.equal(value.generatorVersion,'daily-shadow-policy-v2');assert.equal(value.status,'shadow_ready');assert.equal(value.evidence.mature,300);
   assert.equal(value.evidence.coveragePct,95);assert.equal(value.evidence.train.total,240);assert.equal(value.evidence.validation.total,60);
+  assert.equal(value.scope.source,'debot');assert.equal(value.evidence.validation.proposed.entered,30);assert.equal(value.evidence.validation.proposed.skipped,30);
+  assert.equal(value.evidence.validation.skipped.losers,30);assert.equal(value.evidence.validation.skipped.winners,0);
+  assert.equal(value.evidence.validation.decision.proposed.favorable,57);assert.equal(value.evidence.validation.decision.proposed.adverse,0);
   assert.equal(value.evidence.purgedTraining,0);assert.equal(value.change.from,false);assert.equal(value.change.to,true);
   assert.equal(Object.keys(value.change).length,4);assert.equal(value.mode,'shadow');assert.equal(value.execution,'observation_only');
   assert.equal(value.livePolicyMutation,'forbidden');assert.equal(value.promotion,'manual_review_only_after_forward_shadow');
-  assert.match(value.candidatePolicyVersion,/^shadow-entry-[a-f0-9]{16}$/);assert.match(value.id,/^[a-f0-9]{64}$/);
+  assert.match(value.candidatePolicyVersion,/^shadow-entry-v2-[a-f0-9]{16}$/);assert.match(value.id,/^[a-f0-9]{64}$/);
   assert.ok(value.evidence.validation.deltas.medianGainPct!>0);assert.ok(value.evidence.validation.deltas.p10GainPct!>=-5);
 });
 
@@ -51,20 +54,50 @@ test('a chronological reversal is not promoted and overlapping training outcomes
   assert.equal(purged.evidence.purgedTraining,240);assert.equal(purged.evidence.train.total,0);assert.equal(purged.status,'collecting');
 });
 
+test('a profitable true subset cannot hide the opportunity cost of skipped winners',()=>{
+  const rows=Array.from({length:300},(_,n)=>{
+    const row=sample(n),feature=n%2===0,gain=feature?50:n%4===1?100:-10;
+    return {...row,gainPct:gain,features:{...row.features,positive_net_buy:feature}};
+  });
+  const value=buildShadowPolicyCandidates({asOf:asOf(rows),samples:rows})
+    .find(candidate=>candidate.change.parameter==='entry.require_positive_net_buy')!;
+  assert.equal(value.evidence.validation.proposed.winRatePct,100);
+  assert.equal(value.evidence.validation.skipped.winners,15);
+  assert.equal(value.evidence.validation.skipped.losers,15);
+  assert.equal(value.evidence.validation.decision.current.favorableRatePct,75);
+  assert.equal(value.evidence.validation.decision.proposed.favorableRatePct,75);
+  assert.equal(value.evidence.validation.decision.proposed.adverseRatePct,25);
+  assert.equal(value.status,'not_replicated');
+  assert.ok(value.reasons.includes('VALIDATION_IMPROVEMENT_NOT_OBSERVED'));
+});
+
+test('source, chain and policy are independent candidate denominators',()=>{
+  const rows=[...Array.from({length:300},(_,n)=>sample(n,{source:'debot'})),
+    ...Array.from({length:300},(_,n)=>sample(n,{source:'ave'}))];
+  const candidates=buildShadowPolicyCandidates({asOf:asOf(rows),samples:rows});
+  assert.equal(candidates.length,8);
+  assert.deepEqual([...new Set(candidates.map(value=>value.scope.source))],['ave','debot']);
+  assert.ok(candidates.every(value=>value.evidence.mature===300));
+});
+
 test('reader accepts only mature compact first-feature evidence and never converts missing outcomes to losses',t=>{
   const dir=mkdtempSync(join(tmpdir(),'shadow-policy-reader-')),path=join(dir,'archive.sqlite');t.after(()=>rmSync(dir,{recursive:true,force:true}));
   const db=new DatabaseSync(path);db.exec(`CREATE TABLE signal_followups(chain TEXT,address TEXT,registered_at TEXT,summary_record TEXT)`);
   const insert=db.prepare('INSERT INTO signal_followups VALUES(?,?,?,?)'),registered=iso(0),base={
-    initial:{decision:'BUY_CANDIDATE',policyVersion:'entry-v1',features:{two_wallet_groups:true,positive_net_buy:true,social_link:false,precursor_setup:null,public_entry_setup:false}},
-    performance:{baselineDelayed:false},horizons:{'21600':{at:iso(21600_000),gainPct:25}}};
+    initial:{source:'debot',decision:'BUY_CANDIDATE',policyVersion:'entry-v1',features:{two_wallet_groups:true,positive_net_buy:true,social_link:false,precursor_setup:null,public_entry_setup:false}},
+    performance:{baselineDelayed:false},horizons:{'21600':{at:iso(21600_000),gainPct:25,fixedPoolComparable:true}}};
   insert.run('solana','one',registered,JSON.stringify(base));
   insert.run('solana','missing',registered,JSON.stringify({...base,horizons:{}}));
   insert.run('solana','delayed',registered,JSON.stringify({...base,performance:{baselineDelayed:true}}));
+  insert.run('solana','pool-unknown',registered,JSON.stringify({...base,horizons:{'21600':{at:iso(21600_000),gainPct:900}}}));
+  insert.run('solana','source-unknown',registered,JSON.stringify({...base,initial:{...base.initial,source:undefined}}));
   insert.run('solana','future',iso(24*3600_000),JSON.stringify(base));db.close();
   const rows=readMatureFollowupSamples(path,iso((21600+600)*1000));
-  assert.equal(rows.length,3);assert.equal(rows.find(row=>row.id.endsWith(':one'))?.gainPct,25);
+  assert.equal(rows.length,4);assert.equal(rows.find(row=>row.id.endsWith(':one'))?.gainPct,25);
   assert.equal(rows.find(row=>row.id.endsWith(':missing'))?.gainPct,undefined);
   assert.equal(rows.find(row=>row.id.endsWith(':delayed'))?.gainPct,undefined);
+  assert.equal(rows.find(row=>row.id.endsWith(':pool-unknown'))?.gainPct,undefined);
+  assert.equal(rows.find(row=>row.id.endsWith(':source-unknown')),undefined);
   assert.equal(rows.find(row=>row.id.endsWith(':future')),undefined);
 });
 
@@ -79,6 +112,10 @@ test('candidate ledger is private, immutable and contains no active policy inter
   const trigger=buildNotificationTriggerCandidates({asOf:iso(21601_000),outcomes:triggerRows})[0];
   assert.equal(store.saveAll([candidate,trigger]),2);assert.equal(store.saveAll([candidate,trigger]),0);assert.equal(statSync(path).mode&0o777,0o600);
   const page=store.latest();assert.equal(page.items.length,2);assert.ok(page.items.some(row=>row.id===candidate.id));assert.ok(page.items.some(row=>row.id===trigger.id));
+  const later=buildShadowPolicyCandidates({asOf:new Date(Date.parse(asOf(rows))+3600_000).toISOString(),samples:rows})[0];
+  assert.equal(store.saveAll([later]),1);const latest=store.latest();
+  assert.equal(latest.items.filter(row=>row.generatorVersion==='daily-shadow-policy-v2').length,1);
+  assert.ok(latest.items.some(row=>row.id===later.id));assert.ok(!latest.items.some(row=>row.id===candidate.id));
   assert.equal('activate' in store,false);assert.equal('apply' in store,false);assert.equal('currentPolicy' in store,false);
   assert.throws(()=>store.saveAll([{...candidate,mode:'live'} as never]),/SHADOW_POLICY_STORE_INVALID/);
 });

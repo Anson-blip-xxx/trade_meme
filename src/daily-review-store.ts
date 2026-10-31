@@ -8,6 +8,8 @@ import type {ExitQualityReview} from './exit-quality.js';
 import type {Chain,Report} from './types.js';
 import type {EntryResult} from './entry.js';
 import {VendorPerformanceLedger} from './vendor-performance-ledger.js';
+import type {NotificationTriggerOutcome} from './notification-outcomes.js';
+import type {StoredShadowPolicyCandidate} from './shadow-policy-candidate-store.js';
 
 export interface ReviewPageOptions {date?:string;runId?:string;chain?:Chain;limit?:number;offset?:number;}
 /** Only curated review data and entry outcomes. No raw reports, sessions or signing material. */
@@ -112,6 +114,28 @@ export class DailyReviewStore {
       this.db.exec('COMMIT');
     }catch(error){this.db.exec('ROLLBACK');throw error;}
   }
+  /** Latest complete revision per report date; unknown or incomplete outcomes stay excluded. */
+  notificationOutcomes(limit=100000):NotificationTriggerOutcome[] {
+    const take=Number.isInteger(limit)?Math.max(1,Math.min(100000,limit)):100000;
+    const rows=this.db.prepare(`WITH latest AS (
+        SELECT id,date,generated_at,ROW_NUMBER() OVER(PARTITION BY date ORDER BY generated_at DESC,id DESC) position
+        ,data FROM review_runs
+      ) SELECT i.data FROM review_items i JOIN latest r ON r.id=i.run_id AND r.position=1
+        AND json_extract(r.data,'$.datasetComplete')=1
+      ORDER BY r.date,i.rank`).all();
+    const output:NotificationTriggerOutcome[]=[],seen=new Set<string>();
+    for(const row of rows){
+      let item:ReviewItem;try{item=JSON.parse(String(row.data)) as ReviewItem;}
+      catch{continue;/* Corrupt report evidence is missing, never a negative outcome. */}
+      if(!Array.isArray(item.notificationOutcomes))continue;
+      for(const outcome of item.notificationOutcomes){
+        const identity=[outcome.source,outcome.chain,outcome.address,outcome.sessionFirstReceivedAt,outcome.notificationNumber].join(':');
+        if(seen.has(identity))continue;seen.add(identity);output.push(outcome);
+        if(output.length>take)throw new Error('REVIEW_NOTIFICATION_OUTCOME_LIMIT_EXCEEDED');
+      }
+    }
+    return output;
+  }
   page(options:ReviewPageOptions={},now=new Date()) {
     if(options.date)reviewWindow(options.date);
     const limit=Number.isInteger(options.limit)?Math.max(1,Math.min(100,options.limit!)):20;
@@ -124,7 +148,21 @@ export class DailyReviewStore {
     const status=Object.fromEntries(this.db.prepare('SELECT key,value FROM review_meta').all().map(r=>[r.key,r.value]));
     const quality=this.db.prepare('SELECT data FROM review_exit_quality ORDER BY date DESC LIMIT 1').get();
     const exitQuality=quality?JSON.parse(String(quality.data)) as ExitQualityReview:undefined;
-    const base={enabled:true,schedule:reviewSchedule(now),dates,status,limit,offset,exitQuality};
+    const hasShadow=!!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='review_shadow_policy_candidates'").get();
+    const shadowPolicies=hasShadow?{
+      items:this.db.prepare(`WITH ranked AS (
+        SELECT data,generated_at,id,ROW_NUMBER() OVER(PARTITION BY
+          json_extract(data,'$.generatorVersion'),json_extract(data,'$.scope.chain'),
+          COALESCE(json_extract(data,'$.scope.source'),''),COALESCE(json_extract(data,'$.scope.basePolicyVersion'),''),
+          COALESCE(json_extract(data,'$.scope.decision'),''),COALESCE(json_extract(data,'$.scope.horizonSec'),0),
+          json_extract(data,'$.change.parameter') ORDER BY generated_at DESC,id DESC) position
+        FROM review_shadow_policy_candidates
+        WHERE json_extract(data,'$.generatorVersion') IN ('daily-shadow-policy-v2','notification-trigger-shadow-v2')
+      ) SELECT data FROM ranked WHERE position=1 ORDER BY generated_at DESC,id LIMIT 20`).all()
+        .flatMap(row=>{try{return [JSON.parse(String(row.data)) as StoredShadowPolicyCandidate];}catch{return [];}}),
+      status:Object.fromEntries(this.db.prepare("SELECT key,value FROM review_shadow_policy_meta").all().map(row=>[String(row.key),String(row.value)])),
+    }:{items:[] as StoredShadowPolicyCandidate[],status:{}};
+    const base={enabled:true,schedule:reviewSchedule(now),dates,status,limit,offset,exitQuality,shadowPolicies};
     if(!run)return {...base,report:undefined,total:0,hasMore:false,items:[] as ReviewItem[]};
     if(date&&run.date!==date)throw new Error('REVIEW_DATE_INVALID');
     const filter=options.chain?' AND chain=?':'',params=options.chain?[String(run.id),options.chain]:[String(run.id)];

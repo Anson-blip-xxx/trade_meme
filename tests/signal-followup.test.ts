@@ -253,6 +253,19 @@ test('fixed horizons do not substitute peak prices and preserve true sampled dra
     assert.equal(r.timeline.find(e=>e.kind==='gain_100')!.at,iso(1800000));
   }finally{db.close();}
 });
+test('horizon comparability is permanently lost when a scheduled price path changes pool',()=>{
+  const {db,followup,capture,detail}=setup();try {
+    capture(1);capture(2);const first={poolAddress:address(20)},second={poolAddress:address(21)};
+    followup.price(price(1,1000,10,{market:first}),date(1000));
+    followup.price(price(1,21600000,20,{market:first}),date(21600000));
+    followup.price(price(2,1000,10,{market:first}),date(1000));
+    followup.price(price(2,21600000,20,{market:second}),date(21600000));
+    assert.equal(detail(1).horizons['21600'].fixedPoolComparable,true);
+    assert.equal(detail(2).horizons['21600'].gainPct,100);
+    assert.equal(detail(2).horizons['21600'].fixedPoolComparable,undefined);
+    assert.equal(detail(2).performance.fixedPoolPath,false);
+  }finally{db.close();}
+});
 test('late first quote and missed horizon remain missing, not zero returns',()=>{
   const {db,followup,capture,detail}=setup();try {
     capture(1);capture(2);
@@ -349,8 +362,18 @@ test('summary uses compact aggregates and caches for 60s without hiding detailed
     capture();const s=followup.summary(date());followup.price(price(1,1000,10),date(1000));
     assert.equal(followup.summary(date(1000)).sampled,0);assert.equal(detail().performance.samples,1);
     assert.equal(followup.summary(date(60000)).sampled,1);s.items.length=0;assert.equal(followup.summary(date(60000)).items.length,1);
-    const row=db.prepare('SELECT summary_record FROM signal_followups').get()!;
+    const row=db.prepare('SELECT summary_record FROM signal_followups').get()!,compact=JSON.parse(String(row.summary_record));
     assert.equal(String(row.summary_record).includes('points'),false);assert.equal(String(row.summary_record).includes('timeline'),false);
+    assert.equal(compact.initial.source,'debot');
+  }finally{db.close();}
+});
+test('startup backfills immutable source into summaries from the frozen full record',()=>{
+  const {db,followup,capture}=setup();try {
+    capture();const row=db.prepare('SELECT summary_record FROM signal_followups').get()!,summary=JSON.parse(String(row.summary_record));
+    delete summary.initial.source;db.prepare('UPDATE signal_followups SET summary_record=?').run(JSON.stringify(summary));
+    new SignalFollowup(db);
+    const restored=JSON.parse(String(db.prepare('SELECT summary_record FROM signal_followups').get()!.summary_record));
+    assert.equal(restored.initial.source,'debot');
   }finally{db.close();}
 });
 test('training outcomes crossing validation registration are purged even with many winning samples',()=>{

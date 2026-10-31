@@ -5,6 +5,8 @@ import {pathToFileURL} from 'node:url';
 export interface MemeMaintenanceSnapshot {
   usedBytes:number;checkedAt:string;pressure:boolean;reclaimedSnapshots:number;
   lastDurationMs:number;maxWriteLockMs:number;checkpointedPages:number;error?:string;
+  priceArchive?:{backfilled:number;deleted:number;backfillPending:boolean;retentionBacklog:boolean;
+    stage:'maintain';durationMs:number;error?:string};
 }
 
 /** Runs retention deletes and WAL checkpoints away from the signal event loop. */
@@ -13,6 +15,7 @@ export class MemeMaintenanceRunner {
   private value?:MemeMaintenanceSnapshot;private error?:string;
   constructor(private readonly options:{database:string;maxBytes:number;reclaimedSnapshots:number}){}
   start():void {if(this.running)return;this.running=true;this.launch();}
+  wake():void {if(this.running)try{this.worker?.postMessage('run');}catch{}}
   snapshot(){return {value:this.value,error:this.error,running:this.running&&!!this.worker,restarts:this.restarts};}
   private launch():void {
     if(!this.running)return;

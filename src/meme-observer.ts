@@ -13,6 +13,10 @@ import type {GmgnTokenSnapshot} from './providers/gmgn-safety.js';
 import type {SourceCorroborationAssessment} from './source-corroboration.js';
 import {ReviewSamplingPlanReader,type ReviewSamplingPlan,type ReviewSamplingSource} from './review-sampling.js';
 import {MemeMaintenanceRunner} from './meme-maintenance.js';
+import {archiveMemePrice,backfillMemePriceArchive,initializeMemePriceArchive,MEME_FULL_SNAPSHOT_MAX_ROWS,
+  memePriceArchiveCapacity,memePriceArchiveDeletionCeiling,pruneMemePriceArchive,
+  type MemePriceArchiveCapacity} from './meme-price-archive.js';
+import type {ThirdSignalNotificationSnapshot} from './third-signal-strategy.js';
 
 type Token=Signal['token'];
 type Row=Record<string,any>;
@@ -42,6 +46,7 @@ function validToken(token:Token):Token|undefined {
 }
 function time(value:unknown):number {return typeof value==='string'&&/^\d{4}-\d\d-\d\dT/.test(value)?Date.parse(value):NaN;}
 const iso=(n:number)=>new Date(n).toISOString();
+const FORWARD_TARGET_WINDOW_MS=6*60*60*1000,FORWARD_TARGET_RETENTION_MS=7*24*60*60*1000;
 export interface MemeSignalRegistrationOptions {
   now:Date;windowMs:number;chains:readonly Chain[];display?:{name?:string;symbol?:string};
 }
@@ -79,6 +84,7 @@ const samplingFields="chain,address,last_signal_at,first_seen_at,market_attempt_
 export class MemeObserver {
   private readonly db:DatabaseSync;private readonly now:()=>Date;
   private readonly maxActive:number;private readonly windowMs:number;private readonly maxBytes:number;
+  private readonly priceArchiveCapacity:MemePriceArchiveCapacity;
   private readonly chains:Chain[];
   private readonly samplingReader:ReviewSamplingPlanReader;
   private running=false;private closed=false;private livePriority=false;private marketWork?:Promise<void>;private catalystWork?:Promise<void>;
@@ -87,6 +93,8 @@ export class MemeObserver {
   private lastCycleAt?:string;private error?:string;private catalystError?:string;private nextPrune=0;private dexCooldown=0;
   private marketSampleCallbackError?:string;
   private storagePressure=false;private usedBytes=0;private storageCheckedAt?:string;private reclaimedSnapshots=0;
+  private forwardTargetView:{active:number;selected:number;waiting:number;maxQuoteGapSec:number;projectedRoundSec:number;alert?:string}=
+    {active:0,selected:0,waiting:0,maxQuoteGapSec:0,projectedRoundSec:0};
   private readonly maintenance?:MemeMaintenanceRunner;
   constructor(private readonly options:MemeObserverOptions){
     this.now=options.now??(()=>new Date());this.maxActive=options.maxActive??180;this.windowMs=(options.activeWindowSec??7200)*1000;
@@ -97,14 +105,12 @@ export class MemeObserver {
       !Number.isInteger(this.maxActive)||this.maxActive<1||this.maxActive>300||this.windowMs<60000||this.windowMs>86400000||maxBytes<1048576)
       throw new Error('MEME_OBSERVER_CONFIG_INVALID');
     this.chains=[...new Set(chains)] as Chain[];
-    this.maxBytes=maxBytes;
+    this.maxBytes=maxBytes;this.priceArchiveCapacity=memePriceArchiveCapacity(this.maxActive,maxBytes);
     if(options.database!==':memory:')mkdirSync(dirname(options.database),{recursive:true,mode:0o700});
     this.db=new DatabaseSync(options.database);
     const pageSize=Number(this.db.prepare('PRAGMA page_size').get()!.page_size);
     this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=1500; PRAGMA wal_autocheckpoint=16; PRAGMA journal_size_limit=4194304;
       PRAGMA max_page_count=${Math.floor(maxBytes/pageSize)}`);
-    // Recover space before a new index/schema migration needs additional pages.
-    if(this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meme_snapshots'").get())this.reclaimSpace();
     this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=1500; PRAGMA wal_autocheckpoint=16; PRAGMA journal_size_limit=4194304;
       CREATE TABLE IF NOT EXISTS meme_tokens(chain TEXT,address TEXT,first_seen_at TEXT NOT NULL,last_signal_at TEXT NOT NULL,
         signal TEXT NOT NULL,name TEXT,symbol TEXT,market_attempt_at TEXT,fallback_attempt_at TEXT,catalyst_attempt_at TEXT,last_sample_at TEXT,
@@ -132,13 +138,26 @@ export class MemeObserver {
         selections INTEGER NOT NULL,signal_observed_at TEXT NOT NULL,PRIMARY KEY(plan_id,channel,chain,address,source,reason));
       CREATE INDEX IF NOT EXISTS meme_sampling_selection_token ON meme_sampling_selections(chain,address,first_selected_at DESC);
       CREATE INDEX IF NOT EXISTS meme_sampling_selection_retention ON meme_sampling_selections(last_selected_at);
+      CREATE TABLE IF NOT EXISTS meme_forward_targets(run_id TEXT NOT NULL,window_id TEXT NOT NULL,source TEXT NOT NULL,
+        chain TEXT NOT NULL,address TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal IN (3,4)),trigger_at TEXT NOT NULL,
+        until_at TEXT NOT NULL,created_at TEXT NOT NULL,
+        PRIMARY KEY(run_id,source,chain,address,window_id,ordinal));
+      CREATE INDEX IF NOT EXISTS meme_forward_targets_active ON meme_forward_targets(until_at,chain,address);
+      CREATE INDEX IF NOT EXISTS meme_forward_targets_token ON meme_forward_targets(chain,address,until_at);
       CREATE TABLE IF NOT EXISTS meme_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);`);
     if(!this.db.prepare('PRAGMA table_info(meme_snapshots)').all().some(row=>row.name==='corroboration'))
       this.db.exec('ALTER TABLE meme_snapshots ADD COLUMN corroboration TEXT');
+    initializeMemePriceArchive(this.db,this.now().toISOString());
+    // Keep startup work bounded. Large existing stores continue this frozen-id
+    // backfill in the maintenance worker without delaying signal handling.
+    backfillMemePriceArchive(this.db,this.now().toISOString(),500);
+    // The frozen cursor now protects every still-unmigrated full row. Storage
+    // recovery may reclaim only rows at or below that durable boundary.
+    this.reclaimSpace();
     if(options.database!==':memory:')chmodSync(options.database,0o600);
-    // Large retained research stores run retention and WAL checkpoints in a
-    // worker. Small/test stores keep deterministic inline maintenance.
-    if(options.database!==':memory:'&&this.usedBytes>=64*1024*1024){
+    // Every persistent store grows over time; always keep retention and legacy
+    // backfill away from the signal event loop. In-memory tests stay inline.
+    if(options.database!==':memory:'){
       this.db.exec('PRAGMA wal_autocheckpoint=0');
       this.maintenance=new MemeMaintenanceRunner({database:options.database,maxBytes:this.maxBytes,reclaimedSnapshots:this.reclaimedSnapshots});
       this.maintenance.start();
@@ -176,14 +195,58 @@ export class MemeObserver {
         .run(tokenDisplayText((info as any).name,100)??null,tokenDisplayText((info as any).symbol,32)??null,token.chain,token.address);
     }
   }
+  /** Idempotently bridge a committed live ordinal into the price observer.
+   * The counting database remains the source of truth; this cross-database
+   * projection can be recreated from its frozen snapshots after any failure. */
+  trackForwardTarget(snapshot:ThirdSignalNotificationSnapshot):{created:boolean;active:boolean} {
+    if(this.closed)throw Error('MEME_OBSERVER_CLOSED');
+    const token=validToken({chain:snapshot?.chain,address:snapshot?.address}),trigger=time(snapshot?.receivedAt),occurred=time(snapshot?.occurredAt),now=this.now().getTime();
+    if(snapshot?.version!=='third-signal-notification-v1'||!token||!this.chains.includes(token.chain)||
+      (snapshot.ordinal!==3&&snapshot.ordinal!==4)||snapshot.source!=='debot'&&snapshot.source!=='ave'||
+      typeof snapshot.runId!=='string'||!snapshot.runId||snapshot.runId.length>512||/[\x00-\x1f\x7f]/.test(snapshot.runId)||
+      typeof snapshot.windowId!=='string'||!snapshot.windowId||snapshot.windowId.length>512||/[\x00-\x1f\x7f]/.test(snapshot.windowId)||
+      !Number.isFinite(trigger)||!Number.isFinite(occurred)||occurred>trigger||trigger>now+30000)throw Error('MEME_FORWARD_TARGET_INVALID');
+    const until=trigger+FORWARD_TARGET_WINDOW_MS,createdAt=iso(now),sourceSignal:Signal={source:snapshot.source,
+      sourceEventId:snapshot.eventId,token,occurredAt:iso(occurred),text:`Frozen live N${snapshot.ordinal} quote target`,
+      claim:'unspecified',evidenceUrls:[],...(snapshot.token.claimedPlatform?{claimedPlatform:snapshot.token.claimedPlatform}:{})};
+    this.db.exec('SAVEPOINT meme_forward_target');
+    try {
+      // Priority counting intentionally runs before slower research delivery.
+      // This minimal immutable identity lets quotes start even when that later
+      // observer handoff is delayed or unavailable; a real signal can enrich it.
+      this.db.prepare(`INSERT OR IGNORE INTO meme_tokens(chain,address,first_seen_at,last_signal_at,signal,name,symbol)
+        VALUES(?,?,?,?,?,?,?)`).run(token.chain,token.address,iso(trigger),iso(trigger),JSON.stringify(sourceSignal),
+          tokenDisplayText(snapshot.token.name,100)??null,tokenDisplayText(snapshot.token.symbol,32)??null);
+      const result=this.db.prepare(`INSERT OR IGNORE INTO meme_forward_targets
+        (run_id,window_id,source,chain,address,ordinal,trigger_at,until_at,created_at) VALUES (?,?,?,?,?,?,?,?,?)`)
+        .run(snapshot.runId,snapshot.windowId,snapshot.source,token.chain,token.address,snapshot.ordinal,
+          iso(trigger),iso(until),createdAt);
+      this.db.exec('RELEASE meme_forward_target');return {created:result.changes===1,active:until>now};
+    }catch(error){this.db.exec('ROLLBACK TO meme_forward_target; RELEASE meme_forward_target');throw error;}
+  }
   private row(token:Token):Row|undefined {return this.db.prepare('SELECT * FROM meme_tokens WHERE chain=? AND address=?').get(token.chain,token.address);}
   private activeRows():Row[] {
-    const plan=this.samplingReader.read().plan,cutoff=iso(this.now().getTime()-this.windowMs);
+    const plan=this.samplingReader.read().plan,now=this.now().getTime(),cutoff=iso(now-this.windowMs),nowIso=iso(now);
+    const chainSlots=this.chains.map(()=>'?').join(',');
+    // Outcome targets survive the ordinary two-hour signal window. Select each
+    // token once even when both N3 and N4 are active, with the longest-waiting
+    // quote first. These rows always consume the front of maxActive.
+    const targets=this.db.prepare(`SELECT ${samplingFields},1 AS forward_target,
+      (SELECT MIN(t.trigger_at) FROM meme_forward_targets t WHERE t.chain=meme_tokens.chain AND t.address=meme_tokens.address AND t.until_at>?) AS forward_trigger_at
+      FROM meme_tokens WHERE chain IN (${chainSlots}) AND EXISTS (SELECT 1 FROM meme_forward_targets t
+        WHERE t.chain=meme_tokens.chain AND t.address=meme_tokens.address AND t.until_at>?)
+      ORDER BY COALESCE(market_attempt_at,''),COALESCE(last_sample_at,''),forward_trigger_at,chain,address LIMIT ?`)
+      .all(nowIso,...this.chains,nowIso,this.maxActive);
+    if(targets.length>=this.maxActive)return targets;
     // Filter before every bounded pool, so disabled-chain history cannot crowd
     // active chains out of either fair rotation or deficit-priority research.
-    const where=`last_signal_at>=? AND chain IN (${this.chains.map(()=>'?').join(',')})`;
-    if(!plan)return this.db.prepare(`SELECT ${samplingFields} FROM meme_tokens INDEXED BY meme_tokens_sampling WHERE ${where} ORDER BY last_signal_at DESC,chain,address LIMIT ?`)
-      .all(cutoff,...this.chains,this.maxActive);
+    const where=`last_signal_at>=? AND chain IN (${chainSlots})`;
+    if(!plan){
+      const ordinary=this.db.prepare(`SELECT ${samplingFields} FROM meme_tokens INDEXED BY meme_tokens_sampling WHERE ${where} ORDER BY last_signal_at DESC,chain,address LIMIT ?`)
+        .all(cutoff,...this.chains,this.maxActive);
+      const seen=new Set(targets.map(row=>`${row.chain}:${row.address}`));
+      return [...targets,...ordinary.filter(row=>!seen.has(`${row.chain}:${row.address}`))].slice(0,this.maxActive);
+    }
     // Two bounded pools: old attempts cannot be hidden by the latest maxActive
     // alerts, while a deficient cohort can enter even beyond the fair pool.
     const order="MAX(COALESCE(market_attempt_at,''),COALESCE(last_sample_at,'')),first_seen_at,chain,address";
@@ -193,7 +256,7 @@ export class MemeObserver {
       .all(cutoff,...this.chains,...clauses.flatMap(({cohort,deficit})=>[cohort.chain,cohort.source,deficit])):[];
     const source=(row:Row):ReviewSamplingSource|undefined=>row.sampling_source;
     const deficit=(row:Row)=>{const c=plan.cohorts.find(c=>c.chain===row.chain&&c.source===source(row));return c?.total?c.missing/c.total:0;};
-    const seen=new Set<string>(),selected:Row[]=[];
+    const seen=new Set<string>(targets.map(row=>`${row.chain}:${row.address}`)),selected:Row[]=[...targets];
     const add=(row:Row,reason:'FAIR_ROTATION'|'COVERAGE_DEFICIT')=>{
       const key=`${row.chain}:${row.address}`;if(seen.has(key)||selected.length>=this.maxActive)return;
       seen.add(key);selected.push({...row,samplingSelection:{plan,source:source(row)??'manual',reason}});
@@ -240,6 +303,7 @@ export class MemeObserver {
     try {
       this.db.prepare('INSERT INTO meme_snapshots(chain,address,observed_at,source,fingerprint,market,assessment,corroboration) VALUES(?,?,?,?,?,?,?,?)')
         .run(token.chain,token.address,sample.observedAt,sample.source,fingerprint,JSON.stringify(sample),JSON.stringify(assessment),corroboration?JSON.stringify(corroboration):null);
+      archiveMemePrice(this.db,sample);
       this.db.prepare('UPDATE meme_tokens SET market=?,assessment=?,last_sample_at=?,sample_count=sample_count+1,error=NULL WHERE chain=? AND address=?')
         .run(JSON.stringify(sample),JSON.stringify(assessment),sample.observedAt,token.chain,token.address);
       this.db.exec('RELEASE meme_market');
@@ -340,6 +404,27 @@ export class MemeObserver {
     }
     return {scope:'subsequent_observed_prices',notTradingReturn:true,items:result};
   }
+  private forwardTargetStatus(active:Row[]){
+    const now=this.now().getTime(),nowIso=iso(now),chainSlots=this.chains.map(()=>'?').join(',');
+    const rows=this.db.prepare(`SELECT m.chain,m.address,m.last_sample_at,MIN(t.trigger_at) AS trigger_at
+      FROM meme_forward_targets t JOIN meme_tokens m ON m.chain=t.chain AND m.address=t.address
+      WHERE t.until_at>? AND t.chain IN (${chainSlots}) GROUP BY m.chain,m.address,m.last_sample_at`).all(nowIso,...this.chains);
+    const selectedTargets=active.filter(row=>!!row.forward_target),selected=selectedTargets.length;
+    const maxQuoteGapSec=rows.length?Math.max(...rows.map(row=>{
+      const trigger=time(row.trigger_at),sample=time(row.last_sample_at);
+      return Math.max(0,Math.floor((now-Math.max(trigger,Number.isFinite(sample)?sample:trigger))/1000));
+    })):0;
+    // A cycle is scheduled five seconds after the prior request settles. The
+    // Dex request may consume eight seconds, its bounded fallback another
+    // second, and validation/writes still need a margin. Requests cannot mix
+    // chains, so each chain needs its own final partial batch. This is a
+    // conservative capacity bound, not a latency promise.
+    const batchSize=this.livePriority?3:30,projectedBatches=this.chains.reduce((sum,chain)=>
+      sum+Math.ceil(selectedTargets.filter(row=>row.chain===chain).length/batchSize),0),projectedRoundSec=projectedBatches*15;
+    this.forwardTargetView={active:rows.length,selected,waiting:Math.max(0,rows.length-selected),maxQuoteGapSec,projectedRoundSec,
+      ...(rows.length>240||selected<rows.length||projectedRoundSec>480?{alert:'FORWARD_TARGET_CAPACITY_PRESSURE'}:{})};
+    return {...this.forwardTargetView};
+  }
   status(){
     const recent=Number(this.db.prepare(`SELECT count(*) AS n FROM meme_tokens WHERE last_signal_at>=? AND chain IN (${this.chains.map(()=>'?').join(',')})`)
       .get(iso(this.now().getTime()-this.windowMs),...this.chains)!.n);
@@ -347,9 +432,9 @@ export class MemeObserver {
     const now=this.now().getTime();
     const catalystFresh=active.filter(row=>!row.sampling_catalyst_missing&&row.sampling_catalyst_status!=='unknown'&&time(row.sampling_catalyst_expires_at)>now).length;
     const catalystPending=active.filter(row=>row.sampling_catalyst_missing).length,catalystUnknown=active.filter(row=>row.sampling_catalyst_status==='unknown').length;
-    const sampling=this.samplingReader.read();
+    const sampling=this.samplingReader.read(),forwardTargets=this.forwardTargetStatus(active);
     return {enabled:true,running:this.running,livePriority:this.livePriority,
-      researchMode:this.livePriority?'live_counting_priority':'normal',marketBatchLimit:this.livePriority?1:30,
+      researchMode:this.livePriority?'live_counting_priority':'normal',marketBatchLimit:this.livePriority?3:30,
       catalystPaused:this.livePriority,catalystPausedReason:this.livePriority?'LIVE_SIGNAL_COUNTING_PRIORITY':undefined,
       signalRegistrationPaused:false,activeChains:[...this.chains],active:active.length,waiting:Math.max(0,recent-active.length),fresh,stale:active.length-fresh,
       samplingPlan:{status:sampling.status,reason:sampling.reason,scope:'research_sampling_only',candidateLimit:1200,
@@ -358,26 +443,31 @@ export class MemeObserver {
       catalystFresh,catalystPending,catalystUnknown,catalystStale:active.length-catalystFresh-catalystPending-catalystUnknown,
       catalystMinRetrySec:600,catalystQueueIntervalSec:15,
       maxActive:this.maxActive,activeWindowSec:this.windowMs/1000,intervalSec:5,targetSampleIntervalSec:30,
+      forwardTargets,
       lastCycleAt:this.lastCycleAt,error:this.catalystError??this.error,marketInFlight:!!this.marketWork,catalystInFlight:!!this.catalystWork,
       marketSampleCallbackError:this.marketSampleCallbackError,
       storage:{maxBytes:this.maxBytes,usedBytes:this.usedBytes,checkedAt:this.storageCheckedAt,pressure:this.storagePressure,reclaimedSnapshots:this.reclaimedSnapshots,
         ...(this.maintenance?{maintenance:this.maintenance.snapshot()}:{})},
-      experimental:true,tradingEnabled:false,retentionDays:30,maxSnapshots:250000,learningScope:'frozen_features_and_subsequent_sampled_returns'};
+      experimental:true,tradingEnabled:false,retentionDays:30,maxSnapshots:MEME_FULL_SNAPSHOT_MAX_ROWS,priceArchiveRetentionDays:7,
+      priceArchiveCapacity:{...this.priceArchiveCapacity},
+      learningScope:'frozen_features_and_subsequent_sampled_returns'};
   }
   /** Pure in-memory half of status for HTTP paths. A read-only dashboard worker
    * replaces the aggregate placeholders before the response is sent. */
   runtimeStatus(){
     return {enabled:true,running:this.running,livePriority:this.livePriority,
-      researchMode:this.livePriority?'live_counting_priority':'normal',marketBatchLimit:this.livePriority?1:30,
+      researchMode:this.livePriority?'live_counting_priority':'normal',marketBatchLimit:this.livePriority?3:30,
       catalystPaused:this.livePriority,catalystPausedReason:this.livePriority?'LIVE_SIGNAL_COUNTING_PRIORITY':undefined,
       signalRegistrationPaused:false,activeChains:[...this.chains],active:0,waiting:0,fresh:0,stale:0,
       samplingPlan:{status:'unavailable',reason:'DASHBOARD_QUERY_PENDING',scope:'research_sampling_only',candidateLimit:1200},
       catalystFresh:0,catalystPending:0,catalystUnknown:0,catalystStale:0,catalystMinRetrySec:600,catalystQueueIntervalSec:15,
       maxActive:this.maxActive,activeWindowSec:this.windowMs/1000,intervalSec:5,targetSampleIntervalSec:30,
+      forwardTargets:{...this.forwardTargetView},
       lastCycleAt:this.lastCycleAt,error:this.catalystError??this.error,marketInFlight:!!this.marketWork,catalystInFlight:!!this.catalystWork,
       marketSampleCallbackError:this.marketSampleCallbackError,
       storage:{maxBytes:this.maxBytes,usedBytes:this.usedBytes,checkedAt:this.storageCheckedAt,pressure:this.storagePressure,reclaimedSnapshots:this.reclaimedSnapshots,
-        ...(this.maintenance?{maintenance:this.maintenance.snapshot()}:{})},experimental:true,tradingEnabled:false,retentionDays:30,maxSnapshots:250000,
+        ...(this.maintenance?{maintenance:this.maintenance.snapshot()}:{})},experimental:true,tradingEnabled:false,retentionDays:30,maxSnapshots:MEME_FULL_SNAPSHOT_MAX_ROWS,
+      priceArchiveRetentionDays:7,priceArchiveCapacity:{...this.priceArchiveCapacity},
       learningScope:'frozen_features_and_subsequent_sampled_returns'};
   }
   runOnce():Promise<void>{
@@ -388,12 +478,14 @@ export class MemeObserver {
   }
   private async collect(signal:AbortSignal){
     const now=this.now().getTime();this.prune();if(this.storagePressure||this.dexCooldown>now)return;
-    const due=this.activeRows().filter(r=>!r.market_attempt_at||now-time(r.market_attempt_at)>=30000)
-      .sort((a,b)=>String(a.market_attempt_at??'').localeCompare(String(b.market_attempt_at??''))||String(b.last_signal_at).localeCompare(String(a.last_signal_at)));
+    const active=this.activeRows();this.forwardTargetStatus(active);
+    const due=active.filter(r=>!r.market_attempt_at||now-time(r.market_attempt_at)>=30000)
+      .sort((a,b)=>Number(!!b.forward_target)-Number(!!a.forward_target)||
+        String(a.market_attempt_at??'').localeCompare(String(b.market_attempt_at??''))||String(b.last_signal_at).localeCompare(String(a.last_signal_at)));
     const first=due[0];if(!first)return;
-    // Real-time signal counting still contributes one market sample per cycle,
-    // while bounding each main-thread assessment/write turn to a single token.
-    const rows=due.filter(row=>row.chain===first.chain).slice(0,this.livePriority?1:30);
+    // Three same-chain targets amortize one quote request while each validated
+    // sample still gets its own short assessment/write turn after the response.
+    const rows=due.filter(row=>row.chain===first.chain).slice(0,this.livePriority?3:30);
     // Only the actual request batch needs pool metadata; do not load the full
     // active set's evidence merely to choose its next thirty observations.
     const pools=new Map(this.db.prepare(`SELECT chain,address,json_extract(market,'$.poolAddress') pool FROM meme_tokens WHERE (chain,address) IN (VALUES ${rows.map(()=>'(?,?)').join(',')})`)
@@ -481,9 +573,11 @@ export class MemeObserver {
     if(used<this.maxBytes*0.8&&!this.storagePressure)return;
     this.storagePressure=true;
     for(let batch=0;batch<10&&used>this.maxBytes*0.7;batch++){
+      const ceiling=memePriceArchiveDeletionCeiling(this.db),protectedWhere=ceiling===undefined?'':' WHERE id<=?';
       this.db.exec('SAVEPOINT meme_space_recovery');let deleted=0;
       try {
-        deleted=Number(this.db.prepare('DELETE FROM meme_snapshots WHERE id IN (SELECT id FROM meme_snapshots ORDER BY observed_at,id LIMIT 1000)').run().changes);
+        deleted=Number(this.db.prepare(`DELETE FROM meme_snapshots WHERE id IN (SELECT id FROM meme_snapshots${protectedWhere} ORDER BY observed_at,id LIMIT 1000)`)
+          .run(...(ceiling===undefined?[]:[ceiling])).changes);
         this.db.exec('RELEASE meme_space_recovery');
       }catch(error){this.db.exec('ROLLBACK TO meme_space_recovery; RELEASE meme_space_recovery');this.error='MEME_OBSERVATION_STORAGE_PRESSURE';throw error;}
       this.reclaimedSnapshots+=deleted;used=measure();if(!deleted)break;
@@ -494,6 +588,8 @@ export class MemeObserver {
   }
   private prune():void {
     if(this.maintenance){
+      const now=this.now().getTime();
+      if(now>=this.nextPrune){this.nextPrune=now+(this.storagePressure?1000:60000);this.maintenance.wake();}
       const snapshot=this.maintenance.snapshot();
       if(snapshot.value){this.usedBytes=snapshot.value.usedBytes;this.storageCheckedAt=snapshot.value.checkedAt;
         this.storagePressure=snapshot.value.pressure;this.reclaimedSnapshots=snapshot.value.reclaimedSnapshots;
@@ -507,21 +603,27 @@ export class MemeObserver {
     // Production-sized stores use the worker above. Inline maintenance remains
     // deterministic for small/test stores, where these bounded scans stay
     // below the real-time latency budget.
-    this.db.prepare('DELETE FROM meme_snapshots WHERE observed_at<?').run(cutoff);
-    this.trimRows('meme_snapshots',250000);
+    pruneMemePriceArchive(this.db,now,1000);
+    backfillMemePriceArchive(this.db,iso(now),1000);
+    const ceiling=memePriceArchiveDeletionCeiling(this.db);
+    this.db.prepare(`DELETE FROM meme_snapshots WHERE observed_at<?${ceiling===undefined?'':' AND id<=?'}`)
+      .run(cutoff,...(ceiling===undefined?[]:[ceiling]));
+    this.trimRows('meme_snapshots',MEME_FULL_SNAPSHOT_MAX_ROWS,ceiling);
     this.db.prepare('DELETE FROM meme_catalysts WHERE observed_at<?').run(cutoff);
     this.trimRows('meme_catalysts',20000);
     this.db.prepare('DELETE FROM meme_signals WHERE observed_at<?').run(cutoff);
     this.db.prepare('DELETE FROM meme_tokens WHERE last_signal_at<?').run(cutoff);
     this.db.prepare('DELETE FROM meme_sampling_selections WHERE last_selected_at<?').run(cutoff);
     this.db.prepare('DELETE FROM meme_sampling_plans WHERE first_applied_at<? AND plan_id NOT IN (SELECT plan_id FROM meme_sampling_selections)').run(cutoff);
+    this.db.prepare('DELETE FROM meme_forward_targets WHERE until_at<?').run(iso(now-FORWARD_TARGET_RETENTION_MS));
     this.reclaimSpace();if(this.storagePressure)this.nextPrune=now+1000;
   }
-  private trimRows(table:'meme_snapshots'|'meme_catalysts',limit:number):void {
+  private trimRows(table:'meme_snapshots'|'meme_catalysts',limit:number,maxId?:number):void {
     // COUNT uses a narrow secondary index. OFFSET over the rowid table would
     // visit every large JSON row even when the table is below its row budget.
     const excess=Math.min(10000,Number(this.db.prepare(`SELECT count(*) n FROM ${table}`).get()!.n)-limit);
-    if(excess>0)this.db.prepare(`DELETE FROM ${table} WHERE id IN (SELECT id FROM ${table} ORDER BY id LIMIT ?)`).run(excess);
+    if(excess>0)this.db.prepare(`DELETE FROM ${table} WHERE id IN (SELECT id FROM ${table}${maxId===undefined?'':' WHERE id<=?'} ORDER BY id LIMIT ?)`)
+      .run(...(maxId===undefined?[excess]:[maxId,excess]));
   }
   start(){
     if(this.running||this.closed)return;this.running=true;
@@ -529,8 +631,8 @@ export class MemeObserver {
     const social=()=>{if(!this.running)return;void this.runCatalystOnce().finally(()=>{if(this.running){this.socialTimer=setTimeout(social,15000);this.socialTimer.unref();}});};
     tick();social();
   }
-  /** Live counting keeps signal registration active, limits market learning to
-   * one token per turn, and pauses optional catalyst work until counting stops. */
+  /** Live counting keeps signal registration active, limits each quote request
+   * to three tokens, and pauses optional catalyst work until counting stops. */
   setLivePriority(active:boolean):void {
     if(this.closed||this.livePriority===active)return;this.livePriority=active;
     if(active){this.marketAbort?.abort();this.socialAbort?.abort();return;}

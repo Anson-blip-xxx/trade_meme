@@ -104,6 +104,35 @@ test('restart persists run, events, windows and global claims without replaying 
   }finally{f.close();}
 });
 
+test('notification ordinals two through four freeze source evidence without changing entry decisions',()=>{
+  const f=fixture();try {
+    let s=f.open();const run=s.start();
+    assert.equal(s.observe(f.event()).count,1);assert.equal(s.notificationSnapshots().total,0);
+    const second=f.event({notificationEvidence:{priceUsd:0.01,marketCapUsd:90000,liquidityUsd:12000,
+      poolAddress:'pool-public-id',marketObservedAt:new Date(f.now()).toISOString(),marketTiming:'event_snapshot',claimedPlatform:'four',
+      reportedWalletCount:2,identifiedWalletCount:1,wallets:[{address:other,alias:'early',side:'buy',volumeUsd:50,priceUsd:0.009},
+        {address:'invalid',alias:'anonymous'},{address:other,alias:'early',side:'buy',volumeUsd:50,priceUsd:0.009}]}});
+    assert.equal(s.observe(second).count,2);
+    const frozen=s.notificationSnapshots().items[0];assert.equal(frozen.ordinal,2);
+    assert.deepEqual(frozen.market.price,{status:'observed',value:0.01,observedAt:new Date(f.now()).toISOString(),
+      timing:'event_snapshot',sourceField:'token_trading_stat.price'});
+    assert.equal(frozen.market.liquidity.status,'observed');assert.equal(frozen.market.pool.status,'observed');
+    assert.deepEqual(frozen.safety,{status:'unavailable',reason:'NOT_AVAILABLE_ON_NOTIFICATION_FAST_PATH'});
+    assert.equal(frozen.wallets.verification,'vendor_report');assert.equal(frozen.wallets.observations.length,2);
+    assert.equal(frozen.wallets.observations[0].address,other);assert.equal(frozen.token.claimedPlatform,'four');
+    assert.equal(s.observe({...second,notificationEvidence:{priceUsd:999}}).reason,'DUPLICATE_EVENT');
+    assert.deepEqual(s.notificationSnapshots().items[0],frozen,'duplicate delivery cannot rewrite frozen evidence');
+    assert.equal(s.observe(f.event({notificationEvidence:{marketCapUsd:100000,marketTiming:'receipt_snapshot'}})).status,'candidate');
+    assert.equal(s.observe(f.event()).count,4);assert.equal(s.observe(f.event()).count,5);
+    assert.deepEqual(s.notificationSnapshots().items.map(item=>item.ordinal),[2,3,4]);
+    assert.equal(s.notificationSnapshots({ordinal:3}).items[0].market.marketCap.status,'observed');
+    s.stop();s.start();assert.equal(s.notificationSnapshots().total,0);
+    assert.equal(s.notificationSnapshots({runId:run.runId}).total,3);
+    s.close();s=f.open();assert.equal(s.notificationSnapshots({runId:run.runId,source:'debot',chain:'bsc',address:ca}).total,3);
+    assert.throws(()=>s.notificationSnapshots({address:ca}),/THIRD_SIGNAL_SNAPSHOT_FILTER_INVALID/);
+  }finally{f.close();}
+});
+
 test('events before start, delayed receipt, stale source time, future time and out-of-order delivery do not count',()=>{
   const f=fixture();try {
     const s=f.open();f.advance(hour);s.start();const start=f.now();

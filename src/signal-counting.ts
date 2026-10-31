@@ -3,7 +3,8 @@ import {existsSync} from 'node:fs';
 import bs58 from 'bs58';
 import type {OpeningOrder,OrderStore} from './orders.js';
 import type {Signal} from './types.js';
-import {ThirdSignalStrategy,type ThirdSignalActor,type ThirdSignalCandidate,type ThirdSignalPageOptions,type ThirdSignalMode,type ThirdSignalExecution} from './third-signal-strategy.js';
+import {ThirdSignalStrategy,type ThirdSignalActor,type ThirdSignalCandidate,type ThirdSignalPageOptions,type ThirdSignalMode,
+  type ThirdSignalExecution,type ThirdSignalNotificationSnapshot} from './third-signal-strategy.js';
 
 type Identity={chain:Signal['token']['chain'];address:string;recordId:string};
 const object=(v:unknown):v is Record<string,unknown>=>v!==null&&typeof v==='object'&&!Array.isArray(v);
@@ -31,12 +32,18 @@ export function readControlledOpeningIdentities(path:string):Identity[] {
 }
 
 export interface SignalCountingObservation {signal:Signal;observedAt:string;alertMarketCapUsd?:number;
-  marketCapTiming?:'event_snapshot'|'unverified';name?:string;symbol?:string;}
+  marketCapTiming?:'event_snapshot'|'unverified';marketSnapshotAt?:string;alertPriceUsd?:number;currentPriceUsd?:number;
+  liquidityUsd?:number;poolAddress?:string;name?:string;symbol?:string;
+  walletCount?:number;addressCount?:number;vendorWalletCount?:number;
+  vendorWallets?:readonly {address?:string;alias?:string;side?:'buy'|'sell';lastTradeAt?:string;volumeUsd?:number;priceUsd?:number;}[];}
 interface Options {
   database:string;controlledJournal:string;orders:OrderStore;
   allowedChains?:readonly Signal['token']['chain'][];
   executionMode?:ThirdSignalMode;
   onCandidate?:(candidate:ThirdSignalCandidate)=>Promise<void>|void;
+  /** Project immutable live N3/N4 snapshots into the independent quote store.
+   * Delivery is post-commit, idempotent and retried from the counting ledger. */
+  onForwardTarget?:(snapshot:Readonly<ThirdSignalNotificationSnapshot>)=>Promise<void>|void;
   executionReady?:()=>{ready:boolean;reason?:string};
   enqueue?:(message:{key:string;text:string})=>boolean;
   /** Total active plus queued candidate callbacks. Production defaults to one worker and a bounded burst. */
@@ -59,6 +66,10 @@ export class SignalCounting {
   private readonly postCommitWork:(()=>void)[]=[];
   private readonly postCommitFailures:ThirdSignalCandidate[]=[];
   private postCommitImmediate?:ReturnType<typeof setImmediate>;
+  private readonly forwardTargetSynced=new Set<string>();
+  private readonly forwardTargetPending=new Set<string>();
+  private readonly forwardTargetWork=new Set<Promise<void>>();
+  private forwardTargetReconcileQueued=false;private forwardTargetOffset=0;private forwardTargetError?:string;
   private controlledDb?:DatabaseSync;
   private controlledDataVersion=-1;
   private closed=false;
@@ -70,6 +81,7 @@ export class SignalCounting {
       throw Error('SIGNAL_COUNTING_DISPATCH_OPTIONS_INVALID');
     this.strategy=new ThirdSignalStrategy(options.database);
     try{this.importHistory();}catch{this.historyError='SIGNAL_COUNTING_OPENING_HISTORY_UNAVAILABLE';}
+    this.scheduleForwardTargetReconciliation();
   }
   private mark(identity:Identity) {
     const address=identity.chain==='solana'?identity.address:identity.address.toLowerCase();
@@ -120,7 +132,8 @@ export class SignalCounting {
   status() {const status=this.strategy.status(),ready=this.readiness();return {...status,
     configuredExecutionMode:this.options.executionMode??'simulation',executionReady:ready.ready,readinessReason:ready.reason,
     executionEnabled:status.executionEnabled&&ready.ready,activeChains:[...this.options.allowedChains??['bsc','solana','robinhood']],
-    captureError:this.captureError,historyError:this.historyError};}
+    captureError:this.captureError,historyError:this.historyError,forwardTargetError:this.forwardTargetError,
+    forwardTargetSync:{synced:this.forwardTargetSynced.size,pending:this.forwardTargetPending.size}};}
   page(options:ThirdSignalPageOptions={}) {return {...this.strategy.list(options),status:this.status()};}
   control(action:'start'|'stop',actor:ThirdSignalActor) {
     if(action==='start'){
@@ -129,7 +142,7 @@ export class SignalCounting {
       this.strategy.start(actor,this.options.executionMode??'simulation');
     } else if(action==='stop')this.strategy.stop(actor);
     else throw Error('SIGNAL_COUNTING_ACTION_INVALID');
-    return this.status();
+    this.scheduleForwardTargetReconciliation();return this.status();
   }
   controlText() {
     const s=this.status();
@@ -145,10 +158,25 @@ export class SignalCounting {
   }
   private input(observation:SignalCountingObservation) {
     const signal=observation.signal;
+    const source=signal.source as 'debot'|'ave',debot=source==='debot';
     return {source:signal.source as 'debot'|'ave',chain:signal.token.chain,address:signal.token.address,
       eventId:signal.sourceEventId,occurredAt:signal.occurredAt,receivedAt:observation.observedAt,
       name:observation.name,symbol:observation.symbol,
-      marketCapUsd:signal.source==='debot'&&observation.marketCapTiming!=='event_snapshot'?undefined:observation.alertMarketCapUsd};
+      marketCapUsd:debot&&observation.marketCapTiming!=='event_snapshot'?undefined:observation.alertMarketCapUsd,
+      notificationEvidence:{
+        ...(debot?observation.alertPriceUsd!==undefined?{priceUsd:observation.alertPriceUsd}:{}:
+          observation.currentPriceUsd!==undefined?{priceUsd:observation.currentPriceUsd}:{}),
+        ...(observation.alertMarketCapUsd!==undefined?{marketCapUsd:observation.alertMarketCapUsd}:{}),
+        ...(observation.liquidityUsd!==undefined?{liquidityUsd:observation.liquidityUsd}:{}),
+        ...(observation.poolAddress?{poolAddress:observation.poolAddress}:{}),
+        marketObservedAt:debot?observation.marketSnapshotAt??observation.observedAt:observation.observedAt,
+        marketTiming:debot?observation.marketCapTiming??'unverified':'receipt_snapshot' as const,
+        ...(signal.claimedPlatform?{claimedPlatform:signal.claimedPlatform}:{}),
+        ...((debot?observation.walletCount:observation.vendorWalletCount)!==undefined?
+          {reportedWalletCount:debot?observation.walletCount:observation.vendorWalletCount}:{}),
+        ...(debot&&observation.addressCount!==undefined?{identifiedWalletCount:observation.addressCount}:{}),
+        ...(observation.vendorWallets?.length?{wallets:observation.vendorWallets}:{}),
+      }};
   }
   private observeInternal(observation:SignalCountingObservation,strict:boolean) {
     const signal=observation.signal;if(signal.source!=='ave'&&signal.source!=='debot')return;
@@ -167,6 +195,7 @@ export class SignalCounting {
     // The source inbox may acknowledge this observation after strategy.observe
     // commits it. Failures in execution dispatch or notification must not replay
     // the already-counted source event.
+    if(result.count===3||result.count===4)this.scheduleForwardTargetReconciliation();
     if(result.candidate){
       if(result.candidate.mode==='live')try{this.dispatchCandidate(result.candidate);}
       catch{this.captureError='SIGNAL_COUNTING_CAPTURE_FAILED';}
@@ -189,6 +218,7 @@ export class SignalCounting {
       this.importControlled();results=this.strategy.observeBatch(accepted.map(observation=>this.input(observation)));
       this.captureError=undefined;
     }catch(error){this.captureError='SIGNAL_COUNTING_CAPTURE_FAILED';throw error;}
+    if(results.some(result=>result.count===3||result.count===4))this.scheduleForwardTargetReconciliation();
     const candidates=results.flatMap(result=>result.candidate?[result.candidate]:[]);
     const live=candidates.filter(candidate=>candidate.mode==='live');
     if(live.length&&this.options.onCandidate)try {
@@ -220,6 +250,7 @@ export class SignalCounting {
     this.sentCandidateKeys.add(key);
   }
   tick() {
+    this.scheduleForwardTargetReconciliation();
     if(this.options.executionMode==='live')return;
     try {
       for(let offset=0;;offset+=200){
@@ -236,6 +267,36 @@ export class SignalCounting {
   private dispatchCandidate(candidate:ThirdSignalCandidate):void {
     if(!this.options.onCandidate||!this.strategy.claimDispatch(candidate))return;
     this.queueClaimedCandidate(candidate);
+  }
+  private forwardTargetKey(snapshot:ThirdSignalNotificationSnapshot):string {
+    return `${snapshot.runId}:${snapshot.source}:${snapshot.chain}:${snapshot.address}:${snapshot.windowId}:${snapshot.ordinal}`;
+  }
+  private deliverForwardTarget(snapshot:ThirdSignalNotificationSnapshot):void {
+    const callback=this.options.onForwardTarget;if(!callback||this.closed)return;
+    const key=this.forwardTargetKey(snapshot);if(this.forwardTargetSynced.has(key)||this.forwardTargetPending.has(key))return;
+    this.forwardTargetPending.add(key);
+    let result:Promise<void>|void;
+    try {result=callback(snapshot);}
+    catch {this.forwardTargetPending.delete(key);this.forwardTargetError='SIGNAL_FORWARD_TARGET_SYNC_FAILED';return;}
+    let work!:Promise<void>;
+    work=Promise.resolve(result).then(()=>{if(!this.closed)this.forwardTargetSynced.add(key);this.forwardTargetError=undefined;},
+      ()=>{this.forwardTargetError='SIGNAL_FORWARD_TARGET_SYNC_FAILED';}).finally(()=>{
+      this.forwardTargetPending.delete(key);this.forwardTargetWork.delete(work);
+    });
+    this.forwardTargetWork.add(work);
+  }
+  private scheduleForwardTargetReconciliation():void {
+    if(this.closed||!this.options.onForwardTarget||this.forwardTargetReconcileQueued)return;
+    this.forwardTargetReconcileQueued=true;
+    this.schedulePostCommit(()=>{
+      this.forwardTargetReconcileQueued=false;if(this.closed)return;
+      let page:ReturnType<ThirdSignalStrategy['forwardTargetSnapshots']>;
+      try {page=this.strategy.forwardTargetSnapshots({limit:100,offset:this.forwardTargetOffset});}
+      catch {this.forwardTargetOffset=0;this.forwardTargetError='SIGNAL_FORWARD_TARGET_RECONCILE_FAILED';return;}
+      for(const snapshot of page.items)this.deliverForwardTarget(snapshot);
+      if(page.hasMore){this.forwardTargetOffset+=page.items.length;this.scheduleForwardTargetReconciliation();}
+      else this.forwardTargetOffset=0;
+    });
   }
   private schedulePostCommit(work:()=>void):void {
     if(this.closed)return;this.postCommitWork.push(work);this.armPostCommit();
@@ -303,8 +364,8 @@ export class SignalCounting {
       if(this.postCommitImmediate||this.postCommitWork.length){
         await new Promise<void>(resolve=>setImmediate(resolve));continue;
       }
-      const pending=[...this.dispatches];
-      if(!pending.length&&this.activeDispatches===0&&!this.dispatchQueue.length)return;
+      const pending=[...this.dispatches,...this.forwardTargetWork];
+      if(!pending.length&&this.activeDispatches===0&&!this.dispatchQueue.length&&!this.forwardTargetReconcileQueued)return;
       if(pending.length)await Promise.allSettled(pending);
       else await new Promise<void>(resolve=>setImmediate(resolve));
     }
@@ -312,7 +373,7 @@ export class SignalCounting {
   close(){
     if(this.closed)return;
     if(this.postCommitImmediate)clearImmediate(this.postCommitImmediate);
-    this.postCommitImmediate=undefined;this.postCommitWork.length=0;
+    this.postCommitImmediate=undefined;this.postCommitWork.length=0;this.forwardTargetReconcileQueued=false;
     while(this.postCommitFailures.length)this.failDispatch(this.postCommitFailures.shift()!,'THIRD_SIGNAL_DISPATCH_QUEUE_FULL');
     // Normal runtime shutdown waits before close. Direct callers still get a
     // durable terminal outcome for queued callbacks and no unresolved promise.

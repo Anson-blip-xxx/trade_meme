@@ -7,6 +7,9 @@ import {fetchAveSignalPage} from '../src/providers/ave-signals.js';
 import {DebotSessionClient} from '../src/providers/debot-session.js';
 import {AveSessionClient} from '../src/providers/ave-session.js';
 import {readExitQualityReview} from '../src/exit-quality.js';
+import {buildShadowPolicyCandidates,readMatureFollowupSamples} from '../src/shadow-policy-candidate.js';
+import {buildNotificationTriggerCandidates} from '../src/notification-trigger-candidate.js';
+import {ShadowPolicyCandidateStore} from '../src/shadow-policy-candidate-store.js';
 
 const args=process.argv.slice(2),dateIndex=args.indexOf('--date');
 for(let i=0;i<args.length;i++){if(args[i]==='--date'){if(i!==dateIndex||!args[i+1])throw new Error('DAILY_REVIEW_ARGUMENT_INVALID');reviewWindow(args[++i]);}
@@ -63,6 +66,18 @@ try {
     store.save(report,publishPlan);
     console.log(JSON.stringify({date,id:report.id,status:'completed',counts:report.counts,learning:report.learning.status,datasetComplete:report.datasetComplete}));
   }
+  const shadowStore=new ShadowPolicyCandidateStore(path);
+  try{
+    const featureCandidates=buildShadowPolicyCandidates({asOf,samples:readMatureFollowupSamples(config.dashboard.archivePath,asOf)});
+    const triggerCandidates=buildNotificationTriggerCandidates({asOf,outcomes:store.notificationOutcomes()});
+    const saved=shadowStore.saveAll([...featureCandidates,...triggerCandidates]);
+    shadowStore.prune(now);
+    console.log(JSON.stringify({shadowCandidates:{generated:featureCandidates.length+triggerCandidates.length,saved,
+      ready:[...featureCandidates,...triggerCandidates].filter(candidate=>candidate.status==='shadow_ready').length}}));
+  }catch{
+    // Candidate research is independent and can never block or mutate the saved daily report.
+    shadowStore.failure(asOf);console.error('SHADOW_POLICY_CANDIDATE_FAILED');
+  }finally{shadowStore.close();}
   store.prune(now);store.markRunSucceeded(new Date().toISOString());console.log(JSON.stringify({vendorRefresh}));
 }catch{store.failure(new Date().toISOString());console.error('DAILY_REVIEW_FAILED');process.exitCode=1;}
 finally{store.close();}

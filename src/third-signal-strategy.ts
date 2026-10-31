@@ -12,8 +12,40 @@ export type ThirdSignalMode='simulation'|'live';
 export interface ThirdSignalInput {
   source:ThirdSignalSource;chain:ThirdSignalChain;address:string;eventId:string;
   occurredAt:string;receivedAt:string;marketCapUsd?:number;name?:string;symbol?:string;
+  /** Source-bound values visible when the notification was received. These are
+   * research evidence only and never participate in the live entry decision. */
+  notificationEvidence?:ThirdSignalNotificationEvidenceInput;
   /** Capture the run at signal arrival, before any asynchronous detail lookup. */
   runId?:string;
+}
+export interface ThirdSignalWalletObservation {
+  address?:string;alias?:string;side?:'buy'|'sell';lastTradeAt?:string;volumeUsd?:number;priceUsd?:number;
+}
+export interface ThirdSignalNotificationEvidenceInput {
+  priceUsd?:number;marketCapUsd?:number;liquidityUsd?:number;poolAddress?:string;
+  marketObservedAt?:string;
+  marketTiming?:'event_snapshot'|'receipt_snapshot'|'unverified';
+  claimedPlatform?:'pump'|'bonk'|'four'|'flap';
+  reportedWalletCount?:number;identifiedWalletCount?:number;wallets?:readonly ThirdSignalWalletObservation[];
+}
+export interface ThirdSignalObservedNumber {
+  status:'observed';value:number;observedAt:string;timing:'event_snapshot'|'receipt_snapshot'|'unverified';sourceField:string;
+}
+export interface ThirdSignalObservedText {
+  status:'observed';value:string;observedAt:string;timing:'event_snapshot'|'receipt_snapshot'|'unverified';sourceField:string;
+}
+export interface ThirdSignalUnavailableEvidence {status:'unavailable';reason:'SOURCE_NOTIFICATION_FIELD_UNAVAILABLE'|'NOT_AVAILABLE_ON_NOTIFICATION_FAST_PATH';}
+export interface ThirdSignalNotificationSnapshot {
+  version:'third-signal-notification-v1';runId:string;windowId:string;source:ThirdSignalSource;chain:ThirdSignalChain;
+  address:string;eventId:string;ordinal:2|3|4;occurredAt:string;receivedAt:string;capturedAt:string;
+  token:{name?:string;symbol?:string;claimedPlatform?:'pump'|'bonk'|'four'|'flap'};
+  market:{price:ThirdSignalObservedNumber|ThirdSignalUnavailableEvidence;
+    marketCap:ThirdSignalObservedNumber|ThirdSignalUnavailableEvidence;
+    liquidity:ThirdSignalObservedNumber|ThirdSignalUnavailableEvidence;
+    pool:ThirdSignalObservedText|ThirdSignalUnavailableEvidence;};
+  safety:ThirdSignalUnavailableEvidence;
+  wallets:{status:'observed'|'unavailable';verification:'vendor_report'|'none';reportedCount?:number;
+    identifiedAddressCount?:number;observations:ThirdSignalWalletObservation[];reason?:'SOURCE_NOTIFICATION_FIELD_UNAVAILABLE'};
 }
 export interface ThirdSignalCandidate {
   id:string;runId:string;windowId:string;source:ThirdSignalSource;chain:ThirdSignalChain;address:string;
@@ -30,6 +62,9 @@ export interface ThirdSignalResult {
   repeatBlocked?:boolean;candidate?:ThirdSignalCandidate;
 }
 export interface ThirdSignalPageOptions {limit?:number;offset?:number;}
+export interface ThirdSignalSnapshotPageOptions extends ThirdSignalPageOptions {
+  runId?:string;source?:ThirdSignalSource;chain?:ThirdSignalChain;address?:string;ordinal?:2|3|4;
+}
 export interface ThirdSignalWindow {
   runId:string;windowId:string;source:ThirdSignalSource;chain:ThirdSignalChain;address:string;count:number;
   firstReceivedAt:string;lastReceivedAt:string;expiresAt:string;expired:boolean;marketCapUsd?:number;
@@ -56,6 +91,7 @@ const identifier=(v:unknown):v is string=>typeof v==='string'&&v.length>0&&v.len
 const time=(v:unknown)=>typeof v==='string'&&/^\d{4}-\d{2}-\d{2}T/.test(v)?Date.parse(v):NaN;
 const label=(v:unknown,max:number)=>typeof v==='string'?v.replace(/[\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069]/g,' ').trim().slice(0,max)||undefined:undefined;
 const cap=(v:unknown):number|undefined=>typeof v==='number'&&Number.isFinite(v)&&v>0?v:undefined;
+const boundedCount=(v:unknown):number|undefined=>typeof v==='number'&&Number.isSafeInteger(v)&&v>=0&&v<=1_000_000?v:undefined;
 const stableJson=(value:unknown):string=>JSON.stringify((function sort(item:unknown):unknown {
   if(Array.isArray(item))return item.map(sort);
   if(item!==null&&typeof item==='object')return Object.fromEntries(Object.entries(item as Record<string,unknown>)
@@ -76,6 +112,24 @@ function page(options:ThirdSignalPageOptions={}) {
   if(!Number.isSafeInteger(limit)||limit<1||limit>200||!Number.isSafeInteger(offset)||offset<0)
     fail('THIRD_SIGNAL_PAGE_INVALID');
   return {limit,offset};
+}
+function evidenceTime(value:unknown,received:number):number|undefined {
+  const parsed=time(value);return Number.isFinite(parsed)&&parsed<=received+30_000?parsed:undefined;
+}
+function walletObservations(value:unknown,chain:ThirdSignalChain,received:number):ThirdSignalWalletObservation[] {
+  if(!Array.isArray(value))return [];
+  const result:ThirdSignalWalletObservation[]=[],seen=new Set<string>();
+  for(const raw of value.slice(0,20)){
+    if(!raw||typeof raw!=='object'||Array.isArray(raw))continue;
+    const row=raw as Record<string,unknown>,actual=normalize(chain,row.address),alias=label(row.alias,80);
+    const side=row.side==='buy'||row.side==='sell'?row.side:undefined,last=evidenceTime(row.lastTradeAt,received);
+    const volumeUsd=cap(row.volumeUsd),priceUsd=cap(row.priceUsd);
+    if(!actual&&!alias&&!side&&last===undefined&&volumeUsd===undefined&&priceUsd===undefined)continue;
+    const item:ThirdSignalWalletObservation={...(actual?{address:actual}:{}),...(alias?{alias}:{}),...(side?{side}:{}),
+      ...(last!==undefined?{lastTradeAt:iso(last)}:{}),...(volumeUsd!==undefined?{volumeUsd}:{}),...(priceUsd!==undefined?{priceUsd}:{})};
+    const key=stableJson(item);if(seen.has(key))continue;seen.add(key);result.push(item);
+  }
+  return result;
 }
 
 /** Durable signal counting and write-ahead live candidate claims; no network or trade submission here. */
@@ -103,6 +157,14 @@ export class ThirdSignalStrategy {
         source TEXT NOT NULL,chain TEXT NOT NULL,address TEXT NOT NULL,event_id TEXT NOT NULL,
         occurred_at INTEGER NOT NULL,received_at INTEGER NOT NULL,count INTEGER NOT NULL,result TEXT NOT NULL,
         PRIMARY KEY(run_id,source,chain,address,event_id));
+      CREATE TABLE IF NOT EXISTS third_signal_notification_snapshots(run_id TEXT NOT NULL REFERENCES third_signal_runs(id),
+        window_id TEXT NOT NULL,source TEXT NOT NULL,chain TEXT NOT NULL,address TEXT NOT NULL,event_id TEXT NOT NULL,
+        ordinal INTEGER NOT NULL CHECK(ordinal IN (2,3,4)),occurred_at INTEGER NOT NULL,received_at INTEGER NOT NULL,
+        captured_at INTEGER NOT NULL,data TEXT NOT NULL,
+        PRIMARY KEY(run_id,source,chain,address,window_id,ordinal),
+        UNIQUE(run_id,source,chain,address,event_id));
+      CREATE INDEX IF NOT EXISTS third_signal_snapshot_token ON third_signal_notification_snapshots(source,chain,address,received_at);
+      CREATE INDEX IF NOT EXISTS third_signal_snapshot_run ON third_signal_notification_snapshots(run_id,received_at,source,chain,address);
       CREATE TABLE IF NOT EXISTS third_signal_candidates(id TEXT PRIMARY KEY,run_id TEXT NOT NULL,
         window_id TEXT NOT NULL UNIQUE,created_at INTEGER NOT NULL,payload TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS third_signal_candidate_run ON third_signal_candidates(run_id,created_at,id);
@@ -129,6 +191,36 @@ export class ThirdSignalStrategy {
   private current():Run|undefined {
     return this.db.prepare(`SELECT r.* FROM third_signal_runs r JOIN third_signal_meta m
       ON m.key='current_run' AND m.value=r.id`).get() as unknown as Run|undefined;
+  }
+  private notificationSnapshot(input:ThirdSignalInput,run:Run,windowId:string,ordinal:2|3|4,
+    address:string,occurred:number,received:number,captured:number):ThirdSignalNotificationSnapshot {
+    const evidence=input.notificationEvidence,marketAt=evidenceTime(evidence?.marketObservedAt,received)??received;
+    const timing=evidence?.marketTiming==='event_snapshot'||evidence?.marketTiming==='receipt_snapshot'||
+      evidence?.marketTiming==='unverified'?evidence.marketTiming:'unverified';
+    const sourceField=(kind:'price'|'marketCap'|'liquidity'|'pool')=>input.source==='debot'?{
+      price:'token_trading_stat.price',marketCap:'token_trading_stat.mkt_cap',liquidity:'normalized_notification.liquidity_usd',
+      pool:'normalized_notification.pool_address'}[kind]:{
+      price:'current_price_usd',marketCap:'mc',liquidity:'normalized_notification.liquidity_usd',
+      pool:'normalized_notification.pool_address'}[kind];
+    const number=(value:unknown,kind:'price'|'marketCap'|'liquidity'):ThirdSignalObservedNumber|ThirdSignalUnavailableEvidence=>{
+      const normalized=cap(value);return normalized===undefined?{status:'unavailable',reason:'SOURCE_NOTIFICATION_FIELD_UNAVAILABLE'}:
+        {status:'observed',value:normalized,observedAt:iso(marketAt),timing,sourceField:sourceField(kind)};
+    };
+    const pool=label(evidence?.poolAddress,128),reported=boundedCount(evidence?.reportedWalletCount),
+      wallets=walletObservations(evidence?.wallets,input.chain,received),explicitIdentified=boundedCount(evidence?.identifiedWalletCount),
+      derivedIdentified=wallets.length?new Set(wallets.flatMap(item=>item.address?[item.address]:[])).size:undefined,
+      identified=explicitIdentified??derivedIdentified,walletObserved=reported!==undefined||identified!==undefined||wallets.length>0;
+    return {version:'third-signal-notification-v1',runId:run.id,windowId,source:input.source,chain:input.chain,address,
+      eventId:input.eventId,ordinal,occurredAt:iso(occurred),receivedAt:iso(received),capturedAt:iso(captured),
+      token:{...(label(input.name,120)?{name:label(input.name,120)}:{}),...(label(input.symbol,40)?{symbol:label(input.symbol,40)}:{}),
+        ...(['pump','bonk','four','flap'].includes(String(evidence?.claimedPlatform))?{claimedPlatform:evidence!.claimedPlatform}:{})},
+      market:{price:number(evidence?.priceUsd,'price'),marketCap:number(evidence?.marketCapUsd,'marketCap'),
+        liquidity:number(evidence?.liquidityUsd,'liquidity'),pool:pool?{status:'observed',value:pool,observedAt:iso(marketAt),timing,
+          sourceField:sourceField('pool')}:{status:'unavailable',reason:'SOURCE_NOTIFICATION_FIELD_UNAVAILABLE'}},
+      safety:{status:'unavailable',reason:'NOT_AVAILABLE_ON_NOTIFICATION_FAST_PATH'},
+      wallets:{status:walletObserved?'observed':'unavailable',verification:walletObserved?'vendor_report':'none',
+        ...(reported!==undefined?{reportedCount:reported}:{}),...(identified!==undefined?{identifiedAddressCount:identified}:{}),
+        observations:wallets,...(!walletObserved?{reason:'SOURCE_NOTIFICATION_FIELD_UNAVAILABLE' as const}:{})}};
   }
   start(by:ThirdSignalActor='web',mode:ThirdSignalMode='simulation'):ThirdSignalStatus {
     const who=actor(by);if(mode!=='live'&&mode!=='simulation')fail('THIRD_SIGNAL_MODE_INVALID');
@@ -228,6 +320,13 @@ export class ThirdSignalStrategy {
           name,symbol,decision,reason,candidateId,repeatBlocked);
       this.db.prepare('INSERT INTO third_signal_events VALUES (?,?,?,?,?,?,?,?,?)')
         .run(...identity,input.eventId,occurred,received,count,JSON.stringify(result));
+      if(count===2||count===3||count===4){
+        const snapshot=this.notificationSnapshot(input,run,windowId,count,address,occurred,received,now);
+        this.db.prepare(`INSERT INTO third_signal_notification_snapshots
+          (run_id,window_id,source,chain,address,event_id,ordinal,occurred_at,received_at,captured_at,data)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(run.id,windowId,input.source,input.chain,address,input.eventId,count,
+            occurred,received,now,stableJson(snapshot));
+      }
       return result;
   }
   observe(input:ThirdSignalInput):ThirdSignalResult {
@@ -273,6 +372,44 @@ export class ThirdSignalStrategy {
     const items:ThirdSignalCandidate[]=run?this.db.prepare('SELECT payload FROM third_signal_candidates WHERE run_id=? ORDER BY created_at,id LIMIT ? OFFSET ?')
       .all(run.id,limit,offset).map(row=>JSON.parse(String(row.payload)) as ThirdSignalCandidate):[];
     return {mode:run?.mode??'simulation',executionEnabled:!!run?.running&&run.mode==='live',runId:run?.id,items,total,limit,offset,hasMore:offset+items.length<total};
+  }
+  /** Read-only research evidence frozen in the same transaction as ordinals 2/3/4.
+   * Omitting runId returns only the current explicit counting run. */
+  notificationSnapshots(options:ThirdSignalSnapshotPageOptions={}) {
+    this.open();const {limit,offset}=page(options),runId=options.runId??this.current()?.id;
+    if(runId!==undefined&&!identifier(runId))fail('THIRD_SIGNAL_SNAPSHOT_FILTER_INVALID');
+    if(options.source!==undefined&&!['debot','ave'].includes(options.source)||
+      options.chain!==undefined&&!['bsc','solana','robinhood'].includes(options.chain)||
+      options.ordinal!==undefined&&![2,3,4].includes(options.ordinal))fail('THIRD_SIGNAL_SNAPSHOT_FILTER_INVALID');
+    let address:string|undefined;
+    if(options.address!==undefined){if(!options.chain)fail('THIRD_SIGNAL_SNAPSHOT_FILTER_INVALID');
+      address=normalize(options.chain,options.address);if(!address)fail('THIRD_SIGNAL_SNAPSHOT_FILTER_INVALID');}
+    if(!runId)return {runId:undefined,items:[] as ThirdSignalNotificationSnapshot[],total:0,limit,offset,hasMore:false};
+    const clauses=['run_id=?'],params:(string|number)[]=[runId];
+    if(options.source){clauses.push('source=?');params.push(options.source);}
+    if(options.chain){clauses.push('chain=?');params.push(options.chain);}
+    if(address){clauses.push('address=?');params.push(address);}
+    if(options.ordinal){clauses.push('ordinal=?');params.push(options.ordinal);}
+    const where=clauses.join(' AND '),total=Number(this.db.prepare(`SELECT count(*) AS n FROM third_signal_notification_snapshots WHERE ${where}`).get(...params)!.n);
+    const items=this.db.prepare(`SELECT data FROM third_signal_notification_snapshots WHERE ${where}
+      ORDER BY received_at,source,chain,address,ordinal LIMIT ? OFFSET ?`).all(...params,limit,offset)
+      .map(row=>JSON.parse(String(row.data)) as ThirdSignalNotificationSnapshot);
+    return {runId,items,total,limit,offset,hasMore:offset+items.length<total};
+  }
+  /** Frozen live-run ordinals whose six-hour outcome window is still open.
+   * This intentionally spans stopped and superseded runs: a cross-database
+   * observer write can fail after the counting transaction committed, and the
+   * immutable snapshot remains the compensation source after restart. */
+  forwardTargetSnapshots(options:ThirdSignalPageOptions={}) {
+    this.open();const {limit,offset}=page(options),cutoff=this.clock()-TTL;
+    const where="r.mode='live' AND s.ordinal IN (3,4) AND s.received_at>?";
+    const total=Number(this.db.prepare(`SELECT count(*) AS n FROM third_signal_notification_snapshots s
+      JOIN third_signal_runs r ON r.id=s.run_id WHERE ${where}`).get(cutoff)!.n);
+    const items=this.db.prepare(`SELECT s.data FROM third_signal_notification_snapshots s
+      JOIN third_signal_runs r ON r.id=s.run_id WHERE ${where}
+      ORDER BY s.received_at,s.source,s.chain,s.address,s.ordinal LIMIT ? OFFSET ?`).all(cutoff,limit,offset)
+      .map(row=>JSON.parse(String(row.data)) as ThirdSignalNotificationSnapshot);
+    return {items,total,limit,offset,hasMore:offset+items.length<total};
   }
   /** Fence delayed callbacks against stop/new-run and the durable global token claim. */
   isActive(candidate:ThirdSignalCandidate):boolean {

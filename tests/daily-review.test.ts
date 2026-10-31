@@ -40,12 +40,24 @@ test('local flat prices do not hide a supplier 900 percent report; the two evide
   assert.equal(review.counts.highGainers,1);assert.equal(review.counts.missedHighGainers,1);
   assert.equal(review.items[0].vendorPerformance[0].scope,'vendor_reported_retrospective');assert.match(review.items[0].evidence.join('\n'),/供应商回溯/);
 });
-test('two pools never combine into fictitious returns and unidentified pool prices are uncovered',()=>{
-  const prices=[price(1,1),price(2,2),price(3,1000,{pool:poolB}),price(4,1000,{pool:poolB}),price(5,1000,{pool:poolB}),price(6,1e9,{pool:undefined})];
-  const review=buildDailyReview(input({prices}));assert.equal(review.items[0].localPerformance?.poolAddress,poolB);
-  assert.equal(review.items[0].localPerformance?.maxGainPct,0);assert.equal(review.items[0].localPerformance?.samples,3);
+test('the first valid post-signal quote fixes the comparison pool regardless of later sample counts',()=>{
+  const prices=[price(5,1000,{pool:poolB}),price(1,1),price(4,1000,{pool:poolB}),price(2,2),price(3,1000,{pool:poolB}),price(6,1e9,{pool:undefined})];
+  const review=buildDailyReview(input({prices}));assert.equal(review.items[0].localPerformance?.poolAddress,poolA);
+  assert.equal(review.items[0].localPerformance?.baselineAt,at(1));assert.equal(review.items[0].localPerformance?.peakAt,at(2));
+  assert.equal(review.items[0].localPerformance?.maxGainPct,100);assert.equal(review.items[0].localPerformance?.samples,2);
   const unknown=buildDailyReview(input({prices:[price(1,1,{pool:undefined}),price(2,1000,{pool:undefined,source:'trusted_followup'})]}));
   assert.equal(unknown.items[0].localPerformance,undefined);assert.equal(unknown.counts.withPerformance,0);assert.equal(unknown.learning.priorities[0].covered,0);
+});
+test('a repeated CA starts each report day from that day first signal and ignores older decisions, orders and prices',()=>{
+  const historical=notify({id:'historical',receivedAt:at(-500),occurredAt:at(-500)}),today=notify({id:'today'});
+  const oldDecision=decision({at:at(-499),scanId:'old',decision:'BUY_CANDIDATE',buyEligible:true,reasons:[]});
+  const currentDecision=decision({at:at(1),scanId:'current',frozen:false});
+  const review=buildDailyReview(input({notifications:[historical,today],decisions:[oldDecision,currentDecision],
+    prices:[price(-499,0.01),price(1,10),price(2,20)],orders:[{...token(),at:at(-498),status:'filled',mode:'live'}]}));
+  const item=review.items[0];assert.equal(item.firstReceivedAt,today.receivedAt);assert.equal(item.signalCount,1);
+  assert.equal(item.firstDecision?.scanId,'current');assert.equal(item.latestDecision?.scanId,'current');
+  assert.equal(item.localPerformance?.baselineAt,at(1));assert.equal(item.localPerformance?.maxGainPct,100);
+  assert.equal(item.funnel.hasOrder,false);assert.equal(review.counts.entered,0);
 });
 test('Ave-only high multiples remain focus cases without inventing a percentage return',()=>{
   const review=buildDailyReview(input({notifications:[notify(),notify({...token(2),id:'second'})],prices:[price(1,1),price(2,1.2)],
@@ -132,9 +144,10 @@ function databases(){
 }
 test('read adapter omits future evaluations from historical stage evidence and rejects foreign token prices',()=>{
   const f=databases();try{
-    f.notifyDb();f.quote(1,1,1);f.quote(1,2,2,at(1501));f.quote(1,1501,1000);f.quote(1,3,1000,at(3),{token:token(2)});
+    f.notifyDb();f.quote(1,-1000,999);f.quote(1,1,1);f.quote(1,2,2,at(1501));f.quote(1,1501,1000);f.quote(1,3,1000,at(3),{token:token(2)});
     const before=readFileSync(f.config.meme!.database),raw=f.read();
     assert.equal(raw.datasetComplete,true);assert.equal(raw.prices.length,2);assert.equal(raw.prices.find(p=>p.at===at(2))!.stage,undefined);
+    assert.equal(raw.prices.some(p=>p.at===at(-1000)),false);
     assert.equal(raw.prices.find(p=>p.at===at(2))!.score,undefined);assert.equal(raw.prices.find(p=>p.at===at(1))!.stage,'accelerating');
     assert.deepEqual(readFileSync(f.config.meme!.database),before);const review=buildDailyReview(raw);assert.equal(review.items[0].localPerformance?.maxGainPct,100);
     assert.ok(review.items[0].evidence.filter(s=>s.includes('市场阶段')).every(s=>!s.includes(at(2))));
@@ -166,5 +179,19 @@ test('a source prune watermark intersecting the report day prevents complete-den
     const raw=f.read();assert.equal(raw.datasetComplete,false);assert.ok(raw.limitations.some(s=>s.includes('debot源库已修剪')));
     f.debot.prepare('UPDATE review_retention_watermarks SET pruned_through=?').run('2026-10-13T00:00:00.000Z');
     assert.equal(f.read().datasetComplete,true);
+  }finally{f.close();}
+});
+test('price reads are bounded to the report window and only that window can exhaust the read limit',()=>{
+  const f=databases();try{
+    f.notifyDb();f.quote(1,1,1);f.quote(1,2,2);f.quote(1,1501,3);
+    f.meme.exec(`WITH digits(value) AS (VALUES(0),(1),(2),(3),(4),(5),(6),(7),(8),(9))
+      INSERT INTO meme_snapshots(chain,address,observed_at,source,market,assessment)
+      SELECT 'bsc','${address(1)}','${at(-1000)}','dexscreener_pair','{}','{}'
+      FROM digits a,digits b,digits c,digits d,digits e,digits g LIMIT 250001`);
+    let raw=f.read();
+    assert.equal(raw.datasetComplete,true);assert.deepEqual(raw.prices.map(p=>p.at).sort(),[at(1),at(2)]);
+    f.meme.prepare("UPDATE meme_snapshots SET observed_at=? WHERE market='{}'").run(at(3));
+    raw=f.read();assert.equal(raw.datasetComplete,false);
+    assert.ok(raw.limitations.some(s=>s.includes('独立价格样本达到读取上限')));
   }finally{f.close();}
 });

@@ -124,17 +124,16 @@ export function buildDailyReview(input:ReviewInput):DailyReview {
   for(const [k,events] of all){events.sort((a,b)=>a.receivedAt.localeCompare(b.receivedAt)||a.id.localeCompare(b.id));
     const today=events.filter(n=>n.receivedAt>=window.start&&n.receivedAt<window.end);if(!today.length)continue;
     notificationsCount+=today.length;
-    const first=events[0],firstReceivedAt=first.receivedAt;
+    const first=today[0],firstReceivedAt=first.receivedAt;
     const decisionCandidates=(byDecision.get(k)??[]).filter(d=>d.at>=firstReceivedAt);
     // An explicitly frozen first evaluation outranks a mutable latest scan snapshot.
     decisionCandidates.sort((a,b)=>Number(b.frozen)-Number(a.frozen)||a.at.localeCompare(b.at));
     const firstDecision=decisionCandidates[0];
     const chronological=[...decisionCandidates].sort((a,b)=>a.at.localeCompare(b.at));
     const latestDecision=chronological.at(-1),firstEligible=chronological.find(d=>d.decision==='BUY_CANDIDATE'&&d.buyEligible);
-    const groups=new Map<string,ReviewPrice[]>();
-    for(const p of byPrice.get(k)??[]){if(p.at<firstReceivedAt||!p.pool)continue;const group=p.pool;
-      const rows=groups.get(group)??[];rows.push(p);groups.set(group,rows);}
-    const prices=[...groups.values()].sort((a,b)=>b.length-a.length)[0]?.sort((a,b)=>a.at.localeCompare(b.at))??[];
+    const eligiblePrices=(byPrice.get(k)??[]).filter(p=>p.at>=firstReceivedAt&&p.pool).sort((a,b)=>a.at.localeCompare(b.at));
+    const baselinePool=eligiblePrices[0]?.pool;
+    const prices=baselinePool?eligiblePrices.filter(p=>p.pool===baselinePool):[];
     const distinct=[...new Map(prices.map(p=>[p.at,p])).values()],base=distinct[0],last=distinct.at(-1);
     let localPerformance:ReviewItem['localPerformance'];
     if(base&&last&&distinct.length>=2){const peak=distinct.reduce((a,b)=>b.price>a.price?b:a),maxGainPct=(peak.price/base.price-1)*100,currentGainPct=(last.price/base.price-1)*100;
@@ -247,7 +246,8 @@ export function readDailyReviewInput(config:Config,date:string,asOf:string,revie
     if(!table(db,'meme_snapshots')){out.datasetComplete=false;out.limitations.push('独立价格表不可用。');return;}
     const rows=db.prepare(`SELECT chain,address,observed_at,source,json_extract(market,'$.priceUsd') price,json_extract(market,'$.poolAddress') pool,
       json_extract(market,'$.token.chain') market_chain,json_extract(market,'$.token.address') market_address,json_extract(market,'$.observedAt') market_at,
-      json_extract(assessment,'$.assessedAt') assessed_at,json_extract(assessment,'$.stage') stage,json_extract(assessment,'$.score') score FROM meme_snapshots WHERE observed_at<=? AND market IS NOT NULL ORDER BY observed_at DESC LIMIT 250001`).iterate(asOf);
+      json_extract(assessment,'$.assessedAt') assessed_at,json_extract(assessment,'$.stage') stage,json_extract(assessment,'$.score') score FROM meme_snapshots
+      WHERE observed_at>=? AND observed_at<=? AND market IS NOT NULL ORDER BY observed_at DESC LIMIT 250001`).iterate(reportWindow.start,asOf);
     let priceCount=0;for(const r of rows){if(++priceCount>250000){out.datasetComplete=false;out.limitations.push('独立价格样本达到读取上限，保留覆盖不足标记。');break;}if(r.market_chain!==r.chain||r.market_address!==r.address||r.market_at!==r.observed_at)continue;
       out.prices.push({chain:r.chain as Chain,address:String(r.address),at:String(r.observed_at),price:Number(r.price),source:String(r.source),pool:safe(r.pool,90),assessedAt:validTime(r.assessed_at)&&r.assessed_at<=asOf?r.assessed_at:undefined,stage:validTime(r.assessed_at)&&r.assessed_at<=asOf?safe(r.stage,30):undefined,score:validTime(r.assessed_at)&&r.assessed_at<=asOf&&typeof r.score==='number'?r.score:undefined});}
   });

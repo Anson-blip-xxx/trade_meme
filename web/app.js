@@ -1347,8 +1347,8 @@
   }
   function countingStateLabel(status) {
     if(!validCountingStatus(status))return '状态待核对';
-    if(!status.running)return status.runId?'已停止':'尚未启动';
-    if(status.mode==='live')return status.executionEnabled?'实盘计数运行中':'计数运行中 · 开仓未就绪';
+    if(!status.running)return '自动交易未授权 · 信号仍在采集';
+    if(status.mode==='live')return status.executionEnabled?'自动交易已授权 · 本轮计数中':'本轮计数中 · 开仓未就绪';
     return '模拟计数运行中';
   }
   function renderSignalCounting() {
@@ -1360,7 +1360,7 @@
     statusNode.className=`badge ${running&&!failed?'pass':'neutral'}`;
     statusNode.textContent=failed?'状态待核对':status?.enabled===false?'服务未启用':valid?countingStateLabel(status):'等待读取';
     text('signal-counting-mode',valid?(live?'实盘策略 · 启动后达标自动买入':'模拟计数 · 不执行实盘'):'模式等待读取');
-    text('signal-counting-action-note',valid?(live?'通过开仓核验后提交实盘买单，每单最多使用 SOL 总余额的 3%。':'登记模拟候选，不提交实盘买单。'):'请以服务返回的策略模式为准。');
+    text('signal-counting-action-note',valid?(live?'启用后，通过开仓核验才提交实盘买单，每单最多使用 SOL 总余额的 3%；采集不受此开关影响。':'登记模拟候选，不提交实盘买单；采集不受此开关影响。'):'请以服务返回的策略模式为准。');
     $('signal-counting-start').disabled=disabled||(running&&!upgradeRun)||readinessBlocked;$('signal-counting-stop').disabled=disabled||!running;
     text('signal-counting-start',signalCounting.busy==='start'?'正在启动…':'启动计数');
     text('signal-counting-stop',signalCounting.busy==='stop'?'正在停止…':'停止计数');

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtempSync,rmSync} from 'node:fs';
+import {mkdtempSync,rmSync,writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
@@ -18,6 +18,8 @@ import {readConfig} from '../src/config.js';
 import {ControlledTestJournal} from '../src/controlled-test/journal.js';
 import type {TestRun} from '../src/controlled-test/types.js';
 import {TelegramNotifier} from '../src/telegram-notifier.js';
+import {DebotScanner} from '../src/debot-scanner.js';
+import {AveScanner} from '../src/ave-scanner.js';
 
 const ca='0x'+'a'.repeat(40),mint=bs58.encode(Buffer.alloc(32,1)),wallet=bs58.encode(Buffer.alloc(32,2));
 function fixture() {
@@ -44,6 +46,17 @@ function journal(path:string,invalid=false) {
  const operation={runId:run.id,key:'buy',state:'unknown',body:{chain:'sol',from_address:wallet,output_token:invalid?'bad':mint}};
  db.prepare('INSERT INTO controlled_test_runs VALUES(?,?,?)').run(run.id,wallet,JSON.stringify(run));
  db.prepare('INSERT INTO controlled_test_operations VALUES(?,?,?)').run(run.id,'buy',JSON.stringify(operation));db.close();
+}
+async function waitUntil(check:()=>boolean,timeoutMs=3000) {
+ const deadline=Date.now()+timeoutMs;
+ while(!check()){
+   if(Date.now()>=deadline)assert.fail('condition was not met before timeout');
+   await new Promise(resolve=>setTimeout(resolve,10));
+ }
+}
+function tableCount(path:string,table:string):number {
+ const db=new DatabaseSync(path,{readOnly:true});try{return Number(db.prepare(`SELECT count(*) AS n FROM ${table}`).get()!.n);}
+ finally{db.close();}
 }
 
 test('simulation counts stay separate, send once, and never reserve or submit an order',()=>{
@@ -131,7 +144,7 @@ test('simulation ordinals never enter the live forward-target bridge',async()=>{
 
 test('priority observation only acknowledges a durable strategy write',()=>{
  const f=fixture(),s=new SignalCounting(f.options);try {
-   s.control('start','web');const event=observation();
+   s.control('start','web');const failedRun=s.status().runId,event=observation();
    const original=s.strategy.observe.bind(s.strategy);let attempts=0;
    s.strategy.observe=((input:Parameters<typeof original>[0])=>{
      if(++attempts===1)throw Error('SQLITE_BUSY');
@@ -139,7 +152,9 @@ test('priority observation only acknowledges a durable strategy write',()=>{
    }) as typeof s.strategy.observe;
    assert.throws(()=>s.observePriority(event),/SQLITE_BUSY/);
    assert.equal(s.status().events,0);assert.equal(s.status().captureError,'SIGNAL_COUNTING_CAPTURE_FAILED');
-   assert.equal(s.observePriority(event)?.status,'counted');
+   assert.equal(s.status().captureDegraded,true);assert.equal(s.status().running,false);
+   s.control('start','web');assert.notEqual(s.status().runId,failedRun);
+   assert.equal(s.observePriority(observation())?.status,'counted');
    assert.equal(s.status().events,1);assert.equal(s.status().captureError,undefined);
  }finally{s.close();f.close();}
 });
@@ -163,9 +178,10 @@ test('priority page rolls back every observation when a middle durable write fai
    const db=new DatabaseSync(f.options.database);try {db.exec(`CREATE TRIGGER reject_middle_count BEFORE INSERT ON third_signal_events
      WHEN NEW.event_id='${failedId}' BEGIN SELECT RAISE(ABORT,'TEST_BATCH_FAILURE'); END;`);}finally{db.close();}
    assert.throws(()=>s.observePriorityBatch(page),/TEST_BATCH_FAILURE/);
-   assert.equal(s.status().events,0);assert.equal(s.status().groups,0);
+   assert.equal(s.status().events,0);assert.equal(s.status().groups,0);assert.equal(s.status().running,false);
    const repair=new DatabaseSync(f.options.database);try{repair.exec('DROP TRIGGER reject_middle_count');}finally{repair.close();}
-   assert.equal(s.observePriorityBatch(page).length,20);assert.equal(s.status().events,20);
+   s.control('start','web');
+   assert.equal(s.observePriorityBatch(solanaBatch()).length,20);assert.equal(s.status().events,20);
  }finally{s.close();f.close();}
 });
 
@@ -260,7 +276,156 @@ test('unreadable historical identity blocks starting counts instead of bypassing
  }finally{s.close();f.close();}
 });
 
-test('runtime source callbacks feed simulation before research while existing entry mode remains off',async()=>{
+test('stopped counting never touches failed count storage while DeBot and Ave source rows continue',async()=>{
+ const folder=mkdtempSync(join(tmpdir(),'stopped-count-storage-')),orders=new OrderStore(join(folder,'orders.sqlite')),
+   countPath=join(folder,'counting.sqlite'),debotPath=join(folder,'debot.sqlite'),avePath=join(folder,'ave.sqlite');
+ const counting=new SignalCounting({database:countPath,controlledJournal:join(folder,'controlled.sqlite'),orders});
+ let research=0;
+ const debot=new DebotScanner({database:debotPath,chains:['bsc'],maxAgeSec:600,onSignal:async()=>{},
+   onPriorityObservations:items=>counting.observeBatch(items),onObservation:()=>{research++;}}),
+   ave=new AveScanner({database:avePath,chains:['bsc'],onSignal:async()=>{},
+     onPriorityObservations:items=>counting.observeBatch(items),onObservation:()=>{research++;}});
+ try {
+   const db=new DatabaseSync(countPath);try{db.exec(`CREATE TRIGGER reject_stopped_count BEFORE INSERT ON third_signal_events
+     BEGIN SELECT RAISE(ABORT,'COUNT_DATABASE_MUST_NOT_BE_TOUCHED'); END;`);}finally{db.close();}
+   debot.acceptPage({observations:[observation('debot')],received:1,rejected:0});
+   ave.acceptPage({observations:[observation('ave')],received:1,rejected:0});
+   await waitUntil(()=>tableCount(debotPath,'debot_signals')===1&&tableCount(avePath,'ave_signals')===1&&research===2);
+   const state=counting.status();assert.equal(state.running,false);assert.equal(state.events,0);
+   assert.equal(state.captureError,undefined);assert.equal(state.captureDegraded,false);
+   assert.equal(tableCount(debotPath,'debot_observation_inbox'),0);assert.equal(tableCount(avePath,'ave_observation_inbox'),0);
+ }finally{await Promise.all([debot.close(),ave.close()]);counting.close();orders.close();rmSync(folder,{recursive:true,force:true});}
+});
+
+test('real SQLite writer locks fail single and batch count capture immediately and latch the run closed',()=>{
+ for(const mode of ['single','batch'] as const){
+   const f=fixture(),counting=new SignalCounting(f.options);let lock:DatabaseSync|undefined;
+   try {
+     counting.control('start','web');lock=new DatabaseSync(f.options.database);lock.exec('BEGIN IMMEDIATE');
+     const started=performance.now();
+     if(mode==='single')assert.equal(counting.observe(observation()),undefined);
+     else assert.deepEqual(counting.observeBatch([observation()]),[]);
+     const elapsed=performance.now()-started;
+     assert.ok(elapsed<100,`${mode} count capture waited ${elapsed.toFixed(1)}ms for an external writer`);
+     const state=counting.status();assert.equal(state.running,false);assert.equal(state.storageRunning,true);
+     assert.equal(state.captureDegraded,true);assert.equal(state.captureError,'SIGNAL_COUNTING_CAPTURE_FAILED');
+     assert.equal(state.events,0);assert.equal(state.candidates,0);
+   }finally{
+     try{lock?.exec('ROLLBACK');}catch{/* The held test transaction may already be gone. */}
+     lock?.close();counting.close();f.close();
+   }
+ }
+});
+
+test('a real count-database writer lock cannot synchronously stall DeBot or Ave source capture and research',async()=>{
+ const folder=mkdtempSync(join(tmpdir(),'busy-count-storage-')),orders=new OrderStore(join(folder,'orders.sqlite')),
+   countPath=join(folder,'counting.sqlite'),debotPath=join(folder,'debot.sqlite'),avePath=join(folder,'ave.sqlite');
+ let trades=0,research=0,lock:DatabaseSync|undefined;
+ const counting=new SignalCounting({database:countPath,controlledJournal:join(folder,'controlled.sqlite'),orders,
+   executionMode:'live',executionReady:()=>({ready:true}),onCandidate:()=>{trades++;}});
+ const debot=new DebotScanner({database:debotPath,chains:['bsc'],maxAgeSec:600,onSignal:async()=>{},
+   onPriorityObservations:items=>counting.observeBatch(items),onObservation:()=>{research++;}}),
+   ave=new AveScanner({database:avePath,chains:['bsc'],onSignal:async()=>{},
+     onPriorityObservations:items=>counting.observeBatch(items),onObservation:()=>{research++;}});
+ try {
+   counting.control('start','web');lock=new DatabaseSync(countPath);lock.exec('BEGIN IMMEDIATE');
+   const started=performance.now();
+   debot.acceptPage({observations:[observation('debot')],received:1,rejected:0});
+   ave.acceptPage({observations:[observation('ave')],received:1,rejected:0});
+   const elapsed=performance.now()-started;
+   assert.ok(elapsed<100,`source callbacks waited ${elapsed.toFixed(1)}ms for the optional count database`);
+   await waitUntil(()=>tableCount(debotPath,'debot_signals')===1&&tableCount(avePath,'ave_signals')===1&&research===2);
+   const state=counting.status();assert.equal(state.running,false);assert.equal(state.storageRunning,true);
+   assert.equal(state.captureDegraded,true);assert.equal(state.captureError,'SIGNAL_COUNTING_CAPTURE_FAILED');
+   assert.equal(state.events,0);assert.equal(state.candidates,0);assert.equal(trades,0);
+   assert.equal(tableCount(debotPath,'debot_observation_inbox'),0);assert.equal(tableCount(avePath,'ave_observation_inbox'),0);
+ }finally{
+   try{lock?.exec('ROLLBACK');}catch{/* The held test transaction may already be gone. */}
+   lock?.close();await Promise.all([debot.close(),ave.close()]);counting.close();orders.close();
+   rmSync(folder,{recursive:true,force:true});
+ }
+});
+
+test('a corrupt optional count database cannot prevent the source collectors from starting and persisting alerts',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'count-startup-isolation-'));
+ const config=readConfig({ENTRY_MODE:'off',GMGN_BACKGROUND_RESEARCH_ENABLED:'false',SCANNER_ENABLED:'false',
+   DASHBOARD_ENABLED:'false',WATCH_RECHECK_ENABLED:'false',EXIT_SHADOW_ENABLED:'false',CHAIN_STREAM_ENABLED:'false',
+   WALLET_RESEARCH_ENABLED:'false',WALLET_PROFILES_ENABLED:'false',TOKEN_RANK_RESEARCH_ENABLED:'false',MEME_OBSERVER_ENABLED:'true',
+   DEBOT_SCANNER_ENABLED:'true',AVE_SCANNER_ENABLED:'true',DEBOT_TRANSPORT:'anonymous_poll',SCANNER_CHAINS:'bsc',
+   ORDERS_DATABASE_PATH:join(dir,'orders.sqlite'),SCAN_DATABASE_PATH:join(dir,'scans.sqlite'),
+   DEBOT_SIGNALS_DATABASE_PATH:join(dir,'debot.sqlite'),DEBOT_SESSION_PATH:join(dir,'debot.json'),
+   AVE_SIGNALS_DATABASE_PATH:join(dir,'ave.sqlite'),AVE_SESSION_PATH:join(dir,'ave.json'),
+   SOURCE_EVIDENCE_DATABASE_PATH:join(dir,'source.sqlite'),MEME_DATABASE_PATH:join(dir,'meme.sqlite')});
+ writeFileSync(join(dir,'third-signal-strategy.sqlite'),'not a sqlite database',{mode:0o600});
+ const runtime=createRuntime(config);try {
+   const status=runtime.signalCounting.status();assert.equal(status.running,false);assert.equal(status.executionEnabled,false);
+   assert.equal(status.captureError,'SIGNAL_COUNTING_STORAGE_UNAVAILABLE');assert.equal(status.captureDegraded,true);
+   assert.throws(()=>runtime.signalCountingControl('start','web'),/SIGNAL_COUNTING_STORAGE_UNAVAILABLE/);
+   for(let index=0;index<3;index++){
+     runtime.debotScanner!.acceptPage({observations:[observation()],received:1,rejected:0});
+     runtime.aveScanner!.acceptPage({observations:[observation('ave')],received:1,rejected:0});
+   }
+   await waitUntil(()=>tableCount(config.debotSignalsDatabase,'debot_signals')===3&&
+     tableCount(config.ave!.database,'ave_signals')===3&&tableCount(config.meme!.database,'meme_forward_targets')===2);
+   assert.equal(runtime.signalCounting.status().events,0);
+   assert.equal(tableCount(config.meme!.database,'meme_notification_windows'),2,
+     'DeBot and Ave research windows continue while the trading count store is corrupt');
+ }finally{await runtime.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('running count storage failure is ACKed by both source stores and latches live trading fail-closed',async()=>{
+ const folder=mkdtempSync(join(tmpdir(),'degraded-count-storage-')),orders=new OrderStore(join(folder,'orders.sqlite')),
+   countPath=join(folder,'counting.sqlite'),debotPath=join(folder,'debot.sqlite'),avePath=join(folder,'ave.sqlite');
+ let trades=0,research=0;
+ const counting=new SignalCounting({database:countPath,controlledJournal:join(folder,'controlled.sqlite'),orders,
+   executionMode:'live',executionReady:()=>({ready:true}),onCandidate:()=>{trades++;}});
+ const debot=new DebotScanner({database:debotPath,chains:['bsc'],maxAgeSec:600,onSignal:async()=>{},
+   onPriorityObservations:items=>counting.observeBatch(items),onObservation:()=>{research++;}}),
+   ave=new AveScanner({database:avePath,chains:['bsc'],onSignal:async()=>{},
+     onPriorityObservations:items=>counting.observeBatch(items),onObservation:()=>{research++;}});
+ try {
+   counting.control('start','web');
+   let db=new DatabaseSync(countPath);try{db.exec(`CREATE TRIGGER reject_running_count BEFORE INSERT ON third_signal_events
+     BEGIN SELECT RAISE(ABORT,'TEST_COUNT_DATABASE_FAILED'); END;`);}finally{db.close();}
+   debot.acceptPage({observations:[observation('debot')],received:1,rejected:0});
+   ave.acceptPage({observations:[observation('ave')],received:1,rejected:0});
+   await waitUntil(()=>tableCount(debotPath,'debot_signals')===1&&tableCount(avePath,'ave_signals')===1&&research===2);
+   let state=counting.status();assert.equal(state.captureError,'SIGNAL_COUNTING_CAPTURE_FAILED');
+   assert.equal(state.captureDegraded,true);assert.equal(state.executionEnabled,false);assert.equal(state.events,0);assert.equal(trades,0);
+   db=new DatabaseSync(countPath);try{db.exec('DROP TRIGGER reject_running_count');}finally{db.close();}
+   // Repairing SQLite cannot silently resume an incomplete run. New source
+   // alerts still collect, while counting and execution wait for an explicit
+   // fresh start.
+   for(let index=0;index<3;index++){
+     debot.acceptPage({observations:[observation('debot')],received:1,rejected:0});
+     ave.acceptPage({observations:[observation('ave')],received:1,rejected:0});
+   }
+   await waitUntil(()=>tableCount(debotPath,'debot_signals')===4&&tableCount(avePath,'ave_signals')===4&&research===8);
+   state=counting.status();assert.equal(state.events,0);assert.equal(state.candidates,0);
+   assert.equal(state.executionEnabled,false);assert.equal(trades,0);
+ }finally{await Promise.all([debot.close(),ave.close()]);counting.close();orders.close();rmSync(folder,{recursive:true,force:true});}
+});
+
+test('failed stop or start transactions keep the memory gate closed until a fresh explicit run succeeds',()=>{
+ const f=fixture(),s=new SignalCounting(f.options);try {
+   s.control('start','web');const firstRun=s.status().runId;
+   const stop=s.strategy.stop.bind(s.strategy),start=s.strategy.start.bind(s.strategy);
+   s.strategy.stop=(()=>{throw Error('SQLITE_BUSY');}) as typeof s.strategy.stop;
+   assert.throws(()=>s.control('stop','web'),/SQLITE_BUSY/);
+   assert.equal(s.status().storageRunning,true);assert.equal(s.status().running,false);
+   assert.equal(s.status().captureDegraded,true);assert.equal(s.observe(observation()),undefined);
+   s.strategy.stop=stop;s.control('start','web');assert.equal(s.status().running,true);
+   assert.notEqual(s.status().runId,firstRun,'degraded storage run must never be resumed');
+   s.control('stop','web');
+   s.strategy.start=(()=>{throw Error('SQLITE_FULL');}) as typeof s.strategy.start;
+   assert.throws(()=>s.control('start','web'),/SQLITE_FULL/);
+   assert.equal(s.status().running,false);assert.equal(s.status().captureDegraded,true);
+   s.strategy.start=start;s.control('start','web');assert.equal(s.status().running,true);
+   assert.equal(s.status().captureDegraded,false);
+ }finally{s.close();f.close();}
+});
+
+test('count control changes only the current strategy run while source capture and research stay enabled',async()=>{
  const dir=mkdtempSync(join(tmpdir(),'signal-counting-runtime-'));
  const config=readConfig({ENTRY_MODE:'off',GMGN_BACKGROUND_RESEARCH_ENABLED:'false',
    DASHBOARD_ENABLED:'false',WATCH_RECHECK_ENABLED:'false',EXIT_SHADOW_ENABLED:'false',CHAIN_STREAM_ENABLED:'false',
@@ -274,11 +439,11 @@ test('runtime source callbacks feed simulation before research while existing en
    WALLET_PROFILES_DATABASE_PATH:join(dir,'profiles.sqlite'),TOKEN_RANK_RESEARCH_DATABASE_PATH:join(dir,'rank.sqlite')});
  const runtime=createRuntime(config);try {
    runtime.signalCountingControl('start','web');
-   assert.equal(runtime.walletIndexRunner?.snapshot().livePriority,true);
-   assert.equal(runtime.walletProfiles?.status().livePriority,true);
-   assert.equal(runtime.tokenRankResearch?.status().livePriority,true);
-   assert.equal(runtime.memeObserver?.status().livePriority,true);
-   assert.equal(runtime.memeObserver?.status().marketBatchLimit,3);
+   assert.equal(runtime.walletIndexRunner?.snapshot().livePriority,false);
+   assert.equal(runtime.walletProfiles?.status().livePriority,false);
+   assert.equal(runtime.tokenRankResearch?.status().livePriority,false);
+   assert.equal(runtime.memeObserver?.status().livePriority,false);
+   assert.equal(runtime.memeObserver?.status().marketBatchLimit,30);
    for(let i=0;i<3;i++){
      runtime.debotScanner!.acceptPage({observations:[observation()],received:1,rejected:0});
      runtime.aveScanner!.acceptPage({observations:[observation('ave')],received:1,rejected:0});
@@ -293,11 +458,17 @@ test('runtime source callbacks feed simulation before research while existing en
    assert.equal(runtime.memeObserver?.status().livePriority,false);
    assert.equal(runtime.memeObserver?.status().marketBatchLimit,30);
    runtime.debotScanner!.acceptPage({observations:[observation()],received:1,rejected:0});
+   runtime.aveScanner!.acceptPage({observations:[observation('ave')],received:1,rejected:0});
    assert.equal(runtime.signalCountingPage().status.events,6);
+   const sourceRows=(path:string,table:string)=>{const db=new DatabaseSync(path,{readOnly:true});try {
+     return Number(db.prepare(`SELECT count(DISTINCT id) AS n FROM (SELECT id FROM ${table} UNION ALL SELECT id FROM ${table.replace('_signals','_observation_inbox')})`).get()!.n);
+   }finally{db.close();}};
+   assert.equal(sourceRows(config.debotSignalsDatabase,'debot_signals'),4);
+   assert.equal(sourceRows(config.ave!.database,'ave_signals'),4);
  }finally{await runtime.close();rmSync(dir,{recursive:true,force:true});}
 });
 
-test('runtime restart restores research pause before workers process a persisted active count run',async()=>{
+test('runtime restart keeps collection workers independent from a persisted active count run',async()=>{
  const dir=mkdtempSync(join(tmpdir(),'signal-counting-priority-restart-'));
  const config=readConfig({ENTRY_MODE:'off',GMGN_BACKGROUND_RESEARCH_ENABLED:'false',SCANNER_ENABLED:'false',
    DASHBOARD_ENABLED:'false',WATCH_RECHECK_ENABLED:'false',EXIT_SHADOW_ENABLED:'false',CHAIN_STREAM_ENABLED:'false',
@@ -312,16 +483,17 @@ test('runtime restart restores research pause before workers process a persisted
    runtime.signalCountingControl('start','web');await runtime.close();
    runtime=createRuntime(config);assert.equal(runtime.signalCounting.status().running,true);
    runtime.start();
-   assert.equal(runtime.memeObserver?.status().livePriority,true);
-   assert.equal(runtime.memeObserver?.status().marketBatchLimit,3);
+   assert.equal(runtime.memeObserver?.status().livePriority,false);
+   assert.equal(runtime.memeObserver?.status().marketBatchLimit,30);
    const deadline=Date.now()+15_000;
-   while(runtime.walletIndexRunner?.snapshot().workerLivePriority!==true||
-     runtime.walletProfiles?.status().workerLivePriority!==true||runtime.tokenRankResearch?.status().workerLivePriority!==true){
-     assert.ok(Date.now()<deadline,'research workers did not acknowledge restored live priority');
+   while(runtime.walletIndexRunner?.snapshot().workerLivePriority!==false||
+     runtime.walletProfiles?.status().workerLivePriority!==false||runtime.tokenRankResearch?.status().workerLivePriority!==false){
+     assert.ok(Date.now()<deadline,'collection workers did not remain in normal mode');
      await new Promise(resolve=>setTimeout(resolve,50));
    }
-   assert.equal(runtime.walletProfiles?.status().inFlight,false);
-   assert.equal(runtime.tokenRankResearch?.status().inFlight,false);
+   assert.equal(runtime.walletIndexRunner?.snapshot().livePriority,false);
+   assert.equal(runtime.walletProfiles?.status().livePriority,false);
+   assert.equal(runtime.tokenRankResearch?.status().livePriority,false);
  } finally {await runtime.close();rmSync(dir,{recursive:true,force:true});}
 });
 

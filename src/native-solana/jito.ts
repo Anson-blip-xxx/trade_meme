@@ -2,6 +2,7 @@ import {randomInt} from 'node:crypto';
 import {PublicKey,SystemProgram,type TransactionInstruction} from '@solana/web3.js';
 import bs58 from 'bs58';
 export const JITO_DONT_FRONT='jitodontfront111111111111111111111111111111';
+export type JitoTurnPriority='entry'|'exit';
 const hosts=new Set(['mainnet.block-engine.jito.wtf',...['amsterdam','dublin','frankfurt','london','ny','slc','singapore','tokyo'].map(x=>`${x}.mainnet.block-engine.jito.wtf`)]);
 const object=(v:unknown):v is Record<string,unknown>=>v!==null&&typeof v==='object'&&!Array.isArray(v);
 export function jitoEndpoint(value:string):string {
@@ -19,22 +20,43 @@ export function jitoTipInstruction(wallet:string,recipient:string,lamports:strin
 }
 export class JitoSender {
   private readonly url:string;private id=0;private cachedTips?:string[];
-  private tail:Promise<void>=Promise.resolve();private nextAt=0;
+  private nextAt=0;private active=false;private timer?:ReturnType<typeof setTimeout>;
+  private queues:Record<JitoTurnPriority,{priority:JitoTurnPriority;signal?:AbortSignal;resolve:(release:()=>void)=>void;
+    reject:(reason:unknown)=>void;abort:()=>void;queued:boolean}[]>={entry:[],exit:[]};
   constructor(url:string,private readonly fetcher:typeof fetch=fetch,private readonly pacingMs=1100){
     this.url=jitoEndpoint(url);if(!Number.isInteger(pacingMs)||pacingMs<0||pacingMs>10000)throw Error('NATIVE_JITO_PACING_INVALID');
   }
-  private async turn():Promise<()=>void>{
-    const previous=this.tail;let release!:()=>void;this.tail=new Promise<void>(resolve=>{release=resolve;});
-    await previous;const wait=this.nextAt-Date.now();if(wait>0)await new Promise(resolve=>setTimeout(resolve,wait));
-    let closed=false;return ()=>{if(!closed){closed=true;release();}};
+  private remove(waiter:(typeof this.queues.entry)[number]):boolean {
+    if(!waiter.queued)return false;const queue=this.queues[waiter.priority],index=queue.indexOf(waiter);
+    if(index<0)return false;queue.splice(index,1);waiter.queued=false;waiter.signal?.removeEventListener('abort',waiter.abort);return true;
+  }
+  private pump():void {
+    clearTimeout(this.timer);this.timer=undefined;if(this.active)return;
+    for(;;){const waiter=this.queues.exit[0]??this.queues.entry[0];if(!waiter)return;
+      if(waiter.signal?.aborted){if(this.remove(waiter))waiter.reject(waiter.signal.reason??Error('NATIVE_JITO_QUEUE_ABORTED'));continue;}
+      const wait=this.nextAt-Date.now();if(wait>0){this.timer=setTimeout(()=>this.pump(),wait);return;}
+      this.remove(waiter);this.active=true;let closed=false;
+      waiter.resolve(()=>{if(!closed){closed=true;this.active=false;this.pump();}});return;
+    }
+  }
+  private turn(priority:JitoTurnPriority,signal?:AbortSignal):Promise<()=>void>{
+    if(signal?.aborted)return Promise.reject(signal.reason??Error('NATIVE_JITO_QUEUE_ABORTED'));
+    return new Promise((resolve,reject)=>{const waiter={} as (typeof this.queues.entry)[number];
+      waiter.priority=priority;waiter.signal=signal;waiter.resolve=resolve;waiter.reject=reject;waiter.queued=true;
+      waiter.abort=()=>{if(this.remove(waiter)){reject(signal?.reason??Error('NATIVE_JITO_QUEUE_ABORTED'));this.pump();}};
+      signal?.addEventListener('abort',waiter.abort,{once:true});this.queues[priority].push(waiter);this.pump();});
   }
   /** Reserve before the final entry guard so no pacing wait separates the guard from broadcasting. */
-  async reserveBroadcast():Promise<{broadcast:(rawTransaction:string,signature:string)=>Promise<void>;release:()=>void}>{
-    const unlock=await this.turn();let used=false,released=false;
+  async reserveBroadcast(priority:JitoTurnPriority='entry',signal?:AbortSignal):Promise<{broadcast:(rawTransaction:string,signature:string)=>Promise<void>;release:()=>void}>{
+    const unlock=await this.turn(priority,signal);let used=false,released=false;
     const release=()=>{if(!released){released=true;unlock();}};
     return {release,broadcast:async(rawTransaction,signature)=>{
       if(used||released)throw Error('NATIVE_JITO_TURN_USED');used=true;
-      try{await this.send(rawTransaction,signature);}finally{release();}
+      // The block engine limits request starts, not concurrent HTTP responses.
+      // Release this scheduling turn as soon as fetch has started: the next
+      // waiter will still observe nextAt, but a hung entry response cannot keep
+      // a later stop-loss/manual exit behind it for the full HTTP timeout.
+      const pending=this.send(rawTransaction,signature);release();await pending;
     }};
   }
   private async call(url:string,method:string,params:unknown[]):Promise<unknown>{
@@ -48,7 +70,7 @@ export class JitoSender {
     }catch{throw Error('NATIVE_JITO_UNAVAILABLE');}
   }
   async tipAccount():Promise<string>{
-    if(!this.cachedTips){const release=await this.turn();try{if(!this.cachedTips){const raw=await this.call(new URL('/api/v1/getTipAccounts',this.url).href,'getTipAccounts',[]);
+    if(!this.cachedTips){const release=await this.turn('entry');try{if(!this.cachedTips){const raw=await this.call(new URL('/api/v1/getTipAccounts',this.url).href,'getTipAccounts',[]);
       if(!Array.isArray(raw)||raw.length<1||raw.length>32)throw Error('NATIVE_JITO_TIPS_INVALID');
       try{this.cachedTips=raw.map(v=>{if(typeof v!=='string'||new PublicKey(v).toBase58()!==v)throw Error();return v;});}
       catch{throw Error('NATIVE_JITO_TIPS_INVALID');}}}finally{release();}}
@@ -59,10 +81,10 @@ export class JitoSender {
    * waiting behind our own getTipAccounts request without weakening 1 req/s pacing. */
   async warmup():Promise<void>{
     await this.tipAccount();
-    const release=await this.turn();release();
+    const release=await this.turn('entry');release();
   }
-  async broadcast(rawTransaction:string,expectedSignature:string):Promise<void>{
-    const turn=await this.reserveBroadcast();try{await turn.broadcast(rawTransaction,expectedSignature);}finally{turn.release();}
+  async broadcast(rawTransaction:string,expectedSignature:string,priority:JitoTurnPriority='entry',signal?:AbortSignal):Promise<void>{
+    const turn=await this.reserveBroadcast(priority,signal);try{await turn.broadcast(rawTransaction,expectedSignature);}finally{turn.release();}
   }
   private async send(rawTransaction:string,expectedSignature:string):Promise<void>{
     if(!/^[A-Za-z0-9+/]+={0,2}$/.test(rawTransaction)||Buffer.from(rawTransaction,'base64').length>1232||bs58.decode(expectedSignature).length!==64)

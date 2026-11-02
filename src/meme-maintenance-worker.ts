@@ -26,7 +26,7 @@ const boundedDelete=(table:'meme_snapshots'|'meme_catalysts',where:string,order:
   }catch(error){try{db.exec('ROLLBACK');}catch{}throw error;}
   finally{maxWriteLockMs=Math.max(maxWriteLockMs,performance.now()-started);}
 };
-const boundedRowidDelete=(table:'meme_signals'|'meme_tokens'|'meme_sampling_selections'|'meme_sampling_plans'|'meme_forward_targets',where:string,order:string,args:(string|number|null)[])=>{const started=performance.now();db.exec('BEGIN IMMEDIATE');try{
+const boundedRowidDelete=(table:'meme_signals'|'meme_tokens'|'meme_sampling_selections'|'meme_sampling_plans'|'meme_forward_targets'|'meme_notification_windows',where:string,order:string,args:(string|number|null)[])=>{const started=performance.now();db.exec('BEGIN IMMEDIATE');try{
   const changed=Number(db.prepare(`DELETE FROM ${table} WHERE rowid IN (SELECT rowid FROM ${table} WHERE ${where} ORDER BY ${order} LIMIT ${DELETE_BATCH})`).run(...args).changes);
   db.exec('COMMIT');return changed;}
   catch(error){try{db.exec('ROLLBACK');}catch{}throw error;}
@@ -65,6 +65,7 @@ const run=()=>{
     backlog=boundedRowidDelete('meme_sampling_plans','first_applied_at<? AND plan_id NOT IN (SELECT plan_id FROM meme_sampling_selections)','first_applied_at,rowid',[cutoff])===DELETE_BATCH||backlog;
     const forwardCutoff=new Date(Date.now()-7*86400000).toISOString();
     backlog=boundedRowidDelete('meme_forward_targets','until_at<?','until_at,rowid',[forwardCutoff])===DELETE_BATCH||backlog;
+    backlog=boundedRowidDelete('meme_notification_windows','last_at<?','last_at,rowid',[cutoff])===DELETE_BATCH||backlog;
     let usedBytes=measure(),pressure=usedBytes>=options.maxBytes*0.8;
     if(pressure&&!archiveError){
       const ceiling=memePriceArchiveDeletionCeiling(db),args:number[]=ceiling===undefined?[]:[ceiling];

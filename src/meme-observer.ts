@@ -47,6 +47,7 @@ function validToken(token:Token):Token|undefined {
 function time(value:unknown):number {return typeof value==='string'&&/^\d{4}-\d\d-\d\dT/.test(value)?Date.parse(value):NaN;}
 const iso=(n:number)=>new Date(n).toISOString();
 const FORWARD_TARGET_WINDOW_MS=6*60*60*1000,FORWARD_TARGET_RETENTION_MS=7*24*60*60*1000;
+const COLLECTION_FORWARD_RUN_ID='collection-v1';
 export interface MemeSignalRegistrationOptions {
   now:Date;windowMs:number;chains:readonly Chain[];display?:{name?:string;symbol?:string};
 }
@@ -72,6 +73,26 @@ export function registerMemeSignal(db:DatabaseSync,signal:Signal,receivedAt:stri
       name=COALESCE(excluded.name,name),symbol=COALESCE(excluded.symbol,symbol)`)
       .run(token.chain,token.address,receivedAt,receivedAt,JSON.stringify(clean),
         tokenDisplayText(options.display?.name,100)??null,tokenDisplayText(options.display?.symbol,32)??null);
+    // This receipt counter belongs to research collection, not to the trading
+    // switch. It keeps N3/N4 outcome quotes alive while automatic trading is
+    // stopped or its separate counting database is unavailable.
+    if(signal.source==='debot'||signal.source==='ave'){
+      const prior=db.prepare(`SELECT window_id,first_at,last_at,count FROM meme_notification_windows
+        WHERE source=? AND chain=? AND address=?`).get(signal.source,token.chain,token.address);
+      const priorAt=time(prior?.last_at),outOfOrder=Number.isFinite(priorAt)&&at<priorAt;
+      if(!outOfOrder){
+        const reset=!prior||!Number.isFinite(priorAt)||at-priorAt>=FORWARD_TARGET_WINDOW_MS;
+        const windowId=reset?hash([COLLECTION_FORWARD_RUN_ID,signal.source,token,receivedAt,signal.sourceEventId]):String(prior.window_id);
+        const count=reset?1:Math.min(2_147_483_647,Number(prior.count)+1);
+        db.prepare(`INSERT OR REPLACE INTO meme_notification_windows
+          (source,chain,address,window_id,first_at,last_at,count) VALUES(?,?,?,?,?,?,?)`)
+          .run(signal.source,token.chain,token.address,windowId,reset?receivedAt:String(prior.first_at),receivedAt,count);
+        if(count===3||count===4)db.prepare(`INSERT OR IGNORE INTO meme_forward_targets
+          (run_id,window_id,source,chain,address,ordinal,trigger_at,until_at,created_at) VALUES(?,?,?,?,?,?,?,?,?)`)
+          .run(COLLECTION_FORWARD_RUN_ID,windowId,signal.source,token.chain,token.address,count,
+            receivedAt,iso(at+FORWARD_TARGET_WINDOW_MS),iso(now));
+      }
+    }
     db.exec('RELEASE meme_register');return true;
   }catch(error){db.exec('ROLLBACK TO meme_register; RELEASE meme_register');throw error;}
 }
@@ -144,6 +165,10 @@ export class MemeObserver {
         PRIMARY KEY(run_id,source,chain,address,window_id,ordinal));
       CREATE INDEX IF NOT EXISTS meme_forward_targets_active ON meme_forward_targets(until_at,chain,address);
       CREATE INDEX IF NOT EXISTS meme_forward_targets_token ON meme_forward_targets(chain,address,until_at);
+      CREATE TABLE IF NOT EXISTS meme_notification_windows(source TEXT NOT NULL CHECK(source IN ('debot','ave')),
+        chain TEXT NOT NULL,address TEXT NOT NULL,window_id TEXT NOT NULL,first_at TEXT NOT NULL,last_at TEXT NOT NULL,
+        count INTEGER NOT NULL CHECK(count>=1),PRIMARY KEY(source,chain,address));
+      CREATE INDEX IF NOT EXISTS meme_notification_windows_retention ON meme_notification_windows(last_at);
       CREATE TABLE IF NOT EXISTS meme_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);`);
     if(!this.db.prepare('PRAGMA table_info(meme_snapshots)').all().some(row=>row.name==='corroboration'))
       this.db.exec('ALTER TABLE meme_snapshots ADD COLUMN corroboration TEXT');
@@ -616,6 +641,7 @@ export class MemeObserver {
     this.db.prepare('DELETE FROM meme_sampling_selections WHERE last_selected_at<?').run(cutoff);
     this.db.prepare('DELETE FROM meme_sampling_plans WHERE first_applied_at<? AND plan_id NOT IN (SELECT plan_id FROM meme_sampling_selections)').run(cutoff);
     this.db.prepare('DELETE FROM meme_forward_targets WHERE until_at<?').run(iso(now-FORWARD_TARGET_RETENTION_MS));
+    this.db.prepare('DELETE FROM meme_notification_windows WHERE last_at<?').run(cutoff);
     this.reclaimSpace();if(this.storagePressure)this.nextPrune=now+1000;
   }
   private trimRows(table:'meme_snapshots'|'meme_catalysts',limit:number,maxId?:number):void {

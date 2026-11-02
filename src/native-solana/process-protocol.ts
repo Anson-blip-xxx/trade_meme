@@ -9,6 +9,7 @@ export interface NativeWorkerSnapshot {
 }
 export type NativeParentMessage=
   |{kind:'init';config:NativeWorkerConfig;storePath:string;guardTimeoutMs:number}
+  |{kind:'market_price';mint:string;priceUsd:number;observedAt:string;source:string}
   |{kind:'call';id:string;method:'execute';orderId:string}
   |{kind:'call';id:string;method:'submit';ref:string;percent:number}
   |{kind:'guard_result';id:string;ok:boolean;error?:string}

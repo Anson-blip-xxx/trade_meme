@@ -12,12 +12,14 @@ import {OrderStore} from '../src/orders.js';
 import {parseExitPolicy} from '../src/exit-policy.js';
 import {NativeTradingRuntime} from '../src/native-solana/runtime.js';
 import type {NativeExecutionResult,NativeExecuteRequest} from '../src/native-solana/executor.js';
+import {NativeJournal,type NativeJournalRecord} from '../src/native-solana/journal.js';
 import {NativePositionSupervisor,type NativePositionIO,type NativePositionState,type NativePositionBalance} from '../src/native-solana/positions.js';
 import type {NativeSwapPlan} from '../src/native-solana/pump.js';
 import type {TradeNotificationEvent} from '../src/trade-notifications.js';
 
 const wallet=Keypair.fromSeed(Buffer.alloc(32,61)).publicKey.toBase58();
 const mint=Keypair.fromSeed(Buffer.alloc(32,62)).publicKey.toBase58();
+const mint2=Keypair.fromSeed(Buffer.alloc(32,67)).publicKey.toBase58();
 const curve=Keypair.fromSeed(Buffer.alloc(32,63)).publicKey.toBase58();
 const pool=Keypair.fromSeed(Buffer.alloc(32,64)).publicKey.toBase58();
 const vault=Keypair.fromSeed(Buffer.alloc(32,65)).publicKey.toBase58();
@@ -55,16 +57,19 @@ function fixture(t:TestContext){
     const b=balances.get(tokenMint);if(!b)throw Error('TEST_BALANCE_NOT_STUBBED');return {...b,decimals:6,accounts:[vault],commitment};
   });
   const httpQuote=t.mock.method(internal.adapter,'quoteSell',async()=>{throw Error('TEST_FORBIDS_HTTP_PRICE_POLL');});
+  t.mock.method(internal.adapter,'quoteJupiterSell',async()=>{throw Error('TEST_JUPITER_QUOTE_NOT_STUBBED');});
   t.mock.method(internal.adapter,'quoteSellCached',()=>{throw Error('TEST_QUOTE_NOT_STUBBED');});
   const warm=t.mock.method(internal.adapter,'warmQuoteCache',async()=>({venue:'pump',subscriptionAccounts:[wallet,curve],priceAccounts:[curve],
     slot:102,receivedAtMs:Date.now(),tokenDecimals:6,tokenProgram:TOKEN_PROGRAM_ID.toBase58()}));
+  t.mock.method(internal.adapter,'routeCapability',async()=>({classification:'route_candidate',route:'direct',
+    quoteMint:'So11111111111111111111111111111111111111112',curveState:'active',readiness:'requires_preflight'}));
   t.mock.method(internal.adapter,'cacheStatus',()=>({warm:true,ready:true}));
   t.mock.method(internal.ownerConnection,'getGenesisHash',async()=>{throw Error('TEST_INVENTORY_RPC_NOT_STUBBED');});
   t.mock.method(internal.ownerConnection,'getTokenAccountsByOwner',async()=>{throw Error('TEST_INVENTORY_RPC_NOT_STUBBED');});
   t.mock.method(internal.executor,'execute',async()=>{throw Error('TEST_EXECUTION_NOT_STUBBED');});
   t.mock.method(internal.executor,'reconcile',async()=>{throw Error('TEST_RECONCILE_NOT_STUBBED');});
   t.after(async()=>{await runtime.stop();orders.close();rmSync(dir,{recursive:true,force:true});assert.equal(network.mock.callCount(),0);});
-  function activate(){internal.running=true;internal.chainVerified=true;positions.start();}
+  function activate(){internal.running=true;internal.chainVerified=true;internal.initialRecoveryComplete=true;positions.start();}
   function reserve(){
     const at=new Date(Date.now()-1000);
     const order=orders.reserve({eventKey:'native-fixture',chain:'solana',tokenAddress:mint,mode:'live',wallet,
@@ -97,6 +102,126 @@ function fixture(t:TestContext){
 test('runtime construction never scans closed position history to seed an empty inventory cache',t=>{
   const list=t.mock.method(NativePositionSupervisor.prototype,'list',()=>{throw Error('FULL_HISTORY_SCAN_FORBIDDEN');});
   fixture(t);assert.equal(list.mock.callCount(),0);
+});
+
+test('external wakes use exact Jupiter SOL quotes for TP/SL, coalesce safely, and keep stale manual exits usable',async t=>{
+  const f=fixture(t);f.activate();
+  t.mock.method(f.internal,'warmExternal',async()=>{});
+  const order=f.reserve(),result={...f.result(order.id),'venue':'jupiter' as const,protectionMode:'external_price_stream' as const,subscriptionAccounts:[wallet,vault]};
+  f.internal.applyBuy(order.id,result);f.balance('1000');
+  let full='10000000',quoteCalls=0;const executions:NativeExecuteRequest[]=[];
+  const exact=(request:{mint:string;amount:string},output:string)=>({venue:'jupiter' as const,protectionMode:'external_price_stream' as const,
+    mint:request.mint,side:'sell' as const,inputAmount:request.amount,expectedOutputAmount:output,
+    minimumOutputAmount:(BigInt(output)*95n/100n).toString(),quotedAt:new Date().toISOString(),subscriptionAccounts:[wallet,vault],tokenDecimals:6});
+  f.internal.adapter.quoteJupiterSell=async(request:{mint:string;amount:string})=>{quoteCalls++;return exact(request,full);};
+  f.internal.executor.execute=async(request:NativeExecuteRequest)=>{executions.push(request);return {intentId:request.intentId,orderId:request.orderId,wallet:request.wallet,
+    mint:request.mint,side:'sell',status:'failed',failureReason:'NATIVE_TEST_REJECTED',checkedAt:new Date().toISOString()};};
+  const first=new Date(Date.now()-20).toISOString();
+  assert.equal(f.runtime.observePrice({mint,priceUsd:1e-8,observedAt:first,source:'ave_price_stream_sample'}),true);
+  await f.positions.checkNow(order.id);let row=f.positions.get(order.id)!;
+  assert.equal(row.buy.venue,'jupiter');assert.equal(row.buy.protectionMode,'external_price_stream');assert.equal(row.quote?.source,'jupiter_exact_sell');
+  assert.equal(row.quote?.outputAmount,'10000000');assert.equal('externalPriceAnchor' in row,false);assert.equal(quoteCalls,1);
+  assert.equal(f.runtime.status().protection.maxAutomaticDecisionLatencyMs,1405);
+  // The token/USD wake is unchanged. A SOL move changes only the exact target->SOL quote and must still trigger TP.
+  full='20000000';await new Promise(resolve=>setTimeout(resolve,2));
+  assert.equal(f.runtime.observePrice({mint,priceUsd:1e-8,observedAt:new Date().toISOString(),source:'ave_price_stream_sample'}),true);
+  await f.positions.checkNow(order.id);assert.equal(executions.length,1);assert.equal(executions[0].reason,'take_profit');assert.equal(quoteCalls,2,
+    'the full trigger quote is reused as evidence; executor owns the exact half-size route and final threshold check');
+  const sample=f.internal.externalPrices.get(mint);sample.receivedAt=Date.now()-2000;sample.observedAt=new Date(Date.now()-2000).toISOString();
+  f.positions.markDirty(order.id);await f.positions.checkNow(order.id);row=f.positions.get(order.id)!;assert.equal(quoteCalls,2);
+  assert.equal(row.quote,undefined);assert.equal(row.lastError,'NATIVE_EXTERNAL_PRICE_STALE');assert.equal(f.positions.readiness().ready,false);
+  await new Promise(resolve=>setTimeout(resolve,2));assert.equal(f.runtime.observePrice({mint,priceUsd:1e-8,observedAt:new Date().toISOString(),source:'ave_price_stream_sample'}),true);
+  f.internal.adapter.quoteJupiterSell=async()=>{quoteCalls++;throw Error('JUPITER_BUILD_RATE_LIMITED');};
+  await f.positions.checkNow(order.id);row=f.positions.get(order.id)!;assert.equal(row.lastError,'JUPITER_BUILD_RATE_LIMITED');assert.equal(executions.length,1,
+    'an unavailable exact quote fails closed');
+  sample.receivedAt=Date.now()-2000;sample.observedAt=new Date(Date.now()-2000).toISOString();
+  f.internal.adapter.quoteJupiterSell=async(request:{mint:string;amount:string})=>{quoteCalls++;return exact(request,'12000000');};
+  assert.equal(f.positions.manualSell(order.id,30,'manual-external-stale').status,'accepted');await f.positions.checkNow(order.id);
+  assert.equal(executions.length,2,'manual selling uses a fresh exact route even while the wake feed is stale');
+
+  const g=fixture(t);g.activate();t.mock.method(g.internal,'warmExternal',async()=>{});
+  const stopOrder=g.reserve(),stopResult={...g.result(stopOrder.id),'venue':'jupiter' as const,protectionMode:'external_price_stream' as const,
+    subscriptionAccounts:[wallet,vault]};g.internal.applyBuy(stopOrder.id,stopResult);g.balance('1000');let stopQuotes=0,stopReason:string|undefined;
+  g.internal.adapter.quoteJupiterSell=async(request:{mint:string;amount:string})=>{stopQuotes++;return exact(request,'4000000');};
+  g.internal.executor.execute=async(request:NativeExecuteRequest)=>{stopReason=request.reason;return {intentId:request.intentId,orderId:request.orderId,wallet:request.wallet,
+    mint:request.mint,side:'sell',status:'failed',failureReason:'NATIVE_TEST_REJECTED',checkedAt:new Date().toISOString()};};
+  // The first wake arrives after the fill and its USD value has no baseline. The exact -60% quote still exits.
+  assert.equal(g.runtime.observePrice({mint,priceUsd:99,observedAt:new Date().toISOString(),source:'ave_price_stream_sample'}),true);
+  await g.positions.checkNow(stopOrder.id);assert.equal(stopReason,'stop_loss');assert.equal(stopQuotes,1);assert.equal('externalPriceAnchor' in g.positions.get(stopOrder.id)!,false);
+});
+
+test('an active external PUMP holding keeps stable subscriptions after completion changes its Jupiter route',async t=>{
+  const f=fixture(t);f.activate();t.mock.method(f.internal,'warmExternal',async()=>{});
+  const order=f.reserve(),buy={...f.result(order.id),venue:'jupiter' as const,protectionMode:'external_price_stream' as const,
+    subscriptionAccounts:[wallet,vault]};
+  f.internal.applyBuy(order.id,buy);f.balance('1000');let quoteCalls=0,sellCalls=0;
+  f.internal.adapter.quoteJupiterSell=async(request:{mint:string;amount:string})=>{
+    quoteCalls++;const output=(BigInt(request.amount)*9000n).toString();
+    return {venue:'jupiter' as const,protectionMode:'external_price_stream' as const,route:'pump_bridge',mint:request.mint,side:'sell' as const,
+      inputAmount:request.amount,expectedOutputAmount:output,minimumOutputAmount:(BigInt(output)*95n/100n).toString(),
+      quotedAt:new Date().toISOString(),subscriptionAccounts:[wallet,curve],tokenDecimals:6};
+  };
+  f.internal.executor.execute=async(request:NativeExecuteRequest)=>{sellCalls++;return {intentId:request.intentId,orderId:request.orderId,
+    wallet:request.wallet,mint:request.mint,side:'sell',status:'failed',failureReason:'NATIVE_TEST_REJECTED',checkedAt:new Date().toISOString()};};
+
+  assert.equal(f.runtime.observePrice({mint,priceUsd:1e-8,observedAt:new Date().toISOString(),source:'ave_price_stream_sample'}),true);
+  await f.positions.checkNow(order.id);let row=f.positions.get(order.id)!;
+  assert.equal(row.lastError,undefined);assert.equal(row.quote?.source,'jupiter_exact_sell');assert.equal(row.quote?.outputAmount,'9000000');
+  assert.equal(row.buy.protectionMode,'external_price_stream','route migration must not rewrite the recovered holding mode');
+  assert.deepEqual(row.buy.subscriptionAccounts,[wallet,mint].sort(),'one-shot Jupiter route accounts must not replace stable holding subscriptions');
+  assert.equal(quoteCalls,1,'ordinary automatic protection needs only the exact full target-to-SOL quote');
+
+  assert.equal(f.positions.manualSell(order.id,30,'manual-after-pump-completion').status,'accepted');
+  await f.positions.checkNow(order.id);row=f.positions.get(order.id)!;
+  assert.equal(sellCalls,1);assert.equal(row.lastExit?.reason,'manual');assert.equal(row.buy.protectionMode,'external_price_stream');
+  assert.equal(quoteCalls,2,'manual protection uses the completed Pump bridge quote too');
+});
+
+test('external holding bootstrap resolves token identity once and does not churn websocket subscriptions on every head',async t=>{
+  const f=fixture(t);f.activate();const order=f.reserve();
+  const warmExternal=t.mock.method(f.internal,'warmExternal',async()=>{});
+  f.internal.applyBuy(order.id,{...f.result(order.id),venue:'jupiter',protectionMode:'external_price_stream',subscriptionAccounts:[wallet,vault]});
+  const initialWarmCalls=warmExternal.mock.callCount();
+  f.internal.externalTokenPrograms.set(mint,TOKEN_PROGRAM_ID);
+  await f.internal.bootstrap();await f.internal.bootstrap();
+  assert.equal(warmExternal.mock.callCount(),initialWarmCalls,'a known immutable token program needs no repeated mint RPC');
+  f.internal.externalTokenPrograms.delete(mint);await f.internal.bootstrap();
+  assert.equal(warmExternal.mock.callCount(),initialWarmCalls+1,'restart bootstrap still resolves an unknown token program once');
+});
+
+test('fresh external price triggers exact Jupiter stop loss while the local PUMP/WSOL bridge is silent',async t=>{
+  const localPumpWsolPool='539m4mVWt6iduB6W8rDGPMarzNCMesuqY5eUTiiYHAgR';
+  assert.notEqual(pool,localPumpWsolPool,'fixture Jupiter route must differ from the canonical local bridge');
+  const f=fixture(t);f.activate();t.mock.method(f.internal,'warmExternal',async()=>{});
+  const order=f.reserve();f.internal.applyBuy(order.id,{...f.result(order.id),venue:'jupiter',protectionMode:'account_stream',
+    subscriptionAccounts:[wallet,vault]});
+  f.balance('1000');let quoteCalls=0;const executions:NativeExecuteRequest[]=[];
+  f.internal.adapter.quoteJupiterSell=async(request:{mint:string;amount:string})=>{
+    quoteCalls++;return {venue:'jupiter' as const,protectionMode:'external_price_stream' as const,route:'pump_bridge' as const,
+      mint:request.mint,side:'sell' as const,inputAmount:request.amount,expectedOutputAmount:'3900000',minimumOutputAmount:'3705000',
+      quotedAt:new Date().toISOString(),subscriptionAccounts:[wallet,pool],tokenDecimals:6};
+  };
+  f.internal.executor.execute=async(request:NativeExecuteRequest)=>{executions.push(request);return {intentId:request.intentId,
+    orderId:request.orderId,wallet:request.wallet,mint:request.mint,side:'sell',status:'failed',failureReason:'NATIVE_TEST_REJECTED',checkedAt:new Date().toISOString()};};
+
+  const row=f.positions.get(order.id)!;
+  assert.equal(row.buy.protectionMode,'external_price_stream','legacy completed-PUMP fills are normalized on registration');
+  assert.deepEqual(row.buy.subscriptionAccounts,[wallet,mint].sort());
+  // No local pool update is delivered. The fresh external sample is the sole wake.
+  assert.equal(f.runtime.observePrice({mint,priceUsd:1e-8,observedAt:new Date().toISOString(),source:'ave_price_stream_sample'}),true);
+  await f.positions.checkNow(order.id);
+  assert.equal(executions.length,1);assert.equal(executions[0].reason,'stop_loss');assert.equal(quoteCalls,1);
+  assert.equal(f.positions.get(order.id)?.quote?.source,'jupiter_exact_sell');
+  assert.deepEqual(f.positions.get(order.id)?.buy.subscriptionAccounts,[wallet,mint].sort(),
+    'one-shot Jupiter route pools must not replace stable holding subscriptions');
+});
+
+test('direct PumpSwap protection continues using its local account-stream cache',async t=>{
+  const f=fixture(t);f.activate();const order=f.reserve();
+  f.internal.applyBuy(order.id,{...f.result(order.id),venue:'pumpswap',protectionMode:'account_stream'});
+  f.balance('1000');f.quote(15000n);f.positions.markDirty(order.id,{observedAt:new Date().toISOString(),slot:102});
+  await f.positions.checkNow(order.id);
+  assert.equal(f.positions.get(order.id)?.quote?.source,'solana_account_stream');assert.equal(f.httpQuote.mock.callCount(),0);
 });
 
 test('native recovery loads the indexed active set once and then reconciles only remembered order ids',async t=>{
@@ -134,12 +259,109 @@ test('runtime public readiness blocks absent signer, recovery errors, unknown ch
   f.internal.error='NATIVE_RECOVERY_UNAVAILABLE';
   assert.deepEqual(f.runtime.status().readiness,{ready:false,reason:'NATIVE_RECOVERY_UNAVAILABLE'});
   assert.equal(f.runtime.status().antiMev.publicFallback,false);
+  assert.deepEqual(f.runtime.status().prices.jupiter,{apiKeyConfigured:false,nonSolEntryRequiresApiKey:true,entryCapacity:0,
+    mainBucket:{tier:'keyless',rps:0.5,rpm:30,blockedUntil:undefined},protectionProbeWindowMs:5000,
+    protectionQuoteTimeoutMs:700,protectionQuoteHttpBudgetMs:300,protectionQuotesPerDecision:1,activePositions:0,entryReservations:0});
   f.internal.error=undefined;f.internal.chainVerified=false;
   assert.equal(f.runtime.readiness().reason,'NATIVE_CHAIN_NOT_VERIFIED');
   f.internal.chainVerified=true;f.internal.stream.status=()=>({connected:false,subscribedAccounts:[]});
   assert.equal(f.runtime.readiness().reason,'NATIVE_WEBSOCKET_UNAVAILABLE');
   f.internal.stream.status=()=>({connected:true,subscribedAccounts:[]});f.internal.inventory.status=()=>({ready:false});
   assert.equal(f.runtime.readiness().reason,'NATIVE_INVENTORY_NOT_READY');
+});
+
+test('Jupiter capacity is reserved before executor/Jupiter work and includes durable unresolved buys',async t=>{
+  const f=fixture(t);f.activate();const order=f.reserve();let executions=0;
+  f.internal.adapter.routeCapability=async()=>({classification:'route_candidate',route:'jupiter_bridge',quoteMint:mint2,
+    curveState:'active',readiness:'requires_preflight'});
+  f.internal.executor.execute=async()=>{executions++;throw Error('TEST_EXECUTOR_REACHED');};
+  f.internal.executor.pendingBuyVenueOrderIds=()=>[];
+  f.internal.positions.activeVenueOrderIds=()=>[];
+  f.internal.adapter.jupiterStatus=()=>({apiKeyConfigured:false,entryCapacity:0});
+  await assert.rejects(f.runtime.execute(order,async()=>{}),/NATIVE_JUPITER_PROTECTION_CAPACITY_REACHED/);assert.equal(executions,0,
+    'keyless/full capacity must stop before executor plan construction or Jupiter HTTP');
+  f.internal.adapter.jupiterStatus=()=>({apiKeyConfigured:true,entryCapacity:1});
+  f.internal.positions.activeVenueOrderIds=()=>['active-jupiter'];
+  await assert.rejects(f.runtime.execute(order,async()=>{}),/NATIVE_JUPITER_PROTECTION_CAPACITY_REACHED/);assert.equal(executions,0);
+  f.internal.positions.activeVenueOrderIds=()=>[];f.internal.executor.pendingBuyVenueOrderIds=()=>['unresolved-jupiter'];
+  await assert.rejects(f.runtime.execute(order,async()=>{}),/NATIVE_JUPITER_PROTECTION_CAPACITY_REACHED/);assert.equal(executions,0,
+    'submitted/unknown buys consume capacity even before a position exists');
+  f.internal.executor.pendingBuyVenueOrderIds=()=>[];
+  await assert.rejects(f.runtime.execute(order,async()=>{}),/TEST_EXECUTOR_REACHED/);assert.equal(executions,1);
+  assert.equal(f.internal.jupiterEntryReservations.size,0);
+});
+
+test('capacity one admits only one concurrent Jupiter candidate and releases a failed pre-broadcast reservation',async t=>{
+  const f=fixture(t);f.activate();const first=f.reserve(),second={...first,id:'concurrent-order',eventKey:'concurrent-event',tokenAddress:mint2};
+  f.internal.adapter.routeCapability=async()=>({classification:'route_candidate',route:'jupiter_bridge',quoteMint:curve,
+    curveState:'active',readiness:'requires_preflight'});
+  f.internal.adapter.jupiterStatus=()=>({apiKeyConfigured:true,entryCapacity:1});
+  f.internal.positions.activeVenueOrderIds=()=>[];f.internal.executor.pendingBuyVenueOrderIds=()=>[];
+  let executions=0,release!:()=>void;const gate=new Promise<void>(resolve=>{release=resolve;});
+  f.internal.executor.execute=async()=>{executions++;await gate;throw Error('TEST_FIRST_FINISHED');};
+  const running=f.runtime.execute(first,async()=>{});while(executions===0)await new Promise(resolve=>setImmediate(resolve));
+  await assert.rejects(f.runtime.execute(second,async()=>{}),/NATIVE_JUPITER_PROTECTION_CAPACITY_REACHED/);
+  assert.equal(executions,1,'the rejected concurrent candidate never reaches plan construction');
+  assert.equal(f.internal.jupiterEntryReservations.size,1);release();await assert.rejects(running,/TEST_FIRST_FINISHED/);
+  assert.equal(f.internal.jupiterEntryReservations.size,0);
+});
+
+test('a confirmed Jupiter fill keeps capacity and durable recovery until position registration retries successfully',async t=>{
+  const f=fixture(t);f.activate();t.mock.method(f.internal,'warmExternal',async()=>{});const order=f.reserve();
+  const fill={...f.result(order.id),venue:'jupiter' as const,protectionMode:'external_price_stream' as const,
+    subscriptionAccounts:[wallet,mint]};
+  const register=f.positions.register.bind(f.positions);let unavailable=true;
+  f.positions.register=(input:any)=>{if(unavailable)throw Error('NATIVE_POSITION_DATABASE_BUSY');return register(input);};
+  assert.throws(()=>f.internal.applyBuy(order.id,fill),/NATIVE_POSITION_DATABASE_BUSY/);
+  assert.equal(f.orders.get(order.id)?.status,'confirmed');assert.equal(f.positions.get(order.id),undefined);
+  assert.equal(f.internal.recoveryOrders.has(order.id),true,'registration failure must retain the retry owner');
+  assert.deepEqual(f.internal.durableJupiterFillOrderIds(),[order.id]);
+
+  f.internal.adapter.routeCapability=async()=>({classification:'route_candidate',route:'jupiter_bridge',quoteMint:curve,
+    curveState:'active',readiness:'requires_preflight'});
+  f.internal.adapter.jupiterStatus=()=>({apiKeyConfigured:true,entryCapacity:1});
+  f.internal.executor.pendingBuyVenueOrderIds=()=>[];let executions=0;f.internal.executor.execute=async()=>{executions++;throw Error('TEST_EXECUTOR_REACHED');};
+  const next={...order,id:'after-register-failure',eventKey:'after-register-failure',tokenAddress:mint2};
+  await assert.rejects(f.runtime.execute(next,async()=>{}),/NATIVE_JUPITER_PROTECTION_CAPACITY_REACHED/);
+  assert.equal(executions,0,'an unregistered real holding still occupies the only Jupiter slot');
+
+  unavailable=false;f.internal.executor.warmup=async()=>{};await f.internal.pulse();
+  assert.equal(f.positions.get(order.id)?.state,'active');assert.equal(f.internal.recoveryOrders.has(order.id),false);
+  assert.equal(f.internal.jupiterCapacityOrderIds().has(order.id),true,'the registered position replaces the recovery claim without a capacity gap');
+});
+
+test('restart recovery gate closes the confirmed-journal projection gap before capacity-one admission',async t=>{
+  const f=fixture(t),order=f.reserve(),stamp=Date.now()-1000,owner='restart-fixture-owner';
+  const journal=new NativeJournal(f.config.nativeSolana!.journalPath);const record:NativeJournalRecord={intentId:'buy-'+order.id,
+    orderId:order.id,wallet,mint,side:'buy',amount:order.inputAmount,slippageBps:order.slippagePct*100,status:'prepared',
+    createdAt:new Date(stamp).toISOString(),updatedAt:new Date(stamp).toISOString()};
+  assert.equal(journal.reserve(record,owner,stamp).created,true);
+  Object.assign(record,{status:'confirmed' as const,venue:'jupiter' as const,protectionMode:'external_price_stream' as const,
+    signature,inputAmount:'10000000',outputAmount:'1000',tokenDecimals:6,slot:100,subscriptionAccounts:[wallet,mint]});
+  journal.save(record,owner,stamp+1);journal.release(record.intentId,owner);journal.close();
+
+  f.activate();f.internal.initialRecoveryComplete=false;t.mock.method(f.internal,'warmExternal',async()=>{});
+  f.internal.executor.warmup=async()=>{};f.internal.executor.readiness=()=>({ready:true});
+  let entered!:()=>void,release!:()=>void;const started=new Promise<void>(resolve=>{entered=resolve;});
+  const gate=new Promise<void>(resolve=>{release=resolve;});
+  f.internal.executor.reconcile=async(intentId:string)=>{entered();await gate;const result=f.internal.executor.get(intentId);
+    if(!result)throw Error('NATIVE_INTENT_MISSING');return result;};
+  const recovery=f.internal.pulse();await started;
+  assert.equal(f.internal.chainVerified,true);assert.equal(f.runtime.readiness().reason,'NATIVE_INITIAL_RECOVERY_PENDING');
+
+  let routeCalls=0,executions=0;f.internal.adapter.routeCapability=async()=>{routeCalls++;return {classification:'route_candidate',
+    route:'jupiter_bridge',quoteMint:curve,curveState:'active',readiness:'requires_preflight'};};
+  f.internal.adapter.jupiterStatus=()=>({apiKeyConfigured:true,entryCapacity:1});
+  f.internal.executor.execute=async()=>{executions++;throw Error('TEST_EXECUTOR_REACHED');};
+  const next={...order,id:'restart-gap-candidate',eventKey:'restart-gap-candidate',tokenAddress:mint2};
+  await assert.rejects(f.runtime.execute(next,async()=>{}),/NATIVE_INITIAL_RECOVERY_PENDING/);
+  assert.equal(routeCalls,0);assert.equal(executions,0,'the startup gap cannot reach route or executor work');
+
+  release();await recovery;
+  assert.equal(f.internal.initialRecoveryComplete,true);assert.equal(f.orders.get(order.id)?.status,'confirmed');
+  assert.equal(f.positions.get(order.id)?.buy.venue,'jupiter');
+  await assert.rejects(f.runtime.execute(next,async()=>{}),/NATIVE_JUPITER_PROTECTION_CAPACITY_REACHED/);
+  assert.equal(routeCalls,1);assert.equal(executions,0,'the projected holding occupies capacity immediately after the gate opens');
 });
 
 test('curve-to-pool quotes update actual supervisor subscriptions through runtime IO',async t=>{
@@ -300,6 +522,30 @@ test('native buy verifies its own price subscriptions before broadcast and keeps
   await f.runtime.execute(order,async()=>{guarded++;});
   assert.deepEqual(f.subscriptions.at(-1),[wallet,curve].sort());
   assert.equal(f.internal.entryWatches.size,0);
+});
+
+test('external-price protection requires a sub-1.5s sample at the final Jupiter entry guard',async t=>{
+  const f=fixture(t);f.activate();const order=f.reserve();let guarded=0;
+  f.internal.stream.isSubscribed=()=>true;
+  assert.equal(f.runtime.observePrice({mint,priceUsd:1e-8,observedAt:new Date().toISOString(),source:'ave_price_stream_sample'}),true);
+  const plan={subscriptionAccounts:[wallet,curve],protectionMode:'external_price_stream'} as NativeSwapPlan&{protectionMode:'external_price_stream'};
+  f.internal.executor.execute=async(request:NativeExecuteRequest)=>{
+    request.onPlanReady!(plan);await request.beforeBroadcast!(plan);throw Error('TEST_MUST_NOT_BROADCAST');
+  };
+  await assert.rejects(f.runtime.execute(order,async()=>{guarded++;const sample=f.internal.externalPrices.get(mint);
+    sample.receivedAt=Date.now()-2000;sample.observedAt=new Date(Date.now()-2000).toISOString();}),/NATIVE_ENTRY_EXTERNAL_PRICE_STALE/);
+  assert.equal(guarded,1);assert.equal(f.internal.entryWatches.size,0);
+});
+
+test('a prepared Jupiter target never substitutes for a fresh external price before broadcast',async t=>{
+  const f=fixture(t);f.activate();const order=f.reserve();let guarded=0;
+  f.internal.stream.isSubscribed=()=>true;
+  const plan={subscriptionAccounts:[wallet,curve],protectionMode:'external_price_stream'} as NativeSwapPlan&{protectionMode:'external_price_stream'};
+  f.internal.executor.execute=async(request:NativeExecuteRequest)=>{
+    request.onPlanReady!(plan);await request.beforeBroadcast!(plan);throw Error('TEST_MUST_NOT_BROADCAST');
+  };
+  await assert.rejects(f.runtime.execute(order,async()=>{guarded++;}),/NATIVE_ENTRY_EXTERNAL_PRICE_STALE/);
+  assert.equal(guarded,0);assert.equal(f.internal.entryWatches.size,0);
 });
 
 test('a busy shared opening ledger cannot stop local price decisions and routine summaries stay silent',async t=>{

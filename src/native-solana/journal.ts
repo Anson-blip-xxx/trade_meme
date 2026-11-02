@@ -3,12 +3,15 @@ import {mkdirSync,openSync,closeSync,chmodSync} from 'node:fs';
 import {dirname} from 'node:path';
 import {assertNativeTimingPreserved,type NativeExecutionTiming} from './timing.js';
 export type NativeStatus='prepared'|'submitted'|'confirmed'|'failed'|'unknown';
+export type NativeExecutionVenue='pump'|'pumpswap'|'jupiter';
+export type NativeProtectionMode='account_stream'|'external_price_stream';
 export interface NativeJournalRecord {
   intentId:string;orderId:string;wallet:string;mint:string;side:'buy'|'sell';amount:string;slippageBps:number;
-  status:NativeStatus;createdAt:string;updatedAt:string;failureReason?:string;venue?:string;
+  status:NativeStatus;createdAt:string;updatedAt:string;failureReason?:string;venue?:NativeExecutionVenue;protectionMode?:NativeProtectionMode;
   signature?:string;rawTransaction?:string;blockhash?:string;lastValidBlockHeight?:number;contextSlot?:number;
   armed?:boolean;
   tokenDecimals?:number;minimumOutputAmount?:string;expectedOutputAmount?:string;subscriptionAccounts?:string[];
+  lookupTableAddresses?:string[];
   quotedAt?:string;tipLamports?:string;tipAccount?:string;priorityFeeLamports?:string;computeUnitLimit?:number;
   inputAmount?:string;outputAmount?:string;actualNativeAmount?:string;networkFeeLamports?:string;slot?:number;
   trade?:unknown;provisional?:unknown;lastBroadcastAt?:string;broadcastCount?:number;
@@ -24,11 +27,20 @@ export class NativeJournal {
     this.db=new DatabaseSync(path);this.db.exec(`PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;PRAGMA busy_timeout=5000;
       CREATE TABLE IF NOT EXISTS native_execution(intent_id TEXT PRIMARY KEY,identity TEXT NOT NULL,side TEXT NOT NULL,status TEXT NOT NULL,payload TEXT NOT NULL);
       CREATE UNIQUE INDEX IF NOT EXISTS native_active_sell ON native_execution(identity) WHERE side='sell' AND status IN (${active});
+      CREATE INDEX IF NOT EXISTS native_unresolved_buy ON native_execution(status) WHERE side='buy' AND status IN (${active});
       CREATE TABLE IF NOT EXISTS native_execution_leases(intent_id TEXT PRIMARY KEY,owner TEXT NOT NULL,expires_at INTEGER NOT NULL);`);
   }
   private tx<T>(work:()=>T):T{this.db.exec('BEGIN IMMEDIATE');try{const r=work();this.db.exec('COMMIT');return r;}catch(e){this.db.exec('ROLLBACK');throw e;}}
   get(id:string):NativeJournalRecord|undefined {const row=this.db.prepare('SELECT payload FROM native_execution WHERE intent_id=?').get(id);return row?JSON.parse(String(row.payload)):undefined;}
   listPending():NativeJournalRecord[]{return this.db.prepare(`SELECT payload FROM native_execution WHERE status IN (${active}) ORDER BY rowid`).all().map(r=>JSON.parse(String(r.payload)));}
+  unresolvedBuyVenueOrderIds(venue:NativeExecutionVenue):string[]{
+    if(!['pump','pumpswap','jupiter'].includes(venue))throw Error('NATIVE_EXECUTION_VENUE_INVALID');
+    const result=new Set<string>();
+    for(const row of this.db.prepare(`SELECT payload FROM native_execution WHERE side='buy' AND status IN (${active})`).all()){
+      const record=JSON.parse(String(row.payload)) as NativeJournalRecord;if(record.venue===venue)result.add(record.orderId);
+    }
+    return [...result];
+  }
   reserve(record:NativeJournalRecord,owner:string,now:number):{created:boolean;record:NativeJournalRecord}{return this.tx(()=>{
     const old=this.get(record.intentId);if(old){
       if(['orderId','wallet','mint','side','amount','slippageBps'].some(k=>(old as any)[k]!== (record as any)[k]))throw Error('NATIVE_INTENT_MISMATCH');
@@ -49,8 +61,10 @@ export class NativeJournal {
     const lease=this.db.prepare('SELECT owner,expires_at FROM native_execution_leases WHERE intent_id=?').get(record.intentId);
     if(!lease||lease.owner!==owner||Number(lease.expires_at)<=now)throw Error('NATIVE_LEASE_LOST');
     const old=this.get(record.intentId);if(!old)throw Error('NATIVE_INTENT_MISSING');
-    for(const key of ['orderId','wallet','mint','side','amount','slippageBps','signature','rawTransaction','blockhash','lastValidBlockHeight'] as const)
+    for(const key of ['orderId','wallet','mint','side','amount','slippageBps','venue','protectionMode','signature','rawTransaction','blockhash','lastValidBlockHeight'] as const)
       if(old[key]!==undefined&&old[key]!==record[key])throw Error('NATIVE_INTENT_IMMUTABLE');
+    if(old.lookupTableAddresses!==undefined&&JSON.stringify(old.lookupTableAddresses)!==JSON.stringify(record.lookupTableAddresses))
+      throw Error('NATIVE_INTENT_IMMUTABLE');
     assertNativeTimingPreserved(old.timing,record.timing);
     if(['confirmed','failed'].includes(old.status)&&JSON.stringify(old)!==JSON.stringify(record))throw Error('NATIVE_INTENT_TERMINAL');
     record.updatedAt=new Date(now).toISOString();

@@ -238,7 +238,7 @@ test('count controls retain persistent keyboard when a near-limit message falls 
 });
 
 test('live control messages never inherit a simulation-only keyboard placeholder',()=>{
-  for(const state of ['实盘计数：已停止 · 启动后达标自动实盘买入','实盘计数：运行中 · 达标自动实盘买入']){
+  for(const state of ['自动交易许可：已关闭 · 信号照常采集；不开仓','自动交易许可：已开启 · 第 3 次达标自动实盘买入']){
     const result=formatTelegramMessage(`【计数控制】\n${state}\n处理链：SOL`);
     assert.ok(result.reply_markup&&'input_field_placeholder' in result.reply_markup);
     assert.equal(result.reply_markup.input_field_placeholder,'计数 · 持仓');

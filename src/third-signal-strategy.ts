@@ -144,7 +144,12 @@ export class ThirdSignalStrategy {
       mkdirSync(dirname(path),{recursive:true,mode:0o700});const fd=openSync(path,'a',0o600);closeSync(fd);chmodSync(path,0o600);
     }
     this.db=new DatabaseSync(path);
-    this.db.exec(`PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;PRAGMA busy_timeout=5000;PRAGMA foreign_keys=ON;
+    // This optional counter runs on the source/price event loop. Waiting for an
+    // external SQLite writer would pause every collector and market callback,
+    // so lock contention must fail immediately and let SignalCounting latch the
+    // current run closed. All successful writes still use the same IMMEDIATE
+    // transactions, WAL durability and foreign-key checks below.
+    try {this.db.exec(`PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;PRAGMA busy_timeout=0;PRAGMA foreign_keys=ON;
       CREATE TABLE IF NOT EXISTS third_signal_runs(id TEXT PRIMARY KEY,started_at INTEGER NOT NULL,stopped_at INTEGER,
         running INTEGER NOT NULL,start_actor TEXT NOT NULL,stop_actor TEXT);
       CREATE TABLE IF NOT EXISTS third_signal_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
@@ -178,6 +183,7 @@ export class ThirdSignalStrategy {
     const dispatchColumns=this.db.prepare('PRAGMA table_info(third_signal_dispatch)').all();
     for(const column of ['execution_status','execution_order_id','execution_reason','execution_holder_risk'])if(!dispatchColumns.some(row=>row.name===column))
       this.db.exec(`ALTER TABLE third_signal_dispatch ADD COLUMN ${column} TEXT`);
+    }catch(error){this.db.close();throw error;}
   }
   private clock():number {
     const at=this.now();if(!Number.isSafeInteger(at)||at<0||at>8.64e15-TTL)fail('THIRD_SIGNAL_CLOCK_INVALID');return at;

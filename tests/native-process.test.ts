@@ -102,6 +102,31 @@ test('late guard completion never reaches the fake executor; normal guard does e
   assert.equal(readFileSync(join(f.dir,'actions'),'utf8').trim().split('\n').length,1,'public ref maps durably to only one native ref');
 });
 
+test('prepared native execute publishes a temporary price target immediately and releases it after rejection',async t=>{
+  const changes:{chain:'solana';address:string}[][]=[];let host!:ProcessNativeTradingRuntime;
+  const f=fixture(t,{onPriceTargetsChanged:()=>changes.push(host.priceTargets())});host=f.host;
+  host.start();await until(()=>host.readiness().ready);const order=f.reserve();
+  const execution=host.execute(order,async()=>{throw Error('ENTRY_PRICE_TEST_REJECTED');});
+  assert.deepEqual(host.priceTargets(),[{chain:'solana',address:order.tokenAddress}]);
+  assert.deepEqual(changes.at(-1),[{chain:'solana',address:order.tokenAddress}]);
+  await assert.rejects(execution,/ENTRY_PRICE_TEST_REJECTED/);
+  assert.deepEqual(host.priceTargets(),[]);assert.deepEqual(changes.at(-1),[]);
+  assert.equal(existsSync(join(f.dir,'executions')),false);
+});
+
+test('native active price target survives the prepared window and a terminal order update releases it',async t=>{
+  const changes:{chain:'solana';address:string}[][]=[];let host!:ProcessNativeTradingRuntime;
+  const f=fixture(t,{onPriceTargetsChanged:()=>changes.push(host.priceTargets())});host=f.host;const order=f.reserve();
+  assert.ok(f.orders.update(order.id,['prepared'],{status:'submitting'}));
+  await (host as any).receive({kind:'order',orderId:order.id,version:'active'});
+  assert.deepEqual(host.priceTargets(),[{chain:'solana',address:order.tokenAddress}]);
+  assert.ok(f.orders.update(order.id,['submitting'],{status:'failed',failureReason:'TEST_TERMINAL'}));
+  await (host as any).receive({kind:'order',orderId:order.id,version:'terminal'});
+  assert.deepEqual(host.priceTargets(),[]);assert.deepEqual(changes,[
+    [{chain:'solana',address:order.tokenAddress}],[],
+  ]);
+});
+
 test('notification stays durably queued when parent rejects delivery, then replays after worker restart',async t=>{
   let accept=false,received=0;const f=fixture(t,{},()=>{if(!accept)throw Error('TG_TEMPORARILY_DOWN');received++;return false;});
   f.host.start();await until(()=>f.host.readiness().ready);await pause(100);
@@ -206,6 +231,19 @@ test('repeated identical initialization neither starts a second runtime nor stop
   });
   t.after(()=>worker.stop());const init={kind:'init',storePath:join(dir,'bridge.sqlite'),guardTimeoutMs:1000,config:{}};
   incoming(init);incoming(structuredClone(init));assert.equal(created,1);assert.equal(started,1);assert.equal(stopped,0);
+});
+
+test('market-price IPC is delivered directly to the isolated runtime without creating a trade call',async t=>{
+  const dir=mkdtempSync(join(tmpdir(),'native-worker-price-'));t.after(()=>rmSync(dir,{recursive:true,force:true}));
+  let incoming!:(message:unknown)=>void;const prices:unknown[]=[];
+  const runtime={start(){},async stop(){},readiness:()=>({ready:true}),status:()=>({readiness:{ready:true}}),get:()=>undefined,
+    observePrice:(price:unknown)=>{prices.push(price);return true;}} as unknown as NativeWorkerRuntime;
+  const worker=runNativeProcessWorker({onMessage:l=>incoming=l,onDisconnect:()=>{},send:()=>true,exit:()=>{}},()=>({runtime,
+    orders:{get:()=>undefined,activePositions:()=>[],subscribe:()=>()=>{},close:()=>{}}}));
+  t.after(()=>worker.stop());incoming({kind:'init',storePath:join(dir,'bridge.sqlite'),guardTimeoutMs:1000,config:{}});
+  const sample={kind:'market_price',mint:'11111111111111111111111111111111',priceUsd:1e-8,
+    observedAt:'2026-10-25T00:00:00.000Z',source:'ave_price_stream_sample'};
+  incoming(sample);assert.deepEqual(prices,[{mint:sample.mint,priceUsd:sample.priceUsd,observedAt:sample.observedAt,source:sample.source}]);
 });
 
 test('outbox failure remains entry-blocking across snapshots and recovers only after the durable store works',async t=>{

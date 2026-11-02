@@ -1,5 +1,5 @@
 import test from 'node:test';import assert from 'node:assert/strict';import {mkdtempSync,writeFileSync,rmSync} from 'node:fs';import {tmpdir} from 'node:os';import {join} from 'node:path';
-import {Keypair,PublicKey,TransactionInstruction,VersionedTransaction} from '@solana/web3.js';import bs58 from 'bs58';
+import {AddressLookupTableAccount,ComputeBudgetProgram,Keypair,PublicKey,TransactionInstruction,VersionedTransaction} from '@solana/web3.js';import bs58 from 'bs58';
 import {NativeExecutor,verifyNativeFill,type NativeExecuteRequest} from '../src/native-solana/executor.js';import {NativeJournal,type NativeJournalRecord} from '../src/native-solana/journal.js';
 import {NativeSigner} from '../src/native-solana/signer.js';
 import {NATIVE_EXECUTION_STAGES,type NativeExecutionTiming} from '../src/native-solana/timing.js';
@@ -8,17 +8,26 @@ import {ed25519} from '@noble/curves/ed25519';
 import {userVolumeAccumulatorPda as pumpSwapUserVolumeAccumulatorPda} from '@pump-fun/pump-swap-sdk';
 const kp=Keypair.fromSeed(new Uint8Array(32).fill(1)),wallet=kp.publicKey.toBase58(),mint=Keypair.fromSeed(new Uint8Array(32).fill(2)).publicKey.toBase58();
 const ata=Keypair.fromSeed(new Uint8Array(32).fill(3)).publicKey.toBase58(),tip=Keypair.fromSeed(new Uint8Array(32).fill(4)).publicKey.toBase58();
-const blockhash=Keypair.fromSeed(new Uint8Array(32).fill(5)).publicKey.toBase58(),pump='6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',TOKEN='TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
+const blockhash=Keypair.fromSeed(new Uint8Array(32).fill(5)).publicKey.toBase58(),pump='6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
+const pumpswap='pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA';
+const jupiter='JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4',TOKEN='TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
 const SOL='So11111111111111111111111111111111111111112';
+function lookupData(addresses:PublicKey[],active=true){
+ const data=Buffer.alloc(56+addresses.length*32);data.writeUInt32LE(1,0);data.writeBigUInt64LE(active?(1n<<64n)-1n:10n,4);
+ addresses.forEach((address,index)=>Buffer.from(address.toBytes()).copy(data,56+index*32));return data.toString('base64');
+}
 function fixture(t:any,options:{sendError?:boolean;badSimulation?:boolean;badPlan?:boolean;side?:'buy'|'sell';monotonicNow?:()=>number;
-  advanceClockOnSendMs?:number}={}){
+  advanceClockOnSendMs?:number;advanceClockOnFirstSimulationMs?:number;venue?:'pump'|'pumpswap'|'jupiter';protectionMode?:'account_stream'|'external_price_stream';planProgram?:string;
+  lookupTable?:AddressLookupTableAccount;lookupAccountData?:string}={}){
  const dir=mkdtempSync(join(tmpdir(),'native-executor-')),keyfile=join(dir,'key.json'),journal=join(dir,'state.sqlite');
  writeFileSync(keyfile,JSON.stringify([...kp.secretKey]),{mode:0o600});
- const state={now:Date.now(),sends:0,plans:0,calls:[] as string[],sent:[] as string[],status:null as any,height:100,transaction:undefined as any};
+ const state={now:Date.now(),sends:0,plans:0,simulations:0,calls:[] as string[],sent:[] as string[],status:null as any,height:100,transaction:undefined as any};
  const request:NativeExecuteRequest={intentId:'intent',orderId:'order',wallet,mint,side:options.side??'buy',amount:options.side==='sell'?'1000':'10000000',slippageBps:500};
- const plan=async(r:any):Promise<NativeSwapPlan>=>{state.plans++;return {venue:'pump',mint:r.mint,side:r.side,inputAmount:r.amount,expectedOutputAmount:r.side==='buy'?'1000':'10000000',minimumOutputAmount:r.side==='buy'?'950':'9500000',
+ const plan=async(r:any):Promise<NativeSwapPlan>=>{state.plans++;return {venue:options.venue??'pump',protectionMode:options.protectionMode??'account_stream',mint:r.mint,side:r.side,inputAmount:r.amount,expectedOutputAmount:r.side==='buy'?'1000':'10000000',minimumOutputAmount:r.side==='buy'?'950':'9500000',
   quotedAt:new Date(state.now).toISOString(),tokenDecimals:6,subscriptionAccounts:[ata],instructions:[new TransactionInstruction({programId:new PublicKey(options.badPlan?tip:pump),
-   keys:[{pubkey:kp.publicKey,isSigner:true,isWritable:true},{pubkey:new PublicKey(r.mint),isSigner:false,isWritable:false},{pubkey:new PublicKey(ata),isSigner:false,isWritable:true}],data:Buffer.from([1])})]};};
+   keys:[{pubkey:kp.publicKey,isSigner:true,isWritable:true},{pubkey:new PublicKey(r.mint),isSigner:false,isWritable:false},{pubkey:new PublicKey(ata),isSigner:false,isWritable:true}],data:Buffer.from([1])})]
+   .map(ix=>options.planProgram?new TransactionInstruction({...ix,programId:new PublicKey(options.planProgram)}):ix),
+   ...(options.lookupTable?{addressLookupTables:[options.lookupTable]}:{})};};
  const fetcher:typeof fetch=async(input,init)=>{const url=new URL(String(input)),body=JSON.parse(String(init?.body));state.calls.push(body.method);let result:any;
   if(url.hostname.endsWith('jito.wtf')){
    if(body.method==='getTipAccounts')result=[tip];else {assert.equal(body.method,'sendTransaction');assert.equal(url.search,'?bundleOnly=true');state.sends++;state.sent.push(body.params[0]);
@@ -30,12 +39,15 @@ function fixture(t:any,options:{sendError?:boolean;badSimulation?:boolean;badPla
   }else {assert.equal(url.hostname,'rpc.test');switch(body.method){
    case 'getGenesisHash':result='5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d';break;
    case 'getLatestBlockhash':result={context:{slot:100},value:{blockhash,lastValidBlockHeight:250}};break;
+   case 'getMultipleAccounts':result={context:{slot:101},value:[{data:[options.lookupAccountData,'base64'],executable:false,
+    lamports:1000000,owner:'AddressLookupTab1e1111111111111111111111111',rentEpoch:0}]};break;
    case 'getFeeForMessage':result={context:{slot:100},value:10000};break;
-   case 'getBalance':result={context:{slot:100},value:1000000000};break;
+   case 'getBalance':result={context:{slot:options.lookupTable?101:100},value:1000000000};break;
    case 'simulateTransaction':{
     const unsigned=VersionedTransaction.deserialize(Buffer.from(body.params[0],'base64'));assert.equal(body.params[1].sigVerify,false);
     assert.ok(unsigned.signatures.every(signature=>signature.every(byte=>byte===0)),'public RPC must never receive executable signed bytes');
-    result={context:{slot:100},value:{err:options.badSimulation?{InstructionError:[0,'bad']}:null}};break;}
+    state.simulations++;if(state.simulations===1&&options.advanceClockOnFirstSimulationMs)state.now+=options.advanceClockOnFirstSimulationMs;
+    result={context:{slot:options.lookupTable?101:100},value:{err:options.badSimulation?{InstructionError:[0,'bad']}:null}};break;}
    case 'getSignatureStatuses':result={context:{slot:300},value:[state.status]};break;
    case 'getBlockHeight':result=state.height;break;
    case 'getTransaction':result=state.transaction;break;
@@ -66,6 +78,91 @@ test('native sends one signed protected transaction, journals before send and ex
  const signed=VersionedTransaction.deserialize(Buffer.from(f.state.sent[0],'base64'));assert.ok(signed.message.staticAccountKeys.some(k=>k.toBase58().startsWith('jitodontfront')));
  assert.equal(ed25519.verify(signed.signatures[0],signed.message.serialize(),kp.publicKey.toBytes()),true);
  const again=await f.executor.execute(f.request);assert.equal(again.signature,result.signature);assert.equal(f.state.sends,1);assert.equal(f.state.plans,1);
+});
+test('Jupiter plans compile only after their declared ALT is verified against chain state',async t=>{
+ const tableKey=Keypair.fromSeed(new Uint8Array(32).fill(30)).publicKey,addresses=[new PublicKey(mint),new PublicKey(ata),new PublicKey(ata)];
+ const table=new AddressLookupTableAccount({key:tableKey,state:{deactivationSlot:(1n<<64n)-1n,lastExtendedSlot:0,lastExtendedSlotStartIndex:0,addresses}});
+ const f=fixture(t,{venue:'jupiter',protectionMode:'external_price_stream',planProgram:jupiter,lookupTable:table,lookupAccountData:lookupData(addresses)});
+ const result=await f.executor.execute(f.request);assert.equal(result.status,'submitted');assert.equal(result.venue,'jupiter');assert.equal(result.protectionMode,'external_price_stream');
+ assert.deepEqual(result.lookupTableAddresses,[tableKey.toBase58()]);assert.equal(f.state.calls.filter(method=>method==='getMultipleAccounts').length,1);
+ const signed=VersionedTransaction.deserialize(Buffer.from(f.state.sent[0],'base64'));
+ assert.equal(signed.message.recentBlockhash,blockhash,'executor owns the fresh blockhash instead of Jupiter build');
+ assert.deepEqual(signed.message.addressTableLookups.map(row=>row.accountKey.toBase58()),[tableKey.toBase58()]);
+ const stored=f.executor.get(f.request.intentId)!;assert.equal(stored.venue,'jupiter');assert.equal(stored.protectionMode,'external_price_stream');
+ assert.deepEqual(stored.lookupTableAddresses,[tableKey.toBase58()]);
+});
+test('submitted and unknown Jupiter buys retain durable capacity claims across executor restart',async t=>{
+  const submitted=fixture(t,{venue:'jupiter',protectionMode:'external_price_stream',planProgram:jupiter});
+  assert.equal((await submitted.executor.execute(submitted.request)).status,'submitted');
+  assert.deepEqual(submitted.executor.pendingBuyVenueOrderIds('jupiter'),['order']);
+  const submittedRestart=await submitted.restart();
+  assert.deepEqual(submittedRestart.pendingBuyVenueOrderIds('jupiter'),['order']);
+
+  const unknown=fixture(t,{venue:'jupiter',protectionMode:'external_price_stream',planProgram:jupiter,sendError:true});
+  assert.equal((await unknown.executor.execute(unknown.request)).status,'unknown');
+  assert.deepEqual(unknown.executor.pendingBuyVenueOrderIds('jupiter'),['order']);
+  const unknownRestart=await unknown.restart();
+  assert.deepEqual(unknownRestart.pendingBuyVenueOrderIds('jupiter'),['order']);
+});
+test('Jupiter auto and manual sells refresh after expensive preflight and reject a quote older than 1.5 seconds at the final guard',async t=>{
+ const tableKey=Keypair.fromSeed(new Uint8Array(32).fill(33)).publicKey,addresses=[new PublicKey(mint),new PublicKey(ata)];
+ const table=new AddressLookupTableAccount({key:tableKey,state:{deactivationSlot:(1n<<64n)-1n,lastExtendedSlot:0,lastExtendedSlotStartIndex:0,addresses}});
+ const fresh=fixture(t,{side:'sell',venue:'jupiter',protectionMode:'external_price_stream',planProgram:jupiter,lookupTable:table,
+  lookupAccountData:lookupData(addresses),advanceClockOnFirstSimulationMs:900});
+ let readyAt='',guardAt='';const submitted=await fresh.executor.execute({...fresh.request,reason:'take_profit',onPlanReady:plan=>{readyAt=plan.quotedAt;},
+  beforeBroadcast:async plan=>{guardAt=plan.quotedAt;assert.equal(fresh.state.sends,0);}});
+ assert.equal(submitted.status,'submitted');assert.equal(fresh.state.plans,2);assert.equal(fresh.state.simulations,2);
+ assert.equal(fresh.state.calls.filter(method=>method==='getMultipleAccounts').length,2,'refreshed ALT contents are verified again against chain state');
+ assert.equal(fresh.state.calls.filter(method=>method==='getLatestBlockhash').length,2,'the refreshed plan owns a fresh local blockhash');
+ assert.equal(readyAt,guardAt);assert.equal(guardAt,new Date(fresh.state.now).toISOString());assert.equal(fresh.state.sends,1);
+
+ for(const reason of ['manual','stop_loss']){
+  const stale=fixture(t,{side:'sell',venue:'jupiter',protectionMode:'external_price_stream',planProgram:jupiter});let guards=0;
+  const rejected=await stale.executor.execute({...stale.request,reason,beforeBroadcast:async()=>{guards++;stale.state.now+=1501;}});
+  assert.equal(rejected.status,'failed');assert.equal(rejected.failureReason,'NATIVE_SELL_QUOTE_STALE');assert.equal(rejected.signature,undefined);
+  assert.equal(guards,1);assert.equal(stale.state.sends,0);assert.equal(stale.state.plans,1);
+  const repeat=await stale.executor.execute({...stale.request,reason});assert.equal(repeat.failureReason,'NATIVE_SELL_QUOTE_STALE');
+  assert.equal(stale.state.plans,1);assert.equal(stale.state.sends,0,'a stale terminal intent is never rebuilt or broadcast');
+ }
+});
+test('direct Pump and PumpSwap sells rebuild stale preflight without signing the discarded candidate',async t=>{
+ const original=NativeSigner.prototype.sign;let signs=0;
+ NativeSigner.prototype.sign=function(tx){signs++;return original.call(this,tx);};
+ try{
+  for(const [venue,program] of [['pump',pump],['pumpswap',pumpswap]] as const){
+   const before=signs,f=fixture(t,{side:'sell',venue,planProgram:program,advanceClockOnFirstSimulationMs:900});let guardQuote='';
+   const submitted=await f.executor.execute({...f.request,reason:'take_profit',beforeBroadcast:async plan=>{
+    guardQuote=plan.quotedAt;assert.equal(signs,before,'neither the discarded nor final candidate is signed before the final guard');
+   }});
+   assert.equal(submitted.status,'submitted');assert.equal(f.state.plans,2);assert.equal(f.state.simulations,2);
+   assert.equal(f.state.calls.filter(method=>method==='getLatestBlockhash').length,2,'the direct exit rebuild owns a fresh local blockhash');
+   assert.equal(guardQuote,new Date(f.state.now).toISOString());assert.equal(signs,before+1,'only the refreshed direct exit is signed');
+   assert.equal(f.state.sends,1);assert.equal(f.state.sent.length,1);
+  }
+ }finally{NativeSigner.prototype.sign=original;}
+});
+test('direct Pump and PumpSwap sells reject final-guard delay without signing or broadcasting',async t=>{
+ const original=NativeSigner.prototype.sign;let signs=0;
+ NativeSigner.prototype.sign=function(tx){signs++;return original.call(this,tx);};
+ try{
+  for(const [venue,program] of [['pump',pump],['pumpswap',pumpswap]] as const){
+   const f=fixture(t,{side:'sell',venue,planProgram:program});let guards=0;
+   const rejected=await f.executor.execute({...f.request,reason:'stop_loss',beforeBroadcast:async()=>{guards++;f.state.now+=1501;}});
+   assert.equal(rejected.status,'failed');assert.equal(rejected.failureReason,'NATIVE_SELL_QUOTE_STALE');assert.equal(rejected.signature,undefined);
+   assert.equal(guards,1);assert.equal(f.state.plans,1);assert.equal(f.state.simulations,1);assert.equal(f.state.sends,0);assert.equal(signs,0);
+  }
+ }finally{NativeSigner.prototype.sign=original;}
+});
+test('Jupiter venue binding and chain-owned ALT contents fail closed before signing',async t=>{
+ const tableKey=Keypair.fromSeed(new Uint8Array(32).fill(31)).publicKey,declared=[new PublicKey(mint),new PublicKey(ata)];
+ const table=new AddressLookupTableAccount({key:tableKey,state:{deactivationSlot:(1n<<64n)-1n,lastExtendedSlot:0,lastExtendedSlotStartIndex:0,addresses:declared}});
+ const mismatch=fixture(t,{venue:'jupiter',protectionMode:'external_price_stream',planProgram:jupiter,lookupTable:table,
+  lookupAccountData:lookupData([declared[0],Keypair.fromSeed(new Uint8Array(32).fill(32)).publicKey])});
+ const rejected=await mismatch.executor.execute(mismatch.request);assert.equal(rejected.failureReason,'NATIVE_LOOKUP_TABLE_MISMATCH');assert.equal(mismatch.state.sends,0);
+ const wrongVenue=fixture(t,{venue:'jupiter',protectionMode:'external_price_stream',planProgram:pump});const wrong=await wrongVenue.executor.execute(wrongVenue.request);
+ assert.equal(wrong.failureReason,'NATIVE_PLAN_VENUE_MISMATCH');assert.equal(wrongVenue.state.sends,0);
+ const compute=fixture(t,{venue:'jupiter',protectionMode:'external_price_stream',planProgram:ComputeBudgetProgram.programId.toBase58()});const duplicate=await compute.executor.execute(compute.request);
+ assert.equal(duplicate.failureReason,'NATIVE_PLAN_INSTRUCTIONS_INVALID');assert.equal(compute.state.sends,0);
 });
 test('simulation failure, invalid plan, failed final guard and shutdown never send',async t=>{
  for(const opts of [{badSimulation:true},{badPlan:true}]){const f=fixture(t,opts);const r=await f.executor.execute(f.request);assert.equal(r.status,'failed');assert.equal(f.state.sends,0);}
@@ -121,6 +218,17 @@ test('five and twenty concurrent exits build fresh plans only after their Jito t
   assert.equal(f.state.plans,count);assert.equal(f.state.sends,count,'durable intent idempotency prevents duplicate broadcasts');
  }
 });
+test('a slow entry plan never owns the Jito lane ahead of a manual or automatic exit',async t=>{
+ const f=fixture(t,{venue:'jupiter',protectionMode:'external_price_stream',planProgram:jupiter});
+ const internal=f.executor as any,original=internal.options.plan;let entered!:()=>void,release!:()=>void;
+ const entryStarted=new Promise<void>(resolve=>{entered=resolve}),entryGate=new Promise<void>(resolve=>{release=resolve});
+ internal.options.plan=async(request:any,context:any)=>{if(request.side==='buy'){entered();await entryGate;}return original(request,context);};
+ const buy=f.executor.execute(f.request);await entryStarted;
+ const sellRequest={...f.request,intentId:'priority-exit',orderId:'priority-exit-order',side:'sell' as const,amount:'1000',reason:'manual'};
+ const sell=await f.executor.execute(sellRequest);assert.equal(sell.status,'submitted');assert.equal(f.state.sends,1,
+  'the exit builds and broadcasts while the entry route fetch is still unresolved');
+ release();const bought=await buy;assert.equal(bought.status,'submitted');assert.equal(f.state.sends,2);
+});
 test('fill accounting supports negative net SOL small sales, WSOL receipts and exact bigint token precision',()=>{
  const signature=bs58.encode(new Uint8Array(64).fill(6));const r:NativeJournalRecord={intentId:'i',orderId:'o',wallet,mint,side:'sell',amount:'1000',slippageBps:500,status:'submitted',
  createdAt:new Date().toISOString(),updatedAt:new Date().toISOString(),signature,tokenDecimals:6,tipLamports:'1000',priorityFeeLamports:'5000',minimumOutputAmount:'400'};
@@ -128,6 +236,41 @@ test('fill accounting supports negative net SOL small sales, WSOL receipts and e
  r.minimumOutputAmount='9500000';assert.equal(verifyNativeFill(txProof(signature,'sell',{wsol:true}),r,105,new Date()).outputAmount,'10000000');
  const large=txProof(signature,'sell');large.meta.preTokenBalances[0].uiTokenAmount.amount='9007199254740993';r.amount='9007199254740993';
  assert.equal(verifyNativeFill(large,r,105,new Date()).inputAmount,'9007199254740993');
+});
+test('fill accounting rejects intermediate-token dust but accepts a balanced ALT-loaded route account',()=>{
+ const signature=bs58.encode(new Uint8Array(64).fill(6));
+ const r:NativeJournalRecord={intentId:'i',orderId:'o',wallet,mint,side:'buy',amount:'10000000',slippageBps:500,status:'submitted',
+  createdAt:new Date().toISOString(),updatedAt:new Date().toISOString(),signature,venue:'pumpswap',tokenDecimals:6,tipLamports:'1000',
+  priorityFeeLamports:'5000',minimumOutputAmount:'950'};
+ const quoteMint=Keypair.fromSeed(new Uint8Array(32).fill(21)).publicKey.toBase58();
+ const quoteAta=Keypair.fromSeed(new Uint8Array(32).fill(22)).publicKey.toBase58(),rent=2039280;
+ const proof=txProof(signature,'buy');
+ const index=proof.transaction.message.accountKeys.length;
+ proof.transaction.message.accountKeys.push({pubkey:quoteAta,signer:false,writable:true,source:'lookupTable'} as any);
+ proof.meta.preBalances.push(rent);proof.meta.postBalances.push(rent);
+ const balance=(amount:string)=>({accountIndex:index,mint:quoteMint,owner:wallet,programId:TOKEN,uiTokenAmount:{amount,decimals:6}});
+ proof.meta.preTokenBalances.push(balance('7'));proof.meta.postTokenBalances.push(balance('7'));
+ assert.equal(verifyNativeFill(proof,r,105,new Date()).inputAmount,'10000000');
+ proof.meta.postTokenBalances.at(-1)!.uiTokenAmount.amount='8';
+ assert.throws(()=>verifyNativeFill(proof,r,105,new Date()),/NATIVE_FILL_INTERMEDIATE_BALANCE_CHANGED/);
+});
+test('fill accounting rejects token-account identity changes across pre and post balances',()=>{
+ const signature=bs58.encode(new Uint8Array(64).fill(6));
+ const r:NativeJournalRecord={intentId:'i',orderId:'o',wallet,mint,side:'sell',amount:'1000',slippageBps:500,status:'submitted',
+  createdAt:new Date().toISOString(),updatedAt:new Date().toISOString(),signature,venue:'pumpswap',tokenDecimals:6,tipLamports:'1000',
+  priorityFeeLamports:'5000',minimumOutputAmount:'9500000'};
+ const otherMint=Keypair.fromSeed(new Uint8Array(32).fill(23)).publicKey.toBase58();
+ const otherOwner=Keypair.fromSeed(new Uint8Array(32).fill(24)).publicKey.toBase58();
+ const TOKEN2022='TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
+ for(const mutate of [
+  (row:any)=>{row.mint=otherMint;},
+  (row:any)=>{row.owner=otherOwner;},
+  (row:any)=>{row.programId=TOKEN2022;},
+  (row:any)=>{row.uiTokenAmount.decimals=7;},
+ ]){
+  const proof=txProof(signature,'sell');mutate(proof.meta.postTokenBalances[0]);
+  assert.throws(()=>verifyNativeFill(proof,r,105,new Date()),/NATIVE_FILL_TOKEN_IDENTITY_CHANGED/);
+ }
 });
 test('fill accounting cancels only the official first-created PumpSwap volume PDA rent',()=>{
  const signature=bs58.encode(new Uint8Array(64).fill(6));
@@ -138,6 +281,7 @@ test('fill accounting cancels only the official first-created PumpSwap volume PD
  proof.transaction.message.accountKeys.push({pubkey:volume,signer:false,writable:true});proof.meta.preBalances.push(0);proof.meta.postBalances.push(pdaRent);
  proof.meta.postBalances[0]-=pdaRent;
  assert.equal(verifyNativeFill(proof,r,105,new Date()).inputAmount,'10000000');
+ r.venue='jupiter';assert.equal(verifyNativeFill(proof,r,105,new Date()).inputAmount,'10000000');r.venue='pumpswap';
  const unrelated=structuredClone(proof);unrelated.transaction.message.accountKeys.at(-1)!.pubkey=tip;
  assert.throws(()=>verifyNativeFill(unrelated,r,105,new Date()),/NATIVE_FILL_AMOUNTS_UNVERIFIED/);
  const last=proof.meta.preBalances.length-1;proof.meta.preBalances[last]=pdaRent;proof.meta.postBalances[last]=pdaRent;proof.meta.postBalances[0]+=pdaRent;
@@ -162,9 +306,9 @@ test('last guard receives the executable quote and cannot mutate the submitted p
   plan.instructions[0].data[0]=88;plan.instructions.length=0;plan.subscriptionAccounts.push(tip);
  },beforeBroadcast:async plan=>{
   guards++;assert.equal(f.state.sends,0);assert.ok(f.state.calls.includes('simulateTransaction'));assert.ok(Object.isFrozen(plan));
-  assert.deepEqual({venue:plan.venue,mint:plan.mint,side:plan.side,inputAmount:plan.inputAmount,expectedOutputAmount:plan.expectedOutputAmount,
+  assert.deepEqual({venue:plan.venue,protectionMode:plan.protectionMode,mint:plan.mint,side:plan.side,inputAmount:plan.inputAmount,expectedOutputAmount:plan.expectedOutputAmount,
    minimumOutputAmount:plan.minimumOutputAmount,quotedAt:plan.quotedAt,tokenDecimals:plan.tokenDecimals,subscriptionAccounts:plan.subscriptionAccounts},
-   {venue:'pump',mint,side:'sell',inputAmount:'1000',expectedOutputAmount:'10000000',minimumOutputAmount:'9500000',
+   {venue:'pump',protectionMode:'account_stream',mint,side:'sell',inputAmount:'1000',expectedOutputAmount:'10000000',minimumOutputAmount:'9500000',
     quotedAt:new Date(f.state.now).toISOString(),tokenDecimals:6,subscriptionAccounts:[ata]});
   plan.instructions[0].data[0]=99;plan.instructions[0].keys[0].isSigner=false;plan.instructions.length=0;plan.subscriptionAccounts.push(tip);
  }});
@@ -205,7 +349,7 @@ test('timing measures every stage monotonically without additional RPCs or durab
 test('failed simulation and failed final guard retain completed or attempted stages without inventing broadcast times',async t=>{
  let mono=0;const a=fixture(t,{badSimulation:true,monotonicNow:()=>mono+=2});const failed=await a.executor.execute(a.request);
  const failedTiming=failed.timing!;assert.equal(failed.status,'failed');assert.ok(failedTiming.stagesMs.simulation!>=2&&failedTiming.stagesMs.simulation!<=6);
- assert.ok(failedTiming.stagesMs.broadcastQueue!>=2);assert.equal(failedTiming.stagesMs.sign,undefined);
+ assert.equal(failedTiming.stagesMs.broadcastQueue,undefined,'failed entry preparation never occupies the Jito lane');assert.equal(failedTiming.stagesMs.sign,undefined);
  assert.equal(failedTiming.broadcastStartedAt,undefined);assert.equal(failedTiming.submittedAfterMs,undefined);
  assert.equal(a.state.sends,0);
  const b=fixture(t,{monotonicNow:()=>mono+=3});const guarded=await b.executor.execute({...b.request,beforeBroadcast:async()=>{throw Error('ENTRY_TIMING_TEST_REJECTED');}});

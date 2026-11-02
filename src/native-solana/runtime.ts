@@ -1,4 +1,5 @@
 import {Connection,PublicKey} from '@solana/web3.js';
+import {TOKEN_2022_PROGRAM_ID,TOKEN_PROGRAM_ID,getAssociatedTokenAddressSync,unpackMint} from '@solana/spl-token';
 import {DatabaseSync} from 'node:sqlite';
 import {mkdirSync,chmodSync} from 'node:fs';
 import {dirname} from 'node:path';
@@ -10,7 +11,7 @@ import {crossedPriceMilestones,crossedMilestoneLabel} from '../price-milestones.
 import {formatTokenUnits,type SellPercentage} from '../direct-sell.js';
 import {PumpNativeAdapter} from './pump.js';
 import {NativeExecutor,type NativeExecutionResult} from './executor.js';
-import {NativePositionSupervisor,nativeStopLossTriggered,type NativePositionState,type NativePositionUpdate,type NativePositionExitResult,type NativePositionBalance} from './positions.js';
+import {NativePositionSupervisor,nativeStopLossTriggered,type NativeExternalPrice,type NativePositionState,type NativePositionUpdate,type NativePositionExitResult,type NativePositionBalance,type NativePositionQuote} from './positions.js';
 import {CURRENT_STOP_LOSS_DROP_PCT} from '../exit-policy.js';
 import {NativeAccountStream,type NativeStreamAccountUpdate} from './stream.js';
 import {NativeInventoryCache} from './inventory.js';
@@ -19,6 +20,10 @@ import {validNativeTokenIdentity,type NativeTokenIdentity} from './identity.js';
 const object=(v:unknown):v is Record<string,unknown>=>v!==null&&typeof v==='object'&&!Array.isArray(v);
 const clean=(s:unknown)=>typeof s==='string'?s.replace(/[\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069]/g,' ').slice(0,80):'';
 const SOL=(amount:string)=>formatTokenUnits(amount,9);
+const EXTERNAL_PRICE_MAX_AGE_MS=1500;
+const JUPITER_EXACT_QUOTE_TTL_MS=1000;
+const JUPITER_AUTOMATIC_QUOTE_TIMEOUT_MS=700;
+interface ExternalPrice extends NativeExternalPrice {receivedAt:number;}
 const gain=(p:NativePositionState)=>p.quote&&BigInt(p.quote.inputAmount)>0n?
   Number(BigInt(p.quote.outputAmount)*BigInt(p.costBasis.tokenAtoms)*10000n/
     (BigInt(p.quote.inputAmount)*BigInt(p.costBasis.solLamports)))/100-100:undefined;
@@ -38,15 +43,19 @@ export class NativeTradingRuntime {
   private zeroWork=new Map<string,Promise<void>>();private zeroRetryAt=new Map<string,number>();
   private eventAt=new Map<string,number>();private eventLatencies:number[]=[];private marketError?:string;
   private incompleteSince=new Map<string,number>();
+  private externalPrices=new Map<string,ExternalPrice>();
+  private externalWarming=new Map<string,Promise<void>>();private externalWarmRetryAt=new Map<string,number>();
+  private externalTokenPrograms=new Map<string,PublicKey>();
   private entryWatches=new Map<string,string[]>();
   private orderSyncPending=new Set<string>();
   private buySyncPending=new Map<string,NativeExecutionResult>();
-  private recoveryLoaded=false;private recoveryOrders=new Set<string>();
+  private recoveryLoaded=false;private initialRecoveryComplete=false;private recoveryOrders=new Set<string>();
   private milestoneSeen=new Map<string,number[]>();
   private pendingMilestones=new Map<string,{position:NativePositionState;crossed:number[]}>();
   private monitorReady=new Set<string>();
   private milestoneRetryAt=new Map<string,number>();private milestoneTimer?:ReturnType<typeof setTimeout>;private milestoneTimerAt=0;
   private accountWatchKey?:string;
+  private jupiterEntryReservations=new Map<string,number>();
   constructor(private config:Config,private orders:OrderStore,private enqueue:(event:TradeNotificationEvent)=>boolean){
     const n=config.nativeSolana,wallet=config.entryWallets.solana;
     if(!n?.rpcUrl||!n.wsUrl||!wallet)throw Error('NATIVE_CONFIG_INCOMPLETE');
@@ -56,10 +65,12 @@ export class NativeTradingRuntime {
     this.ownerConnection=new Connection(n.inventoryRpcUrl??'https://api.mainnet-beta.solana.com',{commitment:'confirmed',disableRetryOnRateLimit:true,
       fetch:async(input,init)=>fetch(input,{...init,signal:AbortSignal.timeout(5000),redirect:'error'})});
     this.inventory=new NativeInventoryCache(wallet);
-    this.adapter=new PumpNativeAdapter({connection,ownerConnection:this.ownerConnection});
+    this.adapter=new PumpNativeAdapter({connection,ownerConnection:this.ownerConnection,jupiterApiKey:n.jupiterApiKey,
+      jupiterMainBucketTier:n.jupiterMainBucketTier,jupiterMainBucketRps:n.jupiterMainBucketRps});
     this.executor=new NativeExecutor({rpcUrl:n.rpcUrl,jitoUrl:n.jitoUrl,keypairFile:n.keypairFile??'',wallet,
       journalPath:n.journalPath,tipLamports:n.tipLamports,priorityFeeLamports:n.priorityFeeLamports,
-      maxQuoteAgeMs:10000,plan:request=>this.adapter.build(request)});
+      maxQuoteAgeMs:10000,plan:(request,context)=>this.adapter.build(request,{jupiterEntryAuthorized:
+        request.side==='sell'||this.jupiterEntryReservations.has(context.orderId)})});
     const actionsPath=n.positionsPath+'.actions.sqlite';mkdirSync(dirname(actionsPath),{recursive:true,mode:0o700});
     this.db=new DatabaseSync(actionsPath);chmodSync(actionsPath,0o600);
     this.db.exec(`PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;PRAGMA busy_timeout=5;
@@ -80,7 +91,7 @@ export class NativeTradingRuntime {
       }}},undefined,{maxAccounts:300});
     const stopLossDropPct=config.exitPolicy?.stopLoss.dropPct??CURRENT_STOP_LOSS_DROP_PCT;
     this.positions=new NativePositionSupervisor(n.positionsPath,{fallbackIntervalMs:1000,minCheckIntervalMs:0,loopMs:50,batchSize:20,maxPositions:40,
-      eventDriven:true,staleAfterMs:1500,
+      eventDriven:true,staleAfterMs:1500,quoteRequestTimeoutMs:JUPITER_AUTOMATIC_QUOTE_TIMEOUT_MS,
       stopLossDropPct,
       io:{balance:async request=>{
           if(!this.positionStreamHealthy(request.orderId))throw Error('NATIVE_WEBSOCKET_UNAVAILABLE');
@@ -96,6 +107,10 @@ export class NativeTradingRuntime {
         },
         quote:async request=>{
           if(!this.positionStreamHealthy(request.orderId))throw Error('NATIVE_WEBSOCKET_UNAVAILABLE');
+          const position=this.positions.get(request.orderId);if(!position)throw Error('NATIVE_POSITION_UNAVAILABLE');
+          if(position.buy.venue==='jupiter'){
+            return this.exactJupiterQuote(position,request.amount,request.purpose==='manual',request.signal);
+          }
           const q=this.adapter.quoteSellCached({wallet:request.wallet,mint:request.mint,amount:request.amount,slippageBps:config.entrySlippagePct*100},
             {headSlot:this.stream.headSlot()});
           const now=Date.now();
@@ -136,6 +151,7 @@ export class NativeTradingRuntime {
     if(!this.running)return {ready:false,reason:'NATIVE_PROTECTION_STOPPED'};
     const signer=this.executor.readiness();if(!signer.ready)return signer;
     if(this.error)return {ready:false,reason:this.error};
+    if(!this.initialRecoveryComplete)return {ready:false,reason:'NATIVE_INITIAL_RECOVERY_PENDING'};
     if(this.orderSyncPending.size||this.buySyncPending.size)return {ready:false,reason:'NATIVE_ORDER_SYNC_UNAVAILABLE'};
     if(!this.chainVerified)return {ready:false,reason:'NATIVE_CHAIN_NOT_VERIFIED'};
     if(!this.stream.status().connected)return {ready:false,reason:'NATIVE_WEBSOCKET_UNAVAILABLE'};
@@ -145,11 +161,58 @@ export class NativeTradingRuntime {
   status(){return {provider:'pump_native',antiMev:{provider:'jito',bundleOnly:true,dontFront:true,publicFallback:false},
     readiness:this.readiness(),running:this.running,chainVerified:this.chainVerified,error:this.error,
     stream:this.stream.status(),protection:this.positions.status(),orderSyncPending:this.orderSyncPending.size+this.buySyncPending.size,inventory:{...this.inventory.status(),error:this.inventoryError},
-    prices:{mode:'account_stream_local_quote',activeMarkets:this.mintOrders.size,warming:this.warming.size,error:this.marketError,
-      receiveToEvaluationMs:this.latencyStatus(),marketTimestamp:'last_actual_account_update',quoteTimestamp:'local_evaluation_time'}};}
+    prices:{mode:'external_price_wake_with_exact_jupiter_quote',activeMarkets:this.mintOrders.size,jupiter:{...this.adapter.jupiterStatus(),
+      activePositions:this.positions.activeVenueCount('jupiter'),
+      entryReservations:this.jupiterEntryReservations.size},
+      warming:this.warming.size+this.externalWarming.size,externalFresh:[...this.externalPrices.keys()].filter(mint=>!!this.freshExternal(mint)).length,error:this.marketError,
+      receiveToEvaluationMs:this.latencyStatus(),marketTimestamp:'last_fresh_external_observation',quoteTimestamp:'exact_jupiter_quote_time'}};}
   private latencyStatus(){const values=[...this.eventLatencies].sort((a,b)=>a-b);return {samples:values.length,
     p50:values.length?values[Math.floor((values.length-1)*.5)]:undefined,
     p95:values.length?values[Math.ceil((values.length-1)*.95)]:undefined,max:values.at(-1)};}
+  private freshExternal(mint:string,now=Date.now()):ExternalPrice|undefined {
+    const sample=this.externalPrices.get(mint),observed=sample?Date.parse(sample.observedAt):NaN;
+    return sample&&Number.isFinite(observed)&&observed<=now+250&&now-observed<=EXTERNAL_PRICE_MAX_AGE_MS&&
+      now-sample.receivedAt<=EXTERNAL_PRICE_MAX_AGE_MS?sample:undefined;
+  }
+  /** Feed only fresh, identity-bound market observations. They wake Jupiter
+   * protection but never provide a financial valuation or authorize an exit. */
+  observePrice(input:{mint:string;priceUsd:number;observedAt:string;source:string}):boolean {
+    if(!this.running||typeof input?.mint!=='string'||typeof input.priceUsd!=='number'||!Number.isFinite(input.priceUsd)||input.priceUsd<=0||
+      typeof input.source!=='string'||!/^[a-z0-9_:-]{1,80}$/i.test(input.source))return false;
+    try{if(new PublicKey(input.mint).toBase58()!==input.mint)return false;}catch{return false;}
+    const now=Date.now(),observed=Date.parse(input.observedAt);
+    if(!Number.isFinite(observed)||observed>now+250||now-observed>EXTERNAL_PRICE_MAX_AGE_MS)return false;
+    const prior=this.externalPrices.get(input.mint);if(prior&&Date.parse(prior.observedAt)>=observed)return false;
+    const sample:ExternalPrice={priceUsd:input.priceUsd,observedAt:new Date(observed).toISOString(),source:input.source,receivedAt:now};
+    this.externalPrices.set(input.mint,sample);
+    const orderId=this.mintOrders.get(input.mint),position=orderId?this.positions.get(orderId):undefined;
+    if(orderId&&position?.buy.protectionMode==='external_price_stream'){
+      if(!this.eventAt.has(orderId))this.eventAt.set(orderId,now);
+      this.positions.observeExternalPrice(orderId,sample);
+    }
+    return true;
+  }
+  private async exactJupiterQuote(position:NativePositionState,amount:string,manual:boolean,signal:AbortSignal):Promise<NativePositionQuote> {
+    const protectionMode=position.buy.protectionMode;
+    if(protectionMode!=='external_price_stream')throw Error('NATIVE_JUPITER_PROTECTION_MODE_UNAVAILABLE');
+    if(!manual&&!this.freshExternal(position.buy.mint))throw Error('NATIVE_EXTERNAL_PRICE_STALE');
+    const q=await this.adapter.quoteJupiterSell({wallet:position.buy.wallet,mint:position.buy.mint,amount,
+      slippageBps:this.config.entrySlippagePct*100,signal},position.buy.tokenDecimals,protectionMode);
+    const now=Date.now(),quotedAt=Date.parse(q.quotedAt);
+    const marketObservedAt=manual?undefined:this.freshExternal(position.buy.mint,now)?.observedAt;
+    if(!manual&&!marketObservedAt)throw Error('NATIVE_EXTERNAL_PRICE_STALE');
+    const atomic=(value:unknown):value is string=>typeof value==='string'&&/^[1-9]\d{0,19}$/.test(value)&&BigInt(value)<=(1n<<64n)-1n;
+    const validOutput=atomic(q.expectedOutputAmount)&&atomic(q.minimumOutputAmount)&&BigInt(q.minimumOutputAmount)<=BigInt(q.expectedOutputAmount);
+    if(q.venue!=='jupiter'||q.protectionMode!=='external_price_stream'||q.mint!==position.buy.mint||
+      q.side!=='sell'||q.inputAmount!==amount||q.tokenDecimals!==position.buy.tokenDecimals||!validOutput||
+      !Number.isFinite(quotedAt)||quotedAt>now+250||now-quotedAt>JUPITER_EXACT_QUOTE_TTL_MS)
+      throw Error('NATIVE_JUPITER_QUOTE_INVALID');
+    return {wallet:position.buy.wallet,mint:position.buy.mint,inputAmount:amount,outputAmount:q.expectedOutputAmount,
+      minimumOutputAmount:q.minimumOutputAmount,quotedAt:q.quotedAt,expiresAt:new Date(quotedAt+JUPITER_EXACT_QUOTE_TTL_MS).toISOString(),
+      // Jupiter route accounts are one-shot execution details. Durable entry
+      // subscriptions remain authoritative and must not churn on exact quotes.
+      source:'jupiter_exact_sell',...(marketObservedAt?{marketObservedAt}:{})};
+  }
   private transportHealthy(){return this.stream.transportReady();}
   private positionStreamHealthy(orderId:string){
     const p=this.positions?.get(orderId);return !!p&&this.stream.isSubscribed(p.buy.subscriptionAccounts);
@@ -167,6 +230,7 @@ export class NativeTradingRuntime {
     this.milestoneSeen.delete(orderId);this.pendingMilestones.delete(orderId);this.milestoneRetryAt.delete(orderId);
     if(!this.pendingMilestones.size){clearTimeout(this.milestoneTimer);this.milestoneTimer=undefined;this.milestoneTimerAt=0;}
     this.warmRetryAt.delete(mint);this.incompleteSince.delete(mint);this.finalizedZero.delete(mint);this.zeroRetryAt.delete(mint);
+    this.externalPrices.delete(mint);this.externalWarmRetryAt.delete(mint);this.externalTokenPrograms.delete(mint);
     this.adapter.dropQuoteCache(this.config.entryWallets.solana!,mint);this.inventory.retire(mint);
   }
   private activeMarket(mint:string,orderId:string){return this.running&&this.mintOrders.get(mint)===orderId&&this.positions.get(orderId)?.state==='active';}
@@ -179,6 +243,12 @@ export class NativeTradingRuntime {
       if(!this.eventAt.has(id))this.eventAt.set(id,event.receivedAtMs);
       this.positions.markDirty(id,{slot:event.slot,observedAt:new Date(event.receivedAtMs).toISOString()});
       if(held.includes(mint))this.finalizedZero.delete(mint);
+      const position=this.positions.get(id);
+      if(position?.buy.protectionMode==='external_price_stream'){
+        const program=this.externalTokenPrograms.get(mint),accounts=program?this.externalAccounts(mint,program):this.inventory.addresses(mint);
+        if(accounts.length)this.positions.replaceSubscriptions(id,accounts);
+        continue;
+      }
       const status=this.adapter.cacheStatus(this.config.entryWallets.solana!,mint);
       if(status.ready)this.incompleteSince.delete(mint);
       else if(!this.incompleteSince.has(mint))this.incompleteSince.set(mint,Date.now());
@@ -188,9 +258,37 @@ export class NativeTradingRuntime {
   private async bootstrap(){
     if(!this.running||!this.transportHealthy())return;
     if(!this.inventory.status().ready)void this.refreshInventory();
-    for(const [mint,id] of this.mintOrders){const status=this.adapter.cacheStatus(this.config.entryWallets.solana!,mint);
+    for(const [mint,id] of this.mintOrders){const position=this.positions.get(id);
+      if(position?.buy.protectionMode==='external_price_stream'){
+        if(!this.externalTokenPrograms.has(mint))void this.warmExternal(mint,id);
+        continue;
+      }
+      const status=this.adapter.cacheStatus(this.config.entryWallets.solana!,mint);
       if(!status.warm||!status.ready&&Date.now()-(this.incompleteSince.get(mint)??Date.now())>=750)void this.warm(mint,id);
     }
+  }
+  private externalAccounts(mint:string,program:PublicKey):string[]{
+    const ata=getAssociatedTokenAddressSync(new PublicKey(mint),new PublicKey(this.config.entryWallets.solana!),true,program).toBase58();
+    return [...new Set([...this.inventory.addresses(mint),ata])];
+  }
+  private warmExternal(mint:string,orderId:string):Promise<void>{
+    const existing=this.externalWarming.get(mint);if(existing)return existing;
+    if(!this.activeMarket(mint,orderId)||!this.transportHealthy()||Date.now()<(this.externalWarmRetryAt.get(mint)??0))return Promise.resolve();
+    this.externalWarmRetryAt.set(mint,Date.now()+2000);const generation=this.cacheGeneration;
+    const work=(async()=>{
+      const address=new PublicKey(mint),snapshot=await this.ownerConnection.getAccountInfoAndContext(address,{commitment:'confirmed'}),info=snapshot.value;
+      if(!info||info.executable||![TOKEN_PROGRAM_ID,TOKEN_2022_PROGRAM_ID].some(program=>info.owner.equals(program)))throw Error('NATIVE_MINT_OWNER_INVALID');
+      const data=unpackMint(address,info,info.owner),position=this.positions.get(orderId);
+      if(!position||position.buy.protectionMode!=='external_price_stream'||data.decimals!==position.buy.tokenDecimals)throw Error('NATIVE_MINT_IDENTITY_INVALID');
+      if(!this.activeMarket(mint,orderId)||generation!==this.cacheGeneration)return;
+      this.externalTokenPrograms.set(mint,info.owner);this.inventory.track(mint,data.decimals,info.owner.toBase58());
+      this.positions.replaceSubscriptions(orderId,this.externalAccounts(mint,info.owner));
+      const sample=this.freshExternal(mint);if(sample)this.positions.observeExternalPrice(orderId,sample);
+      try{this.inventory.read(mint,position.buy.buySlot,Date.now());}catch{void this.refreshInventory();}
+      this.positions.markDirty(orderId);this.marketError=undefined;
+    })().catch(error=>{if(this.activeMarket(mint,orderId))this.marketError=error instanceof Error&&/^[A-Z_]+$/.test(error.message)?error.message:'NATIVE_EXTERNAL_BOOTSTRAP_FAILED';})
+      .finally(()=>{this.externalWarming.delete(mint);});
+    this.externalWarming.set(mint,work);return work;
   }
   private warm(mint:string,orderId:string):Promise<void>{
     const existing=this.warming.get(mint);if(existing)return existing;
@@ -229,7 +327,10 @@ export class NativeTradingRuntime {
       }
       if(failed||this.inventory.programsNeedingRefresh().length)throw Error('NATIVE_INVENTORY_RPC_UNAVAILABLE');
       this.inventoryError=undefined;
-      for(const id of this.mintOrders.values())this.positions.markDirty(id);
+      for(const [mint,id] of this.mintOrders){const position=this.positions.get(id),program=this.externalTokenPrograms.get(mint);
+        if(position?.buy.protectionMode==='external_price_stream'&&program)this.positions.replaceSubscriptions(id,this.externalAccounts(mint,program));
+        this.positions.markDirty(id);
+      }
     })().catch(()=>{this.inventoryError='NATIVE_INVENTORY_RPC_UNAVAILABLE';})
       .finally(()=>{this.inventoryWork=undefined;});return this.inventoryWork;
   }
@@ -244,27 +345,67 @@ export class NativeTradingRuntime {
     this.zeroWork.set(mint,work);
   }
   async execute(order:OpeningOrder,beforeBroadcast:()=>Promise<void>):Promise<OpeningOrder>{
+    if(!this.initialRecoveryComplete)throw Error('NATIVE_INITIAL_RECOVERY_PENDING');
+    let releaseJupiter:(()=>void)|undefined;
     try{
-      let entryGeneration:number|undefined,tokenIdentity:NativeTokenIdentity|undefined;
+      const capability=await this.adapter.routeCapability(order.tokenAddress);
+      if(capability.route!=='direct')releaseJupiter=this.reserveJupiterEntry(order.id);
+      let entryGeneration:number|undefined,entryProtectionMode:'account_stream'|'external_price_stream'='account_stream',tokenIdentity:NativeTokenIdentity|undefined;
       const prepare=(plan:Readonly<import('./pump.js').NativeSwapPlan>)=>{
+        if(plan.venue==='jupiter'&&!this.jupiterEntryReservations.has(order.id))throw Error('NATIVE_JUPITER_PROTECTION_CAPACITY_REACHED');
         if(plan.tokenIdentity&&validNativeTokenIdentity(plan.tokenIdentity))tokenIdentity={...plan.tokenIdentity};
+        entryProtectionMode=plan.protectionMode;
         if(entryGeneration!==undefined)return;
         entryGeneration=this.cacheGeneration;this.entryWatches.set(order.id,[...plan.subscriptionAccounts]);this.syncAccountWatches();
       };
       const result=await this.executor.execute({intentId:'buy-'+order.id,orderId:order.id,wallet:order.wallet,mint:order.tokenAddress,
         side:'buy',amount:order.inputAmount,slippageBps:order.slippagePct*100,onPlanReady:prepare,beforeBroadcast:async plan=>{
-          prepare(plan);const generation=entryGeneration!,deadline=Date.now()+1000;
-          while(this.running&&generation===this.cacheGeneration&&!this.stream.isSubscribed(plan.subscriptionAccounts)&&Date.now()<deadline)
+          prepare(plan);const generation=entryGeneration!,deadline=Date.now()+1500;
+          while(this.running&&generation===this.cacheGeneration&&
+            (!this.stream.isSubscribed(plan.subscriptionAccounts)||entryProtectionMode==='external_price_stream'&&!this.freshExternal(order.tokenAddress))&&Date.now()<deadline)
             await new Promise(resolve=>setTimeout(resolve,20));
           if(!this.running||generation!==this.cacheGeneration||!this.stream.isSubscribed(plan.subscriptionAccounts))
             throw Error('NATIVE_ENTRY_PRICE_STREAM_UNAVAILABLE');
+          if(entryProtectionMode==='external_price_stream'&&!this.freshExternal(order.tokenAddress))throw Error('NATIVE_ENTRY_EXTERNAL_PRICE_STALE');
           await beforeBroadcast();
           if(!this.running||generation!==this.cacheGeneration||!this.stream.isSubscribed(plan.subscriptionAccounts))
             throw Error('NATIVE_ENTRY_PRICE_STREAM_UNAVAILABLE');
+          if(entryProtectionMode==='external_price_stream'&&!this.freshExternal(order.tokenAddress))throw Error('NATIVE_ENTRY_EXTERNAL_PRICE_STALE');
         }});
       if(tokenIdentity)this.applyTokenIdentity(order.id,tokenIdentity);
       return this.applyBuy(order.id,result);
-    }finally{this.entryWatches.delete(order.id);this.syncAccountWatches();}
+    }finally{releaseJupiter?.();this.entryWatches.delete(order.id);this.syncAccountWatches();}
+  }
+  private jupiterCapacityOrderIds():Set<string>{
+    return new Set([...this.positions.activeVenueOrderIds('jupiter'),...this.executor.pendingBuyVenueOrderIds('jupiter'),
+      ...this.durableJupiterFillOrderIds(),...this.pendingJupiterSyncOrderIds(),...this.jupiterEntryReservations.keys()]);
+  }
+  private durableJupiterFillOrderIds():string[]{
+    const result:string[]=[];
+    for(const order of this.orders.activeNativePositions()){
+      const fill=order.details.nativeFill;if(object(fill)&&fill.venue==='jupiter')result.push(order.id);
+    }
+    return result;
+  }
+  private pendingJupiterSyncOrderIds():string[]{
+    const result:string[]=[];
+    for(const [orderId,execution] of this.buySyncPending)if(execution.venue==='jupiter'&&execution.status!=='failed')result.push(orderId);
+    return result;
+  }
+  private reserveJupiterEntry(orderId:string):()=>void {
+    const current=this.jupiterEntryReservations.get(orderId);
+    if(current!==undefined){this.jupiterEntryReservations.set(orderId,current+1);return ()=>this.releaseJupiterEntry(orderId);}
+    const occupied=this.jupiterCapacityOrderIds();
+    // Re-entering an already journaled intent cannot build or send a second
+    // transaction; NativeExecutor returns the durable record. Do not charge it twice.
+    if(occupied.has(orderId))return ()=>{};
+    const capacity=this.adapter.jupiterStatus().entryCapacity;
+    if(capacity<1||occupied.size>=capacity)throw Error('NATIVE_JUPITER_PROTECTION_CAPACITY_REACHED');
+    this.jupiterEntryReservations.set(orderId,1);return ()=>this.releaseJupiterEntry(orderId);
+  }
+  private releaseJupiterEntry(orderId:string):void {
+    const current=this.jupiterEntryReservations.get(orderId);if(current===undefined)return;
+    if(current>1)this.jupiterEntryReservations.set(orderId,current-1);else this.jupiterEntryReservations.delete(orderId);
   }
   private applyTokenIdentity(orderId:string,identity:NativeTokenIdentity):void {
     if(!validNativeTokenIdentity(identity))return;
@@ -290,6 +431,7 @@ export class NativeTradingRuntime {
         ...(result.timing?{nativeExecutionTiming:result.timing}:{}),
         ...(fill?{nativeFill:{signature:result.signature,slot:fill.slot,inputAmount:fill.inputAmount,
           outputAmount:fill.outputAmount,tokenDecimals:result.tokenDecimals,venue:result.venue,confirmedAt:fill.checkedAt,
+          protectionMode:result.protectionMode,
           commitment:result.status==='confirmed'?'finalized':'confirmed',subscriptionAccounts:result.subscriptionAccounts??[]}}:{})}};
     let next:OpeningOrder;
     try{next=this.orders.update(orderId,['prepared','submitting','submitted','unknown','confirmed'],patch)??old;}
@@ -302,7 +444,7 @@ export class NativeTradingRuntime {
       return old;
     }
     this.buySyncPending.delete(orderId);
-    if(['submitting','submitted','unknown'].includes(next.status))this.recoveryOrders.add(orderId);else this.recoveryOrders.delete(orderId);
+    if(['submitting','submitted','unknown','confirmed'].includes(next.status))this.recoveryOrders.add(orderId);else this.recoveryOrders.delete(orderId);
     if(fill)this.register(next);
     return next;
   }
@@ -311,19 +453,23 @@ export class NativeTradingRuntime {
     if(!object(fill)||typeof fill.signature!=='string'||typeof fill.inputAmount!=='string'||typeof fill.outputAmount!=='string'||
       !Number.isSafeInteger(fill.slot)||!Number.isInteger(fill.tokenDecimals)||!Array.isArray(fill.subscriptionAccounts))throw Error('NATIVE_FILL_UNVERIFIED');
     const token=object(order.details.token)?order.details.token:{};
+    const venue=fill.venue==='jupiter'||fill.venue==='pumpswap'||fill.venue==='pump'?fill.venue:'pump';
+    const protectionMode=venue==='jupiter'||fill.protectionMode==='external_price_stream'?'external_price_stream':'account_stream';
     const newlyTracked=!this.mintOrders.has(order.tokenAddress);
     const registered=this.positions.register({orderId:order.id,wallet:order.wallet,mint:order.tokenAddress,inputAmount:fill.inputAmount,
       outputAmount:fill.outputAmount,tokenDecimals:Number(fill.tokenDecimals),signature:fill.signature,buySlot:Number(fill.slot),
-      subscriptionAccounts:fill.subscriptionAccounts as string[],confirmedAt:String(fill.confirmedAt),name:clean(token.name??token.symbol)});
+      subscriptionAccounts:fill.subscriptionAccounts as string[],confirmedAt:String(fill.confirmedAt),name:clean(token.name??token.symbol),venue,protectionMode});
     if(registered.state==='active'){
       this.mintOrders.set(order.tokenAddress,order.id);
       // Recovery replays confirmed buys every pulse. They must not become HTTP price polling.
-      if(newlyTracked||!this.adapter.cacheStatus(order.wallet,order.tokenAddress).warm)void this.warm(order.tokenAddress,order.id);
+      if(registered.buy.protectionMode==='external_price_stream'){
+        const sample=this.freshExternal(order.tokenAddress);if(sample)this.positions.observeExternalPrice(order.id,sample);
+        if(newlyTracked||!this.externalTokenPrograms.has(order.tokenAddress))void this.warmExternal(order.tokenAddress,order.id);
+      }else if(newlyTracked||!this.adapter.cacheStatus(order.wallet,order.tokenAddress).warm)void this.warm(order.tokenAddress,order.id);
     }
     // A provisional holding may have closed before its buy reached finalized.
     // Reconcile its authoritative state again now that the opening ledger can accept it.
-    if(order.status==='confirmed')this.syncPosition(registered);
-    if(order.status==='confirmed')this.recoveryOrders.delete(order.id);
+    if(order.status==='confirmed'&&this.syncPosition(registered))this.recoveryOrders.delete(order.id);
   }
   private exitResult(result:NativeExecutionResult):NativePositionExitResult{
     if(result.status==='confirmed'&&result.signature&&result.inputAmount&&result.outputAmount)
@@ -334,7 +480,7 @@ export class NativeTradingRuntime {
   }
   private recordEvaluation(p:NativePositionState){
     const at=this.eventAt.get(p.buy.orderId);
-    if(at!==undefined&&p.quote?.source==='solana_account_stream'&&!p.lastError&&
+    if(at!==undefined&&(p.quote?.source==='solana_account_stream'||p.quote?.source==='jupiter_exact_sell')&&!p.lastError&&
       !!p.lastCheckAt&&Date.parse(p.lastCheckAt)>=at&&Date.parse(p.quote.quotedAt)>=at){
       this.eventLatencies.push(Math.max(0,Date.now()-at));if(this.eventLatencies.length>1000)this.eventLatencies.shift();this.eventAt.delete(p.buy.orderId);
     }
@@ -342,9 +488,13 @@ export class NativeTradingRuntime {
     this.captureMilestones(p);
   }
   private positionSummary(p:NativePositionState,g:number){
+    const market=p.quote?.source==='jupiter_exact_sell'?(p.buy.protectionMode==='external_price_stream'?
+      `外部实时价格唤醒 · ${p.quote.marketObservedAt??'手动查询'} · Jupiter 精确可卖报价`:
+      `链上账户推送 · ${p.quote.marketObservedAt??'手动查询'} · Jupiter 精确可卖报价`):
+      `链上账户推送 · 槽位 ${p.quote?.marketSlot??'未知'}`;
     return `${p.buy.name||p.buy.mint.slice(0,8)} · SOL\nCA：${p.buy.mint}\n当前可卖报价涨幅：${g>=0?'+':''}${g.toFixed(2)}%\n`+
       `剩余数量：${formatTokenUnits(p.balance!.amount,p.buy.tokenDecimals)}\n预计卖出所得：${SOL(p.quote!.outputAmount)} SOL\n`+
-      `行情：链上账户推送 · 槽位 ${p.quote!.marketSlot??'未知'}\n按链上成交成本和整仓卖出报价计算，未扣网络费和小费。`;
+      `行情：${market}\n按链上成交成本和整仓卖出报价计算，未扣网络费和小费。`;
   }
   private captureMilestones(p:NativePositionState){
     if(p.state!=='active'||!p.balance||p.balance.amount==='0'||p.balance.provisionalZero||!p.quote||p.lastError||Date.parse(p.quote.expiresAt)<=Date.now())return;
@@ -424,9 +574,9 @@ export class NativeTradingRuntime {
     }
     this.flush();
   }
-  private syncPosition(p:NativePositionState){
-    try{this.persistPosition(p);this.orderSyncPending.delete(p.buy.orderId);}
-    catch{this.orderSyncPending.add(p.buy.orderId);}
+  private syncPosition(p:NativePositionState):boolean{
+    try{this.persistPosition(p);this.orderSyncPending.delete(p.buy.orderId);return true;}
+    catch{this.orderSyncPending.add(p.buy.orderId);return false;}
   }
   private persistPosition(p:NativePositionState){
     const order=this.orders.get(p.buy.orderId),b=p.balance,fill=order?.details.nativeFill;
@@ -477,6 +627,7 @@ export class NativeTradingRuntime {
         if(order.status==='confirmed')this.register(order);
         else this.applyBuy(order.id,await this.executor.reconcile('buy-'+order.id));
       }
+      this.initialRecoveryComplete=true;
       for(const row of this.db.prepare('SELECT * FROM native_actions WHERE intent_id IS NOT NULL AND dispatched=0 LIMIT 20').all())
         this.dispatchManual(String(row.order_id),Number(row.percentage) as SellPercentage,String(row.intent_id));
       for(const id of this.orderSyncPending){const p=this.positions.get(id);if(p)this.syncPosition(p);else this.orderSyncPending.delete(id);}

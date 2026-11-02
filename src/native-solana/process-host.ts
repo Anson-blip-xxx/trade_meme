@@ -1,6 +1,7 @@
 import {spawn,type ChildProcess} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {randomUUID} from 'node:crypto';
+import {PublicKey} from '@solana/web3.js';
 import type {Config} from '../config.js';
 import type {OpeningOrder,OrderStore} from '../orders.js';
 import type {TradeNotificationEvent} from '../trade-notifications.js';
@@ -14,6 +15,9 @@ interface ReadinessObservation {ready:boolean;reason?:string;changedAt:number;}
 export interface NativeProcessOptions {
   /** Main-process observers read the authoritative shared order ledger after this callback. */
   onOrderUpdate?:(order:OpeningOrder)=>void|Promise<void>;
+  /** A prepared Jupiter entry needs an external-price subscription before it
+   * can pass the worker's final broadcast guard. */
+  onPriceTargetsChanged?:()=>void;
   snapshotStaleMs?:number;guardTimeoutMs?:number;requestTimeoutMs?:number;restartDelayMs?:number;maxPendingRequests?:number;
   /** Test seam; production always starts the pinned local worker under an exclusive kernel lock. */
   spawnWorker?:(lockPath:string)=>ChildProcess;
@@ -24,6 +28,8 @@ export class ProcessNativeTradingRuntime {
   private store:NativeProcessStore;private child?:ChildProcess;private running=false;private stopping?:Promise<void>;
   private snapshot?:NativeWorkerSnapshot;private snapshots=new Map<string,NativePositionState>();
   private pending=new Map<string,Pending>();private error?:string;private retry?:ReturnType<typeof setTimeout>;
+  private activePriceMints=new Set<string>();private pendingPriceMints=new Map<string,{mint:string;references:number}>();
+  private lastPriceAt=new Map<string,number>();
   private readinessObservation?:ReadinessObservation;private readinessTransitions=0;
   private lastFalseReason?:string;private lastFalseAt?:number;private lastRecoveredAt?:number;private lastFalseDurationMs?:number;
   private maxSnapshotAgeMs=0;
@@ -38,6 +44,7 @@ export class ProcessNativeTradingRuntime {
       !Number.isSafeInteger(this.pendingLimit)||this.pendingLimit<1||this.pendingLimit>1000||
       options.restartDelayMs!==undefined&&(!Number.isSafeInteger(options.restartDelayMs)||options.restartDelayMs<10||options.restartDelayMs>60000))throw Error('NATIVE_PROCESS_OPTIONS_INVALID');
     this.storePath=config.nativeSolana.positionsPath+'.process.sqlite';this.store=new NativeProcessStore(this.storePath);
+    for(const order of this.orders.activeNativePositions())if(order.chain==='solana')this.activePriceMints.add(order.tokenAddress);
   }
   start(){if(this.running||this.stopping)return;this.running=true;this.launch();this.readiness();}
   private scheduleRestart(){
@@ -76,7 +83,8 @@ export class ProcessNativeTradingRuntime {
     if(message.kind==='snapshot'){
       const value=message.value;if(!Number.isSafeInteger(value.at)||!Number.isSafeInteger(value.sequence)||!Array.isArray(value.positions))return;
       if(!this.snapshot||value.sequence>this.snapshot.sequence){
-        this.snapshot=value;for(const p of value.positions)this.snapshots.set(p.buy.orderId,p);
+        this.snapshot=value;for(const p of value.positions){this.snapshots.set(p.buy.orderId,p);
+          this.setActivePriceMint(p.buy.mint,p.state==='active');}
         // Historical closure remains in the shared authoritative order ledger.
         if(this.snapshots.size>1000)for(const [id,p] of this.snapshots){if(p.state==='closed')this.snapshots.delete(id);if(this.snapshots.size<=1000)break;}
         this.error=undefined;
@@ -101,7 +109,11 @@ export class ProcessNativeTradingRuntime {
       try{this.enqueue(message.event);this.send({kind:'notice_ack',key:message.event.key});}catch{}return;
     }
     if(message.kind==='order'){
-      try{const order=this.orders.get(message.orderId);if(order)await this.options.onOrderUpdate?.(order);
+      try{const order=this.orders.get(message.orderId);if(order){
+          this.setActivePriceMint(order.tokenAddress,order.chain==='solana'&&
+            ['submitting','submitted','confirmed','unknown'].includes(order.status)&&!order.exit?.positionClosed);
+          await this.options.onOrderUpdate?.(order);
+        }
         this.send({kind:'order_ack',orderId:message.orderId,version:message.version});}catch{}return;
     }
     if(message.kind==='fatal'){this.error=safeProcessError(new Error(message.error));this.readiness();}
@@ -155,9 +167,60 @@ export class ProcessNativeTradingRuntime {
       if(!this.send(message)){clearTimeout(timer);this.pending.delete(message.id);reject(Error('NATIVE_WORKER_UNAVAILABLE'));}
     });
   }
+  private hasPriceMint(mint:string):boolean {
+    return this.activePriceMints.has(mint)||[...this.pendingPriceMints.values()].some(target=>target.mint===mint);
+  }
+  private notifyPriceTargetChange(mint:string,wasTargeted:boolean):void {
+    if(wasTargeted===this.hasPriceMint(mint))return;
+    if(!this.hasPriceMint(mint))this.lastPriceAt.delete(mint);
+    try{this.options.onPriceTargetsChanged?.();}catch{/* Price refresh is retried by the regular runtime pulse. */}
+  }
+  private setActivePriceMint(mint:string,active:boolean):void {
+    const wasTargeted=this.hasPriceMint(mint);
+    if(active)this.activePriceMints.add(mint);else this.activePriceMints.delete(mint);
+    this.notifyPriceTargetChange(mint,wasTargeted);
+  }
+  private retainPendingPriceMint(orderId:string,mint:string):void {
+    const wasTargeted=this.hasPriceMint(mint),current=this.pendingPriceMints.get(orderId);
+    if(current&&current.mint!==mint)throw Error('NATIVE_ORDER_IDENTITY_CHANGED');
+    this.pendingPriceMints.set(orderId,{mint,references:(current?.references??0)+1});
+    this.notifyPriceTargetChange(mint,wasTargeted);
+  }
+  private releasePendingPriceMint(orderId:string):void {
+    const current=this.pendingPriceMints.get(orderId);if(!current)return;
+    const wasTargeted=this.hasPriceMint(current.mint);
+    if(current.references>1)this.pendingPriceMints.set(orderId,{...current,references:current.references-1});
+    else this.pendingPriceMints.delete(orderId);
+    this.notifyPriceTargetChange(current.mint,wasTargeted);
+  }
+  /** Includes both durable active holdings and the short prepared-entry window. */
+  priceTargets():{chain:'solana';address:string}[] {
+    return [...new Set([...this.activePriceMints,...[...this.pendingPriceMints.values()].map(target=>target.mint)])]
+      .map(address=>({chain:'solana' as const,address}));
+  }
   async execute(order:OpeningOrder,beforeBroadcast:()=>Promise<void>):Promise<OpeningOrder>{
     const ready=this.readiness();if(!ready.ready)throw Error(ready.reason??'NATIVE_WORKER_UNAVAILABLE');
-    return this.request({kind:'call',id:randomUUID(),method:'execute',orderId:order.id},beforeBroadcast);
+    if(order.chain!=='solana')throw Error('NATIVE_CHAIN_UNSUPPORTED');
+    this.retainPendingPriceMint(order.id,order.tokenAddress);
+    try {
+      const result=await this.request({kind:'call',id:randomUUID(),method:'execute',orderId:order.id},beforeBroadcast) as OpeningOrder;
+      this.setActivePriceMint(order.tokenAddress,['submitting','submitted','confirmed','unknown'].includes(result.status)&&!result.exit?.positionClosed);
+      return result;
+    }finally{
+      const current=this.orders.get(order.id);
+      if(current)this.setActivePriceMint(order.tokenAddress,['submitting','submitted','confirmed','unknown'].includes(current.status)&&!current.exit?.positionClosed);
+      this.releasePendingPriceMint(order.id);
+    }
+  }
+  /** Fire-and-forget high-rate path. The child validates freshness again and
+   * uses it only for Jupiter-position trigger estimates. */
+  observePrice(price:{chain:string;address:string;priceUsd:number;observedAt:string;source:string}):boolean {
+    if(!this.running||price?.chain!=='solana'||!this.hasPriceMint(price.address)||typeof price.priceUsd!=='number'||
+      !Number.isFinite(price.priceUsd)||price.priceUsd<=0||typeof price.source!=='string'||!/^[a-z0-9_:-]{1,80}$/i.test(price.source))return false;
+    let mint:string;try{mint=new PublicKey(price.address).toBase58();if(mint!==price.address)return false;}catch{return false;}
+    const at=Date.parse(price.observedAt),now=Date.now();if(!Number.isFinite(at)||at>now+250||now-at>1500||at<=(this.lastPriceAt.get(mint)??-1))return false;
+    if(!this.send({kind:'market_price',mint,priceUsd:price.priceUsd,observedAt:new Date(at).toISOString(),source:price.source}))return false;
+    this.lastPriceAt.set(mint,at);return true;
   }
   async submit(ref:string,percent:SellPercentage):Promise<{text:string}>{
     if(!this.running||!this.child?.connected)return {text:'原生交易进程暂时不可用，请稍后刷新。'};

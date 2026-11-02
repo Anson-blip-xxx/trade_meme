@@ -141,6 +141,17 @@ test('pool reserve USD sum wins, incomplete reserve pairs fall back, and malform
   assert.deepEqual(run(malformed),{ok:false,reason:'GMGN_SOL_CARD_NUMBER_INVALID'});
 });
 
+test('reconciles quote symbols from the nested pool and pool endpoint',()=>{
+  const endpointOnly=input();delete (endpointOnly.info as any).pool.quote_symbol;(endpointOnly.pool as any).quote_symbol='USDC';
+  const endpointResult=run(endpointOnly);assert.equal(endpointResult.ok,true);
+  if(endpointResult.ok)assert.equal(endpointResult.card.pool?.quoteSymbol,'USDC');
+  const conflict=input();(conflict.pool as any).quote_symbol='USDC';
+  assert.deepEqual(run(conflict),{ok:false,reason:'GMGN_SOL_CARD_POOL_MISMATCH'});
+  const missing=input();delete (missing.info as any).pool.quote_symbol;
+  const missingResult=run(missing);assert.equal(missingResult.ok,true);
+  if(missingResult.ok)assert.equal(missingResult.card.pool?.quoteSymbol,undefined);
+});
+
 test('known launchpad_platform values are normalized, while contradictory platform evidence rejects',()=>{
   const platform=input();delete (platform.info as any).launchpad;(platform.info as any).launchpad_platform='pumpfun';
   const result=run(platform);assert.equal(result.ok,true);if(result.ok)assert.equal(result.card.market.launchpad,'pump');

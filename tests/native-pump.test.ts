@@ -17,6 +17,7 @@ const wallet=Keypair.fromSeed(Buffer.alloc(32,41)).publicKey;
 const mint=Keypair.fromSeed(Buffer.alloc(32,42)).publicKey;
 const creator=Keypair.fromSeed(Buffer.alloc(32,43)).publicKey;
 const feeRecipient=Keypair.fromSeed(Buffer.alloc(32,46)).publicKey;
+const PUMP_TOKEN_MINT=new PublicKey('pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn');
 const buybackRecipient=Keypair.fromSeed(Buffer.alloc(32,47)).publicKey;
 const tipRecipient=Keypair.fromSeed(Buffer.alloc(32,48)).publicKey;
 const curveKey=bondingCurvePda(mint),poolKey=canonicalPumpPoolPda(mint,NATIVE_MINT);
@@ -107,7 +108,7 @@ function fixture(options:Options={}) {
     async getTokenAccountsByOwner(_wallet:PublicKey,filter:any,config:any){calls.push({method:'owner',config});assert.equal(filter.mint.toBase58(),mint.toBase58());
       return {context:{slot:101},value:owned.filter(key=>map.has(key.toBase58())).map(pubkey=>({pubkey,account:map.get(pubkey.toBase58())!}))};},
   } as unknown as Connection;
-  const adapter=new PumpNativeAdapter({connection});
+  const adapter=new PumpNativeAdapter({connection,jupiterApiKey:'fixture-jupiter-key',jupiterMainBucketTier:'developer'});
   const request=(side:'buy'|'sell',amount=side==='buy'?'10000000':'100000000',slippageBps=100)=>({wallet:wallet.toBase58(),mint:mint.toBase58(),side,amount,slippageBps});
   return {adapter,map,owned,calls,request,program,userAta,curveVault,poolBase,poolQuote,curve,pool,global,ammGlobal,mint,curveKey,poolKey};
 }
@@ -118,7 +119,7 @@ function decoded(plan:NativeSwapPlan) {
 
 test('real Pump SDK builds exact SOL input with integer minimum once, never increases spend by slippage',async()=>{
   const f=fixture();const plan=await f.adapter.build(f.request('buy','10000000',137));
-  assert.equal(plan.venue,'pump');assert.equal(plan.tokenDecimals,6);
+  assert.equal(plan.venue,'pump');assert.equal(plan.protectionMode,'account_stream');assert.equal(plan.tokenDecimals,6);
   const trade=decoded(plan).find(ix=>ix.name==='buyExactQuoteInV3')!;assert.ok(trade);
   const data=trade.data as any;
   assert.equal(data.spendableQuoteIn.toString(),'10000000');
@@ -233,7 +234,7 @@ test('build and warm bind Token-2022 display identity to the exact transaction m
   assert.equal(f.calls.length,before+2,'identity reuses the two existing route snapshot calls');
 });
 
-test('owner, canonical pool identity, SOL quote and migration state are verified before building',async()=>{
+test('owner, canonical pool identity, missing external quote mint and migration state are verified before building',async()=>{
   const fake=fixture();fake.map.get(curveKey.toBase58())!.owner=SystemProgram.programId;
   await assert.rejects(fake.adapter.build(fake.request('buy')),/NATIVE_ACCOUNT_OWNER_INVALID/);
   const badPool=fixture({venue:'pumpswap'});badPool.pool.creator=creator;
@@ -241,9 +242,22 @@ test('owner, canonical pool identity, SOL quote and migration state are verified
   await assert.rejects(badPool.adapter.build(badPool.request('buy')),/NATIVE_POOL_IDENTITY_INVALID/);
   const nonSol=fixture();nonSol.curve.quoteMint=creator;
   nonSol.map.set(curveKey.toBase58(),account(encoded(pumpProgram,'bondingCurve',nonSol.curve),PUMP_PROGRAM_ID));
-  await assert.rejects(nonSol.adapter.build(nonSol.request('buy')),/NATIVE_QUOTE_MINT_UNSUPPORTED/);
+  await assert.rejects(nonSol.adapter.build(nonSol.request('buy')),/NATIVE_MINT_OWNER_INVALID/);
   const migrating=fixture({venue:'pumpswap'});migrating.map.delete(poolKey.toBase58());
   await assert.rejects(migrating.adapter.build(migrating.request('sell')),/NATIVE_ACCOUNT_OWNER_INVALID/);
+});
+
+test('route capability sends active external quotes to Jupiter and reserves the local bridge for completed PUMP quotes',async()=>{
+  const external=fixture();external.curve.quoteMint=creator;external.curve.complete=false;
+  external.map.set(external.curveKey.toBase58(),account(encoded(pumpProgram,'bondingCurve',external.curve),PUMP_PROGRAM_ID));
+  assert.deepEqual(await external.adapter.routeCapability(external.mint.toBase58()),{
+    classification:'route_candidate',route:'jupiter_bridge',quoteMint:creator.toBase58(),curveState:'active',readiness:'requires_preflight',
+  });
+  const pump=fixture();pump.curve.quoteMint=PUMP_TOKEN_MINT;pump.curve.complete=true;
+  pump.map.set(pump.curveKey.toBase58(),account(encoded(pumpProgram,'bondingCurve',pump.curve),PUMP_PROGRAM_ID));
+  assert.deepEqual(await pump.adapter.routeCapability(pump.mint.toBase58()),{
+    classification:'route_candidate',route:'pump_bridge',quoteMint:PUMP_TOKEN_MINT.toBase58(),curveState:'complete',readiness:'requires_preflight',
+  });
 });
 
 test('invalid inputs, dust outputs and insufficient token balances fail closed',async()=>{

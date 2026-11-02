@@ -14,6 +14,9 @@ export function renderReport(input:Report,now=new Date()):string {
     `有效截止：${report.validUntil}`,`此处为研究报告；实际开单状态以开单明细为准。`,
     '',`发行来源：${status[report.provenance.status]}${report.provenance.platform?` (${report.provenance.platform})`:''}`,
     `技术安全：${status[report.safety.status]}`,`叙事判断：${status[report.narrative.status]}`];
+  if(typeof report.provenance.facts.quoteMint==='string') lines.push(
+    `报价资产：${report.provenance.facts.quoteMint}`,
+    `报价路由：${report.provenance.facts.requiresMultiHop===true?'需要多跳':'SOL 直连'}`);
   if(report.decisionAtEvaluation) lines.push(`评估时历史结论：${labels[report.decisionAtEvaluation]}（以当前有效性为准）`);
   if(report.wallets) {
     const w=report.wallets,s=w.summary;

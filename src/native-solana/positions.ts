@@ -8,6 +8,9 @@ import {CURRENT_STOP_LOSS_DROP_PCT,stopLossPricePct,type StopLossDropPct} from '
 export interface NativeConfirmedPosition {
   orderId:string;wallet:string;mint:string;inputAmount:string;outputAmount:string;tokenDecimals:number;
   signature:string;buySlot:number;subscriptionAccounts:string[];confirmedAt?:string;name?:string;
+  /** Jupiter execution always uses a fresh external wake plus an exact sell quote. */
+  venue?:'pump'|'pumpswap'|'jupiter';
+  protectionMode?:'account_stream'|'external_price_stream';
 }
 /** Aggregate every token account for this wallet/mint; a single ATA is insufficient. */
 export interface NativePositionBalance {
@@ -19,7 +22,10 @@ export interface NativePositionBalance {
 export interface NativePositionQuote {
   wallet:string;mint:string;inputAmount:string;outputAmount:string;minimumOutputAmount:string;
   quotedAt:string;expiresAt:string;subscriptionAccounts?:string[];
-  source?:'solana_account_stream';marketObservedAt?:string;marketSlot?:number;
+  source?:'solana_account_stream'|'jupiter_exact_sell';marketObservedAt?:string;marketSlot?:number;
+}
+export interface NativeExternalPrice {
+  priceUsd:number;observedAt:string;source:string;
 }
 export type NativeExitReason='take_profit'|'stop_loss'|'manual';
 export type NativeSellPercentage=number;
@@ -31,12 +37,14 @@ export type NativePositionExitResult=
   | {status:'confirmed';signature:string;inputAmount:string;outputAmount:string;confirmedAt:string;slot:number};
 export interface NativePositionExitRequest {
   orderId:string;wallet:string;mint:string;operationId:string;percent:NativeSellPercentage;reason:NativeExitReason;
-  /** The executor must verify this amount again under its shared manual/automatic sell lock. */
+  /** The executor must verify this amount again under its shared manual/automatic sell lock.
+   * For a Jupiter take-profit, quote is the exact full-position trigger
+   * evidence; the executor builds and rechecks the actual partial amount. */
   expectedAmount:string;quote:NativePositionQuote;
 }
 export interface NativePositionIO {
   balance(input:{orderId:string;wallet:string;mint:string;signal:AbortSignal}):Promise<NativePositionBalance>;
-  quote(input:{orderId:string;wallet:string;mint:string;amount:string;signal:AbortSignal}):Promise<NativePositionQuote>;
+  quote(input:{orderId:string;wallet:string;mint:string;amount:string;purpose?:'automatic'|'manual';signal:AbortSignal}):Promise<NativePositionQuote>;
   /** operationId is an executor intentId, durably idempotent across crashes. */
   sell(input:NativePositionExitRequest):Promise<NativePositionExitResult>;
   /** Look up this intent without a replacement trade; only proved non-submission/failure may fail it. */
@@ -66,6 +74,9 @@ export interface NativePositionSupervisorOptions {
   /** Root owns accountSubscribe and feeds markDirty / setStreamState. */
   onSubscriptions?:(accounts:string[])=>void;
   loopMs?:number;fallbackIntervalMs?:number;minCheckIntervalMs?:number;requestTimeoutMs?:number;
+  /** Per exact automatic quote. Jupiter uses one full trigger quote; its
+   * partial execution is quoted and rechecked by the executor. */
+  quoteRequestTimeoutMs?:number;
   staleAfterMs?:number;maxPositions?:number;batchSize?:number;autoSchedule?:boolean;
   /** Evaluate dirty positions independently; slow exit RPC for one mint cannot block another. */
   eventDriven?:boolean;
@@ -95,7 +106,7 @@ function bounded(v:number|undefined,fallback:number,min:number,max:number):numbe
 export class NativePositionSupervisor {
   private readonly db:DatabaseSync;private readonly now:()=>number;
   private readonly loopMs:number;private readonly fallbackMs:number;private readonly minCheckMs:number;
-  private readonly timeoutMs:number;private readonly staleMs:number;private readonly maxPositions:number;private readonly batchSize:number;
+  private readonly timeoutMs:number;private readonly quoteTimeoutMs:number;private readonly staleMs:number;private readonly maxPositions:number;private readonly batchSize:number;
   private readonly stopLossDropPct:StopLossDropPct;
   private running=false;private closed=false;private timer?:ReturnType<typeof setTimeout>;private flight?:Promise<void>;
   private generation=0;private controllers=new Set<AbortController>();private flushFlight?:Promise<void>;
@@ -119,7 +130,8 @@ export class NativePositionSupervisor {
     if(!path||path.startsWith('file:')||!options.io||['balance','quote','sell','reconcile'].some(k=>typeof options.io[k as keyof NativePositionIO]!=='function'))throw Error('NATIVE_POSITION_OPTIONS_INVALID');
     this.now=options.now??Date.now;this.loopMs=bounded(options.loopMs,1000,50,10000);
     this.fallbackMs=bounded(options.fallbackIntervalMs,5000,1000,30000);this.minCheckMs=bounded(options.minCheckIntervalMs,1000,0,10000);
-    this.timeoutMs=bounded(options.requestTimeoutMs,5000,20,10000);this.staleMs=bounded(options.staleAfterMs,20000,1000,60000);
+    this.timeoutMs=bounded(options.requestTimeoutMs,5000,20,10000);this.quoteTimeoutMs=bounded(options.quoteRequestTimeoutMs,this.timeoutMs,20,10000);
+    this.staleMs=bounded(options.staleAfterMs,20000,1000,60000);
     this.maxPositions=bounded(options.maxPositions,20,1,2000);this.batchSize=bounded(options.batchSize,4,1,20);
     this.snapshotMs=bounded(options.snapshotIntervalMs,1000,50,5000);
     this.stopLossDropPct=options.stopLossDropPct??CURRENT_STOP_LOSS_DROP_PCT;
@@ -134,9 +146,15 @@ export class NativePositionSupervisor {
       CREATE INDEX IF NOT EXISTS native_position_active ON native_positions(state);
       CREATE INDEX IF NOT EXISTS native_position_events_pending ON native_position_events(delivered);`);
     for(const raw of this.db.prepare("SELECT payload FROM native_positions WHERE state='active' ORDER BY rowid").all()){
-      const row=this.decode(raw.payload);this.durableRevisions.set(row.buy.orderId,row.revision);
+      const row=this.decode(raw.payload);
+      if(row.buy.venue==='jupiter'&&row.buy.protectionMode!=='external_price_stream'){
+        row.buy.protectionMode='external_price_stream';row.buy.subscriptionAccounts=[row.buy.wallet,row.buy.mint].sort();
+        this.db.prepare("UPDATE native_positions SET payload=? WHERE order_id=? AND state='active'").run(JSON.stringify(row),row.buy.orderId);
+      }
+      this.durableRevisions.set(row.buy.orderId,row.revision);
       // Restored market observations never authorize a trade or make supervision healthy.
-      delete row.quote;delete row.lastCheckAt;delete row.lastAttemptAt;delete row.lastStreamAt;row.dirty=true;
+      delete row.quote;delete row.lastCheckAt;delete row.lastAttemptAt;delete row.lastStreamAt;
+      delete (row as NativePositionState&{externalPriceAnchor?:unknown}).externalPriceAnchor;row.dirty=true;
       this.rows.set(row.buy.orderId,row);this.index(row);this.scheduleDue(row);
     }
     this.pendingDelivery=!!this.db.prepare('SELECT 1 FROM native_position_events WHERE delivered=0 LIMIT 1').get();
@@ -155,6 +173,15 @@ export class NativePositionSupervisor {
   list():NativePositionState[]{this.open();return this.db.prepare('SELECT payload FROM native_positions ORDER BY rowid').all().map(r=>{
     const row=this.decode(r.payload);return structuredClone(this.rows.get(row.buy.orderId)??row);
   });}
+  /** Capacity checks use only the bounded active in-memory set; closed history is never scanned. */
+  activeVenueCount(venue:NonNullable<NativeConfirmedPosition['venue']>):number {
+    return this.activeVenueOrderIds(venue).length;
+  }
+  activeVenueOrderIds(venue:NonNullable<NativeConfirmedPosition['venue']>):string[] {
+    this.open();if(!['pump','pumpswap','jupiter'].includes(venue))throw Error('NATIVE_POSITION_VENUE_INVALID');
+    const result:string[]=[];for(const row of this.rows.values())if(row.state==='active'&&row.buy.venue===venue)result.push(row.buy.orderId);
+    return result;
+  }
   /** Contract-bound display metadata may arrive after financial registration. */
   setName(orderId:string,name:string):boolean {
     this.open();const value=typeof name==='string'?name.replace(/[\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069]/g,' ').trim().slice(0,80):'';
@@ -274,11 +301,17 @@ export class NativePositionSupervisor {
     if(!input||!id(input.orderId)||!base58(input.wallet,32)||!base58(input.mint,32)||!base58(input.signature,64)||!slot(input.buySlot)||
       !atomic(input.inputAmount)||input.inputAmount==='0'||!atomic(input.outputAmount)||input.outputAmount==='0'||
       !Number.isInteger(input.tokenDecimals)||input.tokenDecimals<0||input.tokenDecimals>255||
+      input.venue!==undefined&&!['pump','pumpswap','jupiter'].includes(input.venue)||
+      input.protectionMode!==undefined&&!['account_stream','external_price_stream'].includes(input.protectionMode)||
       !Array.isArray(input.subscriptionAccounts)||input.subscriptionAccounts.length>100||input.subscriptionAccounts.some(a=>!base58(a,32))||
       input.confirmedAt!==undefined&&(!Number.isFinite(timestamp(input.confirmedAt))||timestamp(input.confirmedAt)>now))throw Error('NATIVE_POSITION_INPUT_INVALID');
+    const venue=input.venue??'pump';
     const buy:NativeConfirmedPosition={orderId:input.orderId,wallet:input.wallet,mint:input.mint,inputAmount:input.inputAmount,outputAmount:input.outputAmount,
-      tokenDecimals:input.tokenDecimals,signature:input.signature,buySlot:input.buySlot,subscriptionAccounts:[...new Set(input.subscriptionAccounts)].sort(),
-      confirmedAt:input.confirmedAt??iso(now),...(typeof input.name==='string'?{name:input.name.replace(/[\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069]/g,' ').slice(0,80)}:{})};
+      tokenDecimals:input.tokenDecimals,signature:input.signature,buySlot:input.buySlot,
+      subscriptionAccounts:venue==='jupiter'?[input.wallet,input.mint].sort():[...new Set(input.subscriptionAccounts)].sort(),
+      confirmedAt:input.confirmedAt??iso(now),venue,
+      protectionMode:venue==='jupiter'?'external_price_stream':input.protectionMode??'account_stream',
+      ...(typeof input.name==='string'?{name:input.name.replace(/[\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069]/g,' ').slice(0,80)}:{})};
     const old=this.get(buy.orderId);
     if(old){if(['wallet','mint','inputAmount','outputAmount','tokenDecimals','signature','buySlot'].some(k=>old.buy[k as keyof NativeConfirmedPosition]!==buy[k as keyof NativeConfirmedPosition]))throw Error('NATIVE_POSITION_IDENTITY_CONFLICT');return old;}
     const row:NativePositionState={buy,state:'active',registeredAt:iso(now),updatedAt:iso(now),revision:0,
@@ -317,6 +350,13 @@ export class NativePositionSupervisor {
       }
     }}
   }
+  /** A fresh market sample only wakes Jupiter protection. It is never used for valuation. */
+  observeExternalPrice(orderId:string,input:NativeExternalPrice):boolean {
+    this.open();const row=this.rows.get(orderId),now=this.clock(),at=timestamp(input?.observedAt);
+    if(!row||row.state!=='active'||row.buy.protectionMode!=='external_price_stream'||typeof input?.priceUsd!=='number'||!Number.isFinite(input.priceUsd)||input.priceUsd<=0||
+      !Number.isFinite(at)||at>now+250||now-at>this.staleMs||typeof input.source!=='string'||!/^[a-z0-9_:-]{1,80}$/i.test(input.source))return false;
+    this.markDirty(orderId,{observedAt:new Date(at).toISOString()});return true;
+  }
   start():void {this.open();if(this.running)return;this.running=true;this.generation++;this.syncSubscriptions();this.scheduleSnapshots();if(this.options.autoSchedule!==false)this.schedule(0);}
   manualSell(orderId:string,percent:NativeSellPercentage,operationId:string):{status:'accepted'|'existing'|'blocked';operationId:string;reason?:string}{
     this.open();if(!id(operationId)||!validSellPercentage(percent))return {status:'blocked',operationId,reason:'NATIVE_POSITION_MANUAL_INVALID'};
@@ -350,13 +390,19 @@ export class NativePositionSupervisor {
       return {ready:false,reason:'NATIVE_POSITION_SUPERVISION_STALE'};
     return {ready:true};
   }
-  status(){const now=this.clock();let pendingExits=0,stale=0;for(const row of this.rows.values()){
+  status(){const now=this.clock();let pendingExits=0,stale=0,externalPricePositions=0,externalPriceStale=0;for(const row of this.rows.values()){
     if(row.pendingExit)pendingExits++;if(!row.lastCheckAt||now-timestamp(row.lastCheckAt)>this.staleMs||!!row.lastError)stale++;
+    if(row.buy.protectionMode==='external_price_stream'){
+      externalPricePositions++;
+      const observed=timestamp(row.quote?.marketObservedAt);
+      if(!row.quote||row.quote.source!=='jupiter_exact_sell'||!Number.isFinite(observed)||now-observed>this.staleMs||!!row.lastError)externalPriceStale++;
+    }
   }return {...this.readiness(),running:this.running,active:this.rows.size,
-    pendingExits,stale,
+    pendingExits,stale,externalPricePositions,externalPriceStale,
     streamConnected:this.connected,subscriptionAccounts:this.accounts().length,subscribedAccounts:this.accounts().filter(a=>this.subscribed.has(a)).length,
     lastTickAt:this.lastTickAt,lastError:this.lastError,fallbackIntervalMs:this.fallbackMs,maxPositions:this.maxPositions,
-    snapshotIntervalMs:this.snapshotMs,pendingSnapshots:this.pendingSnapshots.size};}
+    snapshotIntervalMs:this.snapshotMs,pendingSnapshots:this.pendingSnapshots.size,
+    eventDebounceMs:5,maxAutomaticDecisionLatencyMs:5+this.quoteTimeoutMs*2};}
   /** Health checks use the authoritative in-memory active set; position history must never be scanned on the price loop. */
   hasUnhealthyActive(staleMs=15000,pendingGraceMs=30000):boolean {
     if(!Number.isSafeInteger(staleMs)||staleMs<0||!Number.isSafeInteger(pendingGraceMs)||pendingGraceMs<0)
@@ -374,6 +420,7 @@ export class NativePositionSupervisor {
   checkNow(orderId:string):Promise<void>{
     if(!this.running||this.closed)return Promise.resolve();const row=this.get(orderId);
     if(!row||row.state!=='active'||row.pendingExit&&row.pendingExit.state!=='preparing')return Promise.resolve();
+    const scheduled=this.immediate.get(orderId);if(scheduled){clearTimeout(scheduled);this.immediate.delete(orderId);}
     return this.runCheck(row,this.generation);
   }
   private runCheck(row:NativePositionState,generation:number):Promise<void>{
@@ -396,9 +443,9 @@ export class NativePositionSupervisor {
     void this.flush().catch(()=>{this.lastError='NATIVE_POSITION_CALLBACK_UNAVAILABLE';});
     if(this.lastError==='NATIVE_POSITION_TICK_FAILED')this.lastError=undefined;
   }
-  private async call<T>(fn:(signal:AbortSignal)=>Promise<T>):Promise<T>{
+  private async call<T>(fn:(signal:AbortSignal)=>Promise<T>,timeoutMs=this.timeoutMs):Promise<T>{
     const controller=new AbortController();this.controllers.add(controller);let timer:ReturnType<typeof setTimeout>|undefined;
-    try{return await Promise.race([fn(controller.signal),new Promise<never>((_,reject)=>{timer=setTimeout(()=>{controller.abort();reject(Error('NATIVE_POSITION_IO_TIMEOUT'));},this.timeoutMs);})]);}
+    try{return await Promise.race([fn(controller.signal),new Promise<never>((_,reject)=>{timer=setTimeout(()=>{controller.abort();reject(Error('NATIVE_POSITION_IO_TIMEOUT'));},timeoutMs);})]);}
     finally{clearTimeout(timer);this.controllers.delete(controller);}
   }
   private enabled(generation:number){return this.running&&!this.closed&&generation===this.generation;}
@@ -447,23 +494,28 @@ export class NativePositionSupervisor {
       // Confirmed positive balances drive execution, so their external deltas must
       // also affect accounting. A later reversal makes cost uncertain, never profit.
       if(this.observeExternalBalance(row,balance)&&!this.save(row))return;
-      const full=await this.call(signal=>this.options.io.quote({orderId:row.buy.orderId,wallet:row.buy.wallet,mint:row.buy.mint,amount:balance.amount,signal}));
+      const full=await this.call(signal=>this.options.io.quote({orderId:row.buy.orderId,wallet:row.buy.wallet,mint:row.buy.mint,amount:balance.amount,signal}),this.quoteTimeoutMs);
       if(!this.enabled(generation))return;if(!this.validQuote(row,full,balance.amount))throw Error('NATIVE_POSITION_QUOTE_INVALID');
       row.quote=this.quoteView(full);row.lastCheckAt=iso(this.clock());let routeChanged=this.adoptQuoteRoute(row,full);
       const cost=BigInt(row.buy.inputAmount),bought=BigInt(row.buy.outputAmount),current=BigInt(balance.amount);
-      let action:{percent:50|100;reason:NativeExitReason;amount:string;quote:NativePositionQuote}|undefined;
+      let action:{percent:50|100;reason:NativeExitReason;amount:string;quote:NativePositionQuote;evidenceAmount:string}|undefined;
       if(nativeStopLossTriggered(BigInt(full.outputAmount),bought,cost,current,this.stopLossDropPct))
-        action={percent:100,reason:'stop_loss',amount:balance.amount,quote:full};
-      else if(!row.takeProfitDone&&current/2n>0n){
-        const amount=(current/2n).toString();const half=await this.call(signal=>this.options.io.quote({orderId:row.buy.orderId,wallet:row.buy.wallet,mint:row.buy.mint,amount,signal}));
-        if(!this.enabled(generation))return;if(!this.validQuote(row,half,amount))throw Error('NATIVE_POSITION_QUOTE_INVALID');
-        routeChanged=this.adoptQuoteRoute(row,half)||routeChanged;
-        if(BigInt(half.outputAmount)*bought>=cost*BigInt(amount)*2n)action={percent:50,reason:'take_profit',amount,quote:half};
+        action={percent:100,reason:'stop_loss',amount:balance.amount,quote:full,evidenceAmount:balance.amount};
+      else if(!row.takeProfitDone&&current/2n>0n&&BigInt(full.outputAmount)*bought>=cost*current*2n){
+        const amount=(current/2n).toString();
+        if(row.buy.venue==='jupiter')action={percent:50,reason:'take_profit',amount,quote:full,evidenceAmount:balance.amount};
+        else {
+          const half=await this.call(signal=>this.options.io.quote({orderId:row.buy.orderId,wallet:row.buy.wallet,mint:row.buy.mint,amount,signal}),this.quoteTimeoutMs);
+          if(!this.enabled(generation))return;if(!this.validQuote(row,half,amount))throw Error('NATIVE_POSITION_QUOTE_INVALID');
+          routeChanged=this.adoptQuoteRoute(row,half)||routeChanged;
+          if(BigInt(half.outputAmount)*bought>=cost*BigInt(amount)*2n)
+            action={percent:50,reason:'take_profit',amount,quote:half,evidenceAmount:amount};
+        }
       }
       if(!this.enabled(generation))return;if(!this.save(row))return;if(routeChanged)this.syncSubscriptions();
       try{this.options.onEvaluation?.(structuredClone(row));if(this.lastError==='NATIVE_POSITION_EVALUATION_CALLBACK_UNAVAILABLE')this.lastError=undefined;}
       catch{this.lastError='NATIVE_POSITION_EVALUATION_CALLBACK_UNAVAILABLE';}
-      if(action&&this.validQuote(row,action.quote,action.amount))await this.submit(row,action);
+      if(action&&this.validQuote(row,action.quote,action.evidenceAmount))await this.submit(row,action);
     }catch(error){
       if(!this.enabled(generation))return;
       const current=this.get(row.buy.orderId);if(!current||current.state!=='active'||current.revision!==row.revision)return;
@@ -477,7 +529,7 @@ export class NativePositionSupervisor {
     row.expectedBalanceAmount=balance.amount;
     return amount!==expected;
   }
-  private async submit(row:NativePositionState,action:{percent:50|100;reason:NativeExitReason;amount:string;quote:NativePositionQuote}){
+  private async submit(row:NativePositionState,action:{percent:50|100;reason:NativeExitReason;amount:string;quote:NativePositionQuote;evidenceAmount:string}){
     const operationId=randomUUID(),now=iso(this.clock());
     row.pendingExit={operationId,percent:action.percent,reason:action.reason,expectedAmount:action.amount,state:'pending',createdAt:now,updatedAt:now};
     if(!this.tx(()=>{if(!this.saveInside(row,'exit_pending'))return false;this.db.prepare('INSERT INTO native_position_intents VALUES(?,?)').run(operationId,row.buy.orderId);return true;}))return;
@@ -491,7 +543,7 @@ export class NativePositionSupervisor {
     const amount=BigInt(balance.amount)*BigInt(pending.percent)/100n;
     if(amount===0n){this.applyExit(row,{status:'failed',reason:'NATIVE_POSITION_SELL_AMOUNT_ZERO'});return;}
     if(this.observeExternalBalance(row,balance)&&!this.save(row))return;
-    const quote=await this.call(signal=>this.options.io.quote({orderId:row.buy.orderId,wallet:row.buy.wallet,mint:row.buy.mint,amount:amount.toString(),signal}));
+    const quote=await this.call(signal=>this.options.io.quote({orderId:row.buy.orderId,wallet:row.buy.wallet,mint:row.buy.mint,amount:amount.toString(),purpose:'manual',signal}));
     if(!this.enabled(generation))return;if(!this.validQuote(row,quote,amount.toString()))throw Error('NATIVE_POSITION_QUOTE_INVALID');
     pending.expectedAmount=amount.toString();pending.state='pending';pending.updatedAt=iso(this.clock());
     const routeChanged=this.adoptQuoteRoute(row,quote);delete row.lastError;if(!this.save(row))return;if(routeChanged)this.syncSubscriptions();await this.execute(row,quote);

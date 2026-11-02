@@ -532,11 +532,11 @@ EVM 核对交易、成功回执与当前规范区块的身份；Four / Flap 使�
 
 ### Solana 原生交易与 Jito 防夹
 
-`SOLANA_EXECUTION_PROVIDER=pump_native` 将第三次信号开仓接到官方 Pump / PumpSwap SDK，当前限定 SOL 计价、已核验的官方曲线与 canonical PumpSwap 池。普通和既有 cashback 币均按对应指令构造；未覆盖的池型、报价币、Token-2022 扩展或超出 v0 长度的交易明确拒绝，绝不回退 GMGN 下单。GMGN 仅继续提供开仓前 Top10 / 捆绑 / 老鼠仓数据。
+`SOLANA_EXECUTION_PROVIDER=pump_native` 将第三次信号开仓接到官方 Pump / PumpSwap SDK。SOL 计价池直接使用官方曲线或 canonical PumpSwap 池；PUMP、xStock 和其他代币计价池通过 Jupiter 把 SOL 与实际报价币衔接起来。普通和既有 cashback 币均按对应指令构造；未覆盖的池型、Token-2022 扩展或超出 v0 长度的交易明确拒绝，绝不回退 GMGN 下单。GMGN 仅继续提供开仓前 Top10 / 捆绑 / 老鼠仓数据。
 
-原生签名文件由 `SOLANA_NATIVE_KEYPAIR_FILE` 指定，必须是当前 `ENTRY_WALLET_SOLANA` 对应的 64 字节 JSON keypair，所属用户一致、权限 600；模板中的相对路径按项目工作目录解析，服务部署建议改为绝对路径。不要填 GMGN API 密钥。`SOLANA_NATIVE_RPC_URL` / `SOLANA_NATIVE_WS_URL` 可覆盖现有链上端点；Jito 默认官方主网入口，tip / priority fee 分别受配置上限限制。签名器、主网身份或长连接未就绪时，第三次信号入口保持不可执行。
+原生签名文件由 `SOLANA_NATIVE_KEYPAIR_FILE` 指定，必须是当前 `ENTRY_WALLET_SOLANA` 对应的 64 字节 JSON keypair，所属用户一致、权限 600；模板中的相对路径按项目工作目录解析，服务部署建议改为绝对路径。不要填 GMGN API 密钥。`SOLANA_NATIVE_RPC_URL` / `SOLANA_NATIVE_WS_URL` 可覆盖现有链上端点；Jito 默认官方主网入口，tip / priority fee 分别受配置上限限制。非 SOL 报价的 Pump 池通过 Jupiter 构建 SOL→目标币及目标币→SOL 路由。`JUPITER_MAIN_BUCKET_TIER` / `JUPITER_MAIN_BUCKET_RPS` 显式保留官方 main bucket 容量：keyless 0.5/30、Free 1/60、Developer 10/600、Launch 50/3000、Pro 150/9000（RPS/RPM，60 秒滑窗）。无 API key 时不能声明付费额度，也不新开 Jupiter 仓；已有仓位和手动卖出保留退出通道。退出报价和卖出构建始终优先于开仓构建及开仓保护探针；排队超时会立即移除，开仓请求触发的 429 冷却不会阻塞退出，退出自身处于冷却时则快速失败并等待下一次价格唤醒重试。有 key 但未声明 tier 时按 Free 计算；Free 1 RPS 在最坏相位需要等待一秒，超过 700ms 报价时限，因此新 Jupiter 仓容量为 0。Jupiter 持仓用一次整仓精确报价触发止盈，执行器随后按实际半仓重新构建路线并在广播前复核；容量计算从 700ms 中固定预留 300ms 给 HTTP、响应读取及解析，默认满额 Developer / Launch / Pro 分别最多保留 3 / 19 / 40 个外部实时保护仓位。自定义 RPS 使用同一最坏相位预算。开仓前必须通过买入及整仓退出路线；SOL 报价的 Pump/PumpSwap 路由不依赖 Jupiter 容量。签名器、主网身份或长连接未就绪时，第三次信号入口保持不可执行。
 
-每笔交易先通过未签名预演，签名后的交易只发送到 Jito `bundleOnly=true`，同笔交易包含 tip 和只读 `jitodontfront` 标记。公共 RPC 不接收可广播的签名交易；通道异常不公开广播。此机制降低被夹风险，不是零 MEV 或成交价格保证。官方说明：[Jito 发送与 Sandwich Mitigation](https://docs.jito.wtf/lowlatencytxnsend/)。
+每笔交易先通过未签名预演，签名后的交易只发送到 Jito `bundleOnly=true`，同笔交易包含 tip 和只读 `jitodontfront` 标记。Jito 广播同样按退出优先排队；请求按开始时间保持限速间隔，先前开仓请求的慢 HTTP 响应不会继续占用队列而阻塞手动卖出、止盈或止损。公共 RPC 不接收可广播的签名交易；通道异常不公开广播。此机制降低被夹风险，不是零 MEV 或成交价格保证。官方说明：[Jito 发送与 Sandwich Mitigation](https://docs.jito.wtf/lowlatencytxnsend/)。
 
 本地 SQLite 在广播前保存签名、完整交易、有效高度和业务标识。提交超时保持未知；未过期仅重播相同签名。买入广播尝试永久占用 CA，不自动重买。手动卖出和自动退出共用钱包 / mint 的唯一未决锁，重启按签名恢复。交易读取兼容 v1，本版构造 v0；SDK 指令版本与交易版本分别处理。
 

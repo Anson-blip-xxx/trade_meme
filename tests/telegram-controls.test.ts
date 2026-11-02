@@ -660,7 +660,8 @@ test('live controls report configured mode and /start only shows help before a f
   assert.equal(f.controls.status().manualCloseEnabled,false);
   await f.poll([message(1,'启动计数')]);assert.deepEqual(actions,[]);
   await f.poll([message(2,'/start')]);assert.deepEqual(actions,['status']);
-  assert.match(f.notifications[0].text,/计数控制（实盘策略）/);assert.match(f.notifications[0].text,/后续达标自动买入/);
+  assert.match(f.notifications[0].text,/计数控制（实盘策略）/);assert.match(f.notifications[0].text,/授予自动交易许可并开启本轮第 3 次计数/);
+  assert.match(f.notifications[0].text,/信号始终采集、去重、报价跟踪并进入复盘/);
   assert.doesNotMatch(f.notifications[0].text,/仅模拟/);
   await f.poll([message(3,'启动计数'),message(3,'启动计数')]);assert.deepEqual(actions,['status','start']);
   await f.controls.close();assert.equal(f.controls.status().countingMode,'live');

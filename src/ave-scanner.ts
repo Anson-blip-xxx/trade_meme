@@ -17,7 +17,9 @@ export interface AveSocket {
 export interface AveScannerOptions {
   database:string;chains:Chain[];fetcher?:Fetcher;now?:()=>Date;
   /** Latency-critical consumers run from the durable page inbox before the
-   * slower source and research writes. */
+   * slower source and research writes. A thrown error requests redelivery;
+   * optional consumers must fail closed internally and return normally so they
+   * cannot block source collection. */
   onPriorityObservation?:(observation:AveSignalObservation)=>void;
   onPriorityObservations?:(observations:readonly AveSignalObservation[])=>void;
   onObservation:(observation:AveSignalObservation)=>unknown|Promise<unknown>;

@@ -26,3 +26,26 @@ test('startup warmup fetches tips and consumes the pacing window before the firs
  const reserved=await sender.reserveBroadcast(),ready=Date.now();await reserved.broadcast('AQID',sig);
  assert.equal(at.length,2);assert.ok(at[1]-ready<20);
 });
+test('exit reservations jump queued entries and an aborted waiter is removed immediately',async()=>{
+ const sender=new JitoSender('https://mainnet.block-engine.jito.wtf',async()=>{throw Error('unused');},0),order:string[]=[];
+ const held=await sender.reserveBroadcast('entry'),entry=sender.reserveBroadcast('entry').then(turn=>{order.push('entry');return turn;}),
+  exit=sender.reserveBroadcast('exit').then(turn=>{order.push('exit');return turn;});
+ const controller=new AbortController(),started=Date.now(),cancelled=sender.reserveBroadcast('exit',controller.signal);
+ controller.abort(Error('position deadline'));await assert.rejects(cancelled,/position deadline/);assert.ok(Date.now()-started<50);
+ held.release();const exitTurn=await exit;assert.deepEqual(order,['exit']);exitTurn.release();const entryTurn=await entry;
+ assert.deepEqual(order,['exit','entry']);entryTurn.release();
+});
+test('a hung entry response cannot retain the scheduling turn after pacing has elapsed',async()=>{
+ const sig=bs58.encode(new Uint8Array(64).fill(3)),pacingMs=25,at:number[]=[];let resolveEntry!:(response:Response)=>void;
+ let entryStarted!:()=>void;const started=new Promise<void>(resolve=>{entryStarted=resolve;});
+ const sender=new JitoSender('https://mainnet.block-engine.jito.wtf',async(_input,init)=>{
+  const body=JSON.parse(String(init?.body));at.push(Date.now());
+  if(at.length===1){entryStarted();return new Promise<Response>(resolve=>{resolveEntry=resolve;});}
+  return Response.json({jsonrpc:'2.0',id:body.id,result:sig});
+ },pacingMs);
+ const entry=sender.broadcast('AQID',sig,'entry');await started;const exit=sender.broadcast('AQID',sig,'exit');
+ const deadline=Date.now()+200;while(at.length<2&&Date.now()<deadline)await new Promise(resolve=>setTimeout(resolve,2));
+ assert.equal(at.length,2,'exit starts without waiting for the unresolved entry response');
+ assert.ok(at[1]-at[0]>=20&&at[1]-at[0]<100,'exit observes only the request-start pacing window');
+ resolveEntry(Response.json({jsonrpc:'2.0',id:1,result:sig}));await Promise.all([entry,exit]);
+});

@@ -116,16 +116,23 @@ function launchProgress(card:GmgnSolanaTokenCardDto):string|undefined {
   if(!card.market.launchpad||card.market.launchpadStatus==='migrated'||card.market.launchpadProgressPercent===undefined)return;
   return percent(card.market.launchpadProgressPercent);
 }
+function tradingPair(card:GmgnSolanaTokenCardDto):string|undefined {
+  const quote=card.pool?.quoteSymbol??(card.pool?.quoteAddress?
+    `${card.pool.quoteAddress.slice(0,4)}…${card.pool.quoteAddress.slice(-4)}`:undefined);
+  return quote?`${card.token.symbol} / ${quote}`:undefined;
+}
 function render(card:GmgnSolanaTokenCardDto,_wallet:string|undefined,balance:NativeBalance|undefined,
   position:TelegramTokenPosition|undefined,partial:boolean,now:number):string {
   const title=[card.token.name,card.token.symbol].filter((value,index,all)=>value&&all.indexOf(value)===index).join(' / ');
   const pool=card.pool?.liquidityUsd,ratio=poolRatio(card),progress=launchProgress(card);
+  const pair=tradingPair(card);
   const positionAmount=position?decimalAtomic(position.amountAtomic,position.decimals):undefined;
   const account=[`SOL 余额：${solBalance(balance)}`,
     ...(positionAmount?[`本币持仓：${positionAmount} ${card.token.symbol}`]:[])].join(' ｜ ');
   const lines=[`【合约详情】${title} · Solana`,`CA：${card.address}`,'',
     '💼 账户',account,...(positionLine(position,now)?[positionLine(position,now)!]:[]),'',
     '📊 行情',`价格：${usd(card.market.priceUsd,false)}`,
+    ...(pair?[`交易对：${pair}`]:[]),
     `估算市值：${usd(card.market.marketCapUsd)} ｜ 池子储备：${usd(pool)}${ratio?`（市值占比 ${ratio}%）`:''}`,
     `持有人：${card.market.holderCount??'未取得'} ｜ 币龄：${duration(card.market.ageSeconds)}`,
     ...(progress?[`内盘进度：${progress}`]:[]),'',

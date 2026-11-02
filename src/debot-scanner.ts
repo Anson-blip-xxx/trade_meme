@@ -23,7 +23,10 @@ export interface DebotScannerOptions {
   onSignal:(signal:Signal,observedAt:string,context?:{detailsReady:Promise<void>;repeat?:boolean})=>Promise<unknown>;shouldDefer?:()=>string|undefined;
   repeatCooldownSec?:number;
   /** Page-priority callback. When configured, the durable inbox forwards the
-   * whole page here before any notification/research persistence begins. */
+   * whole page here before any notification/research persistence begins. A
+   * thrown error means the consumer requires a retry and therefore retains the
+   * source inbox row; optional consumers must report their own degraded state
+   * and return normally so unrelated source collection can continue. */
   onPriorityObservation?:(observation:DebotSignalObservation)=>void;
   onPriorityObservations?:(observations:readonly DebotSignalObservation[])=>void;
   onObservation?:(observation:DebotSignalObservation)=>unknown|Promise<unknown>;

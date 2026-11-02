@@ -638,7 +638,7 @@ test('owner TG start enables SOL third-signal live entry with attached exits, du
  const pem=generateKeyPairSync('ed25519').privateKey.export({type:'pkcs8',format:'pem'}).toString();
  const {dir,config}=fixture({DASHBOARD_ENABLED:'false',GMGN_API_KEY:'synthetic-live-runtime-key',GMGN_PRIVATE_KEY:pem,
    ENTRY_WALLET_SOLANA:solWallet,SOLANA_RPC_URL:'https://runtime-rpc.invalid',SCANNER_CHAINS:'solana',
-   THIRD_SIGNAL_EXECUTION_MODE:'live',ENTRY_BALANCE_BPS_SOLANA:'300',ENTRY_INPUT_TOKEN_SOLANA:sol});
+   THIRD_SIGNAL_EXECUTION_MODE:'live',ENTRY_BALANCE_BPS_SOLANA:'300',ENTRY_INPUT_TOKEN_SOLANA:sol,JUPITER_API_KEY:'fixture-jupiter-key'});
  config.walletResearch={...config.walletResearch,enabled:true,database:join(dir,'wallet-history.sqlite')};
  config.walletProfiles={...config.walletProfiles,enabled:true,database:join(dir,'wallet-profiles.sqlite')};
  config.tokenRankResearch={...config.tokenRankResearch!,enabled:true,database:join(dir,'token-rank.sqlite')};
@@ -692,9 +692,9 @@ test('owner TG start enables SOL third-signal live entry with attached exits, du
    const started=await pollTelegram(runtime,config.telegram!.database,tg,[privateMessage(11,'启动计数')]);
    assert.ok(started.some(message=>message.text.includes('达标自动实盘买入')));
    assert.equal(runtime.signalCounting.status().executionEnabled,true);assert.equal(runtime.telegramControls!.status().countingMode,'live');
-   assert.equal(runtime.walletIndexRunner?.snapshot().livePriority,true);
-   assert.equal(runtime.walletProfiles?.status().livePriority,true);
-   assert.equal(runtime.tokenRankResearch?.status().livePriority,true);
+   assert.equal(runtime.walletIndexRunner?.snapshot().livePriority,false);
+   assert.equal(runtime.walletProfiles?.status().livePriority,false);
+   assert.equal(runtime.tokenRankResearch?.status().livePriority,false);
    for(let n=0;n<3;n++){observe('debot');observe('ave');}
    await runtime.signalCounting.waitForDispatches();
    assert.equal(state.posts,1);assert.equal(state.quotes,1);assert.equal(state.balanceReads,2);

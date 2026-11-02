@@ -1,5 +1,5 @@
 import BN from 'bn.js';
-import {Connection, PublicKey, SystemProgram, TransactionInstruction, type AccountInfo} from '@solana/web3.js';
+import {AddressLookupTableAccount,Connection, PublicKey, SystemProgram, TransactionInstruction, type AccountInfo} from '@solana/web3.js';
 import {ASSOCIATED_TOKEN_PROGRAM_ID, TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, NATIVE_MINT,
   MintLayout, ExtensionType, getExtensionTypes, unpackMint, unpackAccount, getAssociatedTokenAddressSync,
   createAssociatedTokenAccountIdempotentInstruction, createTransferCheckedInstruction, type Mint, type Account} from '@solana/spl-token';
@@ -10,12 +10,20 @@ import {PUMP_AMM_SDK, PUMP_AMM_PROGRAM_ID, PUMP_AMM_FEE_CONFIG_PDA, GLOBAL_CONFI
   canonicalPumpPoolPda, pumpPoolAuthorityPda, getPumpAmmProgram, buyQuoteInput, sellBaseInput,
   type SwapSolanaState} from '@pump-fun/pump-swap-sdk';
 import {nativeTokenIdentity,type NativeTokenIdentity} from './identity.js';
+import {PumpMultiQuoteRouter,type NativeRouteCapability} from './multi-quote.js';
+import type {JupiterMainBucketTier} from './jupiter.js';
 
-export interface NativeSwapRequest {wallet:string;mint:string;side:'buy'|'sell';amount:string;slippageBps:number;}
+export interface NativeSwapRequest {
+  wallet:string;mint:string;side:'buy'|'sell';amount:string;slippageBps:number;
+  /** Cancels transient route discovery/quoting only. It is never copied into a transaction plan. */
+  signal?:AbortSignal;
+}
 export interface NativeSwapPlan {
-  venue:'pump'|'pumpswap';mint:string;side:'buy'|'sell';inputAmount:string;
+  venue:'pump'|'pumpswap'|'jupiter';mint:string;side:'buy'|'sell';inputAmount:string;
   expectedOutputAmount:string;minimumOutputAmount:string;quotedAt:string;
+  protectionMode:'account_stream'|'external_price_stream';
   instructions:TransactionInstruction[];subscriptionAccounts:string[];tokenDecimals:number;tokenIdentity?:NativeTokenIdentity;
+  addressLookupTables?:AddressLookupTableAccount[];
 }
 export interface NativeTokenBalance {amount:string;decimals:number;slot:number;accounts:string[];commitment:'confirmed'|'finalized';}
 export type NativeSellQuote = Omit<NativeSwapPlan,'instructions'>;
@@ -43,6 +51,7 @@ function inputAmount(request:NativeSwapRequest):BN {
   if(!['buy','sell'].includes(request.side)||typeof request.amount!=='string'||!/^[1-9]\d{0,19}$/.test(request.amount)||BigInt(request.amount)>U64)
     fail('NATIVE_AMOUNT_INVALID');
   if(!Number.isSafeInteger(request.slippageBps)||request.slippageBps<0||request.slippageBps>=10_000)fail('NATIVE_SLIPPAGE_INVALID');
+  if(request.signal!==undefined&&!(request.signal instanceof AbortSignal))fail('NATIVE_REQUEST_SIGNAL_INVALID');
   return new BN(request.amount);
 }
 function input(request:NativeSwapRequest) {
@@ -122,7 +131,16 @@ export class PumpNativeAdapter {
   private streamBufferEvictions=0;
   private streamSequence=0;
   private cacheGeneration=0;
-  constructor(options:{connection:Connection;ownerConnection?:Connection}) {this.connection=options.connection;this.ownerConnection=options.ownerConnection??options.connection;}
+  private readonly multiQuote:PumpMultiQuoteRouter;
+  constructor(options:{connection:Connection;ownerConnection?:Connection;fetcher?:typeof fetch;jupiterApiKey?:string|null;
+    jupiterMainBucketTier?:JupiterMainBucketTier;jupiterMainBucketRps?:number}) {
+    this.connection=options.connection;this.ownerConnection=options.ownerConnection??options.connection;
+    this.multiQuote=new PumpMultiQuoteRouter(this.connection,this.ownerConnection,options.fetcher,options.jupiterApiKey,
+      options.jupiterMainBucketTier,options.jupiterMainBucketRps);
+  }
+
+  async routeCapability(mint:string):Promise<NativeRouteCapability>{return this.multiQuote.capability(mint);}
+  jupiterStatus(){return this.multiQuote.jupiterStatus();}
 
   private async accounts(keys:PublicKey[],minContextSlot?:number,commitment:'confirmed'|'finalized'=COMMITMENT) {
     const response=await this.connection.getMultipleAccountsInfoAndContext(keys,{commitment,...(minContextSlot===undefined?{}:{minContextSlot})});
@@ -210,7 +228,7 @@ export class PumpNativeAdapter {
   }
 
   /** An HTTP snapshot seeds the cache once; WS continuity must be enforced by the caller. */
-  async warmQuoteCache(wallet:string,mint:string):Promise<NativeQuoteCacheWarm> {
+  private async warmDirectQuoteCache(wallet:string,mint:string):Promise<NativeQuoteCacheWarm> {
     const generation=this.cacheGeneration,evictions=this.streamBufferEvictions,startSequence=this.streamSequence,parsed={wallet:key(wallet),mint:key(mint)},cacheKey=`${wallet}:${mint}`;
     const epoch=this.quoteEpochs.get(cacheKey)??{};this.quoteEpochs.set(cacheKey,epoch);this.activeWarmLoads++;
     try {
@@ -263,8 +281,15 @@ export class PumpNativeAdapter {
     } finally {this.activeWarmLoads--;this.releaseRetiredAccounts();}
   }
 
+  async warmQuoteCache(wallet:string,mint:string):Promise<NativeQuoteCacheWarm> {
+    try{return await this.warmDirectQuoteCache(wallet,mint);}
+    catch(error){if(!(error instanceof NativePumpError)||error.reason!=='NATIVE_QUOTE_MINT_UNSUPPORTED')throw error;
+      return this.multiQuote.warm(wallet,mint);}
+  }
+
   /** Decode complete public WS account frames. No network, signer, or disk I/O occurs here. */
   ingestAccount(address:string,info:AccountInfo<Buffer>|null,slot:number,receivedAtMs:number):string[] {
+    const multi=this.multiQuote.ingest(address,info,slot,receivedAtMs);
     const indexed=this.quoteCacheAccounts.get(address);let copied:AccountInfo<Buffer>|null;
     try{
       if(!indexed)key(address); // Indexed strings were canonicalized when the route was warmed.
@@ -280,7 +305,7 @@ export class PumpNativeAdapter {
       for(const cacheKey of indexed??[]){const entry=this.quoteCache.get(cacheKey);if(entry)entry.invalidReason=reason;}
       return [...new Set([...(indexed??[])].map(cacheKey=>this.quoteCache.get(cacheKey)?.mintAddress).filter((value):value is string=>!!value))];
     }
-    if(!indexed)return [];
+    if(!indexed)return multi;
     const affected=new Set<string>();
     for(const cacheKey of indexed) {
       const entry=this.quoteCache.get(cacheKey);if(!entry)continue;affected.add(entry.mintAddress);
@@ -296,7 +321,7 @@ export class PumpNativeAdapter {
         this.refreshCachedState(entry);
       }catch(error){entry.invalidReason=error instanceof NativePumpError?error.reason:'NATIVE_STREAM_ACCOUNT_INVALID';}
     }
-    return [...affected];
+    return [...new Set([...multi,...affected])];
   }
 
   private refreshCachedState(entry:QuoteCacheEntry):void {
@@ -363,6 +388,7 @@ export class PumpNativeAdapter {
 
   /** WS health is a separate clock: a healthy idle pool must not invent new market timestamps. */
   quoteSellCached(request:Omit<NativeSwapRequest,'side'>,options:NativeQuoteCacheOptions={}):NativeStreamQuote {
+    const multi=this.multiQuote.status(request.wallet,request.mint);if(multi.present)return this.multiQuote.quoteCached(request,options);
     if(typeof request.wallet!=='string'||typeof request.mint!=='string')fail('NATIVE_ADDRESS_INVALID');
     const amount=inputAmount({...request,side:'sell'}),entry=this.quoteCache.get(`${request.wallet}:${request.mint}`);
     if(!entry){input({...request,side:'sell'});return fail('NATIVE_STREAM_CACHE_COLD');}
@@ -378,13 +404,14 @@ export class PumpNativeAdapter {
       fail('NATIVE_STREAM_CONTEXT_INVALID');
     const expected=this.quote(entry.state,'sell',amount),minimum=expected.muln(10_000-request.slippageBps).divn(10_000);
     if(expected.lten(0)||minimum.lten(0)||BigInt(expected.toString())>U64)fail('NATIVE_QUOTE_UNAVAILABLE');
-    return {venue:entry.venue,mint:request.mint,side:'sell',inputAmount:request.amount,
+    return {venue:entry.venue,protectionMode:'account_stream',mint:request.mint,side:'sell',inputAmount:request.amount,
       expectedOutputAmount:expected.toString(),minimumOutputAmount:minimum.toString(),
       quotedAt:new Date(entry.receivedAtMs).toISOString(),slot:entry.slot,receivedAtMs:entry.receivedAtMs,
       subscriptionAccounts:[...entry.subscriptionAddresses],tokenDecimals:entry.state.mint.decimals};
   }
 
   cacheStatus(wallet:string,mint:string) {
+    const multi=this.multiQuote.status(wallet,mint);if(multi.present)return multi;
     const entry=this.quoteCache.get(`${wallet}:${mint}`);
     return entry?{warm:!entry.invalidReason,ready:!entry.invalidReason&&!entry.pendingReason,
       reason:entry.invalidReason??entry.pendingReason,venue:entry.venue,slot:entry.slot,receivedAtMs:entry.receivedAtMs,
@@ -395,6 +422,7 @@ export class PumpNativeAdapter {
    * accounts stay buffered while another cache references them. In-flight warms
    * from the removed epoch cannot recreate the position's cache. */
   dropQuoteCache(wallet:string,mint:string):void {
+    this.multiQuote.drop(wallet,mint);
     const cacheKey=`${wallet}:${mint}`,entry=this.quoteCache.get(cacheKey);
     this.quoteEpochs.delete(cacheKey);this.quoteCache.delete(cacheKey);
     if(entry)for(const address of entry.watched){
@@ -414,7 +442,7 @@ export class PumpNativeAdapter {
   }
 
   /** Every reconnect invalidates the previous subscription generation, including in-flight snapshots. */
-  invalidateCache():void {this.cacheGeneration++;this.quoteCache.clear();this.quoteCacheAccounts.clear();this.quoteEpochs.clear();this.retiredStreamAccounts.clear();
+  invalidateCache():void {this.multiQuote.invalidate();this.cacheGeneration++;this.quoteCache.clear();this.quoteCacheAccounts.clear();this.quoteEpochs.clear();this.retiredStreamAccounts.clear();
     this.latestStreamAccounts.clear();this.streamBufferEvictions=0;this.streamSequence=0;}
 
   private async walletAccounts(wallet:PublicKey,mint:PublicKey,program:PublicKey,minContextSlot:number,commitment:'confirmed'|'finalized'=COMMITMENT) {
@@ -514,17 +542,34 @@ export class PumpNativeAdapter {
       if(instructions.some(ix=>!allowed.some(program=>eq(ix.programId,program))||ix.keys.some(meta=>meta.isSigner&&!eq(meta.pubkey,parsed.wallet))))
         fail('NATIVE_INSTRUCTION_NOT_ALLOWED');
     }
-    return {venue:state.pump?'pump':'pumpswap',mint:request.mint,side:request.side,inputAmount:request.amount,
+    return {venue:state.pump?'pump':'pumpswap',protectionMode:'account_stream',mint:request.mint,side:request.side,inputAmount:request.amount,
       expectedOutputAmount:expected.toString(),minimumOutputAmount:minimum.toString(),quotedAt,instructions,
       subscriptionAccounts:unique(state.subscriptions),tokenDecimals:state.mint.decimals,
       ...(state.tokenIdentity?{tokenIdentity:{...state.tokenIdentity}}:{})};
   }
 
-  async build(request:NativeSwapRequest):Promise<NativeSwapPlan> {
-    try {return await this.prepare(request,true);}catch(error) {if(error instanceof NativePumpError)throw error;return fail('NATIVE_BUILD_UNAVAILABLE');}
+  async build(request:NativeSwapRequest,options:{jupiterEntryAuthorized?:boolean}={}):Promise<NativeSwapPlan> {
+    try {return await this.prepare(request,true);}
+    catch(error) {if(error instanceof NativePumpError&&error.reason==='NATIVE_QUOTE_MINT_UNSUPPORTED'){
+        // Production passes an explicit false until the runtime has reserved a
+        // durable protection-capacity slot. Stop before any Jupiter build or
+        // protection probe when a direct route changed under that preflight.
+        if(request.side==='buy'&&options.jupiterEntryAuthorized===false)fail('NATIVE_JUPITER_PROTECTION_CAPACITY_REACHED');
+        try{return await this.multiQuote.build(request);}catch(next){if(next instanceof Error&&next.message==='NATIVE_MULTI_QUOTE_CURVE_UNSUPPORTED')throw error;
+          throw next;}
+      }
+      if(error instanceof NativePumpError||error instanceof Error&&error.message.startsWith('NATIVE_'))throw error;return fail('NATIVE_BUILD_UNAVAILABLE');}
   }
   async quoteSell(request:Omit<NativeSwapRequest,'side'>):Promise<NativeSellQuote> {
     try {const {instructions:_,...quote}=await this.prepare({...request,side:'sell'},false);return quote;}
-    catch(error) {if(error instanceof NativePumpError)throw error;return fail('NATIVE_QUOTE_UNAVAILABLE');}
+    catch(error) {if(error instanceof NativePumpError&&error.reason==='NATIVE_QUOTE_MINT_UNSUPPORTED'){
+        try{return await this.multiQuote.quoteSell(request);}catch(next){if(next instanceof Error&&next.message==='NATIVE_MULTI_QUOTE_CURVE_UNSUPPORTED')throw error;
+          throw next;}
+      }
+      if(error instanceof NativePumpError||error instanceof Error&&error.message.startsWith('NATIVE_'))throw error;return fail('NATIVE_QUOTE_UNAVAILABLE');}
+  }
+  async quoteJupiterSell(request:Omit<NativeSwapRequest,'side'>,tokenDecimals:number,
+    protectionMode:'account_stream'|'external_price_stream'):Promise<NativeSellQuote> {
+    return this.multiQuote.quoteKnownSell(request,tokenDecimals,protectionMode);
   }
 }

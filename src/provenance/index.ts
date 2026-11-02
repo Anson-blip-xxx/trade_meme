@@ -18,6 +18,10 @@ const flapTax=parseAbiItem('event FlapTokenTaxSet(address token,uint256 tax)');
 const flapAsymmetricTax=parseAbiItem('event FlapTokenAsymmetricTaxSet(address token,uint256 buyTax,uint256 sellTax)');
 const flapModeEvents=[flapVersion,flapExtension,flapTax,flapAsymmetricTax];
 const flapModeTopics=new Set<string>(flapModeEvents.map(toEventSelector));
+// These are the account sizes written by the Pump program versions supported by
+// the official SDK. A different length can still prove official ownership, but
+// its trailing mode fields are not safe to interpret as a known layout.
+const PUMP_BONDING_CURVE_LAYOUTS=new Set([49,81,82,83,115,124,125,141,151,166]);
 const same=(a:unknown,b:unknown)=>typeof a==='string'&&typeof b==='string'&&a.toLowerCase()===b.toLowerCase();
 const hexQuantity=(v:unknown):v is string=>typeof v==='string'&&/^0x[0-9a-f]+$/i.test(v);
 const object=(v:unknown):v is Record<string,any>=>v!==null&&typeof v==='object'&&!Array.isArray(v);
@@ -84,13 +88,21 @@ export function verifyPumpAccount(mint:string,stateAddress:string,account:any):P
   const data=Buffer.from(account.data?.[0]??'','base64');
   if(data.length<49||!data.subarray(0,8).equals(discriminator('BondingCurve'))||data.readBigUInt64LE(40)===0n)
     return unknown('PUMP_STATE_LAYOUT_UNSUPPORTED');
-  // Known layouts: legacy prefix; additional flags are retained as facts, not silently ignored.
-  const modeSupported=[49,81].includes(data.length) ||
-    (data.length===82 && data[81]===0) || (data.length===83 && data[81]===0 && data[82]===0) ||
-    (data.length===166 && data[81]===0 && data[82]===0 && data[123]===0 && data[124]===0);
+  // Pump's layouts are versioned prefixes. Holder rewards, cashback and mayhem
+  // are protocol modes, not proof of an unsafe or forged contract. The quote
+  // mint is an on-chain fact; executability belongs to the route builder and
+  // must never be inferred here from whether that mint happens to be SOL.
+  const booleanOffsets=[81,82,123,124].filter(offset=>offset<data.length);
+  const flagsValid=booleanOffsets.every(offset=>data[offset]===0||data[offset]===1);
+  const modeSupported=PUMP_BONDING_CURVE_LAYOUTS.has(data.length)&&flagsValid;
+  const quoteMint=data.length>=115?bs58.encode(data.subarray(83,115)):'11111111111111111111111111111111';
+  const requiresMultiHop=!['11111111111111111111111111111111','So11111111111111111111111111111111111111112'].includes(quoteMint);
   return {status:'pass',platform:'pump',method:'program_owned_pda',reasons:['PUMP_BONDING_CURVE_VERIFIED'],
     checkedAt:new Date().toISOString(),facts:{mint,stateAddress,program:account.owner,complete:data[48]===1,
       modeSupported,mayhem:data.length>81?data[81]===1:false,cashback:data.length>82?data[82]===1:false,
+      isHolderReward:data.length>124?data[124]===1:false,quoteMint,requiresMultiHop,
+      quoteRoute:requiresMultiHop?'token_quote':'native_sol',
+      ...(!modeSupported?{modeUnsupportedReason:flagsValid?'PUMP_LAYOUT_UNREVIEWED':'PUMP_MODE_FLAGS_INVALID'}:{}),
       source:registry.pump.source,accountLength:data.length}};
 }
 

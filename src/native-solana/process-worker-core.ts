@@ -5,7 +5,7 @@ import type {TradeNotificationEvent} from '../trade-notifications.js';
 import {NativeProcessStore} from './process-store.js';
 import {isProtocolMessage,safeProcessError,type NativeParentMessage,type NativeWorkerConfig,type NativeWorkerMessage} from './process-protocol.js';
 
-export type NativeWorkerRuntime=Pick<NativeTradingRuntime,'start'|'stop'|'readiness'|'status'|'get'|'execute'|'createAction'|'submit'>;
+export type NativeWorkerRuntime=Pick<NativeTradingRuntime,'start'|'stop'|'readiness'|'status'|'get'|'execute'|'createAction'|'submit'|'observePrice'>;
 export interface NativeWorkerChannel {
   onMessage(listener:(message:unknown)=>void):void;
   onDisconnect(listener:()=>void):void;
@@ -120,6 +120,9 @@ export function runNativeProcessWorker(channel:NativeWorkerChannel,
       if(message.kind==='notice_ack'){if(acknowledge(()=>store?.ackNotice(message.key)))noticeSent.delete(message.key);return;}
       if(message.kind==='order_ack'){
         if(acknowledge(()=>store?.ackOrder(message.orderId,message.version)))orderSent.delete(message.orderId+':'+message.version);return;
+      }
+      if(message.kind==='market_price'){
+        runtime?.observePrice({mint:message.mint,priceUsd:message.priceUsd,observedAt:message.observedAt,source:message.source});return;
       }
       if(message.kind==='guard_result'){
         const pending=guards.get(message.id);if(!pending)return;guards.delete(message.id);clearTimeout(pending.timer);

@@ -57,7 +57,7 @@ test('renders a compact GMGN card with grouped market, account and safety facts'
   assert.equal(result.gmgnAvailable,true);assert.equal(result.partial,false);
   assert.equal(result.text,[`【合约详情】Save Bow / Bow · Solana`,`CA：${TOKEN}`,'',
     '💼 账户','SOL 余额：5.35 SOL ｜ 本币持仓：123.45 Bow','持仓盈亏：暂不可用（报价待核验）','',
-    '📊 行情','价格：$0.0000051258066','估算市值：$5.13K ｜ 池子储备：$4.76K（市值占比 92.85%）',
+    '📊 行情','价格：$0.0000051258066','交易对：Bow / WSOL','估算市值：$5.13K ｜ 池子储备：$4.76K（市值占比 92.85%）',
     '持有人：23 ｜ 币龄：1 小时','内盘进度：33.73%','',
     '🛡 安全','权限：铸币 ✅ 已放弃 ｜ 冻结 ✅ 已放弃','流动性：曲线阶段',
     'Top10 持仓：23.00% ｜ 捆绑：7.71% ｜ 老鼠仓：0.00%',

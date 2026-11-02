@@ -67,7 +67,9 @@ export interface Config extends z.infer<typeof schema> {
     endpoints:Partial<Record<Chain,{http:string;ws:string}>>;pinnedWallets?:Partial<Record<Chain,string[]>>};
   walletFast?:{enabled:boolean;database?:string;maxBytes?:number};
   telegram?:{enabled:boolean;token?:string;chatId?:string;database:string;summaryIntervalMs:number};
-  nativeSolana?:{keypairFile?:string;rpcUrl?:string;wsUrl?:string;inventoryRpcUrl?:string;jitoUrl:string;journalPath:string;positionsPath:string;
+  nativeSolana?:{keypairFile?:string;rpcUrl?:string;wsUrl?:string;inventoryRpcUrl?:string;jupiterApiKey?:string;
+    jupiterMainBucketTier:'keyless'|'free'|'developer'|'launch'|'pro';jupiterMainBucketRps:number;
+    jitoUrl:string;journalPath:string;positionsPath:string;
     tipLamports:string;priorityFeeLamports:string};
 }
 export function isPersistentOrderPath(value:string):boolean {
@@ -127,6 +129,16 @@ export function readConfig(env:NodeJS.ProcessEnv=process.env): Config {
     if(solanaPins.length>5)throw new Error();
   }catch {throw new Error('SOLANA_WALLET_WATCHLIST_INVALID');}
   if(streamMaxWallets+solanaPins.length>30)throw new Error('SOLANA_WALLET_WATCHLIST_CAPACITY');
+  const jupiterApiKey=env.JUPITER_API_KEY?.trim()||undefined;
+  const jupiterTier=(env.JUPITER_MAIN_BUCKET_TIER?.trim().toLowerCase()||
+    (jupiterApiKey?'free':'keyless')) as NonNullable<Config['nativeSolana']>['jupiterMainBucketTier'];
+  const jupiterTierRps={keyless:0.5,free:1,developer:10,launch:50,pro:150} as const;
+  if(!(jupiterTier in jupiterTierRps)||!jupiterApiKey&&jupiterTier!=='keyless')throw new Error('JUPITER_MAIN_BUCKET_CONFIG_INVALID');
+  const jupiterRpsRaw=env.JUPITER_MAIN_BUCKET_RPS?.trim();
+  const jupiterMainBucketRps=jupiterRpsRaw===undefined||jupiterRpsRaw===''?jupiterTierRps[jupiterTier]:Number(jupiterRpsRaw);
+  if(!Number.isFinite(jupiterMainBucketRps)||jupiterMainBucketRps<=0||jupiterMainBucketRps>jupiterTierRps[jupiterTier]||
+    Math.round(jupiterMainBucketRps*2)!==jupiterMainBucketRps*2)
+    throw new Error('JUPITER_MAIN_BUCKET_CONFIG_INVALID');
   return {
     ...schema.parse({maxSignalAgeSec:env.MAX_SIGNAL_AGE_SEC, maxEvidenceAgeSec:env.MAX_EVIDENCE_AGE_SEC,
       decisionTtlSec:env.DECISION_TTL_SEC,maxTaxRate:env.MAX_TAX_RATE,xDataProvider:env.X_DATA_PROVIDER,narrativeProvider:env.NARRATIVE_PROVIDER,
@@ -145,6 +157,7 @@ export function readConfig(env:NodeJS.ProcessEnv=process.env): Config {
       rpcUrl:env.SOLANA_NATIVE_RPC_URL?.trim()||env.SOLANA_STREAM_HTTP_URL||env.SOLANA_RPC_URL,
       wsUrl:env.SOLANA_NATIVE_WS_URL?.trim()||env.SOLANA_STREAM_WS_URL,
       inventoryRpcUrl:env.SOLANA_NATIVE_INVENTORY_RPC_URL?.trim()||'https://api.mainnet-beta.solana.com',
+      jupiterApiKey,jupiterMainBucketTier:jupiterTier,jupiterMainBucketRps,
       jitoUrl:env.SOLANA_NATIVE_JITO_URL?.trim()||'https://mainnet.block-engine.jito.wtf/api/v1/transactions',
       journalPath:z.string().trim().refine(isPersistentOrderPath).parse(env.SOLANA_NATIVE_JOURNAL_PATH??'data/native-solana-transactions.sqlite'),
       positionsPath:z.string().trim().refine(isPersistentOrderPath).parse(env.SOLANA_NATIVE_POSITIONS_PATH??'data/native-solana-positions.sqlite'),

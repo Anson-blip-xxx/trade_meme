@@ -85,7 +85,7 @@ const positiveId=(value:unknown):value is number=>typeof value==='number'&&Numbe
 const updateId=(value:unknown):value is number=>typeof value==='number'&&Number.isSafeInteger(value)&&value>=0&&value<Number.MAX_SAFE_INTEGER;
 const forward=(value:Row)=>['forward_origin','forward_from','forward_from_chat','forward_sender_name','forward_date',
   'is_automatic_forward','via_bot','sender_chat','business_connection_id','sender_business_bot','edit_date'].some(key=>value[key]!==undefined);
-const help=(mode:'simulation'|'live')=>`计数控制（${mode==='live'?'实盘策略':'仅模拟'}）：\n启动计数 /count_start${mode==='live'?'（后续达标自动买入）':''}\n停止计数 /count_stop${mode==='live'?'（持仓监控与保护继续）':''}\n计数状态 /count_status\n持仓查询 /positions（可加页码，如 /positions 2）\n代币查询：发送完整 CA，或 /token <CA>\n买入：先查询 CA，再使用代币卡片上的金额按钮\n/start 仅查询状态，不启动计数，不会触发买卖。`;
+const help=(mode:'simulation'|'live')=>`计数控制（${mode==='live'?'实盘策略':'仅模拟'}）：\nDeBot / Ave 信号始终采集、去重、报价跟踪并进入复盘，详情持续补充。\n启动计数 /count_start${mode==='live'?'（授予自动交易许可并开启本轮第 3 次计数）':''}\n停止计数 /count_stop${mode==='live'?'（撤销自动交易许可并清零本轮计数；采集和持仓保护继续）':''}\n计数状态 /count_status\n持仓查询 /positions（可加页码，如 /positions 2）\n代币查询：发送完整 CA，或 /token <CA>\n买入：先查询 CA，再使用代币卡片上的金额按钮\n/start 仅查询状态，不启动计数，不会触发买卖。`;
 const positionsPage=(value:string):number|undefined=>/^[1-9]\d{0,4}$/.test(value)&&Number(value)<=10000?Number(value):undefined;
 const closeConfirmedCallback=new RegExp(`^close:(confirm|cancel):(${TELEGRAM_CLOSE_UUID})$`);
 const tokenCancelCallback=/^(?:token:cancel|nativebuy:cancel):([0-9a-f]{32})$/;

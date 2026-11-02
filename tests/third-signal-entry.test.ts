@@ -38,6 +38,8 @@ function fixture(t:{after:(fn:()=>void)=>void},options:{store?:OrderStore;config
   const config:Config={...readConfig({}),gmgnApiKey:`test-${randomUUID()}`,gmgnPrivateKey:pem,entryMode:'off',
     scannerChains:['solana'],rpc:{solana:'https://rpc.test'},entryWallets:{solana:wallet},entryInputTokens:{solana:SOL},
     entryBalanceBps:{solana:300},entryFeeReserves:{bsc:'1',solana:'10000000',robinhood:'1'},exitPolicy:policy,...options.config};
+  if(config.solanaExecutionProvider==='pump_native'&&!Object.prototype.hasOwnProperty.call(options.config??{},'nativeSolana'))
+    config.nativeSolana={...config.nativeSolana!,jupiterApiKey:'fixture-jupiter-key'};
   const store=options.store??new OrderStore(':memory:');if(!options.store)t.after(()=>store.close());
   const fetcher:typeof fetch=async(input,init)=>{
     const url=new URL(String(input));
@@ -310,6 +312,13 @@ test('native readiness failure cannot silently fall back to GMGN',async t=>{
     execute:async()=>{throw Error('MUST_NOT_EXECUTE');}}});
   assert.equal((await f.controller.consider(f.candidate())).reason,'NATIVE_SIGNER_UNAVAILABLE');
   assert.equal(f.state.posts,0);assert.equal(f.state.quotes,0);assert.equal(f.state.balanceReads,0);
+});
+test('live native third-signal entry can arm with the keyless Jupiter fallback',async t=>{
+  let readinessCalls=0;
+  const f=fixture(t,{config:{solanaExecutionProvider:'pump_native',nativeSolana:{...readConfig({}).nativeSolana!,jupiterApiKey:undefined}},
+    native:{readiness:()=>{readinessCalls++;return {ready:true};},execute:async()=>{throw Error('MUST_NOT_EXECUTE');}}});
+  assert.deepEqual(f.controller.readiness(),{ready:true});assert.equal(readinessCalls,1);
+  assert.equal(f.state.balanceReads,0);assert.equal(f.state.riskReads,0);
 });
 test('native broadcast guard rechecks stop and stale holder proof after transaction construction',async t=>{
   for(const phase of ['stop','stale'] as const){let f:ReturnType<typeof fixture>;

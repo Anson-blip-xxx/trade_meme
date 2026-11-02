@@ -211,6 +211,31 @@ test('live ordinal targets are idempotent, outrank ordinary tokens, and expire e
   }finally{await f.close();}
 });
 
+test('source receipts create N3/N4 quote targets independently from the trading count switch',async()=>{
+  const f=fixture({activeWindowSec:24*60*60});
+  try {
+    const observer=f.create(),target=token(41);
+    for(const [index,hour] of [0,5,10].entries()){
+      f.advance(hour*3600);
+      assert.equal(observer.register({...signal(41,hour*3600,'bsc',`debot-${index}`),token:target}),true);
+    }
+    let targets=f.rows('meme_forward_targets');
+    assert.equal(targets.length,1);assert.equal(targets[0].run_id,'collection-v1');
+    assert.equal(targets[0].source,'debot');assert.equal(targets[0].ordinal,3);
+    assert.equal(targets[0].trigger_at,at(10*3600));assert.equal(targets[0].until_at,at(16*3600));
+    assert.equal(f.rows('meme_notification_windows')[0].count,3);
+    assert.equal(observer.register({...signal(41,10*3600,'bsc','debot-2'),token:target}),false,'source replay is not recounted');
+    f.advance(11*3600);assert.equal(observer.register({...signal(41,11*3600,'bsc','debot-3'),token:target}),true);
+    targets=f.rows('meme_forward_targets');assert.deepEqual(targets.map(row=>row.ordinal),[3,4]);
+    // Sources have independent windows even for the same CA.
+    for(let index=0;index<3;index++)assert.equal(observer.register({
+      ...signal(41,11*3600,'bsc',`ave-${index}`),source:'ave',token:target,
+    }),true);
+    targets=f.rows('meme_forward_targets');assert.equal(targets.length,3);
+    assert.equal(targets.filter(row=>row.source==='ave'&&row.ordinal===3).length,1);
+  }finally{await f.close();}
+});
+
 test('forward target capacity accounts for chain-separated batches and the request deadline',async()=>{
   const f=fixture();try {
     const observer=f.create();

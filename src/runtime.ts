@@ -240,12 +240,6 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
     ...config.tokenRankResearch,historyDatabase:config.walletResearch.database,
     ...(memeObserver?{memeDatabase:config.meme!.database}:{}),
     ...(sourceEvidence?{sourceDatabase:config.corroboration!.database}:{})}):undefined;
-  const setResearchLivePriority=(active:boolean)=>{
-    walletIndexRunner?.setLivePriority(active);
-    walletProfiles?.setLivePriority(active);
-    tokenRankResearch?.setLivePriority(active);
-    memeObserver?.setLivePriority(active);
-  };
   const captureSource=(signal:Signal,at?:string,display?:{name?:string})=>{
     if(!acceptsChain(signal.token.chain))return;
     if(signal.source==='manual'||signal.source==='wallet'||signal.source==='gmgn'&&!signal.sourceEventId.startsWith('gmgn:trade:'))return;
@@ -495,7 +489,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       .filter((p):p is string=>!!p);
     if(paths.some((p,index)=>[...existing,...paths.slice(0,index)].some(q=>sameDatabase(p,q))))throw Error('NATIVE_DATABASE_CONFLICT');
     nativeTrading=new ProcessNativeTradingRuntime(config,orders,event=>{if(!telegram)throw Error('TELEGRAM_UNAVAILABLE');return telegram.enqueue(event);},
-      {onOrderUpdate:order=>captureOrder(order)});
+      {onOrderUpdate:order=>captureOrder(order),onPriceTargetsChanged:()=>refreshPriceSubscriptions()});
   }catch{nativeTradingError='NATIVE_RUNTIME_STARTUP_UNAVAILABLE';}
   if(nativeTrading&&telegram&&config.telegram?.token&&config.telegram.chatId)try{
     manualNativeBuy=new ManualNativeTestController(config,orders,{
@@ -641,10 +635,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       database:config.telegram.database,fetcher:dependencies.telegramFetcher,enqueue:event=>telegram!.enqueue(event),
       countingMode:config.thirdSignalExecutionMode,
       onAction:action=>{
-        if(action!=='status'){
-          signalCounting.control(action,'tg');
-          setResearchLivePriority(signalCounting.status().running);
-        }
+        if(action!=='status')signalCounting.control(action,'tg');
         return signalCounting.controlText();
       },onPositions:page=>telegramPositions.page(page),
       ...((manualClose||directSell||nativeTrading)?{onClose:()=>({text:'【持仓卖出】\n平仓操作已更新，请刷新持仓，直接选择 25%、50%、75% 或 100%。',
@@ -725,6 +716,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
   const unsubscribeOrderNotifications=orders.subscribe(captureOrder);
   const positionPriceTokens=()=>{
     const tokens:ScanToken[]=orders.activePositions().filter(order=>!positionClosed(order.id)).map(order=>({chain:order.chain,address:order.tokenAddress}));
+    tokens.push(...nativeTrading?.priceTargets()??[]);
     try{tokens.push(...heldMonitor?.tokens()??[]);}catch{heldCaptureError='HELD_PRICE_TARGETS_UNAVAILABLE';}
     return [...new Map(tokens.map(token=>[`${token.chain}:${token.address}`,token])).values()];
   };
@@ -754,6 +746,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
   };
   let exitCaptureError:string|undefined;
   const recordPrice=(price:ScanPrice)=>{
+      try{nativeTrading?.observePrice(price);}catch{/* Native worker validates and reports its own protection health. */}
       try{heldMonitor?.observePrice(price);}catch{heldCaptureError='HELD_PRICE_CAPTURE_FAILED';}
       try{tradeNotifications?.observePrice(price);}catch{telegramCaptureError='TELEGRAM_PRICE_CAPTURE_FAILED';}
       try{jevShadow?.observePrice({token:{chain:price.chain,address:price.address},priceUsd:price.priceUsd,
@@ -934,8 +927,10 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       const key=`${sample.chain}:${sample.address}`;
       if(subscribedPriceKeys.has(key))priceFanout.enqueue(key,sample,priorityPriceKeys.has(key));
     });},
-    fetcher:aveSession?.fetcher,onPriorityObservation:observation=>signalCounting.observePriority(observation),
-    onPriorityObservations:observations=>signalCounting.observePriorityBatch(observations),
+    // Source storage is authoritative for collection. Counting is an optional,
+    // fail-closed consumer and must never hold the Ave inbox open.
+    fetcher:aveSession?.fetcher,onPriorityObservation:observation=>signalCounting.observe(observation),
+    onPriorityObservations:observations=>signalCounting.observeBatch(observations),
     onObservation:observeSourceResearch,
     // In focused mode an unavailable GMGN check remains unknown in evaluation;
     // it must not stop independent source delivery or local evidence collection.
@@ -949,8 +944,10 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
     maxConcurrent:debotSession?2:1,parallelDetails:!!debotSession,
     lookupDisplay:reportId=>archive?.tokenDisplay(reportId),
     maxAgeSec:debotSession?Math.min(120,config.maxSignalAgeSec):config.maxSignalAgeSec,onSignal,
-    onPriorityObservation:observation=>signalCounting.observePriority(observation),
-    onPriorityObservations:observations=>signalCounting.observePriorityBatch(observations),
+    // A stopped or degraded counter ACKs this independent source handoff. Its
+    // own status exposes the degradation and execution remains disabled.
+    onPriorityObservation:observation=>signalCounting.observe(observation),
+    onPriorityObservations:observations=>signalCounting.observeBatch(observations),
     onObservation:observeSourceResearch,
     repeatEvidence:(input,signal)=>{
       // Optional profile lookup must not hide independently observed sell trades.
@@ -1097,9 +1094,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       manualNativeBuy:{enabled:!!manualNativeBuy,readiness:manualNativeBuy?.readiness(),error:manualNativeBuyError},
       executionEnabled:counting.executionEnabled,countingRunning:counting.running,executionReady:counting.executionReady};},
     signalCountingPage:(options:{limit?:number;offset?:number}={})=>({...signalCounting.page(options),controls:telegramControls?.status()}),
-    signalCountingControl:(action:'start'|'stop',actor:'web')=>{
-      const result=signalCounting.control(action,actor);setResearchLivePriority(result.running);return result;
-    },
+    signalCountingControl:(action:'start'|'stop',actor:'web')=>signalCounting.control(action,actor),
     jevStatus:()=>{const summary=jevStatusRunner?.snapshot();return {...jevShadow?.status(summary?.aggregate??null),captureError:jevCaptureError,
       summaryState:summary?.state??'disabled',summaryComputedAt:summary?.aggregate?.computedAt,summaryStale:summary?.stale??false,
       summaryError:summary?.error,summaryWorker:summary?.worker};},
@@ -1158,7 +1153,6 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       if(closed) return;
       walletStatsRunner?.start();
       gmgnPlusRunner?.start();
-      setResearchLivePriority(signalCounting.status().running);
       walletIndexRunner?.start();
       followupReview?.start();
       jevStatusRunner?.start();
@@ -1174,8 +1168,8 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
             '\n信号策略开仓金额仍为原生币总余额的 3%，另预留手续费及待结算占用。'});
           if(config.thirdSignalExecutionMode==='live')telegram.enqueue({key:`third-signal-live-controls:v3:${config.solanaExecutionProvider}:${destination}`,
             text:signalCounting.controlText()+`\n\n每单按 SOL 总余额的 3%；翻倍卖出 50%、跌 ${config.exitPolicy?.stopLoss.dropPct??60}% 卖出余仓。`+
-              (config.solanaExecutionProvider==='pump_native'?'\n执行方式：Pump / PumpSwap 原生交易，Jito 防夹；保护由本机持仓服务执行。签名器或监控未就绪时禁止开仓。':'\n执行方式：GMGN 买单附带条件单。')+
-              '\n点击「启动计数」开始接收新信号；点击「停止计数」停止新开仓，持仓监控继续。'});
+              (config.solanaExecutionProvider==='pump_native'?'\n执行方式：SOL 报价走 Pump / PumpSwap，PUMP、股票及其他代币报价走 Jupiter；统一由 Jito 防夹发送，本机监控持仓。':'\n执行方式：GMGN 买单附带条件单。')+
+              '\nDeBot / Ave 的采集、详情、报价和复盘始终运行；「启动计数」授予第三次通知自动交易许可，「停止计数」只撤销该许可并清零本轮计数。'});
           if(directSell){
             const reply=telegramPositions.page(1);
             telegram.enqueue({key:`telegram-direct-sell-menu:v1:${destination}`,

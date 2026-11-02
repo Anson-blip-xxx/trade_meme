@@ -4,7 +4,7 @@ import bs58 from 'bs58';
 import type {OpeningOrder,OrderStore} from './orders.js';
 import type {Signal} from './types.js';
 import {ThirdSignalStrategy,type ThirdSignalActor,type ThirdSignalCandidate,type ThirdSignalPageOptions,type ThirdSignalMode,
-  type ThirdSignalExecution,type ThirdSignalNotificationSnapshot} from './third-signal-strategy.js';
+  type ThirdSignalExecution,type ThirdSignalNotificationSnapshot,type ThirdSignalStatus} from './third-signal-strategy.js';
 
 type Identity={chain:Signal['token']['chain'];address:string;recordId:string};
 const object=(v:unknown):v is Record<string,unknown>=>v!==null&&typeof v==='object'&&!Array.isArray(v);
@@ -54,7 +54,13 @@ interface QueuedDispatch {candidate:ThirdSignalCandidate;complete:()=>void;}
 /** Counts fresh source events; only new live candidates invoke the configured execution callback. */
 export class SignalCounting {
   readonly strategy:ThirdSignalStrategy;
+  private storageUnavailable=false;
   private captureError?:string;
+  /** In-memory gate for the source fast path.  A stopped counter never opens
+   * SQLite for an incoming source event; a failed best-effort capture latches
+   * this gate shut so a later event cannot trade from an incomplete run. */
+  private acceptingObservations=false;
+  private captureDegraded=false;
   private historyError?:string;
   private readonly imported=new Set<string>();
   private sentCandidateKeys=new Set<string>();
@@ -79,7 +85,15 @@ export class SignalCounting {
     if(!Number.isSafeInteger(this.dispatchConcurrency)||this.dispatchConcurrency<1||this.dispatchConcurrency>16||
       !Number.isSafeInteger(this.dispatchCapacity)||this.dispatchCapacity<this.dispatchConcurrency||this.dispatchCapacity>1000)
       throw Error('SIGNAL_COUNTING_DISPATCH_OPTIONS_INVALID');
-    this.strategy=new ThirdSignalStrategy(options.database);
+    try{this.strategy=new ThirdSignalStrategy(options.database);}
+    catch{
+      // Counting is an optional execution gate.  A corrupt or unwritable count
+      // database must leave source collection alive, while trading stays closed.
+      this.strategy=new ThirdSignalStrategy(':memory:');this.storageUnavailable=true;
+      this.captureError='SIGNAL_COUNTING_STORAGE_UNAVAILABLE';this.captureDegraded=true;
+      return;
+    }
+    this.acceptingObservations=this.strategy.status().running;
     try{this.importHistory();}catch{this.historyError='SIGNAL_COUNTING_OPENING_HISTORY_UNAVAILABLE';}
     this.scheduleForwardTargetReconciliation();
   }
@@ -87,7 +101,7 @@ export class SignalCounting {
     const address=identity.chain==='solana'?identity.address:identity.address.toLowerCase();
     const key=`${identity.chain}:${address}:${identity.recordId}`;
     if(this.imported.has(key))return;
-    this.strategy.markOpened({...identity,address});
+    if(!this.storageUnavailable)this.strategy.markOpened({...identity,address});
     // The execution journal has its own atomic permanent deny record too.
     this.options.orders.markPreviouslyOpened({...identity,address});
     this.imported.add(key);
@@ -121,6 +135,7 @@ export class SignalCounting {
     }
   }
   private readiness():{ready:boolean;reason?:string} {
+    if(this.storageUnavailable)return {ready:false,reason:'SIGNAL_COUNTING_STORAGE_UNAVAILABLE'};
     if(this.options.executionMode!=='live')return {ready:false};
     if(!this.options.onCandidate)return {ready:false,reason:'THIRD_SIGNAL_EXECUTION_UNAVAILABLE'};
     if(this.historyError)return {ready:false,reason:this.historyError};
@@ -129,31 +144,65 @@ export class SignalCounting {
       return result.ready?{ready:true}:{ready:false,reason:result.reason&&/^[A-Z][A-Z0-9_]{1,100}$/.test(result.reason)?result.reason:'THIRD_SIGNAL_EXECUTION_UNAVAILABLE'};
     }catch{return {ready:false,reason:'THIRD_SIGNAL_EXECUTION_UNAVAILABLE'};}
   }
-  status() {const status=this.strategy.status(),ready=this.readiness();return {...status,
-    configuredExecutionMode:this.options.executionMode??'simulation',executionReady:ready.ready,readinessReason:ready.reason,
-    executionEnabled:status.executionEnabled&&ready.ready,activeChains:[...this.options.allowedChains??['bsc','solana','robinhood']],
-    captureError:this.captureError,historyError:this.historyError,forwardTargetError:this.forwardTargetError,
+  status() {const status:ThirdSignalStatus=this.storageUnavailable?{mode:'simulation',executionEnabled:false,running:false,
+      ttlMs:6*60*60*1000,maxSignalAgeMs:120000,triggerCount:3 as const,maxMarketCapUsd:100000,
+      groups:0,events:0,candidates:0,repeatBlocked:0,globalClaims:0}:this.strategy.status(),
+    ready=this.readiness(),captureReady=!this.captureDegraded;return {...status,
+    storageRunning:status.running,running:status.running&&captureReady&&this.acceptingObservations,
+    configuredExecutionMode:this.options.executionMode??'simulation',executionReady:ready.ready&&captureReady,
+    readinessReason:this.captureDegraded?'SIGNAL_COUNTING_CAPTURE_FAILED':ready.reason,
+    executionEnabled:status.executionEnabled&&ready.ready&&captureReady&&this.acceptingObservations,
+    activeChains:[...this.options.allowedChains??['bsc','solana','robinhood']],
+    captureError:this.captureError,captureDegraded:this.captureDegraded,historyError:this.historyError,forwardTargetError:this.forwardTargetError,
     forwardTargetSync:{synced:this.forwardTargetSynced.size,pending:this.forwardTargetPending.size}};}
-  page(options:ThirdSignalPageOptions={}) {return {...this.strategy.list(options),status:this.status()};}
+  page(options:ThirdSignalPageOptions={}) {
+    if(!this.storageUnavailable)return {...this.strategy.list(options),status:this.status()};
+    const limit=options.limit??20,offset=options.offset??0;
+    if(!Number.isSafeInteger(limit)||limit<1||limit>200||!Number.isSafeInteger(offset)||offset<0)throw Error('THIRD_SIGNAL_PAGE_INVALID');
+    return {mode:'simulation' as const,executionEnabled:false,runId:undefined,items:[],total:0,limit,offset,hasMore:false,status:this.status()};
+  }
   control(action:'start'|'stop',actor:ThirdSignalActor) {
+    if(action!=='start'&&action!=='stop')throw Error('SIGNAL_COUNTING_ACTION_INVALID');
+    if(this.storageUnavailable){this.acceptingObservations=false;
+      if(action==='start')throw Error('SIGNAL_COUNTING_STORAGE_UNAVAILABLE');
+      return this.status();
+    }
     if(action==='start'){
-      try{this.importHistory();}catch{this.historyError='SIGNAL_COUNTING_OPENING_HISTORY_UNAVAILABLE';throw Error(this.historyError);}
+      try{this.importHistory();}catch{
+        this.acceptingObservations=false;this.historyError='SIGNAL_COUNTING_OPENING_HISTORY_UNAVAILABLE';throw Error(this.historyError);
+      }
       const readiness=this.readiness();if(this.options.executionMode==='live'&&!readiness.ready)throw Error(readiness.reason??'THIRD_SIGNAL_EXECUTION_UNAVAILABLE');
-      this.strategy.start(actor,this.options.executionMode??'simulation');
-    } else if(action==='stop')this.strategy.stop(actor);
+      // A degraded run has missed at least one source event.  Never resume it:
+      // an explicit start creates a fresh run only after SQLite is writable.
+      this.acceptingObservations=false;
+      try {
+        if(this.captureDegraded)this.strategy.stop(actor);
+        const started=this.strategy.start(actor,this.options.executionMode??'simulation');
+        this.acceptingObservations=started.running;this.captureDegraded=false;this.captureError=undefined;
+      } catch(error) {
+        this.captureError='SIGNAL_COUNTING_CAPTURE_FAILED';this.captureDegraded=true;this.acceptingObservations=false;throw error;
+      }
+    } else if(action==='stop'){
+      // Revoke permission before touching SQLite so a busy stop transaction is
+      // still fail-closed for every subsequently arriving source event.
+      this.acceptingObservations=false;
+      try{this.strategy.stop(actor);}
+      catch(error){this.captureError='SIGNAL_COUNTING_CAPTURE_FAILED';this.captureDegraded=true;throw error;}
+    }
     else throw Error('SIGNAL_COUNTING_ACTION_INVALID');
     this.scheduleForwardTargetReconciliation();return this.status();
   }
   controlText() {
     const s=this.status();
     const live=s.running?s.mode==='live':s.configuredExecutionMode==='live';
-    return `【计数控制】\n${live?'实盘计数':'模拟计数'}：${s.running?'运行中':'已停止'} · ${s.executionEnabled?'达标自动实盘买入':live?'启动后达标自动实盘买入':'不执行实盘'}\n`+
+    return `【计数控制】\n${live?'自动交易许可':'模拟计数'}：${s.running?(live?'已开启':'运行中'):(live?'已关闭':'已停止')} · ${s.executionEnabled?'第 3 次达标自动实盘买入':live?'信号照常采集；不开仓':'不执行实盘'}\n`+
       `处理链：${s.activeChains.map(c=>c==='solana'?'SOL':c==='bsc'?'BSC':'Robinhood').join(' / ')}\n`+
       `DeBot / Ave 分别累计；同一链＋CA 第 3 次市值 ≤ $100,000。\n`+
       `每条新通知续期 6 小时；停止后重新启动从零计数。\n`+
       `已收 ${s.events} 条 · ${s.groups} 组 · ${s.mode==='live'?'实盘候选':'模拟达标'} ${s.candidates} 个\n`+
       `永久防重 ${s.globalClaims} 个；已有开仓不会再次触发。\n`+
-      `停止计数不影响现有持仓监控。`+(live&&!s.executionReady?`\n实盘未就绪：${s.readinessReason??'THIRD_SIGNAL_EXECUTION_UNAVAILABLE'}`:'')+
+      `DeBot / Ave 的采集、去重、详情、报价跟踪和复盘始终运行；本开关只是自动交易许可，并控制本轮第 3 次计数。\n`+
+      `停止计数不影响信号采集或现有持仓监控。`+(live&&!s.executionReady?`\n实盘未就绪：${s.readinessReason??'THIRD_SIGNAL_EXECUTION_UNAVAILABLE'}`:'')+
       (s.captureError||s.historyError?'\n状态异常，请查看 Web 系统状态。':'');
   }
   private input(observation:SignalCountingObservation) {
@@ -181,6 +230,10 @@ export class SignalCounting {
   private observeInternal(observation:SignalCountingObservation,strict:boolean) {
     const signal=observation.signal;if(signal.source!=='ave'&&signal.source!=='debot')return;
     if(this.options.allowedChains&&!this.options.allowedChains.includes(signal.token.chain))return;
+    // Collection is independent from this optional run.  In particular, do
+    // not even read the counting database while the user has stopped counting
+    // or after a capture failure has made the current run incomplete.
+    if(!this.acceptingObservations)return;
     let result:ReturnType<ThirdSignalStrategy['observe']>;
     try {
       // Check newly submitted external controlled tests before evaluating another candidate.
@@ -189,6 +242,7 @@ export class SignalCounting {
       this.captureError=undefined;
     } catch(error) {
       this.captureError='SIGNAL_COUNTING_CAPTURE_FAILED';
+      this.captureDegraded=true;this.acceptingObservations=false;
       if(strict)throw error;
       return;
     }
@@ -213,11 +267,12 @@ export class SignalCounting {
     const accepted=observations.filter(observation=>(observation.signal.source==='ave'||observation.signal.source==='debot')&&
       (!this.options.allowedChains||this.options.allowedChains.includes(observation.signal.token.chain)));
     if(!accepted.length)return [];
+    if(!this.acceptingObservations)return [];
     let results:ReturnType<ThirdSignalStrategy['observeBatch']>;
     try {
       this.importControlled();results=this.strategy.observeBatch(accepted.map(observation=>this.input(observation)));
       this.captureError=undefined;
-    }catch(error){this.captureError='SIGNAL_COUNTING_CAPTURE_FAILED';throw error;}
+    }catch(error){this.captureError='SIGNAL_COUNTING_CAPTURE_FAILED';this.captureDegraded=true;this.acceptingObservations=false;throw error;}
     if(results.some(result=>result.count===3||result.count===4))this.scheduleForwardTargetReconciliation();
     const candidates=results.flatMap(result=>result.candidate?[result.candidate]:[]);
     const live=candidates.filter(candidate=>candidate.mode==='live');
@@ -236,6 +291,16 @@ export class SignalCounting {
     });
     return results;
   }
+  /** Source-facing page capture.  Counting storage is deliberately
+   * best-effort: the source scanner may ACK its own durable inbox even when the
+   * separate counter is busy/full/corrupt.  Any failure latches execution off
+   * for the rest of this run; an explicit start is required to create a clean
+   * run. */
+  observeBatch(observations:readonly SignalCountingObservation[]) {
+    if(!this.acceptingObservations)return [];
+    try{return this.observePriorityBatch(observations);}
+    catch{this.captureError='SIGNAL_COUNTING_CAPTURE_FAILED';this.captureDegraded=true;this.acceptingObservations=false;return [];}
+  }
   private notifyCandidate(candidate:ThirdSignalCandidate) {
     if(this.options.allowedChains&&!this.options.allowedChains.includes(candidate.chain))return;
     const key=`third-signal:candidate:${candidate.id}`;
@@ -250,6 +315,7 @@ export class SignalCounting {
     this.sentCandidateKeys.add(key);
   }
   tick() {
+    if(this.storageUnavailable)return;
     this.scheduleForwardTargetReconciliation();
     if(this.options.executionMode==='live')return;
     try {
@@ -261,7 +327,7 @@ export class SignalCounting {
     }catch{this.captureError='SIGNAL_COUNTING_NOTIFICATION_FAILED';}
   }
   isActive(candidate:ThirdSignalCandidate):boolean {
-    return !this.closed&&this.readiness().ready&&
+    return !this.storageUnavailable&&!this.closed&&!this.captureDegraded&&this.acceptingObservations&&this.readiness().ready&&
       (!this.options.allowedChains||this.options.allowedChains.includes(candidate.chain))&&this.strategy.isActive(candidate);
   }
   private dispatchCandidate(candidate:ThirdSignalCandidate):void {
@@ -286,7 +352,7 @@ export class SignalCounting {
     this.forwardTargetWork.add(work);
   }
   private scheduleForwardTargetReconciliation():void {
-    if(this.closed||!this.options.onForwardTarget||this.forwardTargetReconcileQueued)return;
+    if(this.storageUnavailable||this.closed||!this.options.onForwardTarget||this.forwardTargetReconcileQueued)return;
     this.forwardTargetReconcileQueued=true;
     this.schedulePostCommit(()=>{
       this.forwardTargetReconcileQueued=false;if(this.closed)return;
@@ -355,7 +421,9 @@ export class SignalCounting {
       });
     }
   }
-  recordExecution(candidate:ThirdSignalCandidate,execution:ThirdSignalExecution):void {this.strategy.recordExecution(candidate,execution);}
+  recordExecution(candidate:ThirdSignalCandidate,execution:ThirdSignalExecution):void {
+    if(!this.storageUnavailable)this.strategy.recordExecution(candidate,execution);
+  }
   async waitForDispatches():Promise<void> {
     // Work can be enqueued while an active callback is settling. A one-time
     // snapshot can therefore return while the newly started callback is still

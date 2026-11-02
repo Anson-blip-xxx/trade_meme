@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import bs58 from 'bs58';
 import {evaluate,effectiveReport,liveProviders,decide} from '../src/engine.js';
 import {unknown,parseSignal,type VendorNarrative} from '../src/types.js';
 import {analyzeVendorNarrative} from '../src/providers/vendor-narrative.js';
@@ -34,6 +35,15 @@ test('安全拒绝不调用模型',async()=>{
 test('未知发行模式不放行',async()=>{
   const p=providers();p.provenance=async()=>({...pass(),platform:'flap',facts:{modeSupported:false}});
   assert.equal((await evaluate(signal(),config(),p,{now:()=>now})).decision,'WATCH');
+});
+test('已验证的非 SOL 报价 Pump 不会被来源过滤层误判为不安全或不可执行',async()=>{
+  const c=config();c.solanaExecutionProvider='pump_native';
+  const s=signal({token:{chain:'solana',address:bs58.encode(Buffer.alloc(32,8))}});
+  const p=providers();p.provenance=async()=>({...pass(),platform:'pump',facts:{modeSupported:true,requiresMultiHop:true,
+    quoteMint:bs58.encode(Buffer.alloc(32,9)),quoteRoute:'token_quote'}});
+  const result=await evaluate(s,c,p,{now:()=>now});
+  assert.equal(result.decision,'BUY_CANDIDATE');assert.equal(result.reasons.includes('EXECUTION_ROUTE_NOT_SUPPORTED'),false);
+  assert.equal(result.reasons.includes('LAUNCHPAD_MODE_NOT_SUPPORTED'),false);
 });
 test('过期信号不调用外部供应商',async()=>{
   const p=providers();p.safety=async()=>{throw new Error('called');};

@@ -14,6 +14,13 @@ test('lease loss prevents durable mutation',t=>{const db=new NativeJournal(':mem
  assert.equal(db.acquire('a','b',now),false);assert.throws(()=>db.save(row(),'b',now),/LEASE_LOST/);assert.equal(db.acquire('a','b',now+120001),true);
  assert.throws(()=>db.save(row(),'a',now+120001),/LEASE_LOST/);
 });
+test('execution venue and verified ALT identities become immutable once journaled',t=>{
+ const db=new NativeJournal(':memory:');t.after(()=>db.close());const record=row();db.reserve(record,'owner',now);
+ Object.assign(record,{venue:'jupiter' as const,protectionMode:'external_price_stream' as const,lookupTableAddresses:['table-a']});db.save(record,'owner',now);
+ assert.throws(()=>db.save({...record,venue:'pump'},'owner',now),/NATIVE_INTENT_IMMUTABLE/);
+ assert.throws(()=>db.save({...record,protectionMode:'account_stream'},'owner',now),/NATIVE_INTENT_IMMUTABLE/);
+ assert.throws(()=>db.save({...record,lookupTableAddresses:['table-b']},'owner',now),/NATIVE_INTENT_IMMUTABLE/);
+});
 test('timing is append-only and legacy records cannot acquire fabricated start times',t=>{
  const db=new NativeJournal(':memory:');t.after(()=>db.close());const stamp=new Date(now).toISOString();
  const record={...row(),timing:createNativeTiming(stamp)};db.reserve(record,'owner',now);

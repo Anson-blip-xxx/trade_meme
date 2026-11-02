@@ -348,7 +348,9 @@ export function normalizeGmgnSolanaTokenCard(input:GmgnSolanaTokenCardInput):Gmg
       if(nestedPool&&own(nestedPool,'quote_address')&&!nestedQuote||pool&&own(pool,'quote_address')&&!endpointQuote||
         nestedQuote&&endpointQuote&&nestedQuote!==endpointQuote)reject('GMGN_SOL_CARD_POOL_MISMATCH');
       const quote=endpointQuote??nestedQuote;if(quote){if(quote===address)reject('GMGN_SOL_CARD_POOL_MISMATCH');poolDto.quoteAddress=quote;}
-      const quoteSymbol=optionalSymbol(nestedPool?.quote_symbol);if(quoteSymbol)poolDto.quoteSymbol=quoteSymbol;
+      const nestedQuoteSymbol=optionalSymbol(nestedPool?.quote_symbol),endpointQuoteSymbol=optionalSymbol(pool?.quote_symbol);
+      if(nestedQuoteSymbol&&endpointQuoteSymbol&&nestedQuoteSymbol!==endpointQuoteSymbol)reject('GMGN_SOL_CARD_POOL_MISMATCH');
+      const quoteSymbol=endpointQuoteSymbol??nestedQuoteSymbol;if(quoteSymbol)poolDto.quoteSymbol=quoteSymbol;
       const venue=fixed(pool?.exchange??nestedPool?.exchange,VENUES);if(venue)poolDto.venue=venue;
       const baseReserve=optionalDecimal(nestedPool,'base_reserve_value'),quoteReserve=optionalDecimal(nestedPool,'quote_reserve_value');
       const reserveTotal=baseReserve&&quoteReserve?add(baseReserve,quoteReserve):undefined;

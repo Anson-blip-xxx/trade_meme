@@ -42,6 +42,22 @@ test('Pump未知扩展布局保留来源但不支持自动放行',()=>{
   const r=verifyPumpAccount('mint','pda',{owner:registry.pump.program,data:[data.toString('base64'),'base64']});
   assert.equal(r.status,'pass');assert.equal(r.facts.modeSupported,false);
 });
+test('Pump holder reward 与非 SOL 报价都是合法链上事实，不在来源过滤层判断执行能力',()=>{
+  const data=Buffer.alloc(166);createHash('sha256').update('account:BondingCurve').digest().copy(data,0,0,8);
+  data.writeBigUInt64LE(100n,40);data[124]=1;
+  const quote=Buffer.alloc(32,9);quote.copy(data,83);
+  const r=verifyPumpAccount('mint','pda',{owner:registry.pump.program,data:[data.toString('base64'),'base64']});
+  assert.equal(r.status,'pass');assert.equal(r.facts.modeSupported,true);assert.equal(r.facts.isHolderReward,true);
+  assert.equal(r.facts.quoteMint,bs58.encode(quote));assert.equal(r.facts.requiresMultiHop,true);
+  assert.equal(r.facts.quoteRoute,'token_quote');assert.equal(r.facts.executionRouteSupported,undefined);
+});
+test('Pump holder reward 的 SOL 报价仍可走现有原生路由',()=>{
+  const data=Buffer.alloc(166);createHash('sha256').update('account:BondingCurve').digest().copy(data,0,0,8);
+  data.writeBigUInt64LE(100n,40);data[124]=1;
+  const r=verifyPumpAccount('mint','pda',{owner:registry.pump.program,data:[data.toString('base64'),'base64']});
+  assert.equal(r.facts.modeSupported,true);assert.equal(r.facts.requiresMultiHop,false);
+  assert.equal(r.facts.quoteRoute,'native_sol');
+});
 test('LaunchLab官方程序不是Bonk身份的充分证据',()=>{
   const mint=bs58.encode(Buffer.alloc(32,7)),data=Buffer.alloc(429);
   createHash('sha256').update('account:PoolState').digest().copy(data,0,0,8);

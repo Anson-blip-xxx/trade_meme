@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {mkdtempSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
+import {DatabaseSync} from 'node:sqlite';
 import bs58 from 'bs58';
 import {NativePositionSupervisor,type NativeConfirmedPosition,type NativePositionIO,type NativePositionUpdate,type NativePositionExitRequest,type NativePositionExitResult} from '../src/native-solana/positions.js';
 
@@ -23,7 +24,7 @@ function fixture(path=':memory:',overrides:Partial<NativeConfirmedPosition>={}){
       return {status:'confirmed',signature:signature(10+sells.length),inputAmount:request.expectedAmount,outputAmount:request.quote.outputAmount,confirmedAt:new Date(now).toISOString(),slot};},
     async reconcile(){reconcileCalls++;return reconcileResult;},
   };
-  const options={io,now:()=>now,autoSchedule:false,onUpdate:(event:NativePositionUpdate)=>{events.push(event);}};
+  const options={io,now:()=>now,autoSchedule:false,eventDriven:false,onUpdate:(event:NativePositionUpdate)=>{events.push(event);}};
   const s=new NativePositionSupervisor(path,options);s.register(buy);s.start();
   return {s,buy,io,options,events,sells,quotes,now:()=>now,setNow:(n:number)=>{now=n;},advance:(ms=5000)=>{now+=ms;},
     setAmount:(n:string,c:'confirmed'|'finalized'='finalized',atSlot=slot)=>{amount=n;commitment=c;slot=atSlot;},
@@ -49,6 +50,17 @@ test('exact-size executable quotes trigger one double-out-half, then full -60% s
   }finally{await f.s.close();}
 });
 
+test('Jupiter TP needs one deadline quote and leaves the exact half route to the executor',async()=>{
+  const f=fixture(':memory:',{venue:'jupiter',protectionMode:'external_price_stream'});try{
+    f.setPrice(2n);f.setSale(async request=>({status:'confirmed',signature:signature(70),inputAmount:request.expectedAmount,
+      outputAmount:'1000',confirmedAt:new Date(f.now()).toISOString(),slot:102}));
+    await f.s.tick();assert.deepEqual(f.quotes,['1000']);assert.equal(f.sells.length,1);
+    assert.equal(f.sells[0].reason,'take_profit');assert.equal(f.sells[0].expectedAmount,'500');
+    assert.equal(f.sells[0].quote.inputAmount,'1000','the full executable quote is durable trigger evidence');
+    assert.equal(f.s.get(f.buy.orderId)!.takeProfitDone,true);
+  }finally{await f.s.close();}
+});
+
 test('uncertain sell is durably pending across restart and reconciled without another submission',async()=>{
   const dir=mkdtempSync(join(tmpdir(),'native-positions-')),path=join(dir,'positions.sqlite'),f=fixture(path);let restarted:NativePositionSupervisor|undefined;
   try{
@@ -61,6 +73,66 @@ test('uncertain sell is durably pending across restart and reconciled without an
     f.advance();await restarted.tick();assert.equal(f.sells.length,1);assert.equal(restarted.get(f.buy.orderId)!.pendingExit,undefined);
     assert.doesNotMatch(JSON.stringify(restarted.list()),/private upstream/);
   }finally{await f.s.close();await restarted?.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('Jupiter positions use external prices only as fresh wake-ups and restart without trusting an old quote',async()=>{
+  const dir=mkdtempSync(join(tmpdir(),'native-external-price-')),path=join(dir,'positions.sqlite'),f=fixture(path,{venue:'jupiter',protectionMode:'external_price_stream'});
+  let restarted:NativePositionSupervisor|undefined;
+  try{
+    assert.equal(f.s.observeExternalPrice(f.buy.orderId,{priceUsd:1e-8,observedAt:new Date(f.now()).toISOString(),source:'ave_price_stream_sample'}),true);
+    assert.equal('externalPriceAnchor' in f.s.get(f.buy.orderId)!,false);
+    await f.s.tick();assert.ok(f.s.get(f.buy.orderId)!.quote);
+    f.advance(20001);
+    assert.equal(f.s.observeExternalPrice(f.buy.orderId,{priceUsd:2e-8,observedAt:new Date(f.now()-20001).toISOString(),source:'ave_price_stream_sample'}),false,
+      'a stale sample cannot wake automatic exit work');
+    await f.s.close();restarted=new NativePositionSupervisor(path,f.options);
+    const restored=restarted.get(f.buy.orderId)!;
+    assert.equal(restored.buy.venue,'jupiter');assert.equal(restored.buy.protectionMode,'external_price_stream');
+    assert.equal('externalPriceAnchor' in restored,false);
+    assert.equal(restored.quote,undefined);assert.equal(restored.lastCheckAt,undefined);
+    restarted.start();assert.equal(restarted.readiness().reason,'NATIVE_POSITION_SUPERVISION_STALE');
+  }finally{await f.s.close();await restarted?.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('restart migrates legacy Jupiter account-stream rows and drops persisted route accounts',async()=>{
+  const dir=mkdtempSync(join(tmpdir(),'native-jupiter-migration-')),path=join(dir,'positions.sqlite');
+  const f=fixture(path,{venue:'jupiter',protectionMode:'external_price_stream'});let restarted:NativePositionSupervisor|undefined;
+  try{
+    await f.s.close();const db=new DatabaseSync(path);
+    const stored=db.prepare('SELECT payload FROM native_positions WHERE order_id=?').get(f.buy.orderId) as {payload:string};
+    const legacy=JSON.parse(stored.payload);legacy.buy.protectionMode='account_stream';legacy.buy.subscriptionAccounts=[address(4),address(5)];
+    db.prepare('UPDATE native_positions SET payload=? WHERE order_id=?').run(JSON.stringify(legacy),f.buy.orderId);db.close();
+    restarted=new NativePositionSupervisor(path,f.options);const row=restarted.get(f.buy.orderId)!;
+    assert.equal(row.buy.protectionMode,'external_price_stream');assert.deepEqual(row.buy.subscriptionAccounts,[f.buy.wallet,f.buy.mint].sort());
+    await restarted.close();restarted=undefined;
+    const verify=new DatabaseSync(path);const persisted=JSON.parse((verify.prepare('SELECT payload FROM native_positions WHERE order_id=?').get(f.buy.orderId) as {payload:string}).payload);
+    verify.close();assert.equal(persisted.buy.protectionMode,'external_price_stream');assert.deepEqual(persisted.buy.subscriptionAccounts,[f.buy.wallet,f.buy.mint].sort());
+  }finally{await f.s.close();await restarted?.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('external wake bursts coalesce to one in-flight check and one latest follow-up',async()=>{
+  const f=fixture(':memory:',{venue:'jupiter',protectionMode:'external_price_stream'});try{
+    f.options.eventDriven=true;const original=f.io.quote;let calls=0,active=0,maxActive=0,release!:()=>void;
+    const gate=new Promise<void>(resolve=>{release=resolve;});
+    f.io.quote=async request=>{calls++;active++;maxActive=Math.max(maxActive,active);if(calls===1)await gate;
+      try{return await original(request);}finally{active--;}};
+    assert.equal(f.s.observeExternalPrice(f.buy.orderId,{priceUsd:1,observedAt:new Date(f.now()).toISOString(),source:'ave_price_stream_sample'}),true);
+    const first=f.s.checkNow(f.buy.orderId);while(calls===0)await new Promise(resolve=>setImmediate(resolve));
+    const same:Promise<void>[]=[];for(let i=0;i<20;i++){
+      f.s.observeExternalPrice(f.buy.orderId,{priceUsd:1+i/100,observedAt:new Date(f.now()).toISOString(),source:'ave_price_stream_sample'});
+      same.push(f.s.checkNow(f.buy.orderId));
+    }
+    release();await Promise.all([first,...same]);await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(maxActive,1);assert.equal(calls,2,'one full evaluation plus one coalesced latest full evaluation below +100%');
+  }finally{await f.s.close();}
+});
+
+test('Jupiter registration normalizes legacy account-stream protection to external wake-ups',async()=>{
+  const f=fixture(':memory:',{venue:'jupiter',protectionMode:'account_stream'});try{
+    assert.equal(f.s.get(f.buy.orderId)?.buy.protectionMode,'external_price_stream');
+    assert.equal(f.s.observeExternalPrice(f.buy.orderId,{priceUsd:1,observedAt:new Date(f.now()).toISOString(),source:'ave_price_stream_sample'}),true);
+    await f.s.tick();const row=f.s.get(f.buy.orderId)!;assert.ok(row.quote);assert.equal('externalPriceAnchor' in row,false);
+  }finally{await f.s.close();}
 });
 
 test('slippage bounds never shift the -60% or +100% expected executable price triggers',async()=>{

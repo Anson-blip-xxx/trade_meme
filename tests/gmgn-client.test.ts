@@ -213,6 +213,110 @@ test('continuous Market Signal polls yield one non-preemptible retry to backgrou
   assert.equal(order.filter(item=>item.startsWith('market-')).length,5);
 });
 
+test('continuous Market Signal polls yield a complete background turn at the fairness boundary',
+  {timeout:14_000},async()=>{
+  const firstPollStarted=deferred<void>(),releaseFirstPoll=deferred<void>();
+  const backgroundStarted=deferred<void>(),releaseBackground=deferred<void>();
+  const order:string[]=[];let backgroundAttempt=0,marketAttempt=0,backgroundAborted=false;
+  const client=new GmgnClient({apiKey:key(),minIntervalMs:0,fetcher:async(input,init)=>{
+    const path=new URL(String(input)).pathname;
+    if(path==='/v1/callout/global'){
+      backgroundAttempt++;order.push(`background-${backgroundAttempt}-start`);
+      if(backgroundAttempt===2){
+        backgroundStarted.resolve();
+        await new Promise<void>((resolve,reject)=>{
+          const abort=()=>{backgroundAborted=true;reject(new Error('ABORTED'));};
+          if(init?.signal?.aborted)abort();else init?.signal?.addEventListener('abort',abort,{once:true});
+          releaseBackground.promise.then(resolve,reject);
+        });
+        order.push('background-2-finish');
+      }
+      return response({code:0,data:`background-${backgroundAttempt}`});
+    }
+    if(path==='/v1/trade/quote'){
+      order.push('live');return response({code:0,data:'live'});
+    }
+    marketAttempt++;order.push(`market-${marketAttempt}-start`);
+    if(marketAttempt===1){
+      firstPollStarted.resolve();
+      await new Promise<void>((resolve,reject)=>{
+        const abort=()=>reject(new Error('ABORTED'));
+        if(init?.signal?.aborted)abort();else init?.signal?.addEventListener('abort',abort,{once:true});
+        releaseFirstPoll.promise.then(resolve,reject);
+      });
+    }
+    return response({code:0,data:`market-${marketAttempt}`});
+  }});
+
+  // Seed the per-credential boundary, then keep the signal lane continuously
+  // occupied while the next archive request waits for its bounded fair turn.
+  assert.equal(await client.getCalloutGlobal(['sol']), 'background-1');
+  const firstPoll=client.getMemeMarketSignals('sol',{priority:'signal_poll',queueTimeoutMs:15_000});
+  await firstPollStarted.promise;
+  const queuedAt=Date.now();
+  // Use the production default five-second queue budget. The fairness boundary
+  // must leave enough margin that its wake cannot lose to the expiry timer.
+  const background=client.getCalloutGlobal(['sol']);
+  const explicitBackground=client.getCalloutGlobal(['sol'],{},
+    {priority:'background',queueTimeoutMs:4_500});
+  const explicitRejected=assert.rejects(explicitBackground,rejects('GMGN_QUEUE_TIMEOUT'));
+  const queuedPolls=Array.from({length:3},()=>client.getMemeMarketSignals('sol',
+    {priority:'signal_poll',queueTimeoutMs:15_000}));
+  // Stall the event loop across both the four-second fairness boundary and the
+  // original five-second expiry. Neither the timer nor prune path may discard
+  // the earned default turn when the fairness callback did not run on time.
+  const stalledUntil=Date.now()+5_100;
+  while(Date.now()<stalledUntil) { /* intentional event-loop stall */ }
+  // Enqueue live synchronously before yielding to overdue timers. Its scheduler
+  // kick exercises pruneQueue: default background survives, explicit expires.
+  const firstPollRejected=assert.rejects(firstPoll,rejects('GMGN_REQUEST_ABORTED'));
+  const live=client.get('/v1/trade/quote',{chain:'sol',marker:'live'},10,{priority:'live_entry'});
+  await explicitRejected;await firstPollRejected;releaseFirstPoll.resolve();
+  assert.equal(await live,'live');await backgroundStarted.promise;
+  const waitedMs=Date.now()-queuedAt;
+  assert.ok(waitedMs>=5_000&&waitedMs<6_500,`background started after ${waitedMs}ms`);
+
+  // A newly arriving one-second poll must queue behind the granted turn.
+  const latePoll=client.getMemeMarketSignals('sol',{priority:'signal_poll',queueTimeoutMs:15_000});
+  await new Promise(resolve=>setTimeout(resolve,20));
+  assert.equal(backgroundAborted,false);
+  releaseBackground.resolve();assert.equal(await background,'background-2');
+  await Promise.all([...queuedPolls,latePoll]);
+  assert.equal(backgroundAborted,false);
+  assert.deepEqual(order.slice(0,5),['background-1-start','market-1-start','live',
+    'background-2-start','background-2-finish']);
+});
+
+test('a new background job does not inherit fairness age from an old archive turn',
+  {timeout:8_000},async()=>{
+  const blockerStarted=deferred<void>(),releaseBlocker=deferred<void>();
+  const order:string[]=[];let backgroundAttempt=0;
+  const client=new GmgnClient({apiKey:key(),minIntervalMs:0,fetcher:async input=>{
+    const url=new URL(String(input));
+    if(url.pathname==='/v1/callout/global'){
+      backgroundAttempt++;order.push(`background-${backgroundAttempt}`);
+      return response({code:0,data:`background-${backgroundAttempt}`});
+    }
+    if(url.pathname==='/v1/market/token_signal'){
+      order.push('market');return response({code:0,data:'market'});
+    }
+    const marker=url.searchParams.get('marker')!;order.push(marker);
+    if(marker==='blocker'){blockerStarted.resolve();await releaseBlocker.promise;}
+    return response({code:0,data:marker});
+  }});
+
+  assert.equal(await client.getCalloutGlobal(['sol']),'background-1');
+  // The old lane-based clock would make a background job submitted after this
+  // gap immediately protected and place it ahead of a fresh signal poll.
+  await new Promise(resolve=>setTimeout(resolve,4_050));
+  const blocker=client.get(route,{...query,marker:'blocker'});await blockerStarted.promise;
+  const background=client.getCalloutGlobal(['sol']);
+  const signal=client.getMemeMarketSignals('sol',{priority:'signal_poll',queueTimeoutMs:15_000});
+  releaseBlocker.resolve();
+  await Promise.all([blocker,background,signal]);
+  assert.deepEqual(order,['background-1','blocker','market','background-2']);
+});
+
 test('live entry can still preempt a signal-protected background retry', async () => {
   const firstStarted=deferred<void>(),protectedStarted=deferred<void>();let archiveAttempt=0;
   const order:string[]=[];
@@ -318,7 +422,7 @@ test('live-entry quote interrupts an in-flight archive request and passes the no
   assert.deepEqual(order.slice(3), ['normal-0', 'normal-1', 'normal-2', 'normal-3']);
 });
 
-test('a normal flood yields a bounded per-credential opportunity to queued background work', async () => {
+test('a finite normal burst runs before a newly queued background job', async () => {
   const entered = deferred<void>(), release = deferred<void>(), order: string[] = [];
   const client = new GmgnClient({apiKey: key(), minIntervalMs: 0, fetcher: async input => {
     const marker = new URL(String(input)).searchParams.get('marker')!;
@@ -333,10 +437,28 @@ test('a normal flood yields a bounded per-credential opportunity to queued backg
     client.get(route, {...query, marker: `normal-${index}`}));
   release.resolve();
   await Promise.all([blocker, background, ...normal]);
-  assert.deepEqual(order.slice(0, 3), ['blocker', 'background', 'normal-0']);
+  assert.deepEqual(order.slice(0, 3), ['blocker', 'normal-0', 'normal-1']);
+  assert.equal(order.at(-1), 'background');
 });
 
-test('live entry remains ahead of a fair background opportunity', async () => {
+test('sustained normal contention yields one complete background fairness turn',
+  {timeout:7_000},async()=>{
+  const entered=deferred<void>(),release=deferred<void>(),order:string[]=[];
+  const client=new GmgnClient({apiKey:key(),minIntervalMs:0,fetcher:async input=>{
+    const marker=new URL(String(input)).searchParams.get('marker')!;order.push(marker);
+    if(marker==='blocker'){entered.resolve();await release.promise;}
+    return response({code:0,data:marker});
+  }});
+  const blocker=client.get(route,{...query,marker:'blocker'});await entered.promise;
+  const backgrounds=['background-0','background-1'].map(marker=>client.get(route,{...query,marker},1,
+    {priority:'background',queueTimeoutMs:5_000}));
+  const normals=['normal-0','normal-1'].map(marker=>client.get(route,{...query,marker}));
+  await new Promise(resolve=>setTimeout(resolve,4_050));release.resolve();
+  await Promise.all([blocker,...backgrounds,...normals]);
+  assert.deepEqual(order,['blocker','background-0','normal-0','normal-1','background-1']);
+});
+
+test('live entry remains ahead of normal and a newly queued background job', async () => {
   const entered = deferred<void>(), release = deferred<void>(), order: string[] = [];
   const client = new GmgnClient({apiKey: key(), minIntervalMs: 0, fetcher: async input => {
     const marker = new URL(String(input)).searchParams.get('marker')!;
@@ -350,10 +472,10 @@ test('live entry remains ahead of a fair background opportunity', async () => {
   const live = client.get(route, {...query, marker: 'live'}, 1, {priority: 'live_entry'});
   release.resolve();
   await Promise.all([blocker, background, normal, live]);
-  assert.deepEqual(order, ['blocker', 'live', 'background', 'normal']);
+  assert.deepEqual(order, ['blocker', 'live', 'normal', 'background']);
 });
 
-test('fairness never promotes multiple background jobs in a burst', async () => {
+test('new background jobs do not pass a finite normal burst', async () => {
   const entered = deferred<void>(), release = deferred<void>(), order: string[] = [];
   const client = new GmgnClient({apiKey: key(), minIntervalMs: 0, fetcher: async input => {
     const marker = new URL(String(input)).searchParams.get('marker')!;
@@ -367,7 +489,7 @@ test('fairness never promotes multiple background jobs in a burst', async () => 
   const normal = ['normal-0', 'normal-1'].map(marker => client.get(route, {...query, marker}));
   release.resolve();
   await Promise.all([blocker, ...backgrounds, ...normal]);
-  assert.deepEqual(order, ['blocker', 'background-0', 'normal-0', 'normal-1', 'background-1']);
+  assert.deepEqual(order, ['blocker', 'normal-0', 'normal-1', 'background-0', 'background-1']);
 });
 
 test('normal traffic on one credential cannot delay background work on another', async () => {

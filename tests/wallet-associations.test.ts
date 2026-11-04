@@ -5,7 +5,7 @@ import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {DatabaseSync} from 'node:sqlite';
 import {WalletHistory,type WalletTradeObservation} from '../src/wallet-history.js';
-import {WALLET_ASSOCIATION_INVALIDATION_SQL} from '../src/wallet-associations.js';
+import {WALLET_ASSOCIATION_INVALIDATION_SQL,WALLET_ASSOCIATION_TRADE_INVALIDATION_SQL} from '../src/wallet-associations.js';
 
 const base=Date.parse('2026-10-09T00:00:00Z'),iso=(n:number)=>new Date(base+n*1000).toISOString();
 const address=(n:number)=>'0x'+n.toString(16).padStart(40,'0'),hash=(n:number)=>'0x'+n.toString(16).padStart(64,'0');
@@ -92,6 +92,51 @@ test('KOL-directed lead episodes deduplicate feeds and same token, exclude same 
     assert.equal(detail.coverage.firstObservedBuy,true);assert.equal(detail.coverage.exactRealizedPnl,false);
     history.refreshAssociations();assert.equal(history.associationStats().episodes,1);
   } finally {history.close();}
+});
+
+test('batched repeated-token trades preserve sequential association and first-public KOL semantics',()=>{
+  const batched=fixture(),sequential=fixture();
+  const values:WalletTradeObservation[]=[
+    trade({wallet:address(8),txHash:hash(800),eventAt:iso(70),observedAt:iso(80)}),
+    trade({wallet:address(9),txHash:hash(900),eventAt:iso(71),observedAt:iso(81)}),
+    trade({wallet:candidate,tokenAddress:address(101),txHash:hash(2101),eventAt:iso(72),observedAt:iso(82),source:'gmgn_kol_feed'}),
+    trade({wallet:candidate,tokenAddress:address(102),txHash:hash(2102),eventAt:iso(73),observedAt:iso(83),source:'gmgn_kol_feed'}),
+  ];
+  try {
+    for(const value of [batched.history,sequential.history]){pair(value);value.refreshAssociations();}
+    batched.history.recordTrades(values);for(const value of values)sequential.history.recordTrade(value);
+    assert.equal(batched.history.getAssociation(chain,leader,candidate)?.association.status,'stale');
+    assert.equal(sequential.history.getAssociation(chain,leader,candidate)?.association.status,'stale');
+    for(const value of [batched.history,sequential.history])for(let pass=0;pass<5&&value.associationStats().pending;pass++)value.refreshAssociations(5);
+    assert.deepEqual(batched.history.listAssociations(),sequential.history.listAssociations());
+    assert.deepEqual(batched.history.getAssociation(chain,leader,candidate),sequential.history.getAssociation(chain,leader,candidate));
+    assert.equal(batched.history.getAssociation(chain,leader,candidate)?.association.candidatePublic,true,
+      'the first KOL appearance must still invalidate the candidate relation');
+    for(const wallet of [candidate,address(8),address(9)])
+      assert.deepEqual(batched.history.getWallet(chain,wallet),sequential.history.getWallet(chain,wallet));
+  } finally {batched.history.close();sequential.history.close();}
+});
+
+test('batched trade invalidation queries are bounded by unique chain-token pairs',()=>{
+  const {history}=fixture(),db=(history as unknown as {db:DatabaseSync}).db;
+  const original=db.prepare.bind(db),executions={anchors:0,relations:0};
+  try {
+    pair(history);history.refreshAssociations();
+    (db as unknown as {prepare:typeof db.prepare}).prepare=((sql:string)=>{
+      const statement=original(sql),run=statement.run.bind(statement);
+      if(sql===WALLET_ASSOCIATION_TRADE_INVALIDATION_SQL.anchors)statement.run=((...args:any[])=>{
+        executions.anchors++;return run(...args);
+      }) as typeof statement.run;
+      if(sql===WALLET_ASSOCIATION_TRADE_INVALIDATION_SQL.relations)statement.run=((...args:any[])=>{
+        executions.relations++;return run(...args);
+      }) as typeof statement.run;
+      return statement;
+    }) as typeof db.prepare;
+    history.recordTrades(Array.from({length:200},(_,index)=>trade({wallet:address(1_000+index),
+      tokenAddress:index%2?token:address(101),txHash:hash(10_000+index),eventAt:iso(70),observedAt:iso(80)})));
+    assert.deepEqual(executions,{anchors:2,relations:2});
+    assert.equal(history.stats().events,202);
+  } finally {(db as unknown as {prepare:typeof db.prepare}).prepare=original as typeof db.prepare;history.close();}
 });
 
 test('recurrence counts distinct coins; candidate exits after leader are evidence and not inferred profit',()=>{

@@ -44,6 +44,14 @@ export interface SourceCorroborationMetadata {name?:string;txRefs?:SourceTransac
 type Row=Record<string,any>;
 const SOURCES:readonly CorroborationSource[]=['ave','debot','gmgn'];
 const RETENTION_DAYS=30,DEFAULT_MAX_EVENTS=100000,MAX_REFS=20,ASSESS_EVENTS_PER_SOURCE=64,MAX_CAPACITY_PRUNE_BATCH=1000;
+// The recorded-at index looks attractive to SQLite on large ledgers, but it
+// scans every provider for a popular contract before applying source=?. Pin
+// the existing token/source index so empty providers stay O(log n) and the
+// bounded sort sees only one provider's rows.
+export const SOURCE_ASSESSMENT_ROWS_SQL=`SELECT * FROM source_notifications INDEXED BY source_notifications_token
+  WHERE chain=? AND address=? AND source=? AND recorded_at<=? AND recorded_at>=?
+  ORDER BY CASE WHEN occurred_at>=? AND occurred_at<=? AND first_observed_at>=? AND occurred_at<=first_observed_at
+    AND (conflict_at IS NULL OR conflict_at>?) THEN 0 ELSE 1 END,first_observed_at DESC,event_id DESC LIMIT ?`;
 const RETENTION_MS=RETENTION_DAYS*86400000;
 const STATUS_META_VERSION='2';
 const STATUS_META_KEYS={version:'status_version',events:'events',deliveries:'deliveries',latest:'latest_observed_at',
@@ -129,9 +137,7 @@ export class SourceCorroborationReader {
     const end=iso(at),start=iso(at-this.windowSec*1000),retention=retainedFrom(this.db,at),observations:SourceNotificationEvidence[]=[],
       notificationCounts:Partial<Record<CorroborationSource,number>>={};let truncated=false;
     for(const source of SOURCES){
-      const rows=this.db.prepare(`SELECT * FROM source_notifications WHERE chain=? AND address=? AND source=? AND recorded_at<=? AND recorded_at>=?
-        ORDER BY CASE WHEN occurred_at>=? AND occurred_at<=? AND first_observed_at>=? AND occurred_at<=first_observed_at
-          AND (conflict_at IS NULL OR conflict_at>?) THEN 0 ELSE 1 END,first_observed_at DESC,event_id DESC LIMIT ?`)
+      const rows=this.db.prepare(SOURCE_ASSESSMENT_ROWS_SQL)
         .all(token.chain,token.address,source,end,retention,start,end,start,end,ASSESS_EVENTS_PER_SOURCE+1);
       truncated=truncated||rows.length>ASSESS_EVENTS_PER_SOURCE;observations.push(...rows.slice(0,ASSESS_EVENTS_PER_SOURCE).map(row=>this.decode(row)));
       notificationCounts[source]=Number(this.db.prepare(`SELECT count(*) AS n FROM source_notifications WHERE chain=? AND address=? AND source=?
@@ -319,9 +325,7 @@ export class SourceCorroboration {
     const observations:SourceNotificationEvidence[]=[],notificationCounts:Partial<Record<CorroborationSource,number>>={};let truncated=false;
     for(const source of SOURCES){
       // Prefer fresh candidates before limiting reference comparisons. A burst of stale/future copies cannot hide a fresh source.
-      const rows=this.db.prepare(`SELECT * FROM source_notifications WHERE chain=? AND address=? AND source=? AND recorded_at<=? AND recorded_at>=?
-        ORDER BY CASE WHEN occurred_at>=? AND occurred_at<=? AND first_observed_at>=? AND occurred_at<=first_observed_at
-          AND (conflict_at IS NULL OR conflict_at>?) THEN 0 ELSE 1 END,first_observed_at DESC,event_id DESC LIMIT ?`)
+      const rows=this.db.prepare(SOURCE_ASSESSMENT_ROWS_SQL)
         .all(token.chain,token.address,source,end,retention,start,end,start,end,ASSESS_EVENTS_PER_SOURCE+1);
       truncated=truncated||rows.length>ASSESS_EVENTS_PER_SOURCE;
       observations.push(...rows.slice(0,ASSESS_EVENTS_PER_SOURCE).map(row=>this.decode(row)));

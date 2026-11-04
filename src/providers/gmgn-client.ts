@@ -15,7 +15,11 @@ const MAX_NORMAL_QUEUE = 128;
 const MAX_BACKGROUND_QUEUE = 16;
 // A busy normal lane still yields one bounded opportunity to its own archive
 // work. This is per credential: unrelated API keys retain independent lanes.
-const BACKGROUND_FAIRNESS_INTERVAL_MS = 5_000;
+const BACKGROUND_FAIRNESS_INTERVAL_MS = 4_000;
+// Once a queued archive job earns its turn, let the current fixed-timeout
+// request release the lane. This is capped again by MAX_QUEUE_WAIT_MS below,
+// so continuous live-entry traffic still cannot retain a queued job forever.
+const BACKGROUND_FAIRNESS_GRACE_MS = REQUEST_TIMEOUT_MS + 1_000;
 // GMGN documents the plan bucket as weight units refilled per second
 // (Free 5/5, Plus 20/20, Pro 50/50). The 350 ms floor is intentionally
 // conservative enough for Free even when a route carries multiple units.
@@ -64,8 +68,9 @@ interface RateState {
   observedIntervalMs: number;
   lastStartedAt?: number;
   lastCost?: number;
-  lastBackgroundStartedAt?: number;
-  /** A signal poll preempted archive work; its next attempt gets one full turn. */
+  /** Earliest next fairness grant after one protected archive turn starts. */
+  nextBackgroundFairAt?: number;
+  /** Archive work is owed one full turn after a higher-priority interruption. */
   backgroundSignalProtectionPending?: boolean;
 }
 export type GmgnRequestPriority = 'background' | 'normal' | 'signal_poll' | 'live_entry';
@@ -74,9 +79,11 @@ export interface GmgnScheduleOptions {
   /** Queue budget only. Network requests retain their own fixed timeout. */
   queueTimeoutMs?: number;
 }
+const DEFAULT_BACKGROUND_SCHEDULING:GmgnScheduleOptions={priority:'background',queueTimeoutMs:5_000};
 interface ScheduledRequest<T> {
   lane: RateState;
   priority: GmgnRequestPriority;
+  enqueuedAt: number;
   expiresAt: number;
   signal?: AbortSignal;
   waitMs: () => number;
@@ -84,11 +91,15 @@ interface ScheduledRequest<T> {
   resolve: (value: T) => void;
   reject: (error: unknown) => void;
   timer?: ReturnType<typeof setTimeout>;
+  fairnessTimer?: ReturnType<typeof setTimeout>;
   abort?: () => void;
   interrupt?: () => void;
   protectedFromSignalPoll?: boolean;
   interruptedBySignalPoll?: boolean;
   interruptedByLiveEntry?: boolean;
+  backgroundFairAt?: number;
+  backgroundFairTurn?: boolean;
+  extendFairnessPromise?: boolean;
   started: boolean;
   settled: boolean;
 }
@@ -114,6 +125,7 @@ function removeScheduled(job: ScheduledRequest<unknown>): boolean {
 }
 function cleanupScheduled(job: ScheduledRequest<unknown>): void {
   if (job.timer) clearTimeout(job.timer);
+  if (job.fairnessTimer) clearTimeout(job.fairnessTimer);
   if (job.abort && job.signal) job.signal.removeEventListener('abort', job.abort);
 }
 function rejectScheduled(job: ScheduledRequest<unknown>, error: unknown): void {
@@ -126,12 +138,74 @@ function kickScheduler(): void {
   if (schedulerWake) { clearTimeout(schedulerWake); schedulerWake = undefined; }
   if (!schedulerActive) void drainScheduler();
 }
+function armQueueExpiry(job: ScheduledRequest<unknown>): void {
+  if (job.timer) clearTimeout(job.timer);
+  job.timer = setTimeout(() => {
+    if (job.started) return;
+    const now=Date.now();
+    // Under process load the event loop can cross both the four-second fair
+    // boundary and the original five-second expiry before either callback is
+    // dispatched. Default archive work must atomically claim/extend its earned
+    // turn here instead of relying on the fairness timer winning that race.
+    if(job.extendFairnessPromise) {
+      if(!job.backgroundFairTurn)grantBackgroundFairTurn(job,now);
+      if(job.backgroundFairTurn&&job.expiresAt>now) {
+        kickScheduler();
+        return;
+      }
+    }
+    if (!removeScheduled(job)) return;
+    rejectScheduled(job, new GmgnError('GMGN_QUEUE_TIMEOUT'));
+    kickScheduler();
+  }, Math.max(1, job.expiresAt - Date.now()));
+}
+function effectiveBackgroundFairAt(job:ScheduledRequest<unknown>):number {
+  return Math.max(job.backgroundFairAt ?? job.enqueuedAt + BACKGROUND_FAIRNESS_INTERVAL_MS,
+    job.lane.nextBackgroundFairAt ?? Number.NEGATIVE_INFINITY);
+}
+function laneHasBackgroundFairTurn(job:ScheduledRequest<unknown>):boolean {
+  if(backgroundQueue.some(other=>other!==job&&other.lane===job.lane&&other.backgroundFairTurn))return true;
+  const active=activeRequests.get(job.lane);
+  return active?.priority==='background'&&active.protectedFromSignalPoll===true;
+}
+function grantBackgroundFairTurn(job: ScheduledRequest<unknown>, now: number): boolean {
+  if (job.started || job.settled || job.priority !== 'background' || job.backgroundFairTurn ||
+      !backgroundQueue.includes(job)) return false;
+  const position=backgroundQueue.indexOf(job);
+  if(backgroundQueue.slice(0,position).some(earlier=>earlier.lane===job.lane))return false;
+  if(now<effectiveBackgroundFairAt(job)||laneHasBackgroundFairTurn(job))return false;
+  job.backgroundFairTurn = true;
+  // The caller's normal five-second budget establishes eligibility. Once
+  // earned, retain that promise long enough for the one active GMGN request to
+  // hit its fixed timeout and release the serial credential lane. The absolute
+  // scheduler cap prevents an unbounded promise under continuous live work.
+  const promisedUntil = Math.min(job.enqueuedAt + MAX_QUEUE_WAIT_MS, now + BACKGROUND_FAIRNESS_GRACE_MS);
+  if (job.extendFairnessPromise&&promisedUntil > job.expiresAt) {
+    job.expiresAt = promisedUntil;
+    armQueueExpiry(job);
+  }
+  return true;
+}
 function pruneQueue(queue: ScheduledRequest<unknown>[], now: number): void {
   for (let index = queue.length - 1; index >= 0; index--) {
     const job = queue[index];
-    if (job.signal?.aborted || job.expiresAt <= now) {
+    // Cancellation always wins, even if default archive work reached its fair
+    // boundary at the same instant.
+    if(job.signal?.aborted) {
       queue.splice(index, 1);
-      rejectScheduled(job, new GmgnError(job.signal?.aborted ? 'GMGN_REQUEST_ABORTED' : 'GMGN_QUEUE_TIMEOUT'));
+      rejectScheduled(job,new GmgnError('GMGN_REQUEST_ABORTED'));
+      continue;
+    }
+    if(job.expiresAt<=now) {
+      // A scheduler kick can prune queues before overdue timer callbacks run.
+      // Give default archive work the same atomic fair-grant opportunity as its
+      // expiry callback; explicit queue budgets remain hard deadlines.
+      if(job.extendFairnessPromise) {
+        if(!job.backgroundFairTurn)grantBackgroundFairTurn(job,now);
+        if(job.backgroundFairTurn&&job.expiresAt>now)continue;
+      }
+      queue.splice(index,1);
+      rejectScheduled(job,new GmgnError('GMGN_QUEUE_TIMEOUT'));
     }
   }
 }
@@ -146,7 +220,7 @@ function nextReady(queue: ScheduledRequest<unknown>[]): {job?: ScheduledRequest<
   return {wait};
 }
 function nextReadyBackground(now: number): {
-  job?: ScheduledRequest<unknown>; wait: number; contended: boolean; signalProtected: boolean;
+  job?: ScheduledRequest<unknown>; wait: number; contended: boolean; protectedTurn: boolean;
 } {
   let wait = Number.POSITIVE_INFINITY;
   let unopposed: ScheduledRequest<unknown> | undefined;
@@ -158,18 +232,28 @@ function nextReadyBackground(now: number): {
     // Once a signal poll has cut an archive request short, the next archive
     // attempt must finish (or hit its own timeout) before more signal polls on
     // this credential. This prevents a 1 s poller from starving persistence.
-    if (job.lane.backgroundSignalProtectionPending)
-      return {job, wait: 0, contended: true, signalProtected: true};
-    const contended = normalQueue.some(normal => normal.lane === job.lane);
+    if (job.lane.backgroundSignalProtectionPending || job.backgroundFairTurn)
+      return {job, wait: 0, contended: true, protectedTurn: true};
+    // Signal polling is intentionally above ordinary reads, but it still has
+    // to yield one complete archive turn at the same bounded fairness boundary.
+    // Otherwise a continuously replenished poll queue can keep the archive
+    // request queued until its own five-second budget expires.
+    const contended = signalPollQueue.some(signal => signal.lane === job.lane) ||
+      normalQueue.some(normal => normal.lane === job.lane);
     if (!contended) { unopposed ??= job; continue; }
-    const fairAt = (job.lane.lastBackgroundStartedAt ?? Number.NEGATIVE_INFINITY) + BACKGROUND_FAIRNESS_INTERVAL_MS;
+    const fairAt = effectiveBackgroundFairAt(job);
     const fairnessWait = Math.max(0, fairAt - now);
-    if (fairnessWait === 0) { fair ??= job; continue; }
+    if (fairnessWait === 0) {
+      if(grantBackgroundFairTurn(job, now))fair ??= job;
+      continue;
+    }
     wait = Math.min(wait, fairnessWait);
   }
-  if (fair) return {job: fair, wait: 0, contended: true, signalProtected: false};
-  if (unopposed) return {job: unopposed, wait: 0, contended: false, signalProtected: false};
-  return {wait, contended: false, signalProtected: false};
+  // A fairness turn is complete, not merely permission to start. New signal
+  // polls may queue behind it but cannot interrupt it; live entry still can.
+  if (fair) return {job: fair, wait: 0, contended: true, protectedTurn: true};
+  if (unopposed) return {job: unopposed, wait: 0, contended: false, protectedTurn: false};
+  return {wait, contended: false, protectedTurn: false};
 }
 async function drainScheduler(): Promise<void> {
   if (schedulerActive) return;
@@ -180,13 +264,13 @@ async function drainScheduler(): Promise<void> {
       pruneQueue(liveEntryQueue, now); pruneQueue(signalPollQueue, now); pruneQueue(normalQueue, now); pruneQueue(backgroundQueue, now);
       const live = nextReady(liveEntryQueue);
       const signal = live.job ? {wait: Number.POSITIVE_INFINITY} : nextReady(signalPollQueue);
-      const background = live.job ? {wait: Number.POSITIVE_INFINITY, contended: false, signalProtected: false} :
+      const background = live.job ? {wait: Number.POSITIVE_INFINITY, contended: false, protectedTurn: false} :
         nextReadyBackground(now);
-      const normal = live.job || signal.job || background.signalProtected ? {wait: Number.POSITIVE_INFINITY} : nextReady(normalQueue);
+      const normal = live.job || signal.job || background.protectedTurn ? {wait: Number.POSITIVE_INFINITY} : nextReady(normalQueue);
       // A contended background job is selected only at its per-credential
       // fairness boundary. Uncontended background work remains below normal
       // priority; the loop can start it concurrently once other lanes are busy.
-      const selected = live.job ?? (background.signalProtected ? background.job : signal.job) ??
+      const selected = live.job ?? (background.protectedTurn ? background.job : undefined) ?? signal.job ??
         (background.contended ? background.job : normal.job ?? background.job);
       if (!selected) {
         const wait = Math.min(live.wait, signal.wait, normal.wait, background.wait);
@@ -195,8 +279,9 @@ async function drainScheduler(): Promise<void> {
       }
       removeScheduled(selected); selected.started = true; cleanupScheduled(selected); activeLanes.add(selected.lane);
       if (selected.priority === 'background') {
-        selected.lane.lastBackgroundStartedAt = now;
-        selected.protectedFromSignalPoll = selected.lane.backgroundSignalProtectionPending === true;
+        selected.protectedFromSignalPoll = selected === background.job && background.protectedTurn;
+        if(selected.protectedFromSignalPoll)
+          selected.lane.nextBackgroundFairAt=now+BACKGROUND_FAIRNESS_INTERVAL_MS;
       }
       activeRequests.set(selected.lane,selected);
       void (async () => {
@@ -220,9 +305,11 @@ async function drainScheduler(): Promise<void> {
     }
   } finally { schedulerActive = false; }
 }
-function enqueueScheduled<T>(job: Omit<ScheduledRequest<T>, 'resolve'|'reject'|'started'|'settled'>): Promise<T> {
+function enqueueScheduled<T>(job: Omit<ScheduledRequest<T>, 'resolve'|'reject'|'started'|'settled'|'enqueuedAt'>): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const scheduled: ScheduledRequest<T> = {...job, resolve, reject, started: false, settled: false};
+    const enqueuedAt=Date.now();
+    const scheduled: ScheduledRequest<T> = {...job,enqueuedAt,resolve,reject,started:false,settled:false,
+      ...(job.priority==='background'?{backgroundFairAt:enqueuedAt+BACKGROUND_FAIRNESS_INTERVAL_MS}:{})};
     const queue = scheduled.priority === 'live_entry' ? liveEntryQueue : scheduled.priority === 'signal_poll' ? signalPollQueue :
       scheduled.priority === 'background' ? backgroundQueue : normalQueue;
     pruneQueue(queue as ScheduledRequest<unknown>[], Date.now());
@@ -234,11 +321,7 @@ function enqueueScheduled<T>(job: Omit<ScheduledRequest<T>, 'resolve'|'reject'|'
     if (queue.reduce((count,queued)=>count+Number(queued.lane===scheduled.lane),0) >= capacity) {
       reject(new GmgnError('GMGN_QUEUE_TIMEOUT')); return;
     }
-    scheduled.timer = setTimeout(() => {
-      if (scheduled.started || !removeScheduled(scheduled as ScheduledRequest<unknown>)) return;
-      rejectScheduled(scheduled as ScheduledRequest<unknown>, new GmgnError('GMGN_QUEUE_TIMEOUT'));
-      kickScheduler();
-    }, Math.max(1, scheduled.expiresAt - Date.now()));
+    armQueueExpiry(scheduled as ScheduledRequest<unknown>);
     scheduled.abort = () => {
       if (scheduled.started || !removeScheduled(scheduled as ScheduledRequest<unknown>)) return;
       rejectScheduled(scheduled as ScheduledRequest<unknown>, new GmgnError('GMGN_REQUEST_ABORTED'));
@@ -247,6 +330,10 @@ function enqueueScheduled<T>(job: Omit<ScheduledRequest<T>, 'resolve'|'reject'|'
     scheduled.signal?.addEventListener('abort', scheduled.abort, {once: true});
     if (scheduled.signal?.aborted) { scheduled.abort(); return; }
     queue.push(scheduled as ScheduledRequest<unknown>);
+    if(scheduled.priority==='background')scheduled.fairnessTimer=setTimeout(()=>{
+      grantBackgroundFairTurn(scheduled as ScheduledRequest<unknown>,Date.now());
+      kickScheduler();
+    },BACKGROUND_FAIRNESS_INTERVAL_MS);
     // The first signal poll may preempt archive work. Its retry gets one
     // signal-proof turn, while live entry can always preempt either read lane.
     if(scheduled.priority==='signal_poll'||scheduled.priority==='live_entry') {
@@ -254,6 +341,9 @@ function enqueueScheduled<T>(job: Omit<ScheduledRequest<T>, 'resolve'|'reject'|'
       if(active?.priority==='background'&&active.interrupt) {
         if(scheduled.priority==='live_entry') {
           active.interruptedByLiveEntry=true;
+          // A live request can always preempt archive work. If that archive was
+          // already owed a full turn, preserve the promise for its next attempt.
+          if(active.protectedFromSignalPoll)active.lane.backgroundSignalProtectionPending=true;
           active.interrupt();
         } else if(!active.protectedFromSignalPoll&&!active.interruptedBySignalPoll) {
           active.interruptedBySignalPoll=true;
@@ -333,7 +423,7 @@ export class GmgnClient {
 
   /** Signed, read-only page of trades made by wallets followed in GMGN. */
   async getFollowWallet(chain:'sol'|'bsc'|'robinhood', limit=100,
-    scheduling:GmgnScheduleOptions={priority:'background',queueTimeoutMs:5_000}):Promise<unknown> {
+    scheduling:GmgnScheduleOptions=DEFAULT_BACKGROUND_SCHEDULING):Promise<unknown> {
     this.checkAborted();
     if(!this.apiKey)throw new GmgnError('GMGN_API_KEY_MISSING');
     if(!this.privateKeyPem)throw new GmgnError('GMGN_SIGNING_KEY_MISSING');
@@ -344,7 +434,7 @@ export class GmgnClient {
 
   /** Fixed research feed: exits, CTO, smart-money and platform/KOL calls. */
   async getMemeMarketSignals(chain:'sol'|'bsc'|'robinhood',
-    scheduling:GmgnScheduleOptions={priority:'background',queueTimeoutMs:5_000}):Promise<unknown> {
+    scheduling:GmgnScheduleOptions=DEFAULT_BACKGROUND_SCHEDULING):Promise<unknown> {
     this.checkAborted();
     if(!this.apiKey)throw new GmgnError('GMGN_API_KEY_MISSING');
     if(!['sol','bsc','robinhood'].includes(chain))throw new GmgnError('GMGN_QUERY_INVALID');
@@ -361,7 +451,7 @@ export class GmgnClient {
 
   /** Latest or cursor page from GMGN's read-only global call-out feed. */
   async getCalloutGlobal(chains:readonly ('sol'|'bsc'|'robinhood')[],options:{limit?:number;pageToken?:string;
-    onlyDeclaration?:boolean}={},scheduling:GmgnScheduleOptions={priority:'background',queueTimeoutMs:5_000}):Promise<unknown>{
+    onlyDeclaration?:boolean}={},scheduling:GmgnScheduleOptions=DEFAULT_BACKGROUND_SCHEDULING):Promise<unknown>{
     this.checkAborted();if(!this.apiKey)throw new GmgnError('GMGN_API_KEY_MISSING');
     const unique=[...new Set(chains)];
     if(!unique.length||unique.length>20||unique.some(chain=>!['sol','bsc','robinhood'].includes(chain))||
@@ -375,21 +465,21 @@ export class GmgnClient {
   }
 
   async getWalletStats(chain:'sol'|'bsc'|'robinhood',wallets:readonly string[],period:'7d'|'30d'='7d',
-    scheduling:GmgnScheduleOptions={priority:'background',queueTimeoutMs:5_000}):Promise<unknown>{
+    scheduling:GmgnScheduleOptions=DEFAULT_BACKGROUND_SCHEDULING):Promise<unknown>{
     const safe=this.wallets(chain,wallets,20);
     return this.backgroundRequest(3,scheduling,signal=>this.request('/v1/user/wallet_stats',
       {chain,wallet_address:safe,period},false,'GET',undefined,signal));
   }
 
   async getWalletProfits(chain:'sol'|'bsc'|'robinhood',wallets:readonly string[],period:'1d'|'7d'|'30d'|'all'='all',
-    scheduling:GmgnScheduleOptions={priority:'background',queueTimeoutMs:5_000}):Promise<unknown>{
+    scheduling:GmgnScheduleOptions=DEFAULT_BACKGROUND_SCHEDULING):Promise<unknown>{
     const safe=this.wallets(chain,wallets,100);
     return this.backgroundRequest(3,scheduling,signal=>this.request('/v1/user/wallet_profits',{},false,'POST',
       {chain,period,wallet_addresses:safe},signal));
   }
 
   async getWalletActivity(chain:'sol'|'bsc'|'robinhood',wallet:string,cursor?:string,
-    scheduling:GmgnScheduleOptions={priority:'background',queueTimeoutMs:5_000}):Promise<unknown>{
+    scheduling:GmgnScheduleOptions=DEFAULT_BACKGROUND_SCHEDULING):Promise<unknown>{
     const [safe]=this.wallets(chain,[wallet],1);
     if(cursor!==undefined&&!/^[\x21-\x7e]{1,512}$/.test(cursor))throw new GmgnError('GMGN_QUERY_INVALID');
     return this.backgroundRequest(3,scheduling,signal=>this.request('/v1/user/wallet_activity',
@@ -398,7 +488,7 @@ export class GmgnClient {
 
   async getWalletHoldings(chain:'sol'|'bsc'|'robinhood',wallet:string,
     options:{limit?:number;cursor?:string;closedOnly?:boolean}={},
-    scheduling:GmgnScheduleOptions={priority:'background',queueTimeoutMs:5_000}):Promise<unknown>{
+    scheduling:GmgnScheduleOptions=DEFAULT_BACKGROUND_SCHEDULING):Promise<unknown>{
     const [safe]=this.wallets(chain,[wallet],1);
     if(!this.privateKeyPem)throw new GmgnError('GMGN_SIGNING_KEY_MISSING');
     if(options.limit!==undefined&&(!Number.isSafeInteger(options.limit)||options.limit<1||options.limit>50)||
@@ -412,7 +502,7 @@ export class GmgnClient {
 
   async getCalloutRecord(chain:'sol'|'bsc'|'robinhood',wallet:string,
     options:{limit?:number;pageToken?:string}={},
-    scheduling:GmgnScheduleOptions={priority:'background',queueTimeoutMs:5_000}):Promise<unknown>{
+    scheduling:GmgnScheduleOptions=DEFAULT_BACKGROUND_SCHEDULING):Promise<unknown>{
     const [safe]=this.wallets(chain,[wallet],1);
     if(options.limit!==undefined&&(!Number.isSafeInteger(options.limit)||options.limit<1||options.limit>50)||
       options.pageToken!==undefined&&!/^[\x21-\x7e]{1,512}$/.test(options.pageToken))throw new GmgnError('GMGN_QUERY_INVALID');
@@ -431,11 +521,13 @@ export class GmgnClient {
 
   private backgroundRequest<T>(weight:number,scheduling:GmgnScheduleOptions,run:(signal:AbortSignal)=>Promise<T>):Promise<T>{
     const controller=new AbortController();
-    return this.scheduleRequest(weight,()=>run(controller.signal),scheduling,()=>controller.abort());
+    return this.scheduleRequest(weight,()=>run(controller.signal),scheduling,()=>controller.abort(),
+      scheduling===DEFAULT_BACKGROUND_SCHEDULING);
   }
 
   /** Shared budget only: this does not expose a network write method or credentials. */
-  async scheduleRequest<T>(weight: number, execute: () => Promise<T>, scheduling: GmgnScheduleOptions = {},interrupt?:()=>void): Promise<T> {
+  async scheduleRequest<T>(weight: number, execute: () => Promise<T>, scheduling: GmgnScheduleOptions = {},
+    interrupt?:()=>void,extendFairnessPromise=false): Promise<T> {
     this.checkAborted();
     if (!this.apiKey) throw new GmgnError('GMGN_API_KEY_MISSING');
     if (!Number.isFinite(weight) || weight < 1 || weight > 100) throw new GmgnError('GMGN_QUERY_INVALID');
@@ -445,7 +537,8 @@ export class GmgnClient {
       scheduling.queueTimeoutMs < 1 || scheduling.queueTimeoutMs > MAX_QUEUE_WAIT_MS)) throw new GmgnError('GMGN_QUERY_INVALID');
     const cost = Math.ceil(weight), priority = scheduling.priority ?? 'normal';
     const queueTimeoutMs = Math.floor(scheduling.queueTimeoutMs ?? MAX_QUEUE_WAIT_MS);
-    return enqueueScheduled<T>({lane: this.state, priority, expiresAt: Date.now() + queueTimeoutMs, signal: this.signal,interrupt,
+    return enqueueScheduled<T>({lane:this.state,priority,expiresAt:Date.now()+queueTimeoutMs,signal:this.signal,interrupt,
+      extendFairnessPromise,
       waitMs: () => Math.max(0, this.state.nextAt - this.now()), run: async () => {
       this.checkAborted();
       const now = this.now();

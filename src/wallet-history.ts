@@ -426,7 +426,9 @@ export class WalletHistory {
   recordTrades(inputs:WalletTradeObservation[]):void {
     const normalized=Array.isArray(inputs)?inputs.slice(0,2_000).map(value=>this.trade(value)).filter((v):v is WalletTradeObservation=>!!v):[];
     if(!normalized.length) return;
-    this.append(normalized,()=>{const changes=this.associationChanges();for(const value of normalized)this.putTrade(value,changes);
+    this.append(normalized,()=>{const changes=this.associationChanges(),associationTrades:WalletTradeObservation[]=[];
+      for(const value of normalized)if(this.putTrade(value,changes))associationTrades.push(value);
+      this.associations.recordTrades(associationTrades);
       this.flushAssociationChanges(changes);});
   }
 
@@ -503,7 +505,7 @@ export class WalletHistory {
     const records=analysis.wallets.slice(0,200).flatMap(wallet=>this.snapshot(target,wallet,context.source,observed,snapshotAt)??[]);
     this.append(records,()=>{
       if(reportKey&&!Number(this.db.prepare('INSERT OR IGNORE INTO wh_report_captures VALUES (?,?)').run(reportKey,observed).changes)) return;
-      const changes=this.associationChanges();
+      const changes=this.associationChanges(),associationTrades:WalletTradeObservation[]=[];
       this.putToken(target,observed);
       for(const record of records) {
         this.putWallet(target.chain,record.holding.wallet,observed,{labels:record.holding.labels,name:record.holding.name,twitter:record.holding.twitter},changes);
@@ -511,8 +513,9 @@ export class WalletHistory {
         this.observation('holding',record.holding,record.holding.wallet,target.address);
         if(record.stats) this.observation('stats',record.stats,record.holding.wallet,target.address);
         if(record.funding) this.putFunding(record.funding,changes);
-        for(const event of record.events) this.putTrade(event,changes);
+        for(const event of record.events)if(this.putTrade(event,changes))associationTrades.push(event);
       }
+      this.associations.recordTrades(associationTrades);
       this.flushAssociationChanges(changes);
       this.db.prepare('UPDATE wh_tokens SET last_checked_at=? WHERE chain=? AND address=?').run(observed,target.chain,target.address);
     });
@@ -882,7 +885,7 @@ export class WalletHistory {
       amount:positiveDecimal(value.amount),amountUnit:['human','atomic','vendor_quantity'].includes(String(value.amountUnit))?value.amountUnit:'unknown',
       usd:positiveDecimal(value.usd),priceUsd:positiveDecimal(value.priceUsd),...(value.eventIndex===undefined?{}:{eventIndex:value.eventIndex})};
   }
-  private putTrade(value:WalletTradeObservation,changes:AssociationChanges):void {
+  private putTrade(value:WalletTradeObservation,changes:AssociationChanges):boolean {
     const id=digest([value.chain,value.wallet,value.tokenAddress,value.txHash,value.side,value.eventIndex??null]);
     this.putWallet(value.chain,value.wallet,value.observedAt,{},changes);this.putToken({chain:value.chain,address:value.tokenAddress},value.observedAt);
     this.putWalletToken(value.chain,value.wallet,value.tokenAddress);
@@ -900,7 +903,7 @@ export class WalletHistory {
     const evidenceId=digest(['trade',id,content]);
     const newEvidence=!this.db.prepare('SELECT 1 FROM wh_observations WHERE id=?').get(evidenceId);
     this.observation('trade',value,value.wallet,value.tokenAddress,id,evidenceId);
-    if(Number(inserted.changes)||newEvidence) this.associations.recordTrade(value);
+    return !!Number(inserted.changes)||newEvidence;
   }
   private putWallet(chain:Chain,address:string,observed:string,profile:{labels?:string[];name?:string;twitter?:string},changes:AssociationChanges):void {
     const previous=this.db.prepare('SELECT profile,last_at FROM wh_wallets WHERE chain=? AND address=?').get(chain,address);

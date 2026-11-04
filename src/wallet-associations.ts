@@ -98,6 +98,11 @@ export const WALLET_ASSOCIATION_INVALIDATION_SQL={
     WHERE e.chain=? AND e.candidate=w.wallet AND e.active=1
       AND a.chain=e.chain AND a.leader=e.leader AND a.token_address=e.token_address)`
 } as const;
+export const WALLET_ASSOCIATION_TRADE_INVALIDATION_SQL={
+  anchors:'UPDATE wh_assoc_anchors SET dirty=1 WHERE chain=? AND token_address=? AND dirty<>1',
+  relations:`UPDATE wh_assoc_relations SET dirty=1 WHERE chain=? AND dirty<>1 AND (leader,candidate) IN
+    (SELECT leader,candidate FROM wh_assoc_episodes WHERE chain=? AND token_address=? AND active=1)`
+} as const;
 const event=(row:Row):AssociationEvent=>{const data=JSON.parse(String(row.data)) as WalletTradeObservation;return {
   eventId:String(row.id),wallet:String(row.wallet),txHash:String(row.tx_hash),eventAt:String(row.event_at),observedAt:String(row.observed_at),source:data.source};};
 const coverage:WalletAssociationDetail['coverage']={sampleOnly:true,firstObservedBuy:true,leadWindowSeconds:86400,
@@ -164,21 +169,30 @@ export class WalletAssociations {
         chain,COALESCE(collection_checked_at,''),token_count DESC,funding_count DESC,leader,candidate) WHERE token_count>0`);
   }
 
-  recordTrade(value:WalletTradeObservation):void {
-    if(value.side==='buy'&&value.source==='gmgn_kol_feed') {
-      const alreadyPublic=!!this.db.prepare('SELECT 1 FROM wh_assoc_anchors WHERE chain=? AND leader=? LIMIT 1').get(value.chain,value.wallet);
-      this.db.prepare(`INSERT INTO wh_assoc_anchors(chain,leader,token_address,public_observed_at)
-        VALUES (?,?,?,?) ON CONFLICT(chain,leader,token_address) DO UPDATE SET public_observed_at=MIN(public_observed_at,excluded.public_observed_at),dirty=1`)
-        .run(value.chain,value.wallet,value.tokenAddress,value.observedAt);
-      if(!alreadyPublic) {
-        this.db.prepare(`UPDATE wh_assoc_anchors SET dirty=1 WHERE chain=? AND dirty<>1 AND (leader,token_address) IN
-          (SELECT leader,token_address FROM wh_assoc_episodes WHERE chain=? AND candidate=? AND active=1)`).run(value.chain,value.chain,value.wallet);
-        this.db.prepare('UPDATE wh_assoc_relations SET dirty=1 WHERE chain=? AND candidate=? AND dirty<>1').run(value.chain,value.wallet);
+  recordTrade(value:WalletTradeObservation):void {this.recordTrades([value]);}
+  recordTrades(values:readonly WalletTradeObservation[]):void {
+    if(!values.length)return;
+    const tokens=new Map<string,{chain:Chain;tokenAddress:string}>();
+    for(const value of values) {
+      if(value.side==='buy'&&value.source==='gmgn_kol_feed') {
+        const alreadyPublic=!!this.db.prepare('SELECT 1 FROM wh_assoc_anchors WHERE chain=? AND leader=? LIMIT 1').get(value.chain,value.wallet);
+        this.db.prepare(`INSERT INTO wh_assoc_anchors(chain,leader,token_address,public_observed_at)
+          VALUES (?,?,?,?) ON CONFLICT(chain,leader,token_address) DO UPDATE SET public_observed_at=MIN(public_observed_at,excluded.public_observed_at),dirty=1`)
+          .run(value.chain,value.wallet,value.tokenAddress,value.observedAt);
+        if(!alreadyPublic) {
+          this.db.prepare(`UPDATE wh_assoc_anchors SET dirty=1 WHERE chain=? AND dirty<>1 AND (leader,token_address) IN
+            (SELECT leader,token_address FROM wh_assoc_episodes WHERE chain=? AND candidate=? AND active=1)`).run(value.chain,value.chain,value.wallet);
+          this.db.prepare('UPDATE wh_assoc_relations SET dirty=1 WHERE chain=? AND candidate=? AND dirty<>1').run(value.chain,value.wallet);
+        }
       }
+      tokens.set(`${value.chain}\0${value.tokenAddress}`,{chain:value.chain,tokenAddress:value.tokenAddress});
     }
-    this.db.prepare('UPDATE wh_assoc_anchors SET dirty=1 WHERE chain=? AND token_address=? AND dirty<>1').run(value.chain,value.tokenAddress);
-    this.db.prepare(`UPDATE wh_assoc_relations SET dirty=1 WHERE chain=? AND dirty<>1 AND (leader,candidate) IN
-      (SELECT leader,candidate FROM wh_assoc_episodes WHERE chain=? AND token_address=? AND active=1)`).run(value.chain,value.chain,value.tokenAddress);
+    const anchors=this.db.prepare(WALLET_ASSOCIATION_TRADE_INVALIDATION_SQL.anchors),
+      relations=this.db.prepare(WALLET_ASSOCIATION_TRADE_INVALIDATION_SQL.relations);
+    for(const {chain,tokenAddress} of tokens.values()) {
+      anchors.run(chain,tokenAddress);
+      relations.run(chain,chain,tokenAddress);
+    }
   }
   fundingChanged(chain:Chain,wallet:string):void {
     this.fundingChangedMany([{chain,wallet}]);
@@ -209,7 +223,7 @@ export class WalletAssociations {
     // Only the indexed KOL source is scanned; existing raw history is never rewritten.
     const indexed=this.db.prepare(`SELECT rowid,data FROM wh_observations WHERE source='gmgn_kol_feed' AND kind='trade' AND rowid>? ORDER BY rowid LIMIT 200`).all(cursor);
     if(indexed.length) this.write(indexed.map(row=>row.rowid),()=>{
-      for(const row of indexed) this.recordTrade(JSON.parse(String(row.data)) as WalletTradeObservation);
+      this.recordTrades(indexed.map(row=>JSON.parse(String(row.data)) as WalletTradeObservation));
       this.db.prepare("UPDATE wh_meta SET value=? WHERE key='association_cursor'").run(String(indexed.at(-1)!.rowid));
       this.db.prepare("UPDATE wh_meta SET value=CAST(value AS INTEGER)+? WHERE key='association_indexed_count'").run(indexed.length);
     });

@@ -193,7 +193,7 @@ GMGN 标签不证明真人身份；共同资金来源仅是关联线索，不证
 
 每个画像保留计算时间、证据时间、首次入组时间、依据和入组 / 退组历史。新证据、供应商利润过期或底层关联待重算，都会影响分组；新证据立即入队，无变化画像按配置周期核对，利润将在其 24 小时有效期到期时提前排队。排队延迟会显示为过期，而不会冒充已刷新。分组历史首次时间指本系统实际建档时间，不追溯到过去的交易时间。关系图仍属于待核查线索，不能认定同一控制人或真实收益。
 
-`WALLET_PROFILES_ENABLED` 未设置时跟随 `WALLET_RESEARCH_ENABLED`；显式设为 `false` 可停用。默认每批结束后等 2 秒，目标批量 100（部分数据源补充可能略多），由 `WALLET_PROFILES_INTERVAL_SEC` / `WALLET_PROFILES_BATCH_SIZE` 调整。来源游标会立即重算发生变化的钱包；无变化钱包只按 `WALLET_PROFILES_REFRESH_AFTER_SEC=21600`（6 小时）做周期核对，避免反复扫描整个历史库。上限 `WALLET_PROFILES_MAX_MB=512` 包含数据库及 WAL，达到容量时停止派生写入并告警，保留已有画像；增加容量后重启恢复。首次补建需要时间，控制台“钱包研究 → 画像分组”显示覆盖数量、分组数量、陈旧画像和运行状态。
+`WALLET_PROFILES_ENABLED` 未设置时跟随 `WALLET_RESEARCH_ENABLED`；显式设为 `false` 可停用。默认每批结束后等 2 秒，目标批量 20（部分数据源补充可能略多），由 `WALLET_PROFILES_INTERVAL_SEC` / `WALLET_PROFILES_BATCH_SIZE` 调整。小批量限制了单轮读取 16 GB 历史库的 I/O 峰值，同时持续推进画像。来源游标会立即重算发生变化的钱包；无变化钱包只按 `WALLET_PROFILES_REFRESH_AFTER_SEC=21600`（6 小时）做周期核对，避免反复扫描整个历史库。上限 `WALLET_PROFILES_MAX_MB=512` 包含数据库及 WAL，达到容量时停止派生写入并告警，保留已有画像；增加容量后重启恢复。首次补建需要时间，控制台“钱包研究 → 画像分组”显示覆盖数量、分组数量、陈旧画像和运行状态。
 
 只读且需要控制台认证的 API：`/dashboard/api/wallet-profiles/status`、`/dashboard/api/wallet-profiles?chain=bsc&group=repeated_early&limit=25`、`/dashboard/api/wallet-profiles/:chain/:address`。详情包含最近 20 次分组变化；完整变化记录仍在本地数据库。画像经下述钱包路径筛选参与信号研究，分组标签本身不直接授权开单。
 

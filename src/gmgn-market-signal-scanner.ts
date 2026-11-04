@@ -93,10 +93,11 @@ function signalRoute(type:number,signalTimes:number,vendorWallets:number):{route
   // CTO and platform calls are scarce, high-context meme events. They earn a
   // full research pass, while the vendor label remains an unverified claim.
   if(type===11||type===13||type===19)return {route:'narrative_analysis',analysisEligible:true};
-  // A lone price pulse is retained for forward tracking. A repeated pulse
-  // earns an independent price, liquidity and safety evaluation.
-  if(type===6)return {route:'conditional_analysis',analysisEligible:signalTimes>=2};
-  if(type===10)return {route:'negative_analysis',analysisEligible:true};
+  // Price pulses and bundler sells remain routed, archived and delivered to
+  // the fast observation lane. They are high-volume market evidence, so they
+  // must not spend the scarce full-analysis budget even when repeated.
+  if(type===6)return {route:'conditional_analysis',analysisEligible:false};
+  if(type===10)return {route:'negative_analysis',analysisEligible:false};
   // Attention mechanics are useful heat evidence, but a paid DEX placement,
   // social edit, boost, key level or live stream is not independent buy proof.
   if([1,2,3,4,5,7,8,9,17,18,21].includes(type))return {route:'observation_only',analysisEligible:false};

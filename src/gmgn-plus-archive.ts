@@ -34,6 +34,8 @@ const boundedScalar=(value:unknown,max=160):string=>typeof value==='string'&&val
 // the OpenAPI envelope is removed. Never recursively unwrap arbitrary `data`.
 const portfolioData=(value:unknown):unknown=>object(value)&&(value.code===0||value.code==='0')&&Object.hasOwn(value,'data')?
   value.data:value;
+const countedTables=['gpa_events','gpa_event_wallets','gpa_wallet_candidates','gpa_wallet_snapshots',
+  'gpa_wallet_holding_pages','gpa_wallet_activity'] as const;
 
 export interface GmgnPlusArchiveOptions {path:string;maxBytes:number;now?:()=>Date;maxCandidates?:number;}
 export interface ArchiveWrite {received:number;accepted:number;rejected:number;candidates:number;capacityReached:boolean;}
@@ -45,7 +47,6 @@ export interface ArchiveWrite {received:number;accepted:number;rejected:number;c
  */
 export class GmgnPlusArchive {
   private readonly db:DatabaseSync;private readonly maxBytes:number;private readonly now:()=>Date;private readonly maxCandidates:number;
-  private statusCountCache?:{at:number;counts:Record<string,number>};
   constructor(options:GmgnPlusArchiveOptions){
     if(!options.path||options.path===':memory:'||!Number.isSafeInteger(options.maxBytes)||options.maxBytes<16*1024*1024||
       options.maxBytes>4*1024*1024*1024||options.maxCandidates!==undefined&&(!Number.isSafeInteger(options.maxCandidates)||options.maxCandidates<100||options.maxCandidates>100_000))
@@ -93,7 +94,29 @@ export class GmgnPlusArchive {
         token_address TEXT NOT NULL,event_at TEXT NOT NULL,amount_usd TEXT,observed_at TEXT NOT NULL,raw_json TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS gpa_activity_wallet ON gpa_wallet_activity(chain,wallet_address,event_at DESC);
       CREATE INDEX IF NOT EXISTS gpa_activity_token ON gpa_wallet_activity(chain,token_address,event_at DESC);`);
+    this.initializeTableCounts();
     chmodSync(options.path,0o600);
+  }
+  private initializeTableCounts(){
+    try{this.db.exec(`BEGIN IMMEDIATE;
+      CREATE TABLE IF NOT EXISTS gpa_table_counts(
+        table_name TEXT PRIMARY KEY,
+        row_count INTEGER NOT NULL CHECK(row_count>=0)
+      ) WITHOUT ROWID;`);
+      const existing=new Set(this.db.prepare('SELECT table_name FROM gpa_table_counts').all().map(row=>String(row.table_name)));
+      if(countedTables.some(table=>!existing.has(table))||existing.size!==countedTables.length){
+        this.db.exec('DELETE FROM gpa_table_counts');
+        for(const table of countedTables)this.db.prepare(`INSERT INTO gpa_table_counts VALUES(?,(SELECT count(*) FROM ${table}))`).run(table);
+      }
+      this.db.exec(countedTables.map(table=>`
+        CREATE TRIGGER IF NOT EXISTS gpa_count_${table}_insert AFTER INSERT ON ${table} BEGIN
+          UPDATE gpa_table_counts SET row_count=row_count+1 WHERE table_name='${table}';
+        END;
+        CREATE TRIGGER IF NOT EXISTS gpa_count_${table}_delete AFTER DELETE ON ${table} BEGIN
+          UPDATE gpa_table_counts SET row_count=row_count-1 WHERE table_name='${table}';
+        END;`).join('\n'));
+      this.db.exec('COMMIT');
+    }catch(error){try{this.db.exec('ROLLBACK');}catch{}throw error;}
   }
   close(){this.db.close();}
   meta(key:string):string|undefined{return this.db.prepare('SELECT value FROM gpa_meta WHERE key=?').get(key)?.value as string|undefined;}
@@ -102,12 +125,9 @@ export class GmgnPlusArchive {
   storageBytes(){return Number(this.db.prepare('PRAGMA page_count').get()!.page_count)*Number(this.db.prepare('PRAGMA page_size').get()!.page_size);}
   capacityReached(extraBytes=0){return this.storageBytes()+Math.max(0,extraBytes)+1_048_576>=this.maxBytes;}
   status(){
-    const now=this.now().getTime();if(!this.statusCountCache||now-this.statusCountCache.at>=5_000){
-      this.statusCountCache={at:now,counts:Object.fromEntries(['gpa_events','gpa_event_wallets','gpa_wallet_candidates','gpa_wallet_snapshots','gpa_wallet_holding_pages','gpa_wallet_activity'].map(table=>
-        [table,Number(this.db.prepare(`SELECT count(*) AS n FROM ${table}`).get()!.n)]))};
-    }
-    const counts=this.statusCountCache.counts;
-    return {enabled:true,maxBytes:this.maxBytes,storageBytes:this.storageBytes(),capacityReached:this.capacityReached(),
+    const counts=Object.fromEntries(this.db.prepare('SELECT table_name,row_count FROM gpa_table_counts').all().map(row=>
+      [String(row.table_name),Number(row.row_count)])),storageBytes=this.storageBytes();
+    return {enabled:true,maxBytes:this.maxBytes,storageBytes,capacityReached:storageBytes+1_048_576>=this.maxBytes,
       events:counts.gpa_events,candidates:counts.gpa_wallet_candidates,walletSnapshots:counts.gpa_wallet_snapshots,
       walletHoldingPages:counts.gpa_wallet_holding_pages,candidateEvidence:counts.gpa_event_wallets,walletActivities:counts.gpa_wallet_activity,
       runnerCursor:Number(this.meta('runner_cursor')??0),lastSuccessAt:this.meta('last_success_at'),
@@ -201,15 +221,15 @@ export class GmgnPlusArchive {
         const updated=candidateUpdate.run(seed.mask,newOccurrence,newOccurrence,at,chain,seed.address);
         if(!updated.changes)candidateInsert.run(chain,seed.address,seed.mask,chain,seed.address,at,at);
         candidates+=newOccurrence;}}
-      this.pruneCandidates();this.setMeta('last_success_at',at);this.setMeta('last_error','');this.db.exec('COMMIT');this.invalidateStatusCounts();
+      this.pruneCandidates();this.setMeta('last_success_at',at);this.setMeta('last_error','');this.db.exec('COMMIT');
       return {received:rows.length,accepted,rejected,candidates,capacityReached:false};
     }catch(error){try{this.db.exec('ROLLBACK');}catch{}if(this.isFull(error))return {received:rows.length,accepted:0,rejected:0,candidates:0,capacityReached:true};throw error;}
   }
-  private pruneCandidates(){const extra=Number(this.db.prepare('SELECT max(count(*)-?,0) AS n FROM gpa_wallet_candidates').get(this.maxCandidates)!.n);
+  private pruneCandidates(){const extra=Number(this.db.prepare(`SELECT max(row_count-?,0) AS n FROM gpa_table_counts
+      WHERE table_name='gpa_wallet_candidates'`).get(this.maxCandidates)!.n);
     if(extra>0)this.db.prepare(`DELETE FROM gpa_wallet_candidates WHERE (chain,address) IN (
       SELECT chain,address FROM gpa_wallet_candidates ORDER BY occurrences,last_seen_at LIMIT ?)` ).run(extra);}
   private isFull(error:unknown){return error instanceof Error&&/(?:SQLITE_FULL|database or disk is full)/i.test(error.message);}
-  private invalidateStatusCounts(){this.statusCountCache=undefined;}
 
   calloutCursor(feed:GmgnCalloutFeed){const value=this.meta(`callout_${feed}_backfill_cursor`);if(value===undefined||value==='')return;
     if(cursorToken(value))return value;this.resetCalloutCursor(feed);return this.calloutFrontier(feed);}
@@ -296,7 +316,7 @@ export class GmgnPlusArchive {
         observed_at=excluded.observed_at,normalized_json=excluded.normalized_json,raw_json=excluded.raw_json`).run(chain,address,kind,period,at,JSON.stringify(normalized),raw);
       this.db.prepare(`UPDATE gpa_wallet_candidates SET ${column}=?,failure_count=0,retry_after=NULL WHERE chain=? AND address=?`).run(at,chain,address);acceptedAddresses.add(address);}
       const missing=[...requestedSet].filter(address=>!acceptedAddresses.has(address));this.deferCandidatesAt(chain,missing,new Date(at));
-      this.setMeta('last_success_at',at);this.db.exec('COMMIT');this.invalidateStatusCounts();return {accepted:acceptedAddresses.size,missing:missing.length,capacityReached:false};
+      this.setMeta('last_success_at',at);this.db.exec('COMMIT');return {accepted:acceptedAddresses.size,missing:missing.length,capacityReached:false};
     }catch(error){try{this.db.exec('ROLLBACK');}catch{}if(this.isFull(error))return {accepted:0,capacityReached:true};throw error;}
   }
 
@@ -310,7 +330,7 @@ export class GmgnPlusArchive {
     const at=this.now().toISOString(),next=cursorToken(data.next)?data.next:null;
     try{this.db.prepare(`INSERT INTO gpa_wallet_holding_pages VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(chain,address,mode,page) DO UPDATE SET
       observed_at=excluded.observed_at,row_count=excluded.row_count,next_cursor=excluded.next_cursor,raw_json=excluded.raw_json`)
-      .run(chain,wallet,mode,page,at,data.list.length,next,raw);this.setMeta('last_success_at',at);this.invalidateStatusCounts();
+      .run(chain,wallet,mode,page,at,data.list.length,next,raw);this.setMeta('last_success_at',at);
       return {accepted:1,rows:data.list.length,capacityReached:false};
     }catch(error){if(this.isFull(error))return {accepted:0,capacityReached:true};throw error;}
   }
@@ -339,7 +359,7 @@ export class GmgnPlusArchive {
         pages=Number(current?.activity_pages??0)+1,done=!next||pages>=2;
       this.db.prepare(`UPDATE gpa_wallet_candidates SET activity_cursor=?,activity_pages=?,activity_truncated=?,last_activity_at=?,failure_count=0,retry_after=NULL
         WHERE chain=? AND address=?`).run(done?null:next,done?0:pages,Number(!!next&&pages>=2),done?at:null,chain,wallet);
-      this.setMeta('last_success_at',at);this.db.exec('COMMIT');this.invalidateStatusCounts();return {accepted,rejected,capacityReached:false};
+      this.setMeta('last_success_at',at);this.db.exec('COMMIT');return {accepted,rejected,capacityReached:false};
     }catch(error){try{this.db.exec('ROLLBACK');}catch{}if(this.isFull(error))return {accepted:0,rejected:0,capacityReached:true};throw error;}
   }
   activityCursor(chain:GmgnArchiveChain,wallet:string){const value=this.db.prepare('SELECT activity_cursor FROM gpa_wallet_candidates WHERE chain=? AND address=?').get(chain,wallet)?.activity_cursor;
@@ -365,10 +385,12 @@ export class GmgnPlusArchive {
 export interface GmgnPlusArchiveRunnerOptions {archive:GmgnPlusArchive;client:Pick<GmgnClient,'getMemeMarketSignals'|'getCalloutGlobal'|'getWalletStats'|'getWalletProfits'|'getWalletActivity'|'cooldownUntil'>;
   chains:GmgnArchiveChain[];intervalMs:number;now?:()=>Date;dedicatedMarketChains?:GmgnArchiveChain[];}
 type Task={kind:'market';chain:GmgnArchiveChain}|{kind:'callout_latest'|'callout_backfill';feed:GmgnCalloutFeed}|{kind:'stats'|'profits'|'activity'};
+const PREEMPTION_RETRY_MS=100;
+const expectedPreemption=(error:unknown):error is GmgnError=>error instanceof GmgnError&&error.reason==='GMGN_REQUEST_ABORTED';
 
 export class GmgnPlusArchiveRunner {
   private readonly tasks:Task[];private readonly now:()=>Date;private running=false;private inFlight?:Promise<void>;private timer?:ReturnType<typeof setTimeout>;
-  private lastTask?:string;private lastError?:string;
+  private lastTask?:string;private lastError?:string;private retryAfterPreemption=false;private preemptions=0;private lastPreemptedAt?:string;
   constructor(private readonly options:GmgnPlusArchiveRunnerOptions){
     if(!options.chains.length||options.chains.some(chain=>!['sol','bsc','robinhood'].includes(chain))||
       options.dedicatedMarketChains?.some(chain=>!['sol','bsc','robinhood'].includes(chain))||
@@ -381,6 +403,7 @@ export class GmgnPlusArchiveRunner {
       {kind:'stats'},{kind:'profits'},{kind:'activity'}];
   }
   status(){return {...this.options.archive.status(),running:this.running,inFlight:!!this.inFlight,lastTask:this.lastTask,lastError:this.lastError,
+    preemptions:this.preemptions,lastPreemptedAt:this.lastPreemptedAt,
     intervalMs:this.options.intervalMs,tasks:this.tasks.length,dedicatedMarketChains:[...new Set(this.options.dedicatedMarketChains??[])],
     marketSignals:this.options.dedicatedMarketChains?.length?'hybrid_dedicated_and_round_robin':'round_robin',
     coverage:'deduplicated_latest_feeds_plus_cursor_backfill',entryPipeline:false};}
@@ -389,7 +412,8 @@ export class GmgnPlusArchiveRunner {
   runOnce(){if(this.inFlight)return this.inFlight;const run=this.execute();this.inFlight=run;void run.then(
     ()=>{if(this.inFlight===run)this.inFlight=undefined;},()=>{if(this.inFlight===run)this.inFlight=undefined;});return run;}
   private tick(delay:number){if(!this.running)return;this.timer=setTimeout(()=>{this.timer=undefined;void this.runOnce().catch(()=>{}).finally(()=>{
-    if(!this.running)return;const cooldown=Math.max(0,this.options.client.cooldownUntil-this.now().getTime());this.tick(Math.max(this.options.intervalMs,cooldown));});},delay);this.timer.unref();}
+    if(!this.running)return;const cooldown=Math.max(0,this.options.client.cooldownUntil-this.now().getTime()),retry=this.retryAfterPreemption;
+    this.retryAfterPreemption=false;this.tick(retry?Math.max(PREEMPTION_RETRY_MS,cooldown):Math.max(this.options.intervalMs,cooldown));});},delay);this.timer.unref();}
   private async execute(){
     if(this.options.archive.capacityReached()){this.lastError='GMGN_PLUS_ARCHIVE_CAPACITY_REACHED';return;}
     if(this.options.client.cooldownUntil>this.now().getTime()){this.lastError='GMGN_RATE_LIMITED';return;}
@@ -412,32 +436,37 @@ export class GmgnPlusArchiveRunner {
       }else if(task.kind==='stats'){
         const batch=this.options.archive.candidateBatch('stats',1,6*60*60*1000);if(batch.addresses.length){
           try{this.options.archive.recordWalletStats(batch.chain,batch.addresses,await this.options.client.getWalletStats(batch.chain,batch.addresses));}
-          catch(error){this.options.archive.deferCandidates(batch.chain,batch.addresses);throw error;}}
+          catch(error){if(!expectedPreemption(error))this.options.archive.deferCandidates(batch.chain,batch.addresses);throw error;}}
       }else if(task.kind==='profits'){
         const batch=this.options.archive.candidateBatch('profits',20,6*60*60*1000);if(batch.addresses.length){
           try{this.options.archive.recordWalletProfits(batch.chain,batch.addresses,await this.options.client.getWalletProfits(batch.chain,batch.addresses));}
-          catch(error){this.options.archive.deferCandidates(batch.chain,batch.addresses);throw error;}}
+          catch(error){if(!expectedPreemption(error))this.options.archive.deferCandidates(batch.chain,batch.addresses);throw error;}}
       }else{
         const batch=this.options.archive.candidateBatch('activity',1,24*60*60*1000),wallet=batch.addresses[0];if(wallet){
           try{this.options.archive.recordWalletActivity(batch.chain,wallet,await this.options.client.getWalletActivity(batch.chain,wallet,
             this.options.archive.activityCursor(batch.chain,wallet)));}
           catch(error){if(error instanceof GmgnError&&error.reason==='GMGN_CURSOR_INVALID')
-            this.options.archive.resetActivityCursor(batch.chain,wallet);else this.options.archive.deferCandidates(batch.chain,batch.addresses);throw error;}}
+            this.options.archive.resetActivityCursor(batch.chain,wallet);else if(!expectedPreemption(error))this.options.archive.deferCandidates(batch.chain,batch.addresses);throw error;}}
       }
       this.options.archive.setMeta('runner_cursor',String(cursor+1));this.options.archive.setMeta('last_success_at',this.now().toISOString());
       this.options.archive.setMeta('last_error','');this.options.archive.setMeta(breakerKey,'0');this.lastError=undefined;
     }catch(error){
+      if(expectedPreemption(error)){
+        this.preemptions++;this.lastPreemptedAt=this.now().toISOString();
+        if(this.running)this.retryAfterPreemption=true;
+        return;
+      }
       if(error instanceof GmgnError&&error.reason==='GMGN_CURSOR_INVALID'&&'feed'in task){
         if(task.kind==='callout_latest')this.options.archive.resetCalloutLatest(task.feed);else this.options.archive.resetCalloutCursor(task.feed);
       }
       this.lastError=error instanceof GmgnError?error.reason:'GMGN_PLUS_ARCHIVE_REQUEST_FAILED';
       try{this.options.archive.setMeta('last_error',this.lastError);}catch{}
-      // Rate/queue/preemption failures retry exactly. Bad cursors reset once;
+      // Rate/queue failures retry exactly. Bad cursors reset once;
       // other persistent endpoint failures trip a three-attempt task breaker
       // so one unavailable route cannot freeze all research feeds.
       if(error instanceof GmgnError&&error.reason==='GMGN_CURSOR_INVALID'){
         this.options.archive.setMeta(breakerKey,'0');this.options.archive.setMeta('runner_cursor',String(cursor+1));
-      }else if(!(error instanceof GmgnError&&['GMGN_RATE_LIMITED','GMGN_QUEUE_TIMEOUT','GMGN_REQUEST_ABORTED'].includes(error.reason))){
+      }else if(!(error instanceof GmgnError&&['GMGN_RATE_LIMITED','GMGN_QUEUE_TIMEOUT'].includes(error.reason))){
         const failures=Math.min(3,Math.max(0,Number(this.options.archive.meta(breakerKey)??0)||0)+1);
         this.options.archive.setMeta(breakerKey,String(failures));if(failures>=3){
           this.options.archive.setMeta(breakerKey,'0');this.options.archive.setMeta('runner_cursor',String(cursor+1));

@@ -34,7 +34,7 @@ test('strict normalization rejects wrong identity, timestamp, chain and malforme
   assert.equal(result.observations[0].signal.token.address,token(2));
 });
 
-test('route policy analyzes buys, repeated price spikes and negative evidence without flooding on ATH or unknown types',async()=>{
+test('route policy reserves full analysis for strong wallet buys and narrative events',async()=>{
   const rows=[row(1,base,{signal_type:12}),row(2,base,{signal_type:20}),row(3,base,{signal_type:6,signal_times:1}),
     row(4,base,{signal_type:6,signal_times:2}),row(5,base,{signal_type:10}),row(6,base,{signal_type:7}),
     row(7,base,{signal_type:13}),row(8,base,{signal_type:99}),row(9,base,{signal_type:11}),
@@ -44,10 +44,20 @@ test('route policy analyzes buys, repeated price spikes and negative evidence wi
   await prime(scanner);
   const cycle=await scanner.runOnce();await scanner.waitForIdle();
   assert.equal(observed.length,11);assert.deepEqual(analyzed.map(value=>value.split(':').at(-1)),
-    [id(1),id(2),id(7),id(9),id(10),id(4),id(5)]);
+    [id(1),id(2),id(7),id(9),id(10)]);
   assert.deepEqual(cycle.routes,{priority_analysis:2,narrative_analysis:3,conditional_analysis:2,negative_analysis:1,
     observation_only:2,unknown_research:1});
-  assert.equal(cycle.queued,7);assert.equal(scanner.status().entryPipeline,false);assert.equal(scanner.status().countingPipeline,false);
+  assert.equal(cycle.queued,5);assert.equal(scanner.status().entryPipeline,false);assert.equal(scanner.status().countingPipeline,false);
+});
+
+test('price spikes and bundler sells keep their route and fast evidence but never enter full analysis',()=>{
+  const observations=normalizeGmgnMarketSignals([
+    row(1,base,{signal_type:6,signal_times:1}),row(2,base,{signal_type:6,signal_times:99}),
+    row(3,base,{signal_type:10})],'sol').observations;
+  assert.deepEqual(observations.map(item=>[item.route,item.analysisEligible]),[
+    ['conditional_analysis',false],['conditional_analysis',false],['negative_analysis',false]]);
+  assert.match(observations[1].signal.text,/price_spike/);
+  assert.match(observations[2].signal.text,/bundler_sell/);
 });
 
 test('meme heat mechanics are retained as observation-only evidence',()=>{

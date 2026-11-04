@@ -21,6 +21,8 @@ const signal=(id='signal-0001')=>({id,token_address:wallet(1),signal_type:12,ath
 const callout=(id='01M66CJD4D4TV7X5D2T1AEKA8R')=>({ulid:id,chain:'sol',call_wallet:wallet(3),call_token:wallet(1),
   call_price:'0.00001',call_mc:'10000',call_thesis:{source_content:'plain research text'},create_time:at,
   token_symbol:'CALL',multiplier:'2.1',is_safe:'safe',is_kol:true,is_declaration:false});
+const archiveCounts=(archive:GmgnPlusArchive)=>{const status=archive.status();return {events:status.events,evidence:status.candidateEvidence,
+  candidates:status.candidates,snapshots:status.walletSnapshots,holdings:status.walletHoldingPages,activities:status.walletActivities};};
 
 test('market and callout rows are normalized, deduplicated and seed bounded wallet candidates',()=>{
   const f=fixture();try{const archive=f.create();
@@ -47,6 +49,54 @@ test('market and callout rows are normalized, deduplicated and seed bounded wall
       assert.equal(archive.calloutCursor('global'),'cursor-one','the first latest page freezes the historical frontier');
       assert.equal(archive.calloutFrontier('global'),'cursor-two');
     }finally{db.close();archive.close();}
+  }finally{f.close();}
+});
+
+test('persistent table counters follow inserts, upserts, deletes, rollbacks and restarts',()=>{
+  const f=fixture();try{let archive=f.create();archive.recordMarketSignals('sol',[signal()]);
+    archive.recordMarketSignals('sol',[{...signal(),market_cap:99_999}]);archive.recordCallouts('global',{list:[callout()]});
+    archive.recordWalletStats('sol',[wallet(3)],{wallet_address:wallet(3),realized_profit:'12'});
+    archive.recordWalletProfits('sol',[wallet(3)],{list:[{wallet_address:wallet(3),total_profit:'20'}]});
+    archive.recordWalletHoldingsPage('sol',wallet(3),'closed',1,{list:[{token:{address:wallet(4)}}],next:''});
+    archive.recordWalletHoldingsPage('sol',wallet(3),'closed',1,{list:[],next:''});
+    const activity={tx_hash:tx(1),event_type:'buy',token:{address:wallet(4)},timestamp:at/1000,token_amount:'1'};
+    archive.recordWalletActivity('sol',wallet(3),{activities:[activity],next:''});
+    archive.recordWalletActivity('sol',wallet(3),{activities:[activity],next:''});
+    assert.deepEqual(archiveCounts(archive),{events:2,evidence:2,candidates:2,snapshots:2,holdings:1,activities:1},
+      'conflict updates do not increment persistent counts');
+    const db=new DatabaseSync(f.path);try{
+      db.prepare("UPDATE gpa_events SET symbol='UPDATED' WHERE event_key=?").run('market:sol:signal-0001');
+      db.prepare("DELETE FROM gpa_wallet_snapshots WHERE kind='profits'").run();
+      db.prepare('DELETE FROM gpa_wallet_activity').run();
+      db.exec('BEGIN IMMEDIATE');
+      db.prepare(`INSERT INTO gpa_wallet_candidates(chain,address,source_mask,occurrences,first_seen_at,last_seen_at)
+        VALUES('sol','rolled-back',1,1,?,?)`).run(new Date(at).toISOString(),new Date(at).toISOString());
+      db.exec('ROLLBACK');
+    }finally{db.close();}
+    assert.deepEqual(archiveCounts(archive),{events:2,evidence:2,candidates:2,snapshots:1,holdings:1,activities:0},
+      'delete triggers decrement while rolled-back trigger writes disappear');
+    archive.close();archive=f.create();
+    assert.deepEqual(archiveCounts(archive),{events:2,evidence:2,candidates:2,snapshots:1,holdings:1,activities:0},
+      'a restart reuses durable counters');archive.close();
+  }finally{f.close();}
+});
+
+test('legacy archives initialize exact counters once and candidate pruning decrements them',()=>{
+  const f=fixture();try{let archive=f.create();archive.recordMarketSignals('sol',[signal()]);archive.recordCallouts('global',{list:[callout()]});archive.close();
+    const legacy=new DatabaseSync(f.path);try{
+      for(const row of legacy.prepare("SELECT name FROM sqlite_schema WHERE type='trigger' AND name LIKE 'gpa_count_%'").all())
+        legacy.exec(`DROP TRIGGER ${String(row.name)}`);
+      legacy.exec('DROP TABLE gpa_table_counts');
+    }finally{legacy.close();}
+    archive=f.create();assert.deepEqual(archiveCounts(archive),{events:2,evidence:2,candidates:2,snapshots:0,holdings:0,activities:0},
+      'the first upgraded open initializes counters from legacy table contents');
+    const db=new DatabaseSync(f.path);try{const insert=db.prepare(`INSERT INTO gpa_wallet_candidates(
+      chain,address,source_mask,occurrences,first_seen_at,last_seen_at) VALUES('sol',?,1,1,?,?)`),when=new Date(at).toISOString();
+      db.exec('BEGIN IMMEDIATE');for(let i=0;i<101;i++)insert.run(`seed-${i}`,when,when);db.exec('COMMIT');
+    }finally{db.close();}
+    assert.equal(archive.status().candidates,103);archive.recordMarketSignals('sol',[]);
+    assert.equal(archive.status().candidates,100,'pruning deletes update the persistent counter in the same transaction');
+    archive.close();archive=f.create();assert.equal(archive.status().candidates,100);archive.close();
   }finally{f.close();}
 });
 
@@ -246,6 +296,47 @@ test('per-task breaker advances after persistent endpoint failures but retries q
     await runner.runOnce();await runner.runOnce();assert.equal(runner.status().runnerCursor,0);await runner.runOnce();assert.equal(runner.status().runnerCursor,1);
     archive.setMeta('runner_cursor','0');reason='GMGN_REQUEST_ABORTED';await runner.runOnce();await runner.runOnce();await runner.runOnce();
     assert.equal(runner.status().runnerCursor,0,'live-entry preemption retries the exact archive task');await runner.stop();
+  }finally{f.close();}
+});
+
+test('automatic runner retries a preempted candidate quickly without error or backoff state',async()=>{
+  const f=fixture();try{const archive=f.create();archive.recordMarketSignals('sol',[signal()]);archive.setMeta('runner_cursor','5');
+    const priorLastError=archive.meta('last_error');
+    let calls=0,secondStartedAt=0,releaseSecond!:()=>void,notifySecond!:()=>void;
+    const secondStarted=new Promise<void>(resolve=>{notifySecond=resolve;}),secondGate=new Promise<void>(resolve=>{releaseSecond=resolve;});
+    const callTimes:number[]=[];const client={cooldownUntil:0,getMemeMarketSignals:async()=>[],getCalloutGlobal:async()=>({list:[]}),
+      getWalletStats:async()=>{calls++;callTimes.push(Date.now());if(calls===1)throw new GmgnError('GMGN_REQUEST_ABORTED');
+        secondStartedAt=Date.now();notifySecond();await secondGate;return {code:0,data:{wallet_address:wallet(2),realized_profit:'1'}};},
+      getWalletProfits:async()=>({list:[]}),getWalletActivity:async()=>({activities:[]})};
+    const runner=new GmgnPlusArchiveRunner({archive,client:client as never,chains:['sol'],intervalMs:5000,now:f.now});runner.start();
+    await Promise.race([secondStarted,new Promise<never>((_,reject)=>setTimeout(()=>reject(new Error('PREEMPTION_RETRY_TIMEOUT')),1000))]);
+    assert.equal(calls,2);assert.ok(secondStartedAt-callTimes[0]!<1000,'preemption retries before the regular five-second interval');
+    assert.equal(archive.meta('runner_cursor'),'5','the preempted task retains its exact cursor');
+    assert.equal(archive.meta('last_error'),priorLastError,'expected scheduler preemption does not change persisted error state');
+    assert.equal(runner.status().lastError,undefined);assert.equal(runner.status().preemptions,1);
+    const during=new DatabaseSync(f.path,{readOnly:true});try{const row=during.prepare(
+      'SELECT failure_count,retry_after FROM gpa_wallet_candidates WHERE chain=? AND address=?').get('sol',wallet(2))!;
+      assert.deepEqual({failures:Number(row.failure_count),retryAfter:row.retry_after},{failures:0,retryAfter:null});
+    }finally{during.close();}
+    releaseSecond();
+    const deadline=Date.now()+1000;while(archive.meta('runner_cursor')!=='6'&&Date.now()<deadline)await new Promise(resolve=>setTimeout(resolve,5));
+    assert.equal(archive.meta('runner_cursor'),'6','one successful retry advances the cursor exactly once');assert.equal(calls,2);
+    assert.equal(runner.status().lastError,undefined);await runner.stop();
+  }finally{f.close();}
+});
+
+test('preemption preserves the previous real error until the same task succeeds',async()=>{
+  const f=fixture();try{const archive=f.create();let attempt=0;const client={cooldownUntil:0,
+    getMemeMarketSignals:async()=>{attempt++;if(attempt===1)throw new GmgnError('GMGN_AUTH_FAILED');
+      if(attempt===2)throw new GmgnError('GMGN_REQUEST_ABORTED');return [];},getCalloutGlobal:async()=>({list:[]}),
+    getWalletStats:async()=>({}),getWalletProfits:async()=>({list:[]}),getWalletActivity:async()=>({activities:[]})};
+    const runner=new GmgnPlusArchiveRunner({archive,client:client as never,chains:['sol'],intervalMs:5000,now:f.now});
+    await runner.runOnce();assert.equal(runner.status().lastError,'GMGN_AUTH_FAILED');assert.equal(archive.meta('last_error'),'GMGN_AUTH_FAILED');
+    await runner.runOnce();assert.equal(runner.status().runnerCursor,0);assert.equal(runner.status().lastError,'GMGN_AUTH_FAILED');
+    assert.equal(archive.meta('last_error'),'GMGN_AUTH_FAILED','preemption does not hide an earlier actionable failure');
+    assert.equal(archive.meta('task_failure_market_sol'),'1','preemption does not alter the existing breaker count');
+    await runner.runOnce();assert.equal(runner.status().runnerCursor,1);assert.equal(runner.status().lastError,undefined);
+    assert.equal(archive.meta('last_error'),'');assert.equal(archive.meta('task_failure_market_sol'),'0');await runner.stop();
   }finally{f.close();}
 });
 

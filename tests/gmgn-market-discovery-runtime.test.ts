@@ -4,6 +4,7 @@ import {mkdtempSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {randomUUID} from 'node:crypto';
+import {DatabaseSync} from 'node:sqlite';
 import bs58 from 'bs58';
 import {readConfig} from '../src/config.js';
 import {createRuntime} from '../src/runtime.js';
@@ -50,7 +51,21 @@ test('runtime wires Trending, Trenches and compact Kline research without enabli
     ORDERS_DATABASE_PATH:orders});
   const runtime=createRuntime(config,{gmgnFetcher:fetcher});
   try {
-    assert.ok(runtime.gmgnMarketDiscovery);await runtime.gmgnMarketDiscovery.pollNow();
+    assert.ok(runtime.gmgnMarketDiscovery);assert.ok(runtime.walletHistory);
+    const walletHistory=runtime.walletHistory,
+      captureMarketCandidate=walletHistory.captureMarketCandidate.bind(walletHistory);
+    walletHistory.captureMarketCandidate=()=>false;
+    await runtime.gmgnMarketDiscovery.pollNow();
+    let status=runtime.dashboardOverview().gmgnMarketDiscovery;
+    assert.equal(status.candidateErrors,1);
+    assert.equal(status.store.pendingCandidateDeliveries,1,'failed WalletHistory writes remain durable and unacked');
+    let walletDb=(walletHistory as unknown as {db:DatabaseSync}).db;
+    assert.equal(Number(walletDb.prepare("SELECT count(*) AS n FROM wh_observations WHERE kind='market_candidate'").get()!.n),0);
+    walletHistory.captureMarketCandidate=captureMarketCandidate;
+    await runtime.gmgnMarketDiscovery.pollNow();
+    status=runtime.dashboardOverview().gmgnMarketDiscovery;
+    assert.equal(status.store.pendingCandidateDeliveries,0,'the pending candidate is acked only after WalletHistory accepts it');
+    assert.equal(Number(walletDb.prepare("SELECT count(*) AS n FROM wh_observations WHERE kind='market_candidate'").get()!.n),1);
     // Scanner unit tests cover the production 30 s cadence. Reset only its
     // local slot clock here so this runtime wiring test can exercise the three
     // round-robin work classes without sleeping for a minute.
@@ -58,7 +73,7 @@ test('runtime wires Trending, Trenches and compact Kline research without enabli
     await runtime.gmgnMarketDiscovery.pollNow();
     (runtime.gmgnMarketDiscovery as unknown as {nextRemoteAt:number}).nextRemoteAt=0;
     await runtime.gmgnMarketDiscovery.pollNow();
-    const status=runtime.dashboardOverview().gmgnMarketDiscovery;
+    status=runtime.dashboardOverview().gmgnMarketDiscovery;
     assert.equal(status.enabled,true);assert.equal(status.researchOnly,true);assert.equal(status.entryPipeline,false);
     assert.equal(status.countingPipeline,false);assert.equal(status.notificationPipeline,false);
     assert.equal(status.feeds.trending.polls,1);assert.equal(status.feeds.trenches.polls,1);
@@ -69,7 +84,13 @@ test('runtime wires Trending, Trenches and compact Kline research without enabli
     assert.equal(status.store.current,2);assert.equal(status.store.observations,2);
     assert.equal(status.store.lifecycleRegressions,0);
     assert.equal(status.store.klineObservations,1);assert.equal(status.klinePolls,1);
-    assert.ok(runtime.walletHistory);assert.equal(runtime.walletHistory.stats().events,0);assert.equal(runtime.walletHistory.stats().prices,0);
+    assert.equal(runtime.walletHistory.stats().events,0);assert.equal(runtime.walletHistory.stats().prices,0);
+    const observations=walletDb.prepare("SELECT data FROM wh_observations WHERE kind='market_candidate' ORDER BY rowid").all()
+        .map(row=>JSON.parse(String(row.data)));
+    assert.equal(observations.length,2);
+    assert.ok(observations.every(row=>row.firstSeenLowerBound===undefined&&row.firstSeenUpperBound===row.observedAt&&
+      row.leftCensored===true&&row.firstSeenIntervalScope==='local_gmgn_feed_selection_observation_only'&&
+      row.firstSeenIntervalClaimsTokenLaunchTime===false));
     assert.deepEqual(runtime.walletHistory.watchTargets(1,new Date(now+1_000),'solana'),[{chain:'solana',address:mint}]);
     assert.equal(runtime.executionStatus().executionEnabled,false);
   } finally {await runtime.close();rmSync(directory,{recursive:true,force:true});}

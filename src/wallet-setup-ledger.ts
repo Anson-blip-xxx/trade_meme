@@ -95,6 +95,25 @@ export class WalletSetupLedger {
     if(!this.db.prepare('PRAGMA table_info(wsl_setups)').all().some(row=>row.name==='check_seq'))this.db.exec('ALTER TABLE wsl_setups ADD COLUMN check_seq INTEGER NOT NULL DEFAULT 0');
     const pageSize=Number(this.db.prepare('PRAGMA page_size').get()!.page_size);
     this.db.exec(`PRAGMA max_page_count=${Math.floor(this.maxBytes/pageSize)}`);
+    this.migrateCandidateReductions();
+  }
+  private migrateCandidateReductions():void {
+    const key='candidate_reduction_wallet_v1';
+    if(this.db.prepare('SELECT 1 FROM wsl_meta WHERE key=?').get(key))return;
+    const rows=this.db.prepare("SELECT id,data,closed_at FROM wsl_setups WHERE state='reduced'").all(),
+      update=this.db.prepare('UPDATE wsl_setups SET state=?,data=? WHERE id=?'),now=this.time();
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      for(const row of rows){
+        const item=JSON.parse(String(row.data)) as WalletSetupLedgerItem;
+        if(!item.reduction||item.reduction.wallet===item.wallet)continue;
+        delete item.reduction;
+        item.state=item.leaderEntry?'leader_entered':item.route==='public_entry'?'direct_entry':row.closed_at||now!==undefined&&now>=item.expiresAt?'expired_unconfirmed':'awaiting_leader';
+        update.run(item.state,JSON.stringify(item),row.id);
+      }
+      this.db.prepare('INSERT INTO wsl_meta VALUES (?,?)').run(key,'1');
+      this.db.exec('COMMIT');
+    }catch(error){this.db.exec('ROLLBACK');throw error;}
   }
   private time(input?:Date|string):string|undefined {
     const actual=this.now();if(!Number.isFinite(actual.getTime()))return;
@@ -212,7 +231,7 @@ export class WalletSetupLedger {
       const eligible=evidence.filter(e=>!e.conflict&&e.event.eventAt>item.registeredAt&&e.event.observedAt>item.registeredAt&&e.event.eventAt<=item.expiresAt)
         .map(e=>e.event).sort((a,b)=>a.eventAt.localeCompare(b.eventAt)||a.txHash.localeCompare(b.txHash));
       item.leaderEntry=!item.triggerConflicted&&item.route==='precursor'?eligible.find(e=>e.wallet===item.leader&&e.side==='buy'):undefined;
-      item.reduction=eligible.find(e=>e.side==='sell'||e.side==='transferOut');
+      item.reduction=eligible.find(e=>e.wallet===item.wallet&&(e.side==='sell'||e.side==='transferOut'));
       const expired=now>=item.expiresAt;
       item.state=item.reduction?'reduced':item.leaderEntry?'leader_entered':item.route==='public_entry'?'direct_entry':expired?'expired_unconfirmed':'awaiting_leader';
       item.lastCheckedAt=now;if(expired&&!item.closedAt)item.closedAt=now;

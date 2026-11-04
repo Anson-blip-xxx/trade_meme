@@ -150,7 +150,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
     const configured=config.gmgnMarketDiscovery?.enabled===true;
     const emptyFeed=()=>({polls:0,received:0,accepted:0,deduplicated:0,rejected:0,truncated:0,changes:0,unchanged:0,errors:0,nextDueAt:0,idleStreak:0});
     const store=gmgnMarketDiscoveryStore?.status()??{enabled:false,current:0,observations:0,maxCurrent:0,maxObservations:0,
-      maxBytes:0,klineObservations:0,storageBytes:0,usedBytes:0,capacityReached:false,retentionMs:0,
+      maxBytes:0,klineObservations:0,pendingCandidateDeliveries:0,storageBytes:0,usedBytes:0,capacityReached:false,retentionMs:0,
       lastWriteAt:undefined,lastKlineAt:undefined,lifecycleRegressions:0,lastLifecycleRegressionAt:undefined,
       researchOnly:true,entryPipeline:false,countingPipeline:false,rawPayloadStored:false};
     const status=gmgnMarketDiscovery?.status()??{enabled:configured,running:false,inFlight:false,
@@ -316,13 +316,15 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       intervalMs:config.gmgnMarketDiscovery.intervalSec*1000,maxCandidates:config.gmgnMarketDiscovery.maxCandidates,
       klineCooldownMs:config.gmgnMarketDiscovery.klineCooldownSec*1000,
       onCandidate:candidate=>{
-        if(candidate.walletTrackingRecommended)walletHistory?.captureMarketCandidate(
+        if(candidate.walletTrackingRecommended&&walletHistory&&!walletHistory.captureMarketCandidate(
           {chain:'solana',address:candidate.tokenAddress},{source:candidate.source,observedAt:candidate.observedAt,
             kind:candidate.feed,reason:`${candidate.kind}:${candidate.category}`,window:candidate.window,
             changeKind:candidate.kind,category:candidate.category,previousCategory:candidate.previousCategory,
+            ...(candidate.kind==='first_seen'?{firstSeenLowerBound:candidate.previousSuccessfulPollAt,
+              firstSeenUpperBound:candidate.observedAt,leftCensored:candidate.leftCensored}:{}),
             rank:candidate.snapshot.rank,smartDegenCount:candidate.snapshot.smartDegenCount,
             renownedCount:candidate.snapshot.renownedCount,smartDegenDelta:candidate.smartDegenDelta,
-            renownedDelta:candidate.renownedDelta});
+            renownedDelta:candidate.renownedDelta}))throw new Error('GMGN_MARKET_CANDIDATE_CAPTURE_FAILED');
         const snapshot=candidate.snapshot;
         if(candidate.kind==='category_transition'||candidate.smartDegenDelta>0||candidate.renownedDelta>0||
           candidate.feed==='trending'&&(snapshot.rank??Number.POSITIVE_INFINITY)<=5||

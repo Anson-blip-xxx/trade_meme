@@ -29,6 +29,9 @@ function relation(f:ReturnType<typeof fixture>,tokens=[100],forward=false){
   for(const token of tokens){const data={tokenAddress:address(token),leaderBuy:{wallet:leader,eventAt:iso(30),observedAt:iso(31)},candidateBuy:{wallet:candidate,eventAt:iso(10),observedAt:iso(11)},firstDiscoveredAt:iso(40),updatedAt:stamp,leaderPublicObservedAt:iso(30),forwardValidated:forward};
     f.raw.prepare('INSERT OR REPLACE INTO wh_assoc_episodes VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)').run(String(token),chain,leader,candidate,address(token),iso(40),stamp,1,1,forward?1:0,0,20,JSON.stringify(data));}
 }
+function profileMeta(path:string,key:string):string|undefined {const db=new DatabaseSync(path,{readOnly:true});try{
+  return db.prepare('SELECT value FROM wp_meta WHERE key=?').get(key)?.value as string|undefined;
+}finally{db.close();}}
 
 test('reader does not create a missing database and can open it after the worker creates it',()=>{
   const root=mkdtempSync(join(tmpdir(),'wallet-profiles-reader-')),path=join(root,'missing.sqlite'),reader=new WalletProfileReader(path);
@@ -175,6 +178,270 @@ test('live wallet and coordination changes are consumed ahead of historical back
       .run(iso(104),JSON.stringify({sharedFunding:[],synchronized:[{wallet:address(2),tokenAddress:address(100),distinctTransactions:2,windowSeconds:120}]}),'bsc',address(1));
     f.batch(5);assert.equal(f.reader.get('bsc',address(1))!.computedAt,iso(104));assert.ok(f.groups().includes('synchronized'));
     assert.equal(f.reader.status().initialComplete,false);
+  }finally{f.close();}
+});
+
+test('new GMGN market first-seen intervals reclassify existing wallets without waiting for profile expiry',()=>{
+  const f=fixture({refreshAfterSec:3600});try{
+    f.setNow(1000);
+    for(let i=0;i<3;i++)f.trade(1,{tokenAddress:address(100+i),txHash:hash(7000+i),eventAt:iso(100+i*10),observedAt:iso(101+i*10)});
+    f.batch();assert.equal(f.reader.get('bsc',address(1))!.initiatorAnalysis,undefined);
+    for(let i=0;i<3;i++)f.history.captureMarketCandidate({chain:'bsc',address:address(100+i)},
+      {source:'gmgn_market_discovery',observedAt:iso(220+i*10),kind:'trenches',reason:'first_seen:new_creation',window:'lifecycle',
+        changeKind:'first_seen',category:'new_creation',firstSeenLowerBound:iso(210+i*10),firstSeenUpperBound:iso(220+i*10),leftCensored:false});
+    f.setNow(1002);f.batch();let profile=f.reader.get('bsc',address(1))!,analysis=profile.initiatorAnalysis!;
+    assert.equal(profile.computedAt,iso(1002));assert.equal(analysis.classification,'precursor');assert.equal(analysis.prospectivePreTokens,3);
+    assert.equal(analysis.qualification?.knownAt,iso(1002));assert.equal(analysis.screeningEvidence,undefined);
+    assert.ok(f.groups().includes('market_precursor_pattern'));assert.equal(profile.groups.find(group=>group.id==='market_precursor_pattern')!.evidenceCount,3);
+    assert.equal(f.reader.status().groupCounts.market_precursor_pattern,1);
+    assert.equal(f.reader.streamTargets('bsc',1)[0]?.address,address(1),'prospective precursors enter the bounded research stream cohort');
+    const qualifiedAt=analysis.qualification!.knownAt;
+    for(let i=0;i<3;i++)f.trade(1,{tokenAddress:address(100+i),txHash:hash(7100+i),side:'sell',eventAt:iso(300+i*10),observedAt:iso(301+i*10)});
+    f.setNow(1004);f.batch();profile=f.reader.get('bsc',address(1))!;analysis=profile.initiatorAnalysis!;
+    assert.equal(analysis.qualification?.knownAt,qualifiedAt,'later exits do not re-date the directional qualification');
+    assert.equal(analysis.postActivationExitTokens,3);assert.ok(f.groups().includes('market_repeated_exit'));
+  }finally{f.close();}
+});
+
+test('a prospective market precursor becomes a visible-start candidate only after pre-registered public wallets buy later',()=>{
+  const f=fixture({refreshAfterSec:3600});try{
+    f.setNow(1000);
+    for(let i=0;i<3;i++){
+      f.trade(1,{tokenAddress:address(100+i),txHash:hash(7200+i),eventAt:iso(100+i*10),observedAt:iso(101+i*10)});
+      f.trade(2,{tokenAddress:address(100+i),txHash:hash(7300+i),eventAt:iso(150+i*10),observedAt:iso(151+i*10),source:'gmgn_kol_feed'});
+      f.history.captureMarketCandidate({chain:'bsc',address:address(100+i)},
+        {source:'gmgn_market_discovery',observedAt:iso(220+i*10),kind:'trenches',reason:'first_seen:new_creation',window:'lifecycle',
+          changeKind:'first_seen',category:'new_creation',firstSeenLowerBound:iso(210+i*10),firstSeenUpperBound:iso(220+i*10),leftCensored:false});
+    }
+    f.raw.prepare(`INSERT INTO wh_assoc_relations(chain,leader,candidate,first_at,updated_at,token_count,forward_count,funding_count,dirty,data,funding_data,active_since)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run('bsc',address(2),address(1),iso(40),iso(300),3,3,0,0,'{}','[]',iso(50));
+    f.batch(1000);const profile=f.reader.get('bsc',address(1))!,visible=profile.visibleStartAnalysis!;
+    assert.equal(profile.initiatorAnalysis?.classification,'precursor');
+    assert.equal(visible.classification,'visible_start_candidate');assert.equal(visible.status,'current');
+    assert.equal(visible.directionalTokens.followed,3);assert.equal(visible.followShare,1);
+    assert.equal(visible.qualification?.knownAt,iso(1000));assert.equal(visible.screeningEvidence,undefined);
+    assert.ok(f.groups().includes('market_visible_start'));assert.equal(profile.groups.find(group=>group.id==='market_visible_start')!.evidenceCount,3);
+    assert.equal(f.reader.streamTargets('bsc',1)[0]?.address,address(1));
+  }finally{f.close();}
+});
+
+test('partial precursor coverage cannot be upgraded into a current visible-start qualification',()=>{
+  const f=fixture({refreshAfterSec:3600});try{
+    f.setNow(2000);
+    for(let i=0;i<3;i++){
+      f.trade(1,{tokenAddress:address(100+i),txHash:hash(7400+i),eventAt:iso(100+i*10),observedAt:iso(101+i*10)});
+      f.trade(2,{tokenAddress:address(100+i),txHash:hash(7500+i),eventAt:iso(150+i*10),observedAt:iso(151+i*10),source:'gmgn_kol_feed'});
+      f.history.captureMarketCandidate({chain:'bsc',address:address(100+i)},
+        {source:'gmgn_market_discovery',observedAt:iso(220+i*10),kind:'trenches',reason:'first_seen:new_creation',window:'lifecycle',
+          changeKind:'first_seen',category:'new_creation',firstSeenLowerBound:iso(210+i*10),firstSeenUpperBound:iso(220+i*10),leftCensored:false});
+    }
+    f.raw.prepare(`INSERT INTO wh_assoc_relations(chain,leader,candidate,first_at,updated_at,token_count,forward_count,funding_count,dirty,data,funding_data,active_since)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run('bsc',address(2),address(1),iso(40),iso(300),3,3,0,0,'{}','[]',iso(50));
+    for(let i=0;i<500;i++)f.trade(1,{tokenAddress:address(2000+i),txHash:hash(20_000+i),eventAt:iso(300+i),observedAt:iso(301+i)});
+    for(let i=0;i<10;i++)f.batch(20);
+    const profile=f.reader.get('bsc',address(1))!,visible=profile.visibleStartAnalysis!;
+    assert.equal(profile.initiatorAnalysis?.classification,'precursor');assert.equal(profile.initiatorAnalysis?.status,'partial');
+    assert.equal(visible.status,'partial');assert.equal(visible.classification,'insufficient');assert.equal(visible.qualification,undefined);
+    assert.ok(!f.groups().includes('market_visible_start'));
+  }finally{f.close();}
+});
+
+test('a relation update immediately recomputes the candidate after its public peer buys',()=>{
+  const f=fixture({refreshAfterSec:3600});try{
+    f.setNow(1000);
+    for(let i=0;i<3;i++){
+      f.trade(1,{tokenAddress:address(100+i),txHash:hash(7600+i),eventAt:iso(100+i*10),observedAt:iso(101+i*10)});
+      f.history.captureMarketCandidate({chain:'bsc',address:address(100+i)},
+        {source:'gmgn_market_discovery',observedAt:iso(220+i*10),kind:'trenches',reason:'first_seen:new_creation',window:'lifecycle',
+          changeKind:'first_seen',category:'new_creation',firstSeenLowerBound:iso(210+i*10),firstSeenUpperBound:iso(220+i*10),leftCensored:false});
+    }
+    f.raw.prepare(`INSERT INTO wh_assoc_relations(chain,leader,candidate,first_at,updated_at,token_count,forward_count,funding_count,dirty,data,funding_data,active_since)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run('bsc',address(2),address(1),iso(40),iso(300),3,0,0,0,'{}','[]',iso(50));
+    f.batch(1000);const before=f.reader.get('bsc',address(1))!;
+    assert.equal(before.visibleStartAnalysis?.classification,'insufficient');assert.ok(!f.groups().includes('market_visible_start'));
+    f.setNow(1200);
+    for(let i=0;i<3;i++)f.trade(2,{tokenAddress:address(100+i),txHash:hash(7700+i),eventAt:iso(500+i*10),observedAt:iso(501+i*10),source:'gmgn_kol_feed'});
+    f.raw.prepare('UPDATE wh_assoc_relations SET updated_at=?,forward_count=3 WHERE chain=? AND leader=? AND candidate=?')
+      .run(iso(1100),'bsc',address(2),address(1));
+    f.batch(1000);const after=f.reader.get('bsc',address(1))!;
+    assert.equal(after.computedAt,iso(1200));assert.equal(after.visibleStartAnalysis?.classification,'visible_start_candidate');
+    assert.ok(f.groups().includes('market_visible_start'));
+  }finally{f.close();}
+});
+
+test('a zero-token relation update immediately revokes a visible-start qualification and group',()=>{
+  const f=fixture({refreshAfterSec:3600});try{
+    f.setNow(1000);
+    for(let i=0;i<3;i++){
+      f.trade(1,{tokenAddress:address(100+i),txHash:hash(7800+i*2),eventAt:iso(100+i*10),observedAt:iso(101+i*10)});
+      f.trade(2,{tokenAddress:address(100+i),txHash:hash(7801+i*2),eventAt:iso(150+i*10),observedAt:iso(151+i*10),source:'gmgn_kol_feed'});
+      f.history.captureMarketCandidate({chain:'bsc',address:address(100+i)},
+        {source:'gmgn_market_discovery',observedAt:iso(220+i*10),kind:'trenches',reason:'first_seen:new_creation',window:'lifecycle',
+          changeKind:'first_seen',category:'new_creation',firstSeenLowerBound:iso(210+i*10),firstSeenUpperBound:iso(220+i*10),leftCensored:false});
+    }
+    f.raw.prepare(`INSERT INTO wh_assoc_relations(chain,leader,candidate,first_at,updated_at,token_count,forward_count,funding_count,dirty,data,funding_data,active_since)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run('bsc',address(2),address(1),iso(40),iso(300),3,3,0,0,'{}','[]',iso(50));
+    f.batch(1000);let profile=f.reader.get('bsc',address(1))!;
+    assert.equal(profile.visibleStartAnalysis?.classification,'visible_start_candidate');assert.ok(profile.visibleStartAnalysis?.qualification);
+    assert.ok(f.groups().includes('market_visible_start'));
+    f.setNow(1200);f.raw.prepare(`UPDATE wh_assoc_relations SET updated_at=?,token_count=0,forward_count=0,active_since=NULL
+      WHERE chain=? AND leader=? AND candidate=?`).run(iso(1100),'bsc',address(2),address(1));
+    f.batch(1000);profile=f.reader.get('bsc',address(1))!;
+    assert.equal(profile.computedAt,iso(1200),'the relation cursor refreshes the candidate before periodic expiry');
+    assert.equal(profile.visibleStartAnalysis?.classification,'insufficient');
+    assert.equal(profile.visibleStartAnalysis?.qualificationState,'revoked');assert.equal(profile.visibleStartAnalysis?.qualification,undefined);
+    assert.ok(!f.groups().includes('market_visible_start'));
+    assert.ok(profile.changes?.some(change=>change.removed.includes('market_visible_start')));
+  }finally{f.close();}
+});
+
+test('capacity interruption does not advance the relation cursor and recovery retries the candidate',()=>{
+  const f=fixture({refreshAfterSec:3600});try{
+    f.setNow(1000);
+    for(let i=0;i<3;i++){
+      f.trade(1,{tokenAddress:address(100+i),txHash:hash(7900+i),eventAt:iso(100+i*10),observedAt:iso(101+i*10)});
+      f.history.captureMarketCandidate({chain:'bsc',address:address(100+i)},
+        {source:'gmgn_market_discovery',observedAt:iso(220+i*10),kind:'trenches',reason:'first_seen:new_creation',window:'lifecycle',
+          changeKind:'first_seen',category:'new_creation',firstSeenLowerBound:iso(210+i*10),firstSeenUpperBound:iso(220+i*10),leftCensored:false});
+    }
+    f.raw.prepare(`INSERT INTO wh_assoc_relations(chain,leader,candidate,first_at,updated_at,token_count,forward_count,funding_count,dirty,data,funding_data,active_since)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run('bsc',address(2),address(1),iso(40),iso(300),3,0,0,0,'{}','[]',iso(50));
+    f.batch(1000);assert.equal(f.reader.get('bsc',address(1))!.visibleStartAnalysis?.classification,'insufficient');
+    const before={at:profileMeta(f.database,'relation_changed_at'),row:profileMeta(f.database,'relation_changed_row')};
+    f.setNow(1200);
+    for(let i=0;i<3;i++)f.trade(2,{tokenAddress:address(100+i),txHash:hash(7950+i),eventAt:iso(500+i*10),observedAt:iso(501+i*10),source:'gmgn_kol_feed'});
+    f.raw.prepare('UPDATE wh_assoc_relations SET updated_at=?,forward_count=3 WHERE chain=? AND leader=? AND candidate=?')
+      .run(iso(1100),'bsc',address(2),address(1));
+    f.restart(16_384);assert.equal(f.batch(1000).capacityReached,true);
+    assert.deepEqual({at:profileMeta(f.database,'relation_changed_at'),row:profileMeta(f.database,'relation_changed_row')},before);
+    f.restart(16*1024*1024);f.batch(1000);const profile=f.reader.get('bsc',address(1))!;
+    assert.equal(profile.visibleStartAnalysis?.classification,'visible_start_candidate');assert.ok(profile.visibleStartAnalysis?.qualification);
+    assert.ok(f.groups().includes('market_visible_start'));
+    assert.equal(profileMeta(f.database,'relation_changed_at'),iso(1100));
+  }finally{f.close();}
+});
+
+test('ordinary due profiles do not scan lifetime market tokens before a prospective nomination',()=>{
+  const f=fixture();try{
+    f.trade();f.batch();assert.equal(f.reader.get('bsc',address(1))!.initiatorAnalysis,undefined);
+    f.raw.exec('DROP TABLE wh_wallet_tokens');f.setNow(102);
+    assert.doesNotThrow(()=>f.batch());assert.equal(f.reader.get('bsc',address(1))!.initiatorAnalysis,undefined);
+  }finally{f.close();}
+});
+
+test('market cursor skips empty observations and pages every buyer of a popular token without skipping the next token',()=>{
+  const f=fixture({refreshAfterSec:3600});try{
+    f.setNow(1000);
+    for(let wallet=1;wallet<=7;wallet++)f.trade(wallet,{tokenAddress:address(100),txHash:hash(8000+wallet),
+      eventAt:iso(100+wallet),observedAt:iso(101+wallet)});
+    f.trade(8,{tokenAddress:address(101),txHash:hash(8100),eventAt:iso(120),observedAt:iso(121)});
+    f.batch(100);assert.ok(Array.from({length:8},(_,i)=>f.reader.get('bsc',address(i+1))).every(Boolean));
+    f.history.captureMarketCandidate({chain:'bsc',address:address(999)},
+      {source:'gmgn_market_discovery',observedAt:iso(200),kind:'trenches',reason:'first_seen:new_creation',window:'lifecycle',
+        changeKind:'first_seen',category:'new_creation',firstSeenLowerBound:iso(190),firstSeenUpperBound:iso(200),leftCensored:false});
+    for(const [token,at] of [[100,220],[101,230]] as const)f.history.captureMarketCandidate({chain:'bsc',address:address(token)},
+      {source:'gmgn_market_discovery',observedAt:iso(at),kind:'trenches',reason:'first_seen:new_creation',window:'lifecycle',
+        changeKind:'first_seen',category:'new_creation',firstSeenLowerBound:iso(at-10),firstSeenUpperBound:iso(at),leftCensored:false});
+    f.setNow(1002);for(let i=0;i<9;i++)f.batch(5);
+    for(let wallet=1;wallet<=8;wallet++)assert.ok(f.reader.get('bsc',address(wallet))!.initiatorAnalysis,
+      `wallet ${wallet} must be nominated exactly through the durable market page`);
+    assert.equal(profileMeta(f.database,'market_wallet'),'');
+  }finally{f.close();}
+});
+
+test('legacy first-seen remains left-censored counterevidence when another feed later creates an interval',()=>{
+  const f=fixture({refreshAfterSec:3600});try{
+    f.setNow(1000);f.trade(1,{eventAt:iso(100),observedAt:iso(101)});f.batch();
+    f.history.captureMarketCandidate({chain:'bsc',address:address(100)},
+      {source:'gmgn_market_discovery',observedAt:iso(150),kind:'trenches',reason:'first_seen:new_creation',window:'lifecycle',
+        changeKind:'first_seen',category:'new_creation'});
+    f.history.captureMarketCandidate({chain:'bsc',address:address(100)},
+      {source:'gmgn_market_discovery',observedAt:iso(220),kind:'trending',reason:'first_seen:trending',window:'1h',
+        changeKind:'first_seen',category:'trending',firstSeenLowerBound:iso(210),firstSeenUpperBound:iso(220),leftCensored:false});
+    f.setNow(1002);f.batch();const profile=f.reader.get('bsc',address(1))!,analysis=profile.initiatorAnalysis!;
+    assert.equal(analysis.classification,'insufficient');assert.equal(analysis.prospectivePreTokens,0);
+    assert.equal(analysis.directionalTokens.ambiguous,1);assert.ok(!f.groups().includes('market_pre_candidate'));
+    const output=new DatabaseSync(f.database,{readOnly:true});try{
+      assert.equal(output.prepare('SELECT market_at FROM wp_initiator_tokens WHERE chain=? AND address=? AND token_address=?')
+        .get('bsc',address(1),address(100))!.market_at,iso(150),'frame order freezes the canonical earliest first-seen');
+    }finally{output.close();}
+  }finally{f.close();}
+});
+
+test('a later wallet buy joins an existing prospective market cohort without another market notification',()=>{
+  const f=fixture({refreshAfterSec:3600});try{
+    f.setNow(300);f.history.captureMarketCandidate({chain:'bsc',address:address(100)},
+      {source:'gmgn_market_discovery',observedAt:iso(200),kind:'trenches',reason:'first_seen:new_creation',window:'lifecycle',
+        changeKind:'first_seen',category:'new_creation',firstSeenLowerBound:iso(190),firstSeenUpperBound:iso(200),leftCensored:false});
+    f.batch();
+    f.setNow(400);f.trade(1,{eventAt:iso(250),observedAt:iso(251),txHash:hash(8200)});f.batch();
+    const analysis=f.reader.get('bsc',address(1))!.initiatorAnalysis!;
+    assert.equal(analysis.directionalTokens.post,1);assert.equal(analysis.classification,'insufficient');
+    const output=new DatabaseSync(f.database,{readOnly:true});try{
+      assert.equal(output.prepare('SELECT count(*) AS n FROM wp_initiator_tokens WHERE chain=? AND address=?').get('bsc',address(1))!.n,1);
+    }finally{output.close();}
+  }finally{f.close();}
+});
+
+test('global event cursor retains an older post-market buy after a busy wallet pushes it outside the recent 500 frame',()=>{
+  const f=fixture({refreshAfterSec:3600});try{
+    f.setNow(300);f.history.captureMarketCandidate({chain:'bsc',address:address(100)},
+      {source:'gmgn_market_discovery',observedAt:iso(200),kind:'trenches',reason:'first_seen:new_creation',window:'lifecycle',
+        changeKind:'first_seen',category:'new_creation',firstSeenLowerBound:iso(190),firstSeenUpperBound:iso(200),leftCensored:false});
+    f.batch(1000);assert.equal(f.reader.get('bsc',address(1)),undefined,'market page is exhausted before the wallet appears');
+    f.setNow(2000);f.trade(1,{tokenAddress:address(100),txHash:hash(9000),eventAt:iso(250),observedAt:iso(251)});
+    for(let i=0;i<500;i++)f.trade(1,{tokenAddress:address(2000+i),txHash:hash(10_000+i),eventAt:iso(300+i),observedAt:iso(301+i)});
+    f.batch(1000);let profile=f.reader.get('bsc',address(1))!,analysis=profile.initiatorAnalysis!;
+    assert.equal(profile.metrics.observedEvents,500,'the ordinary profile frame has dropped the older relevant buy');
+    assert.equal(analysis.directionalTokens.post,1,'the independent event cursor still nominates the dropped buy');
+    assert.equal(analysis.status,'partial','qualification stays conservative until the durable event cursor catches up');
+    const output=new DatabaseSync(f.database,{readOnly:true});try{
+      assert.equal(output.prepare('SELECT count(*) AS n FROM wp_initiator_tokens WHERE chain=? AND address=? AND token_address=?')
+        .get('bsc',address(1),address(100))!.n,1);
+    }finally{output.close();}
+    f.batch(1000);f.batch(1000);assert.equal(Number(profileMeta(f.database,'initiator_event_cursor')),501);
+    f.setNow(5601);f.batch(1000);profile=f.reader.get('bsc',address(1))!;analysis=profile.initiatorAnalysis!;
+    assert.equal(analysis.status,'current');assert.equal(analysis.directionalTokens.post,1);
+  }finally{f.close();}
+});
+
+test('tracked initiator refresh reads only the compact token ledger despite thousands of unrelated lifetime tokens',()=>{
+  const f=fixture({refreshAfterSec:3600});try{
+    f.setNow(1000);f.trade(1,{eventAt:iso(100),observedAt:iso(101)});f.batch();
+    f.history.captureMarketCandidate({chain:'bsc',address:address(100)},
+      {source:'gmgn_market_discovery',observedAt:iso(220),kind:'trenches',reason:'first_seen:new_creation',window:'lifecycle',
+        changeKind:'first_seen',category:'new_creation',firstSeenLowerBound:iso(210),firstSeenUpperBound:iso(220),leftCensored:false});
+    f.setNow(1002);f.batch();assert.ok(f.reader.get('bsc',address(1))!.initiatorAnalysis);
+    f.raw.exec('BEGIN');const insert=f.raw.prepare('INSERT OR IGNORE INTO wh_wallet_tokens VALUES (?,?,?)');
+    for(let i=0;i<3000;i++)insert.run('bsc',address(1),address(10_000+i));f.raw.exec('COMMIT');
+    f.raw.exec('DROP TABLE wh_wallet_tokens');f.setNow(5000);
+    assert.doesNotThrow(()=>f.batch());const analysis=f.reader.get('bsc',address(1))!.initiatorAnalysis!;
+    assert.equal(analysis.selectedTokens,1);assert.equal(analysis.totalCandidateTokens,1);
+  }finally{f.close();}
+});
+
+test('capacity interruption preserves both levels of the market cursor and retries the nomination',()=>{
+  const f=fixture({refreshAfterSec:3600});try{
+    f.setNow(1000);f.trade(1,{eventAt:iso(100),observedAt:iso(101)});f.batch();
+    f.history.captureMarketCandidate({chain:'bsc',address:address(100)},
+      {source:'gmgn_market_discovery',observedAt:iso(220),kind:'trenches',reason:'first_seen:new_creation',window:'lifecycle',
+        changeKind:'first_seen',category:'new_creation',firstSeenLowerBound:iso(210),firstSeenUpperBound:iso(220),leftCensored:false});
+    const before={cursor:profileMeta(f.database,'market_cursor'),wallet:profileMeta(f.database,'market_wallet')};
+    f.restart(16_384);f.setNow(1002);assert.equal(f.batch().capacityReached,true);
+    assert.deepEqual({cursor:profileMeta(f.database,'market_cursor'),wallet:profileMeta(f.database,'market_wallet')},before);
+    f.restart(16*1024*1024);f.batch();assert.ok(f.reader.get('bsc',address(1))!.initiatorAnalysis);
+  }finally{f.close();}
+});
+
+test('capacity interruption never advances the prospective wallet-event cursor',()=>{
+  const f=fixture({refreshAfterSec:3600});try{
+    f.setNow(300);f.history.captureMarketCandidate({chain:'bsc',address:address(100)},
+      {source:'gmgn_market_discovery',observedAt:iso(200),kind:'trenches',reason:'first_seen:new_creation',window:'lifecycle',
+        changeKind:'first_seen',category:'new_creation',firstSeenLowerBound:iso(190),firstSeenUpperBound:iso(200),leftCensored:false});
+    f.batch();f.setNow(400);f.trade(1,{eventAt:iso(250),observedAt:iso(251),txHash:hash(8300)});
+    const before=profileMeta(f.database,'initiator_event_cursor');f.restart(16_384);assert.equal(f.batch().capacityReached,true);
+    assert.equal(profileMeta(f.database,'initiator_event_cursor'),before);
+    f.restart(16*1024*1024);f.batch();assert.equal(f.reader.get('bsc',address(1))!.initiatorAnalysis!.directionalTokens.post,1);
   }finally{f.close();}
 });
 

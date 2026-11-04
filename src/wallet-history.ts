@@ -21,6 +21,9 @@ export interface WalletMarketCandidateContext extends WalletHistoryContext {
   category?:'trending'|'new_creation'|'near_completion'|'completed';
   previousCategory?:'trending'|'new_creation'|'near_completion'|'completed';
   rank?:number;smartDegenCount?:number;renownedCount?:number;smartDegenDelta?:number;renownedDelta?:number;
+  /** Bounds only this process's observation of selection into a GMGN feed page.
+   * They do not bound token creation, launch time, or GMGN's global first sighting. */
+  firstSeenLowerBound?:string;firstSeenUpperBound?:string;leftCensored?:boolean;
 }
 export interface WalletVendorNominationInput {
   source:'ave';eventId:string;occurredAt:string;observedAt:string;
@@ -559,13 +562,19 @@ export class WalletHistory {
   }
 
   /** Research nomination only. It adds a token to the wallet-enrichment queue without fabricating a signal, trade or permission to buy. */
-  captureMarketCandidate(token:WalletHistoryToken,context:WalletMarketCandidateContext):void {
+  captureMarketCandidate(token:WalletHistoryToken,context:WalletMarketCandidateContext):boolean {
     const target=this.target(token),observed=this.observed(context.observedAt);
-    if(!target||!observed||!source(context.source)||!['trending','trenches'].includes(context.kind))return;
+    if(!target||!observed||!source(context.source)||!['trending','trenches'].includes(context.kind))return false;
     const integer=(value:unknown,min:number,max:number)=>typeof value==='number'&&Number.isSafeInteger(value)&&value>=min&&value<=max?value:undefined;
     const changeKind=['first_seen','updated','category_transition'].includes(String(context.changeKind))?context.changeKind:undefined;
     const category=['trending','new_creation','near_completion','completed'].includes(String(context.category))?context.category:undefined;
     const previousCategory=['trending','new_creation','near_completion','completed'].includes(String(context.previousCategory))?context.previousCategory:undefined;
+    const intervalSupplied=context.firstSeenLowerBound!==undefined||context.firstSeenUpperBound!==undefined||context.leftCensored!==undefined;
+    const firstSeenLowerBound=changeKind==='first_seen'?at(context.firstSeenLowerBound):undefined,
+      firstSeenUpperBound=changeKind==='first_seen'?at(context.firstSeenUpperBound):undefined,
+      leftCensored=changeKind==='first_seen'&&typeof context.leftCensored==='boolean'?context.leftCensored:undefined;
+    if(intervalSupplied&&(!firstSeenUpperBound||firstSeenUpperBound!==observed||leftCensored===undefined||
+      firstSeenLowerBound!==undefined&&firstSeenLowerBound>=firstSeenUpperBound||!leftCensored&&!firstSeenLowerBound))return false;
     const rank=integer(context.rank,0,1_000_000),smartDegenCount=integer(context.smartDegenCount,0,1_000_000_000),
       renownedCount=integer(context.renownedCount,0,1_000_000_000),smartDegenDelta=integer(context.smartDegenDelta,-1_000_000_000,1_000_000_000),
       renownedDelta=integer(context.renownedDelta,-1_000_000_000,1_000_000_000);
@@ -578,11 +587,16 @@ export class WalletHistory {
       Math.min(20,Math.max(0,smartDegenDelta??0)*4)+Math.min(30,Math.max(0,renownedDelta??0)*10)+
       (changeKind==='category_transition'?15:0));
     const priorityUntil=new Date(Date.parse(observed)+30*60_000).toISOString();
+    const firstSeenInterval=firstSeenUpperBound?{firstSeenLowerBound,firstSeenUpperBound,leftCensored,
+      firstSeenIntervalScope:'local_gmgn_feed_selection_observation_only' as const,
+      firstSeenIntervalClaimsTokenLaunchTime:false as const}:{};
     const value={...target,source:context.source,observedAt:observed,feed:context.kind,
       reason:clean(context.reason,80),window:clean(context.window,20),changeKind,stage:category,previousStage:previousCategory,rank,
-      smartDegenCount,renownedCount,smartDegenDelta,renownedDelta,researchPriority:priority,priorityUntil,
+      smartDegenCount,renownedCount,smartDegenDelta,renownedDelta,...firstSeenInterval,researchPriority:priority,priorityUntil,
       scope:'research_nomination_only',entryPermission:false,countingEvent:false};
-    this.append(value,()=>{this.putToken(target,observed);this.observation('market_candidate',value,undefined,target.address);
+    const observationId=digest(['market_candidate',value]);
+    if(this.db.prepare('SELECT 1 FROM wh_observations WHERE id=?').get(observationId))return true;
+    const committed=this.append(value,()=>{this.putToken(target,observed);this.observation('market_candidate',value,undefined,target.address,undefined,observationId);
       this.db.prepare(`DELETE FROM wh_market_research_targets WHERE rowid IN (
         SELECT rowid FROM wh_market_research_targets WHERE priority_until<=? ORDER BY priority_until LIMIT 100)`).run(observed);
       this.db.prepare(`INSERT INTO wh_market_research_targets(chain,address,nominated_at,priority,priority_until,data) VALUES (?,?,?,?,?,?)
@@ -590,6 +604,7 @@ export class WalletHistory {
           priority_until=excluded.priority_until,data=excluded.data
         WHERE excluded.nominated_at>=wh_market_research_targets.nominated_at`)
         .run(target.chain,target.address,observed,priority,priorityUntil,JSON.stringify(value));});
+    return committed&&!!this.db.prepare('SELECT 1 FROM wh_observations WHERE id=?').get(observationId);
   }
 
   captureTokenTraders(token:WalletHistoryToken,rows:WalletTokenTraderObservation[],context:WalletHistoryContext):void {
@@ -1076,18 +1091,19 @@ export class WalletHistory {
     let total=0;for(const path of [this.path,`${this.path}-wal`,`${this.path}-shm`]) {try {total+=statSync(path).size;} catch { /* An inactive WAL may not exist. */ }}
     return total;
   }
-  private append(evidence:unknown,write:()=>unknown):void {
+  private append(evidence:unknown,write:()=>unknown):boolean {
     // Reserve growth for indexes/WAL rather than filling the configured budget to
     // its last byte. Capacity errors are observable and never evict old research.
-    if(this.error===CAPACITY) return;
+    if(this.error===CAPACITY) return false;
     const estimate=Buffer.byteLength(JSON.stringify(evidence)??'')*3+32_768;
-    if(this.bytes()+estimate>this.maxBytes) {this.capacity();return;}
+    if(this.bytes()+estimate>this.maxBytes) {this.capacity();return false;}
     this.db.exec('BEGIN IMMEDIATE');
     try {
       write();
       const pages=Number(this.db.prepare('PRAGMA page_count').get()!.page_count)*Number(this.db.prepare('PRAGMA page_size').get()!.page_size);
-      if(Math.max(pages,this.bytes())+16_384>this.maxBytes) {this.db.exec('ROLLBACK');this.capacity();return;}
+      if(Math.max(pages,this.bytes())+16_384>this.maxBytes) {this.db.exec('ROLLBACK');this.capacity();return false;}
       this.db.exec('COMMIT');
+      return true;
     } catch(error) {this.db.exec('ROLLBACK');throw error;}
   }
   private capacity():void {

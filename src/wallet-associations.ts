@@ -150,6 +150,7 @@ export class WalletAssociations {
         chain,token_count DESC,funding_count DESC,forward_count DESC,updated_at DESC,leader,candidate) WHERE token_count>0;
       CREATE INDEX IF NOT EXISTS wh_assoc_relation_candidate ON wh_assoc_relations(chain,candidate);
       CREATE INDEX IF NOT EXISTS wh_assoc_relation_candidate_leader ON wh_assoc_relations(chain,candidate,leader);
+      CREATE INDEX IF NOT EXISTS wh_assoc_relation_updated ON wh_assoc_relations(updated_at);
       CREATE INDEX IF NOT EXISTS wh_assoc_episode_pair ON wh_assoc_episodes(chain,leader,candidate,active,updated_at DESC);
       CREATE INDEX IF NOT EXISTS wh_assoc_episode_anchor ON wh_assoc_episodes(chain,leader,token_address,active);
       CREATE INDEX IF NOT EXISTS wh_assoc_episode_token ON wh_assoc_episodes(chain,token_address,active,leader,candidate);

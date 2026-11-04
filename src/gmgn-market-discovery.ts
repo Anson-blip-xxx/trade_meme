@@ -41,12 +41,26 @@ export interface GmgnMarketDiscoveryCandidate {
   researchOnly:true;entryPipeline:false;countingPipeline:false;notificationPipeline:false;
 }
 
+/** A scanner callback adds the local polling boundary around this observation.
+ * It describes only entry into this process's selected GMGN feed page, never
+ * token creation, launch time, or first appearance at GMGN globally. */
+export interface GmgnMarketDiscoveryObservedCandidate extends GmgnMarketDiscoveryCandidate {
+  previousSuccessfulPollAt?:string;
+  /** True on the first successful poll and on a recovery poll after a failed attempt. */
+  leftCensored:boolean;
+}
+
 export interface GmgnMarketDiscoveryStoreOptions {
   path:string;maxBytes:number;retentionMs?:number;maxObservations?:number;now?:()=>Date;
 }
 
 export interface GmgnDiscoveryStoreWrite {
   received:number;inserted:number;unchanged:number;capacityReached:boolean;events:GmgnMarketDiscoveryCandidate[];
+  continuityLostFeeds:GmgnDiscoveryFeed[];
+}
+
+interface GmgnCandidateDeliveryContext {
+  previousSuccessfulPollAt?:string;leftCensored:boolean;
 }
 
 export interface GmgnMarketKlineObservation {
@@ -72,7 +86,7 @@ export interface GmgnMarketDiscoveryClient {
 export interface GmgnMarketDiscoveryScannerOptions {
   client:GmgnMarketDiscoveryClient;store:GmgnMarketDiscoveryStore;intervalMs:number;maxCandidates:number;
   klineCooldownMs?:number;trendingInterval?:GmgnDiscoveryInterval;queueTimeoutMs?:number;now?:()=>Date;
-  onCandidate?:(candidate:GmgnMarketDiscoveryCandidate)=>unknown|Promise<unknown>;
+  onCandidate?:(candidate:GmgnMarketDiscoveryObservedCandidate)=>unknown|Promise<unknown>;
   onKline?:(observation:GmgnMarketKlineObservation)=>unknown|Promise<unknown>;
 }
 
@@ -283,6 +297,9 @@ export class GmgnMarketDiscoveryStore {
         changed_fields_json TEXT NOT NULL,data_json TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS gmd_observations_time ON gmd_observations(observed_at);
       CREATE INDEX IF NOT EXISTS gmd_observations_token ON gmd_observations(chain,token_address,observed_at DESC);
+      CREATE TABLE IF NOT EXISTS gmd_candidate_outbox(
+        id TEXT PRIMARY KEY,observed_at TEXT NOT NULL,data_json TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS gmd_candidate_outbox_time ON gmd_candidate_outbox(observed_at,id);
       CREATE TABLE IF NOT EXISTS gmd_kline(
         id INTEGER PRIMARY KEY,chain TEXT NOT NULL,token_address TEXT NOT NULL,nominated_at TEXT NOT NULL,observed_at TEXT NOT NULL,
         reason TEXT NOT NULL,resolution TEXT NOT NULL,from_at TEXT NOT NULL,until_at TEXT NOT NULL,momentum_json TEXT,
@@ -291,6 +308,8 @@ export class GmgnMarketDiscoveryStore {
       CREATE INDEX IF NOT EXISTS gmd_kline_time ON gmd_kline(observed_at);
       CREATE INDEX IF NOT EXISTS gmd_kline_token ON gmd_kline(chain,token_address,observed_at DESC);
       CREATE TABLE IF NOT EXISTS gmd_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);`);
+    this.db.prepare("INSERT OR IGNORE INTO gmd_meta VALUES('continuity_lost_trending','0')").run();
+    this.db.prepare("INSERT OR IGNORE INTO gmd_meta VALUES('continuity_lost_trenches','0')").run();
     const pageSize=Number(this.db.prepare('PRAGMA page_size').get()!.page_size);
     this.db.exec(`PRAGMA max_page_count=${Math.max(256,Math.floor(this.maxBytes/pageSize))}`);
     if(options.path!==':memory:')chmodSync(options.path,0o600);
@@ -304,24 +323,52 @@ export class GmgnMarketDiscoveryStore {
     return {storageBytes:pages*pageSize,usedBytes:(pages-free)*pageSize};}
   status(){const current=Number(this.db.prepare('SELECT count(*) AS n FROM gmd_current').get()!.n),
     observations=Number(this.db.prepare('SELECT count(*) AS n FROM gmd_observations').get()!.n),
-    klineObservations=Number(this.db.prepare('SELECT count(*) AS n FROM gmd_kline').get()!.n),storage=this.storage();
+    klineObservations=Number(this.db.prepare('SELECT count(*) AS n FROM gmd_kline').get()!.n),
+    pendingCandidateDeliveries=Number(this.db.prepare('SELECT count(*) AS n FROM gmd_candidate_outbox').get()!.n),storage=this.storage();
     return {enabled:true,current,observations,maxCurrent:this.maxCurrent,maxObservations:this.maxObservations,maxBytes:this.maxBytes,
-      klineObservations,...storage,capacityReached:storage.usedBytes+64*1024>=this.maxBytes,retentionMs:this.retentionMs,
+      klineObservations,pendingCandidateDeliveries,...storage,capacityReached:storage.usedBytes+64*1024>=this.maxBytes,retentionMs:this.retentionMs,
       lastWriteAt:this.db.prepare("SELECT value FROM gmd_meta WHERE key='last_write_at'").get()?.value as string|undefined,
       lastKlineAt:this.db.prepare('SELECT observed_at FROM gmd_kline ORDER BY observed_at DESC,id DESC LIMIT 1').get()?.observed_at as string|undefined,
       lifecycleRegressions:Number(this.db.prepare("SELECT value FROM gmd_meta WHERE key='lifecycle_regressions'").get()?.value??0),
       lastLifecycleRegressionAt:this.db.prepare("SELECT value FROM gmd_meta WHERE key='last_lifecycle_regression_at'").get()?.value as string|undefined,
       researchOnly:true,entryPipeline:false,countingPipeline:false,rawPayloadStored:false};
   }
-  apply(page:GmgnDiscoveryNormalizedPage,observedAt=this.now()):GmgnDiscoveryStoreWrite {
+  continuityLost(feed:GmgnDiscoveryFeed):boolean {
+    return this.db.prepare('SELECT value FROM gmd_meta WHERE key=?').get(`continuity_lost_${feed}`)?.value==='1';
+  }
+  markContinuityLost(feed:GmgnDiscoveryFeed):void {
+    this.db.prepare('UPDATE gmd_meta SET value=\'1\' WHERE key=?').run(`continuity_lost_${feed}`);
+  }
+  restoreContinuity(feed:GmgnDiscoveryFeed):void {
+    this.db.prepare('UPDATE gmd_meta SET value=\'0\' WHERE key=?').run(`continuity_lost_${feed}`);
+  }
+  pendingCandidateDeliveries(limit=32):GmgnMarketDiscoveryObservedCandidate[] {
+    const bounded=Math.max(1,Math.min(100,Math.trunc(limit)));
+    return this.db.prepare('SELECT data_json FROM gmd_candidate_outbox ORDER BY observed_at,id LIMIT ?').all(bounded).map(row=>{
+      const value=JSON.parse(String(row.data_json)) as GmgnMarketDiscoveryObservedCandidate;
+      if(value?.source!=='gmgn_market_discovery'||value.kind!=='first_seen'||typeof value.id!=='string'||
+        typeof value.leftCensored!=='boolean'||!Number.isFinite(Date.parse(value.observedAt)))
+        throw new Error('GMGN_MARKET_DISCOVERY_OUTBOX_INVALID');
+      return value;
+    });
+  }
+  ackCandidateDelivery(id:string):boolean {
+    return Number(this.db.prepare('DELETE FROM gmd_candidate_outbox WHERE id=?').run(id).changes)>0;
+  }
+  apply(page:GmgnDiscoveryNormalizedPage,observedAt=this.now(),delivery?:GmgnCandidateDeliveryContext):GmgnDiscoveryStoreWrite {
     if(!Number.isFinite(observedAt.getTime())||page.records.length>MAX_DISCOVERY_ROWS)throw new Error('GMGN_MARKET_DISCOVERY_WRITE_INVALID');
-    const at=observedAt.toISOString(),events:GmgnMarketDiscoveryCandidate[]=[];
+    const at=observedAt.toISOString(),previous=delivery?.previousSuccessfulPollAt;
+    if(delivery&&(typeof delivery.leftCensored!=='boolean'||previous!==undefined&&
+      (!Number.isFinite(Date.parse(previous))||new Date(previous).toISOString()!==previous||previous>at)||!delivery.leftCensored&&!previous))
+      throw new Error('GMGN_MARKET_DISCOVERY_DELIVERY_CONTEXT_INVALID');
+    const events:GmgnMarketDiscoveryCandidate[]=[];
     const currentGet=this.db.prepare('SELECT fingerprint,data_json FROM gmd_current WHERE feed=? AND window=? AND chain=? AND token_address=?'),
       currentPut=this.db.prepare(`INSERT INTO gmd_current VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(feed,window,chain,token_address) DO UPDATE SET
         category=excluded.category,last_seen_at=excluded.last_seen_at,seen_count=gmd_current.seen_count+1,
         fingerprint=excluded.fingerprint,data_json=excluded.data_json`),
       observationPut=this.db.prepare(`INSERT OR IGNORE INTO gmd_observations(
         feed,window,chain,token_address,category,observed_at,fingerprint,change_kind,changed_fields_json,data_json) VALUES(?,?,?,?,?,?,?,?,?,?)`),
+      outboxPut=this.db.prepare('INSERT OR IGNORE INTO gmd_candidate_outbox VALUES (?,?,?)'),
       metaPut=this.db.prepare("INSERT INTO gmd_meta VALUES('last_write_at',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value"),
       regressionPut=this.db.prepare(`INSERT INTO gmd_meta VALUES('lifecycle_regressions','1') ON CONFLICT(key) DO UPDATE SET
         value=CAST(CAST(gmd_meta.value AS INTEGER)+1 AS TEXT)`),
@@ -335,23 +382,29 @@ export class GmgnMarketDiscoveryStore {
       const event=candidate(previous,record,at,fingerprint),result=observationPut.run(record.feed,record.window,record.chain,record.address,
         record.category,at,fingerprint,event.kind,JSON.stringify(event.changedFields),json);
       currentPut.run(record.feed,record.window,record.chain,record.address,record.category,at,at,1,fingerprint,json);
-      if(result.changes){inserted++;events.push(event);}}
-      this.prune(at);metaPut.run(at);this.db.exec('COMMIT');
-      return {received:page.records.length,inserted,unchanged,capacityReached:false,events};
+      if(result.changes){inserted++;events.push(event);
+        if(delivery&&event.kind==='first_seen')outboxPut.run(event.id,at,JSON.stringify({...event,...delivery}));}}
+      const continuityLostFeeds=this.prune(at);metaPut.run(at);this.db.exec('COMMIT');
+      return {received:page.records.length,inserted,unchanged,capacityReached:false,events,continuityLostFeeds};
     }catch(error){try{this.db.exec('ROLLBACK');}catch{}if(error instanceof Error&&/(SQLITE_FULL|database or disk is full)/i.test(error.message))
-      return {received:page.records.length,inserted:0,unchanged:0,capacityReached:true,events:[]};throw error;}
+      return {received:page.records.length,inserted:0,unchanged:0,capacityReached:true,events:[],continuityLostFeeds:[]};throw error;}
   }
-  private prune(at:string){const cutoff=new Date(new Date(at).getTime()-this.retentionMs).toISOString();
+  private prune(at:string):GmgnDiscoveryFeed[]{const cutoff=new Date(new Date(at).getTime()-this.retentionMs).toISOString(),lost=new Set<GmgnDiscoveryFeed>(),
+    mark=(rows:Record<string,unknown>[])=>rows.forEach(row=>{if(row.feed==='trending'||row.feed==='trenches')lost.add(row.feed);});
     this.db.prepare('DELETE FROM gmd_observations WHERE observed_at<?').run(cutoff);
     const observations=Number(this.db.prepare('SELECT count(*) AS n FROM gmd_observations').get()!.n),extra=observations-this.maxObservations;
     if(extra>0)this.db.prepare('DELETE FROM gmd_observations WHERE id IN (SELECT id FROM gmd_observations ORDER BY observed_at,id LIMIT ?)').run(extra);
+    mark(this.db.prepare('SELECT DISTINCT feed FROM gmd_current WHERE last_seen_at<?').all(cutoff));
     this.db.prepare('DELETE FROM gmd_current WHERE last_seen_at<?').run(cutoff);
     const current=Number(this.db.prepare('SELECT count(*) AS n FROM gmd_current').get()!.n),currentExtra=current-this.maxCurrent;
-    if(currentExtra>0)this.db.prepare(`DELETE FROM gmd_current WHERE (feed,window,chain,token_address) IN (
-      SELECT feed,window,chain,token_address FROM gmd_current ORDER BY last_seen_at LIMIT ?)` ).run(currentExtra);
+    if(currentExtra>0){mark(this.db.prepare(`SELECT DISTINCT feed FROM (SELECT feed FROM gmd_current ORDER BY last_seen_at,feed,window,chain,token_address LIMIT ?)` ).all(currentExtra));
+      this.db.prepare(`DELETE FROM gmd_current WHERE (feed,window,chain,token_address) IN (
+        SELECT feed,window,chain,token_address FROM gmd_current ORDER BY last_seen_at,feed,window,chain,token_address LIMIT ?)` ).run(currentExtra);}
+    for(const feed of lost)this.markContinuityLost(feed);
     this.db.prepare('DELETE FROM gmd_kline WHERE observed_at<?').run(cutoff);
     const klineLimit=Math.max(100,Math.floor(this.maxObservations/10)),klineCount=Number(this.db.prepare('SELECT count(*) AS n FROM gmd_kline').get()!.n);
     if(klineCount>klineLimit)this.db.prepare('DELETE FROM gmd_kline WHERE id IN (SELECT id FROM gmd_kline ORDER BY observed_at,id LIMIT ?)').run(klineCount-klineLimit);
+    return [...lost].sort();
   }
   recordKline(observation:GmgnMarketKlineObservation):GmgnKlineStoreResult {
     if(observation.chain!=='solana'||!solAddress(observation.tokenAddress)||observation.resolution!=='30s'||
@@ -412,6 +465,7 @@ export class GmgnMarketDiscoveryScanner {
   private readonly feeds:Record<GmgnDiscoveryFeed,FeedState>={
     trending:{polls:0,received:0,accepted:0,deduplicated:0,rejected:0,truncated:0,changes:0,unchanged:0,errors:0,nextDueAt:0,idleStreak:0},
     trenches:{polls:0,received:0,accepted:0,deduplicated:0,rejected:0,truncated:0,changes:0,unchanged:0,errors:0,nextDueAt:0,idleStreak:0}};
+  private readonly feedPollContinuous:Record<GmgnDiscoveryFeed,boolean>={trending:false,trenches:false};
   constructor(private readonly options:GmgnMarketDiscoveryScannerOptions){
     if(!Number.isSafeInteger(options.intervalMs)||options.intervalMs<1_000||options.intervalMs>600_000||
       !Number.isSafeInteger(options.maxCandidates)||options.maxCandidates<1||options.maxCandidates>MAX_DISCOVERY_ROWS||
@@ -427,7 +481,8 @@ export class GmgnMarketDiscoveryScanner {
     this.klineCooldownMs=options.klineCooldownMs??300_000;this.queueTimeoutMs=options.queueTimeoutMs??10_000;
     this.trendingInterval=options.trendingInterval??'1m';
   }
-  start(){if(this.running)return;this.running=true;this.generation++;const now=this.now().getTime();this.feeds.trending.nextDueAt=now;this.feeds.trenches.nextDueAt=now;this.schedule(0,this.generation);}
+  start(){if(this.running)return;this.running=true;this.generation++;this.feedPollContinuous.trending=false;this.feedPollContinuous.trenches=false;
+    const now=this.now().getTime();this.feeds.trending.nextDueAt=now;this.feeds.trenches.nextDueAt=now;this.schedule(0,this.generation);}
   stop(){this.running=false;this.generation++;if(this.timer)clearTimeout(this.timer);this.timer=undefined;}
   async drain(){await this.active;}
   nominate(token:{chain:'sol'|'solana';address:string},observedAt:string|Date,reason='external_signal'):boolean {
@@ -466,7 +521,20 @@ export class GmgnMarketDiscoveryScanner {
     this.nominations.size?Math.max(this.nextKlineAt,Math.min(...[...this.nominations.values()].map(row=>row.nextAttemptAt))):Number.POSITIVE_INFINITY);
     const readyAt=Number.isFinite(due)?Math.max(due,this.nextRemoteAt):Number.POSITIVE_INFINITY;
     return Math.max(25,Math.min(this.intervalMs,Number.isFinite(readyAt)?readyAt-now:this.intervalMs));}
-  private async runCycle(){const now=this.now().getTime(),cooldown=Math.max(now,this.options.client.cooldownUntil??0);
+  private async deliverPendingCandidates():Promise<void> {
+    if(!this.options.onCandidate)return;
+    let pending:GmgnMarketDiscoveryObservedCandidate[];
+    try{pending=this.options.store.pendingCandidateDeliveries(32);}catch{this.candidateErrors++;return;}
+    for(const event of pending)try{await this.options.onCandidate(event);this.options.store.ackCandidateDelivery(event.id);}
+      catch{this.candidateErrors++;}
+  }
+  private async deliverCandidate(event:GmgnMarketDiscoveryCandidate,context:GmgnCandidateDeliveryContext):Promise<void> {
+    if(!this.options.onCandidate)return;
+    try{await this.options.onCandidate({...event,...context});
+      if(event.kind==='first_seen')this.options.store.ackCandidateDelivery(event.id);
+    }catch{this.candidateErrors++;}
+  }
+  private async runCycle(){await this.deliverPendingCandidates();const now=this.now().getTime(),cooldown=Math.max(now,this.options.client.cooldownUntil??0);
     if(cooldown>now){this.feeds.trending.nextDueAt=Math.max(this.feeds.trending.nextDueAt,cooldown);this.feeds.trenches.nextDueAt=Math.max(this.feeds.trenches.nextDueAt,cooldown);
       this.nextKlineAt=Math.max(this.nextKlineAt,cooldown);this.nextRemoteAt=Math.max(this.nextRemoteAt,cooldown);return;}
     if(now<this.nextRemoteAt)return;
@@ -488,18 +556,27 @@ export class GmgnMarketDiscoveryScanner {
     }
   }
   private scheduling():GmgnDiscoveryScheduling{return {priority:'background',queueTimeoutMs:this.queueTimeoutMs};}
-  private async pollFeed(feed:GmgnDiscoveryFeed){const state=this.feeds[feed],at=this.now();state.polls++;
+  private async pollFeed(feed:GmgnDiscoveryFeed){const state=this.feeds[feed],
+    previousSuccessfulPollAt=state.lastSuccessAt,leftCensored=!previousSuccessfulPollAt||!this.feedPollContinuous[feed]||
+      this.options.store.continuityLost(feed),delivery={previousSuccessfulPollAt,leftCensored};state.polls++;
     try{const payload=feed==='trending'?await this.options.client.getMarketTrending('sol',{interval:this.trendingInterval,limit:Math.min(MAX_TRENDING_ROWS,this.maxCandidates)},this.scheduling()):
         await this.options.client.getMarketTrenches('sol',{categories:['new_creation','near_completion','completed'],limit:Math.min(MAX_TRENCH_ROWS_PER_CATEGORY,this.maxCandidates)},this.scheduling()),
+      observedAt=this.now(),
       page=feed==='trending'?normalizeGmgnMarketTrending(payload,{interval:this.trendingInterval,maxRows:this.maxCandidates}):
         normalizeGmgnMarketTrenches(payload,{maxRows:this.maxCandidates,maxRowsPerCategory:Math.min(MAX_TRENCH_ROWS_PER_CATEGORY,this.maxCandidates)}),
-      write=this.options.store.apply(page,at);
+      write=this.options.store.apply(page,observedAt,this.options.onCandidate?delivery:undefined);
       state.received+=page.received;state.accepted+=page.accepted;state.deduplicated+=page.deduplicated;
       state.rejected+=page.rejected;state.truncated+=page.truncated;
-      state.lastSuccessAt=at.toISOString();state.lastError=undefined;state.changes+=write.inserted;state.unchanged+=write.unchanged;
-      state.idleStreak=write.inserted?0:Math.min(3,state.idleStreak+1);
-      for(const event of write.events)if(this.options.onCandidate)try{await this.options.onCandidate(event);}catch{this.candidateErrors++;}
-    }catch(error){state.errors++;state.lastError=error instanceof Error?error.message.slice(0,300):String(error).slice(0,300);state.idleStreak=Math.min(3,state.idleStreak+1);}
+      if(write.capacityReached){state.errors++;state.lastError='GMGN_MARKET_DISCOVERY_STORE_CAPACITY';
+        state.idleStreak=Math.min(3,state.idleStreak+1);this.feedPollContinuous[feed]=false;
+        try{this.options.store.markContinuityLost(feed);}catch{/* The in-memory break still prevents a false bounded interval. */}}
+      else {state.lastSuccessAt=observedAt.toISOString();state.lastError=undefined;state.changes+=write.inserted;state.unchanged+=write.unchanged;
+        state.idleStreak=write.inserted?0:Math.min(3,state.idleStreak+1);
+        for(const lost of write.continuityLostFeeds)this.feedPollContinuous[lost]=false;
+        if(!write.continuityLostFeeds.includes(feed)){this.feedPollContinuous[feed]=true;this.options.store.restoreContinuity(feed);}
+      }
+      for(const event of write.events)await this.deliverCandidate(event,delivery);
+    }catch(error){this.feedPollContinuous[feed]=false;state.errors++;state.lastError=error instanceof Error?error.message.slice(0,300):String(error).slice(0,300);state.idleStreak=Math.min(3,state.idleStreak+1);}
     const multiplier=Math.min(4,2**state.idleStreak);state.nextDueAt=this.now().getTime()+this.intervalMs*multiplier;
   }
   private nominationDue(now:number):boolean {

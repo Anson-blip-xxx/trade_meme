@@ -110,6 +110,33 @@ test('sell and transfer-out take priority over leader entry without asserting li
   }finally{f.ledger.close();}}
 });
 
+test('a leader sell cannot mark the precursor wallet as reduced',()=>{
+  const f=fixture();try{
+    f.ledger.record(report());f.advance(120);
+    f.ledger.observe(token,[event(105),event(110,{side:'sell'})]);
+    assert.equal(f.one().state,'leader_entered');
+    assert.equal(f.one().leaderEntry?.eventAt,iso(105));
+    assert.equal(f.one().reduction,undefined);
+  }finally{f.ledger.close();}
+});
+
+test('legacy leader reductions are repaired without erasing a confirmed leader entry',()=>{
+  const directory=mkdtempSync(join(tmpdir(),'meme-wallet-setup-reduction-')),database=join(directory,'setups.sqlite');let now=100;
+  let ledger=new WalletSetupLedger(database,{now:()=>new Date(iso(now))});
+  try {
+    ledger.record(report());now=120;ledger.observe(token,[event(105)]);ledger.close();
+    const db=new DatabaseSync(database);try{
+      const row=db.prepare('SELECT id,data FROM wsl_setups').get()!,item=JSON.parse(String(row.data));
+      item.reduction=event(110,{side:'sell'});item.state='reduced';
+      db.prepare("UPDATE wsl_setups SET state='reduced',data=? WHERE id=?").run(JSON.stringify(item),row.id);
+      db.prepare("DELETE FROM wsl_meta WHERE key='candidate_reduction_wallet_v1'").run();
+    }finally{db.close();}
+    ledger=new WalletSetupLedger(database,{now:()=>new Date(iso(now))});
+    const repaired=ledger.list().items[0];assert.equal(repaired.state,'leader_entered');assert.equal(repaired.leaderEntry?.eventAt,iso(105));assert.equal(repaired.reduction,undefined);
+    assert.equal(ledger.status().stateCounts.reduced,undefined);assert.equal(ledger.status().stateCounts.leader_entered,1);
+  }finally{ledger.close();rmSync(directory,{recursive:true,force:true});}
+});
+
 test('same-transaction conflicts cannot produce success in either ordering and retract earlier confirmation',()=>{
   for(const reverse of [false,true]){const f=fixture();try{
     f.ledger.record(report());f.advance(120);

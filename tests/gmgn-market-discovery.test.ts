@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import {mkdtempSync,statSync} from 'node:fs';
+import {mkdtempSync,rmSync,statSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import test from 'node:test';
@@ -7,7 +7,8 @@ import {DatabaseSync} from 'node:sqlite';
 import bs58 from 'bs58';
 import {
   GmgnMarketDiscoveryScanner,GmgnMarketDiscoveryStore,normalizeGmgnMarketTrenches,normalizeGmgnMarketTrending,
-  type GmgnMarketDiscoveryCandidate,type GmgnMarketDiscoveryClient,type GmgnMarketKlineObservation,
+  type GmgnMarketDiscoveryCandidate,type GmgnMarketDiscoveryClient,type GmgnMarketDiscoveryObservedCandidate,
+  type GmgnMarketKlineObservation,
 } from '../src/gmgn-market-discovery.js';
 
 const address=(seed:number)=>bs58.encode(Uint8Array.from({length:32},(_,index)=>(seed+index*17)%256));
@@ -93,6 +94,7 @@ test('store deduplicates compact snapshots and emits research-only transitions',
   try{
     const first=store.apply(normalizeGmgnMarketTrenches({new_creation:[trenchRow()]}),at);
     assert.equal(first.inserted,1);assert.equal(first.events[0].kind,'first_seen');assert.equal(first.events[0].entryPipeline,false);
+    assert.deepEqual(first.continuityLostFeeds,[]);assert.equal(store.status().pendingCandidateDeliveries,0);
     assert.equal(first.events[0].countingPipeline,false);assert.equal(first.events[0].notificationPipeline,false);
     const duplicate=store.apply(normalizeGmgnMarketTrenches({new_creation:[trenchRow()]}),new Date(at.getTime()+1_000));
     assert.deepEqual({inserted:duplicate.inserted,unchanged:duplicate.unchanged,events:duplicate.events.length},{inserted:0,unchanged:1,events:0});
@@ -159,6 +161,108 @@ test('scanner uses bounded background scheduling, persists candidates and keeps 
       rejected:status.feeds.trending.rejected,truncated:status.feeds.trending.truncated},
       {received:2,accepted:2,deduplicated:0,rejected:0,truncated:0});
   }finally{scanner.stop();store.close();}
+});
+
+test('scanner marks first and interrupted successful feed observations as left-censored, then restores a bounded interval',async()=>{
+  let now=new Date(at),trendingCalls=0;const events:GmgnMarketDiscoveryObservedCandidate[]=[];
+  const second=address(30),third=address(31),client:GmgnMarketDiscoveryClient={
+    async getMarketTrending(){trendingCalls++;now=new Date(now.getTime()+2_000);
+      if(trendingCalls===2)throw new Error('temporary feed failure');
+      const rows=[trendingRow()];if(trendingCalls>=3)rows.push(trendingRow({address:second}));
+      if(trendingCalls>=4)rows.push(trendingRow({address:third}));return {rank:rows};},
+    async getMarketTrenches(){return {new_creation:[],near_completion:[],completed:[]};},
+  };
+  const store=new GmgnMarketDiscoveryStore({path:':memory:',maxBytes:2*1024*1024,maxObservations:100,now:()=>now}),
+    scanner=new GmgnMarketDiscoveryScanner({client,store,intervalMs:1_000,maxCandidates:7,now:()=>now,onCandidate:event=>events.push(event)});
+  const poll=async()=>{await scanner.pollNow();now=new Date(now.getTime()+30_001);};
+  try{
+    await poll(); // first Trending success
+    await poll(); // Trenches
+    await poll(); // failed Trending
+    await poll(); // Trenches
+    await poll(); // recovered Trending
+    await poll(); // Trenches
+    await poll(); // consecutive Trending success
+    assert.equal(events.length,3);
+    assert.equal(events[0].observedAt,new Date(at.getTime()+2_000).toISOString(),'upper bound uses response receipt, not request start');
+    assert.deepEqual({token:events[0].tokenAddress,previous:events[0].previousSuccessfulPollAt,leftCensored:events[0].leftCensored},
+      {token,previous:undefined,leftCensored:true});
+    assert.deepEqual({token:events[1].tokenAddress,previous:events[1].previousSuccessfulPollAt,leftCensored:events[1].leftCensored},
+      {token:second,previous:events[0].observedAt,leftCensored:true});
+    assert.deepEqual({token:events[2].tokenAddress,previous:events[2].previousSuccessfulPollAt,leftCensored:events[2].leftCensored},
+      {token:third,previous:events[1].observedAt,leftCensored:false});
+  }finally{scanner.stop();store.close();}
+});
+
+test('capacity rollback breaks feed continuity and recovery first-seen observations remain left-censored',async()=>{
+  let now=new Date(at),trendingCalls=0;const events:GmgnMarketDiscoveryObservedCandidate[]=[],second=address(32),third=address(33);
+  const client:GmgnMarketDiscoveryClient={
+    async getMarketTrending(){trendingCalls++;const rows=[trendingRow()];if(trendingCalls>=2)rows.push(trendingRow({address:second}));
+      if(trendingCalls>=3)rows.push(trendingRow({address:third}));return {rank:rows};},
+    async getMarketTrenches(){return {new_creation:[],near_completion:[],completed:[]};},
+  };
+  const store=new GmgnMarketDiscoveryStore({path:':memory:',maxBytes:2*1024*1024,maxObservations:100,now:()=>now}),
+    apply=store.apply.bind(store);let rejectNextTrending=true;
+  store.apply=((page,observedAt,delivery)=>{
+    if(page.feed==='trending'&&trendingCalls===2&&rejectNextTrending){rejectNextTrending=false;
+      return {received:page.records.length,inserted:0,unchanged:0,capacityReached:true,events:[],continuityLostFeeds:[]};}
+    return apply(page,observedAt,delivery);
+  }) as typeof store.apply;
+  const scanner=new GmgnMarketDiscoveryScanner({client,store,intervalMs:1_000,maxCandidates:7,now:()=>now,onCandidate:event=>events.push(event)}),
+    poll=async()=>{await scanner.pollNow();now=new Date(now.getTime()+30_001);};
+  try{
+    await poll();await poll();await poll();
+    const capacityStatus=scanner.status().feeds.trending;
+    assert.equal(capacityStatus.errors,1);
+    assert.equal(capacityStatus.lastError,'GMGN_MARKET_DISCOVERY_STORE_CAPACITY');
+    assert.equal(capacityStatus.lastSuccessAt,at.toISOString(),'a rejected store write is not a successful feed boundary');
+    assert.equal(store.continuityLost('trending'),true);
+    await poll();await poll();
+    assert.equal(trendingCalls,3);assert.equal(events.filter(event=>event.feed==='trending').length,3);
+    const recovered=events.filter(event=>[second,third].includes(event.tokenAddress));
+    assert.equal(recovered.length,2);assert.ok(recovered.every(event=>event.leftCensored));
+    assert.equal(store.continuityLost('trending'),false);
+  }finally{scanner.stop();store.close();}
+});
+
+test('current snapshot eviction durably breaks only the affected feed continuity before the next baseline',async()=>{
+  let now=new Date(at),trendingCalls=0;const events:GmgnMarketDiscoveryObservedCandidate[]=[],second=address(34),
+    rows=(seed:number)=>Array.from({length:50},(_,index)=>trenchRow({address:address(seed+index)}));
+  const client:GmgnMarketDiscoveryClient={
+    async getMarketTrending(){trendingCalls++;return {rank:[trendingRow(),...(trendingCalls>=2?[trendingRow({address:second})]:[])]};},
+    async getMarketTrenches(){return {new_creation:rows(50),near_completion:rows(110),completed:rows(170)};},
+  };
+  const store=new GmgnMarketDiscoveryStore({path:':memory:',maxBytes:4*1024*1024,maxObservations:100,now:()=>now}),
+    scanner=new GmgnMarketDiscoveryScanner({client,store,intervalMs:1_000,maxCandidates:120,now:()=>now,onCandidate:event=>events.push(event)}),
+    poll=async()=>{await scanner.pollNow();now=new Date(now.getTime()+30_001);};
+  try{
+    await poll();await poll();
+    assert.equal(store.continuityLost('trending'),true);assert.equal(store.continuityLost('trenches'),true);
+    await poll();
+    const recovered=events.filter(event=>event.feed==='trending'&&[token,second].includes(event.tokenAddress)&&event.observedAt>at.toISOString());
+    assert.equal(recovered.length,2);assert.ok(recovered.every(event=>event.leftCensored));
+    assert.equal(store.continuityLost('trending'),false);
+  }finally{scanner.stop();store.close();}
+});
+
+test('first-seen callback failures remain in a durable outbox and replay exactly after restart',async()=>{
+  const directory=mkdtempSync(join(tmpdir(),'gmd-outbox-')),path=join(directory,'discovery.sqlite');let now=new Date(at);
+  const client:GmgnMarketDiscoveryClient={async getMarketTrending(){return {rank:[trendingRow()]};},
+    async getMarketTrenches(){return {new_creation:[],near_completion:[],completed:[]};}};
+  let store=new GmgnMarketDiscoveryStore({path,maxBytes:4*1024*1024,maxObservations:100,now:()=>now}),
+    scanner=new GmgnMarketDiscoveryScanner({client,store,intervalMs:1_000,maxCandidates:7,now:()=>now,
+      onCandidate(){assert.equal(store.status().pendingCandidateDeliveries,1,'the relay must remain pending while its callback runs');
+        throw new Error('downstream unavailable');}});
+  try{
+    await scanner.pollNow();assert.equal(scanner.status().candidateErrors,1);assert.equal(store.status().pendingCandidateDeliveries,1);
+    scanner.stop();store.close();now=new Date(now.getTime()+30_001);
+    const replayed:GmgnMarketDiscoveryObservedCandidate[]=[];store=new GmgnMarketDiscoveryStore({path,maxBytes:4*1024*1024,maxObservations:100,now:()=>now});
+    scanner=new GmgnMarketDiscoveryScanner({client,store,intervalMs:1_000,maxCandidates:7,now:()=>now,onCandidate:event=>{
+      assert.equal(store.status().pendingCandidateDeliveries,1,'ack follows callback success');replayed.push(event);}});
+    await scanner.pollNow();assert.equal(replayed.length,1);assert.equal(replayed[0].tokenAddress,token);
+    assert.equal(replayed[0].kind,'first_seen');assert.equal(replayed[0].leftCensored,true);
+    assert.equal(store.status().pendingCandidateDeliveries,0);
+  }finally{scanner.stop();store.close();rmSync(directory,{recursive:true,force:true});}
 });
 
 test('scanner records invalid feed schemas as errors rather than successful empty polls',async()=>{

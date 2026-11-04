@@ -116,10 +116,14 @@ test('涨幅以首次已观察买入之后的实际价格为基线，不用未�
 test('GMGN 市场候选只登记研究目标，不伪造钱包交易或价格',()=>{
   const {history}=fixture(),db=(history as unknown as {db:DatabaseSync}).db;
   try {
-    const context={source:'gmgn_market_discovery',observedAt:iso(20),kind:'trenches' as const,reason:'category_transition:near_completion',
-      window:'lifecycle',changeKind:'category_transition' as const,category:'near_completion' as const,previousCategory:'new_creation' as const,
+    const context={source:'gmgn_market_discovery',observedAt:iso(20),kind:'trenches' as const,reason:'first_seen:new_creation',
+      window:'lifecycle',changeKind:'first_seen' as const,category:'new_creation' as const,
+      firstSeenLowerBound:iso(10),firstSeenUpperBound:iso(20),leftCensored:false,
       rank:4,smartDegenCount:7,renownedCount:2,smartDegenDelta:3,renownedDelta:1};
-    history.captureMarketCandidate(token,context);history.captureMarketCandidate(token,context);
+    assert.equal(history.captureMarketCandidate(token,context),true);
+    assert.equal(history.captureMarketCandidate(token,context),true,'an idempotent replay confirms the evidence already exists');
+    assert.equal(history.captureMarketCandidate(token,{...context,observedAt:iso(21)}),false,
+      'an interval whose upper bound does not match observation time is rejected');
     const stats=history.stats();
     assert.equal(stats.tokens,1);assert.equal(stats.observations,1);assert.equal(stats.wallets,0);assert.equal(stats.events,0);assert.equal(stats.prices,0);
     assert.deepEqual(history.watchTargets(5),[token]);
@@ -127,8 +131,11 @@ test('GMGN 市场候选只登记研究目标，不伪造钱包交易或价格',(
     assert.deepEqual({feed:observation.feed,window:observation.window,changeKind:observation.changeKind,category:observation.stage,
       previousCategory:observation.previousStage,rank:observation.rank,smart:observation.smartDegenCount,renowned:observation.renownedCount,
       smartDelta:observation.smartDegenDelta,renownedDelta:observation.renownedDelta},
-    {feed:'trenches',window:'lifecycle',changeKind:'category_transition',category:'near_completion',previousCategory:'new_creation',
+    {feed:'trenches',window:'lifecycle',changeKind:'first_seen',category:'new_creation',previousCategory:undefined,
       rank:4,smart:7,renowned:2,smartDelta:3,renownedDelta:1});
+    assert.deepEqual({lower:observation.firstSeenLowerBound,upper:observation.firstSeenUpperBound,leftCensored:observation.leftCensored,
+      scope:observation.firstSeenIntervalScope,claimsLaunch:observation.firstSeenIntervalClaimsTokenLaunchTime},
+    {lower:iso(10),upper:iso(20),leftCensored:false,scope:'local_gmgn_feed_selection_observation_only',claimsLaunch:false});
     assert.equal(observation.scope,'research_nomination_only');assert.equal(observation.entryPermission,false);assert.equal(observation.countingEvent,false);
     const priority=db.prepare('SELECT priority,nominated_at,priority_until FROM wh_market_research_targets WHERE chain=? AND address=?')
       .get(token.chain,token.address)!;

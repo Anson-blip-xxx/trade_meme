@@ -83,6 +83,7 @@ import {LatestWorkQueue} from './latest-work-queue.js';
 import {SourceObservationRunner,type SourceResearchObservation} from './source-observation-runner.js';
 import {GmgnPlusArchive,GmgnPlusArchiveRunner} from './gmgn-plus-archive.js';
 import {GmgnMarketArchiveError,GmgnMarketSignalScanner} from './gmgn-market-signal-scanner.js';
+import {GmgnMarketDiscoveryScanner,GmgnMarketDiscoveryStore} from './gmgn-market-discovery.js';
 
 export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;jevInvoke?:JevShadowOptions['invoke'];telegramFetcher?:typeof fetch;
   heldFetcher?:typeof fetch;entryFetcher?:typeof fetch;gmgnFetcher?:typeof fetch;
@@ -117,6 +118,11 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
   const protectedPaths=[config.ordersDatabase,config.dashboard.archivePath,config.walletResearch.database,config.walletProfiles.database,
     config.walletScreening.database,config.chainStream.database,config.exitShadow.database,config.debotSignalsDatabase,config.debotSessionPath,
     ...(config.meme?.enabled?[config.meme.database]:[])];
+  if(config.gmgnMarketDiscovery?.enabled&&protectedPaths.some(path=>sameDatabase(path,config.gmgnMarketDiscovery!.database)))
+    throw new Error('GMGN_MARKET_DISCOVERY_DATABASE_MUST_BE_SEPARATE');
+  const gmgnMarketDiscoveryStore=config.gmgnMarketDiscovery?.enabled?new GmgnMarketDiscoveryStore({
+    path:config.gmgnMarketDiscovery.database,maxBytes:config.gmgnMarketDiscovery.maxBytes}):undefined;
+  if(config.gmgnMarketDiscovery?.enabled)protectedPaths.push(config.gmgnMarketDiscovery.database);
   const gmgnPlusConflicts=[...protectedPaths,'.env',config.ave?.database,config.ave?.sessionPath,config.corroboration?.database,
     config.jev?.database,config.tokenRankResearch?.database,config.walletFast?.database].filter((path):path is string=>!!path);
   if(config.gmgnPlusArchive?.enabled&&gmgnPlusConflicts.some(path=>sameDatabase(path,config.gmgnPlusArchive!.database)))
@@ -124,7 +130,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
   const gmgnPlusArchive=config.gmgnPlusArchive?.enabled?new GmgnPlusArchive({path:config.gmgnPlusArchive.database,
     maxBytes:config.gmgnPlusArchive.maxBytes,maxCandidates:config.gmgnPlusArchive.maxCandidates}):undefined;
   if(config.gmgnPlusArchive?.enabled)protectedPaths.push(config.gmgnPlusArchive.database);
-  let gmgnMarketScanner:GmgnMarketSignalScanner|undefined;
+  let gmgnMarketScanner:GmgnMarketSignalScanner|undefined,gmgnMarketDiscovery:GmgnMarketDiscoveryScanner|undefined;
   const dedicatedGmgnMarketChains=[...new Set(config.scannerChains.map(chain=>chain==='solana'?'sol':chain))] as ('sol'|'bsc'|'robinhood')[];
   const gmgnPlusRunner=gmgnPlusArchive&&config.gmgnApiKey?.trim()?new GmgnPlusArchiveRunner({archive:gmgnPlusArchive,client,
     chains:config.gmgnPlusArchive!.chains,intervalMs:config.gmgnPlusArchive!.intervalSec*1000,
@@ -140,6 +146,26 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
   };
   const gmgnPlusStatus=()=>({...(gmgnPlusRunner?.status()??(gmgnPlusArchive?{...gmgnPlusArchive.status(),running:false,
     pausedReason:'GMGN_API_KEY_MISSING'}:{enabled:false})),realtimeMarketSignals:gmgnMarketStatus()});
+  const gmgnMarketDiscoveryStatus=()=>{
+    const configured=config.gmgnMarketDiscovery?.enabled===true;
+    const emptyFeed=()=>({polls:0,received:0,accepted:0,deduplicated:0,rejected:0,truncated:0,changes:0,unchanged:0,errors:0,nextDueAt:0,idleStreak:0});
+    const store=gmgnMarketDiscoveryStore?.status()??{enabled:false,current:0,observations:0,maxCurrent:0,maxObservations:0,
+      maxBytes:0,klineObservations:0,storageBytes:0,usedBytes:0,capacityReached:false,retentionMs:0,
+      lastWriteAt:undefined,lastKlineAt:undefined,lifecycleRegressions:0,lastLifecycleRegressionAt:undefined,
+      researchOnly:true,entryPipeline:false,countingPipeline:false,rawPayloadStored:false};
+    const status=gmgnMarketDiscovery?.status()??{enabled:configured,running:false,inFlight:false,
+      intervalMs:(config.gmgnMarketDiscovery?.intervalSec??30)*1000,maxCandidates:config.gmgnMarketDiscovery?.maxCandidates??0,
+      priority:'background' as const,queueTimeoutMs:10_000,feeds:{trending:emptyFeed(),trenches:emptyFeed()},nominations:0,
+      nominationCapacity:0,nominationEvictions:0,nominationRejected:0,klineMinIntervalMs:30_000,
+      klineSupported:typeof client.getMarketKline==='function',klineCooldownMs:(config.gmgnMarketDiscovery?.klineCooldownSec??300)*1000,
+      klinePolls:0,klineSuccesses:0,klineDuplicates:0,klineErrors:0,klineStoreCapacityErrors:0,
+      lastKlineAt:undefined,lastKlineError:undefined,candidateErrors:0,store,researchOnly:true,entryPipeline:false,
+      countingPipeline:false,notificationPipeline:false};
+    const pausedReason=!configured?'GMGN_MARKET_DISCOVERY_DISABLED':!backgroundGmgnEnabled?backgroundGmgnPausedReason:
+      !config.gmgnApiKey?.trim()?'GMGN_API_KEY_MISSING':!config.scannerChains.includes('solana')?'GMGN_MARKET_DISCOVERY_SOLANA_ONLY':
+        !gmgnMarketDiscovery?'GMGN_MARKET_DISCOVERY_UNAVAILABLE':undefined;
+    return {...status,...(pausedReason?{running:false,pausedReason}:{})};
+  };
   if(config.telegram?.enabled&&config.telegram.token&&config.telegram.chatId&&
     [...protectedPaths,'.env',config.ave?.database,config.ave?.sessionPath,config.corroboration?.database,
       config.jev?.database,config.tokenRankResearch?.database,config.walletFast?.database].filter((path):path is string=>!!path)
@@ -228,6 +254,13 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
     catalyst:(signal,abort,snapshot)=>collectMemeCatalyst(signal,config,{signal:abort,snapshot}),
     corroboration:sourceEvidence?(token,now)=>sourceEvidence.assess(token,now):undefined,
     walletEvidence:(token,now)=>({evidence:walletHistory?.followupEvidence(token,new Date(now.getTime()-120000).toISOString(),now.toISOString())})}):undefined;
+  const nominateMarketKline=(signal:Signal,observedAt?:string,reason=`source_${signal.source}`)=>{
+    if(signal.token.chain!=='solana')return false;
+    // GMGN Market produces many observation-only rows. Only the explicitly
+    // selected routes below enter the bounded retrospective Kline queue.
+    if(signal.source==='gmgn'&&signal.sourceEventId.startsWith('gmgn:market:')&&reason==='source_gmgn')return false;
+    return gmgnMarketDiscovery?.nominate({chain:'solana',address:signal.token.address},observedAt??new Date().toISOString(),reason)??false;
+  };
   const sourceObservation=(config.ave?.enabled||config.debotScannerEnabled||config.gmgnMarketSignals.enabled)&&
     (sourceEvidence||memeObserver||walletHistory&&config.ave?.enabled)
     ?new SourceObservationRunner({
@@ -239,6 +272,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
     }):undefined;
   const observeSourceResearch=async(observation:SourceResearchObservation)=>{
     try {
+      nominateMarketKline(observation.signal,observation.observedAt);
       if(!sourceObservation){observeSignal(observation.signal,observation.observedAt,observation);return {};}
       const result=await sourceObservation.submit(observation);
       sourceCaptureError=result.sourceError?'SOURCE_EVIDENCE_CAPTURE_FAILED':undefined;
@@ -272,9 +306,35 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
   };
   const observeSignal=(signal:Signal,at?:string,display?:{name?:string;symbol?:string},recordSource=true)=>{
     if(!acceptsChain(signal.token.chain))return;
+    nominateMarketKline(signal,at);
     if(recordSource)captureSource(signal,at,display);
     try{memeObserver?.register(signal,at,display);memeCaptureError=undefined;}catch{memeCaptureError='MEME_SIGNAL_CAPTURE_FAILED';}
   };
+  if(config.gmgnMarketDiscovery?.enabled&&backgroundGmgnEnabled&&config.gmgnApiKey?.trim()&&
+    config.scannerChains.includes('solana')&&gmgnMarketDiscoveryStore){
+    gmgnMarketDiscovery=new GmgnMarketDiscoveryScanner({client,store:gmgnMarketDiscoveryStore,
+      intervalMs:config.gmgnMarketDiscovery.intervalSec*1000,maxCandidates:config.gmgnMarketDiscovery.maxCandidates,
+      klineCooldownMs:config.gmgnMarketDiscovery.klineCooldownSec*1000,
+      onCandidate:candidate=>{
+        if(candidate.walletTrackingRecommended)walletHistory?.captureMarketCandidate(
+          {chain:'solana',address:candidate.tokenAddress},{source:candidate.source,observedAt:candidate.observedAt,
+            kind:candidate.feed,reason:`${candidate.kind}:${candidate.category}`,window:candidate.window,
+            changeKind:candidate.kind,category:candidate.category,previousCategory:candidate.previousCategory,
+            rank:candidate.snapshot.rank,smartDegenCount:candidate.snapshot.smartDegenCount,
+            renownedCount:candidate.snapshot.renownedCount,smartDegenDelta:candidate.smartDegenDelta,
+            renownedDelta:candidate.renownedDelta});
+        const snapshot=candidate.snapshot;
+        if(candidate.kind==='category_transition'||candidate.smartDegenDelta>0||candidate.renownedDelta>0||
+          candidate.feed==='trending'&&(snapshot.rank??Number.POSITIVE_INFINITY)<=5||
+          candidate.kind==='first_seen'&&((snapshot.smartDegenCount??0)>=3||(snapshot.renownedCount??0)>=1))
+          gmgnMarketDiscovery?.nominate({chain:'solana',address:candidate.tokenAddress},candidate.observedAt,
+            candidate.kind==='category_transition'?`discovery_${candidate.feed}_category_transition`:
+              candidate.renownedDelta>0?`discovery_${candidate.feed}_renowned_delta`:
+                candidate.smartDegenDelta>0?`discovery_${candidate.feed}_smart_delta`:
+                  candidate.feed==='trending'&&(snapshot.rank??Number.POSITIVE_INFINITY)<=5?'discovery_trending_rank':
+                    `discovery_${candidate.feed}_first_seen_wallets`);
+      }});
+  }
   const store=new Store(':memory:',item=>{
     // The two research archives are independent observers; a failed archive must
     // neither suppress the other nor roll back the signal / affect order submission.
@@ -925,6 +985,8 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       knownProcessedIds:gmgnPlusArchive?(chain,ids)=>gmgnPlusArchive.knownProcessedMarketSignalIds(chain,ids):undefined,
       markProcessed:gmgnPlusArchive?(chain,id)=>gmgnPlusArchive.markMarketSignalProcessed(chain,id):undefined,
       onObservation:async(signal,receivedAt,observation)=>{
+        if(['priority_analysis','narrative_analysis'].includes(observation.route))
+          nominateMarketKline(signal,receivedAt,`gmgn_market_${observation.route}`);
         const result=await observeSourceResearch({id:observation.id,signal,observedAt:receivedAt,
           ...(observation.name?{name:observation.name}:{}),...(observation.symbol?{symbol:observation.symbol}:{})});
         if(result.sourceError||result.memeError||result.nominationError)throw new Error('GMGN_MARKET_SIGNAL_OBSERVATION_FAILED');
@@ -1155,6 +1217,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
   sourceObservation?.start();
   return {client,providers,store,orders,entry,dailyReview,scanner,debotScanner,debotStream,debotAuth,archive,followupReview,tracking,priceRouter,walletHistory,walletIndexRunner,walletObserver,walletResearchStatus,walletAssociationsStatus,walletProfiles,walletProfilesStatus,walletScreening,watchRechecker,exitShadow,chainMonitor,chainStreamStatus,walletFastResearch,memeObserver,sourceEvidence,sourceObservation,aveScanner,aveSession,tokenRankResearch,jevShadow,telegram,tradeNotifications,telegramStatus,heldMonitor,heldTracking,
     signalCounting,telegramControls,telegramPositions,manualClose,directSell,manualNativeBuy,telegramTokenCard,gmgnMarketScanner,
+    gmgnMarketDiscovery,gmgnMarketDiscoveryStore,
     executionStatus:()=>{const counting=signalCounting.status();return {
       configuredEntryMode:config.entryMode,configuredThirdSignalMode:config.thirdSignalExecutionMode,
       solanaExecutionProvider:config.solanaExecutionProvider,native:nativeTrading?.status(),nativeError:nativeTradingError,
@@ -1203,7 +1266,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
           'wallet_discovery_research','watch_rechecks'],
         retainedTasks:['signal_details_and_safety','positions','price_fallback','trading',
           'debot_ave_signals','chain_trade_classification','wallet_verified_buy_on_demand_research','local_wallet_profiles_and_indexes']},
-      gmgnPlusArchive:gmgnPlusStatus(),gmgnMarketSignals:gmgnMarketStatus(),
+      gmgnPlusArchive:gmgnPlusStatus(),gmgnMarketSignals:gmgnMarketStatus(),gmgnMarketDiscovery:gmgnMarketDiscoveryStatus(),
       scanner:{...scanner.getStatus(),enabled:backgroundGmgnEnabled&&config.scannerEnabled,pausedReason:backgroundGmgnPausedReason},
       debotScanner:debotScanner?.getStatus()??{enabled:false,running:false},
       debotStream:debotStream?.getStatus(),
@@ -1221,6 +1284,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       walletStatsRunner?.start();
       gmgnPlusRunner?.start();
       if(backgroundGmgnEnabled)gmgnMarketScanner?.start();
+      if(backgroundGmgnEnabled)gmgnMarketDiscovery?.start();
       walletIndexRunner?.start();
       followupReview?.start();
       jevStatusRunner?.start();
@@ -1284,6 +1348,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       // Establish the market poll fence before the first await in shutdown.
       // The returned promise drains only work admitted before this point.
       const gmgnMarketStop=gmgnMarketScanner?.stop();
+      gmgnMarketDiscovery?.stop();const gmgnMarketDiscoveryDrain=gmgnMarketDiscovery?.drain();
       scanner.stop();clearInterval(sweep);clearInterval(reconcileTimer);clearInterval(debotSyncTimer);clearInterval(exitMaintenanceTimer);clearInterval(telegramTimer);
       await telegramControls?.close();
       // Fence both sources before draining third-signal callbacks. Otherwise a
@@ -1291,6 +1356,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       await debotStream?.stop();
       await Promise.all([aveScanner?.stop(),debotScanner?.stop()]);
       await gmgnMarketStop;
+      await gmgnMarketDiscoveryDrain;
       // No queued Ave sample may run after downstream price consumers begin stopping.
       priceFanout.close();
       await thirdEntry?.stop();await signalCounting.waitForDispatches();
@@ -1324,5 +1390,6 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       directSell?.close();manualClose?.close();
       signalCounting.close();
       store.close();orders.close();dailyReview?.close();archive?.close();walletHistory?.close();exitShadow?.close();
+      gmgnMarketDiscoveryStore?.close();
     }};
 }

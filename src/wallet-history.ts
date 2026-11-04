@@ -15,6 +15,13 @@ import {WalletResearchSeeds,type WalletResearchSeedSnapshot,type WalletResearchS
 export interface WalletHistoryToken {chain:Chain;address:string;}
 export interface WalletHistoryOptions {maxBytes?:number;now?:()=>Date;}
 export interface WalletHistoryContext {source:string;observedAt:string;}
+export interface WalletMarketCandidateContext extends WalletHistoryContext {
+  kind:'trending'|'trenches';reason?:string;window?:string;
+  changeKind?:'first_seen'|'updated'|'category_transition';
+  category?:'trending'|'new_creation'|'near_completion'|'completed';
+  previousCategory?:'trending'|'new_creation'|'near_completion'|'completed';
+  rank?:number;smartDegenCount?:number;renownedCount?:number;smartDegenDelta?:number;renownedDelta?:number;
+}
 export interface WalletVendorNominationInput {
   source:'ave';eventId:string;occurredAt:string;observedAt:string;
   wallets:{address:string;alias?:string;side?:'buy'|'sell';lastTradeAt?:string;chain?:Chain;tokenAddress?:string}[];
@@ -292,6 +299,7 @@ export class WalletHistory {
   private error?:string;
   private readonly associations:WalletAssociations;
   private readonly researchSeeds:WalletResearchSeeds;
+  private readonly marketPriorityStreak=new Map<Chain,number>();
   constructor(private readonly path:string,options:WalletHistoryOptions={}) {
     this.maxBytes=options.maxBytes??512*1024*1024;this.now=options.now??(()=>new Date());
     if(!Number.isSafeInteger(this.maxBytes)||this.maxBytes<16_384) throw new Error('WALLET_HISTORY_CONFIG_INVALID');
@@ -310,6 +318,9 @@ export class WalletHistory {
         coordination_score INTEGER DEFAULT 0,coordination_data TEXT,coordination_checked_at TEXT,coordination_dirty INTEGER DEFAULT 1,last_at TEXT,PRIMARY KEY(chain,address));
       CREATE TABLE IF NOT EXISTS wh_wallet_tokens(chain TEXT,wallet TEXT,token_address TEXT,PRIMARY KEY(chain,wallet,token_address));
       CREATE TABLE IF NOT EXISTS wh_report_captures(id TEXT PRIMARY KEY,observed_at TEXT);
+      CREATE TABLE IF NOT EXISTS wh_market_research_targets(
+        chain TEXT NOT NULL,address TEXT NOT NULL,nominated_at TEXT NOT NULL,priority INTEGER NOT NULL,
+        priority_until TEXT NOT NULL,data TEXT NOT NULL,PRIMARY KEY(chain,address));
       CREATE TABLE IF NOT EXISTS wh_association_invalidations(
         kind TEXT NOT NULL CHECK(kind IN ('funding_wallet','funding_address','public_service')),
         chain TEXT NOT NULL,address TEXT NOT NULL,enqueued_at TEXT NOT NULL,
@@ -329,7 +340,9 @@ export class WalletHistory {
       CREATE INDEX IF NOT EXISTS wh_funding_wallet ON wh_funding(chain,wallet,funding_address,observed_at);
       CREATE INDEX IF NOT EXISTS wh_funding_address ON wh_funding(chain,funding_address,observed_at);
       CREATE INDEX IF NOT EXISTS wh_wallets_recent ON wh_wallets(last_at DESC);
-      CREATE INDEX IF NOT EXISTS wh_metrics_dirty ON wh_metrics(coordination_dirty,coordination_checked_at);`);
+      CREATE INDEX IF NOT EXISTS wh_tokens_watch_chain ON wh_tokens(chain,COALESCE(last_checked_at,''),first_at,address);
+      CREATE INDEX IF NOT EXISTS wh_metrics_dirty ON wh_metrics(coordination_dirty,coordination_checked_at);
+      CREATE INDEX IF NOT EXISTS wh_market_research_priority ON wh_market_research_targets(chain,priority_until,nominated_at,priority,address);`);
     const invalidationColumns=new Set(this.db.prepare('PRAGMA table_info(wh_association_invalidations)').all().map(column=>String(column.name)));
     if(!invalidationColumns.has('stage'))this.db.exec('ALTER TABLE wh_association_invalidations ADD COLUMN stage INTEGER NOT NULL DEFAULT 0');
     if(!invalidationColumns.has('cursor'))this.db.exec('ALTER TABLE wh_association_invalidations ADD COLUMN cursor TEXT');
@@ -543,6 +556,40 @@ export class WalletHistory {
         observedAt:observed,source:context.source}];
     });
     this.append(values,()=>{for(const value of values) {this.putToken(value,observed);this.observation('token_rank',value,undefined,value.address);}});
+  }
+
+  /** Research nomination only. It adds a token to the wallet-enrichment queue without fabricating a signal, trade or permission to buy. */
+  captureMarketCandidate(token:WalletHistoryToken,context:WalletMarketCandidateContext):void {
+    const target=this.target(token),observed=this.observed(context.observedAt);
+    if(!target||!observed||!source(context.source)||!['trending','trenches'].includes(context.kind))return;
+    const integer=(value:unknown,min:number,max:number)=>typeof value==='number'&&Number.isSafeInteger(value)&&value>=min&&value<=max?value:undefined;
+    const changeKind=['first_seen','updated','category_transition'].includes(String(context.changeKind))?context.changeKind:undefined;
+    const category=['trending','new_creation','near_completion','completed'].includes(String(context.category))?context.category:undefined;
+    const previousCategory=['trending','new_creation','near_completion','completed'].includes(String(context.previousCategory))?context.previousCategory:undefined;
+    const rank=integer(context.rank,0,1_000_000),smartDegenCount=integer(context.smartDegenCount,0,1_000_000_000),
+      renownedCount=integer(context.renownedCount,0,1_000_000_000),smartDegenDelta=integer(context.smartDegenDelta,-1_000_000_000,1_000_000_000),
+      renownedDelta=integer(context.renownedDelta,-1_000_000_000,1_000_000_000);
+    // Priority is deliberately bounded and expires. A fresh market lead gets a
+    // short research head start, while ordinary accumulated targets keep a
+    // guaranteed turn in watchTargets and old leads fall back to normal FIFO.
+    const stagePriority=category==='completed'?15:category==='near_completion'?10:category==='new_creation'?5:0;
+    const rankPriority=rank!==undefined&&rank>0?Math.max(0,25-Math.min(24,rank-1)):0;
+    const priority=Math.min(100,20+stagePriority+rankPriority+
+      Math.min(20,Math.max(0,smartDegenDelta??0)*4)+Math.min(30,Math.max(0,renownedDelta??0)*10)+
+      (changeKind==='category_transition'?15:0));
+    const priorityUntil=new Date(Date.parse(observed)+30*60_000).toISOString();
+    const value={...target,source:context.source,observedAt:observed,feed:context.kind,
+      reason:clean(context.reason,80),window:clean(context.window,20),changeKind,stage:category,previousStage:previousCategory,rank,
+      smartDegenCount,renownedCount,smartDegenDelta,renownedDelta,researchPriority:priority,priorityUntil,
+      scope:'research_nomination_only',entryPermission:false,countingEvent:false};
+    this.append(value,()=>{this.putToken(target,observed);this.observation('market_candidate',value,undefined,target.address);
+      this.db.prepare(`DELETE FROM wh_market_research_targets WHERE rowid IN (
+        SELECT rowid FROM wh_market_research_targets WHERE priority_until<=? ORDER BY priority_until LIMIT 100)`).run(observed);
+      this.db.prepare(`INSERT INTO wh_market_research_targets(chain,address,nominated_at,priority,priority_until,data) VALUES (?,?,?,?,?,?)
+        ON CONFLICT(chain,address) DO UPDATE SET nominated_at=excluded.nominated_at,priority=excluded.priority,
+          priority_until=excluded.priority_until,data=excluded.data
+        WHERE excluded.nominated_at>=wh_market_research_targets.nominated_at`)
+        .run(target.chain,target.address,observed,priority,priorityUntil,JSON.stringify(value));});
   }
 
   captureTokenTraders(token:WalletHistoryToken,rows:WalletTokenTraderObservation[],context:WalletHistoryContext):void {
@@ -790,10 +837,32 @@ export class WalletHistory {
     this.append(data,()=>this.observation('collection',data));
   }
 
-  watchTargets(limit=20,_now=this.now(),chain?:Chain):WalletHistoryToken[] {
+  watchTargets(limit=20,now=this.now(),chain?:Chain):WalletHistoryToken[] {
     const n=Number.isSafeInteger(limit)?Math.max(1,Math.min(200,limit)):20;
-    return this.db.prepare(`SELECT chain,address FROM wh_tokens ${chain?'WHERE chain=?':''} ORDER BY COALESCE(last_checked_at,''),first_at,chain,address LIMIT ?`)
-      .all(...(chain?[chain,n]:[n])).map(row=>({chain:row.chain as Chain,address:String(row.address)}));
+    const timestamp=Number.isFinite(now?.getTime())?now.toISOString():this.now().toISOString(),chainWhere=chain?'AND t.chain=?':'';
+    const priority=this.db.prepare(`SELECT t.chain,t.address FROM wh_market_research_targets p
+      JOIN wh_tokens t ON t.chain=p.chain AND t.address=p.address
+      WHERE p.nominated_at<=? AND p.priority_until>? ${chainWhere}
+        AND (t.last_checked_at IS NULL OR t.last_checked_at<p.nominated_at)
+      ORDER BY p.priority*MAX(0,julianday(p.priority_until)-julianday(?))/
+        MAX(0.000001,julianday(p.priority_until)-julianday(p.nominated_at)) DESC,
+        p.nominated_at DESC,t.chain,t.address LIMIT ?`)
+      .all(...(chain?[timestamp,timestamp,chain,timestamp,n]:[timestamp,timestamp,timestamp,n]))
+      .map(row=>({chain:row.chain as Chain,address:String(row.address)}));
+    const ordinary=this.db.prepare(`SELECT t.chain,t.address FROM wh_tokens t
+      WHERE 1=1 ${chain?'AND t.chain=?':''} AND NOT EXISTS(
+        SELECT 1 FROM wh_market_research_targets p WHERE p.chain=t.chain AND p.address=t.address
+          AND p.nominated_at<=? AND p.priority_until>? AND (t.last_checked_at IS NULL OR t.last_checked_at<p.nominated_at))
+      ORDER BY COALESCE(t.last_checked_at,''),t.first_at,t.chain,t.address LIMIT ?`)
+      .all(...(chain?[chain,timestamp,timestamp,n]:[timestamp,timestamp,n]))
+      .map(row=>({chain:row.chain as Chain,address:String(row.address)}));
+    let priorityFirst=priority.length>0;
+    if(chain&&priority.length&&ordinary.length){const streak=this.marketPriorityStreak.get(chain)??0;priorityFirst=streak<3;
+      this.marketPriorityStreak.set(chain,priorityFirst?streak+1:0);
+    }else if(chain&&!priority.length)this.marketPriorityStreak.set(chain,0);
+    const first=priorityFirst?priority:ordinary,second=priorityFirst?ordinary:priority,result:WalletHistoryToken[]=[],seen=new Set<string>();
+    for(const row of [...first,...second]){const key=`${row.chain}:${row.address}`;if(!seen.has(key)){seen.add(key);result.push(row);if(result.length>=n)break;}}
+    return result;
   }
   markTargetChecked(value:WalletHistoryToken,observedAt=this.now().toISOString()):void {
     const target=this.target(value),observed=this.observed(observedAt);if(!target||!observed) return;

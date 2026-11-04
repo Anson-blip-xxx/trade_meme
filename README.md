@@ -40,7 +40,7 @@ npm run dev
 
 ## Web 控制台
 
-界面按观察、研究、运行分为 14 个独立栏目：工作台总览、Meme 动态、实时风控、信号扫描、条件后追踪、榜单研究、每日复盘、持续复盘、钱包画像、前置关联、止盈保护、订单记录、信号来源、运行状态。首页请求 `/dashboard/api/home` 与分页的 `/dashboard/api/signal-counting`，展示服务摘要、第三次通知策略的启停与当前批次；摘要缓存最多 15 秒，不读取完整钱包研究、历史曲线或止盈报价。DeBot 登录放在信号来源，余额和服务器详情放在运行状态。
+界面按观察、研究、运行分为 14 个独立栏目：工作台总览、Meme 动态、实时风控、信号扫描、条件后追踪、榜单研究、每日复盘、持续复盘、钱包画像、前置关联、止盈保护、订单记录、信号来源、运行状态。首页请求 `/dashboard/api/home` 与分页的 `/dashboard/api/signal-counting`，展示服务摘要、第三次通知策略的启停与当前批次；摘要缓存最多 15 秒，不读取完整钱包研究、历史曲线或止盈报价。DeBot 登录放在信号来源，余额和服务器详情放在运行状态。GMGN 市场发现的 Trending／Trenches／Kline 轮询、候选队列、错误和存储容量同时显示在“信号来源”和“运行状态”。
 
 各列表默认每页 20 条，通过服务端 `limit/offset` 查询当前页并显示总数。扫描支持链、结论、名称/完整 CA 搜索；实时风控支持链和状态，翻历史页固定接收时间边界，避免新信号把记录不断挤到下一页。持续复盘的逐币记录、分组对比和因子验证分开加载并分页。切换栏目取消旧请求，后台标签停止页面轮询，历史页暂停自动刷新；首页不加载隐藏栏目的数据。列表只传摘要，点击记录再读取安全、叙事、钱包路径、机会账本及价格轨迹。
 
@@ -76,6 +76,14 @@ npm run dev
 | 结论 | `BUY_CANDIDATE` 为研究候选，必要数据缺失或模式未适配为 `WATCH`，明确阻断为 `REJECT`。实际执行结果看订单账本 |
 
 有限公开标签钱包样本不等于全市场发现。未来涨幅、`price_change`、金银铜狗、事后 10 倍不作为当前信号，不回填到历史入场特征。
+
+### GMGN 市场发现：Trending、Trenches 与 Kline
+
+`GMGN_MARKET_DISCOVERY_ENABLED=true` 启用 Solana 市场发现。Trending 读取官方 `/v1/market/rank` 的 1 分钟窗口，保存排名、成交、热度、聪明钱包与风险字段的变化；Trenches 读取官方 `/v1/trenches`，覆盖新建、接近毕业和已毕业阶段，记录同一 CA 的阶段迁移与报价资产。字段变化保存为候选变化记录；首次出现、阶段迁移、聪明钱包数量增加或风险字段变化会标记为钱包跟踪优先。重复且字段完全相同的快照只更新最后看见时间，不重复生成样本。
+
+Kline 读取官方 `/v1/market/token_kline`，只对已提名的候选按需取得 30 秒蜡烛，不进行全市场逐币轮询。同一 CA 默认至少间隔 5 分钟；取得的历史轨迹保留提名时间与抓取时间，不能伪装成系统当时已经实时观察到的价格，也不写入持仓实时行情或止盈止损判断。Trending、Trenches 和 Kline 都使用可被 Market Signal 与交易任务抢占的后台队列；供应商冷却、排队超时或错误只影响本轮发现，不阻塞 DeBot／Ave 信号接收。
+
+市场发现是独立研究输入：不增加 DeBot／Ave 的通知次数，不触发第三次通知策略，不直接创建订单，不改变自动开仓风控，也不代替持仓长连接报价。SQLite 只保存规范化后的紧凑快照与变化字段，不保存 GMGN 原始响应；默认最多 128 MiB，变化记录保留 30 天或最多 50,000 条。9528 的“信号来源”和“运行状态”展示两路轮询次数、变化数、Kline 补轨迹次数、待处理候选、最近错误和存储容量。
 
 DeBot 配置为 `DEBOT_SCANNER_ENABLED=true`、`DEBOT_TRANSPORT=authenticated_stream`。在 9528 控制台“信号来源 → DeBot 登录”中发送邮箱验证码，并输入邮箱验证码和 Google Authenticator 当前动态码。邮箱由服务器 `DEBOT_LOGIN_EMAIL` 固定配置；两个验证码仅用于当次请求，不存入数据库、日志或浏览器存储。通过官方 `/api/user/info` 验证后，会话原子保存到 `DEBOT_SESSION_PATH`（默认 `data/debot/session.json`，目录 0700、文件 0600）。该凭据文件仅留在服务器，禁止提交到 Git。
 
@@ -422,6 +430,12 @@ npm run orders -- <订单ID>
 | 配置 | 默认值 / 用途 |
 | --- | --- |
 | `GMGN_MIN_INTERVAL_MS` | 350；按权重排队，429 服从供应商冷却，不保证套餐吞吐 |
+| `GMGN_MARKET_DISCOVERY_ENABLED` | false；启用 Solana Trending、Trenches 与按需 Kline 研究建档 |
+| `GMGN_MARKET_DISCOVERY_DATABASE_PATH` | `data/gmgn-market-discovery.sqlite`；必须与其他数据库使用不同路径 |
+| `GMGN_MARKET_DISCOVERY_MAX_MB` | 128；规范化市场发现档案的容量上限 |
+| `GMGN_MARKET_DISCOVERY_INTERVAL_SEC` | 30；两路发现的基础轮询间隔，无变化时自动放慢 |
+| `GMGN_MARKET_DISCOVERY_MAX_CANDIDATES` | 20；单路单轮最多接受的规范化候选数 |
+| `GMGN_MARKET_KLINE_COOLDOWN_SEC` | 300；同一 CA 两次按需补 Kline 的最短间隔 |
 | `SCANNER_INTERVAL_SEC` / `SCANNER_MAX_SIGNALS` | 60 / 3 |
 | `DEBOT_SCANNER_ENABLED` / `DEBOT_SCANNER_INTERVAL_SEC` | false / 30；启用信号来源，间隔仅用于匿名诊断模式；认证流每 60 秒补数 |
 | `DEBOT_TRANSPORT` | `authenticated_stream`；匿名轮询仅供诊断 |

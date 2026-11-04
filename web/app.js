@@ -229,6 +229,16 @@
     WALLET_FEED_SCHEMA_INVALID: '钱包信号数据格式异常',
     WALLET_ACTIVITY_SCHEMA_INVALID: '钱包活动数据格式异常',
     GMGN_RANK_SCHEMA_INVALID: '代币排行榜数据格式异常',
+    GMGN_MARKET_DISCOVERY_CAPACITY_REACHED: 'GMGN 市场发现库已接近容量上限',
+    GMGN_MARKET_DISCOVERY_DISABLED: 'GMGN 市场发现未启用',
+    GMGN_MARKET_DISCOVERY_SOLANA_ONLY: 'GMGN 市场发现当前只覆盖 Solana',
+    GMGN_MARKET_DISCOVERY_UNAVAILABLE: 'GMGN 市场发现任务未就绪',
+    GMGN_MARKET_DISCOVERY_STORE_CONFIG_INVALID: 'GMGN 市场发现存储配置无效',
+    GMGN_MARKET_DISCOVERY_WRITE_INVALID: 'GMGN 市场发现记录未能写入',
+    GMGN_MARKET_DISCOVERY_SCANNER_CONFIG_INVALID: 'GMGN 市场发现调度配置无效',
+    GMGN_MARKET_TRENDING_SCHEMA_INVALID: 'GMGN Trending 返回结构异常',
+    GMGN_MARKET_TRENCHES_SCHEMA_INVALID: 'GMGN Trenches 返回结构异常',
+    GMGN_MARKET_DISCOVERY_KLINE_STORE_CAPACITY: 'GMGN Kline 研究库容量不足',
     GMGN_TRADERS_SCHEMA_INVALID: '单币交易者榜数据格式异常',
     GMGN_TOKEN_INFO_SCHEMA_INVALID: '代币报价或基础信息格式异常',
     GMGN_WALLET_STATS_SCHEMA_INVALID: '钱包 7 日统计数据格式异常',
@@ -1469,6 +1479,7 @@
         kv('Market 请求 P50 / P95', `${finite(marketLatency.request?.p50) ? `${marketLatency.request.p50} ms` : '—'} / ${finite(marketLatency.request?.p95) ? `${marketLatency.request.p95} ms` : '—'}`),
         kv('Market 实时新增：接收至观察 P95', finite(marketLatency.liveNewReceiveToObservation?.p95 ?? marketLatency.receiveToObservation?.p95) ? `${marketLatency.liveNewReceiveToObservation?.p95 ?? marketLatency.receiveToObservation.p95} ms` : '等待实时新增样本'));
       if (market.lastError || marketCycle.reason) runtime.append(el('p', 'detail-message detail-error', reasonNames[market.lastError || marketCycle.reason] || scalar(market.lastError || marketCycle.reason)));
+      renderGmgnMarketDiscovery(runtime, data.gmgnMarketDiscovery);
       const cycle = data.scanner?.lastCycle || {};
       for (const item of cycle.diagnostics || []) runtime.append(kv(`${chainName(item.chain)} · ${scalar(item.kind)}`, {ok:'正常',empty:'暂无新记录',invalid_response:'响应异常',unavailable:'暂不可用',rate_limited:'限流'}[item.status] || scalar(item.status)));
     }
@@ -2257,7 +2268,7 @@
     const used = options.usedBytes ?? store?.bytes, limit = store?.maxBytes;
     const errors = [...new Set((options.errors || []).filter(value => typeof value === 'string' && value))];
     const full = (finite(used) && finite(limit) && limit > 0 && used >= limit) ||
-      (finite(options.records) && finite(options.maxRecords) && options.maxRecords > 0 && options.records >= options.maxRecords);
+      (options.rollingRecords !== true && finite(options.records) && finite(options.maxRecords) && options.maxRecords > 0 && options.records >= options.maxRecords);
     const status = store?.enabled === false ? '未启用' : store?.enabled !== true ? '状态待确认' : errors.length ? '记录受阻' : full ? '已达到容量上限' : store.ready === false ? '等待初始化' : store.running === false ? '未运行' : '已启用';
     runtime.append(kv(`${title}存储状态`, status), kv(`${title}已用 / 容量上限`, `${bytes(used)} / ${bytes(limit)}`));
     if (options.recordLabel) runtime.append(kv(`${title}${options.recordLabel}`, Object.hasOwn(options, 'maxRecords') ? `${count(options.records)} / ${count(options.maxRecords)}` : count(options.records)));
@@ -2265,6 +2276,46 @@
       const warning = el('p', 'notice warning', errors.length ? `${title}：${errors.map(sourceDiagnostic).join('；')}` : `${title}已达到存储上限，新增记录可能无法保存。`);
       if (errors.length) warning.title = errors.join(' · ');
       runtime.append(warning);
+    }
+  }
+  function renderGmgnMarketDiscovery(runtime, discovery, compact = false) {
+    if (!discovery) return;
+    const feeds = discovery.feeds || {}, trending = feeds.trending || {}, trenches = feeds.trenches || {};
+    const store = discovery.store || discovery.storage || {};
+    const totals = discovery.totals || {}, cycle = discovery.lastCycle || {};
+    const enabled = discovery.enabled !== false;
+    const running = discovery.running === true;
+    const status = !enabled ? '未启用' : running ? discovery.inFlight ? '正在读取' : '后台研究中' : '未运行';
+    const pollCount = finite(totals.polls) ? totals.polls : (finite(trending.polls) || finite(trenches.polls) ? (trending.polls || 0) + (trenches.polls || 0) : undefined);
+    const errors = [...new Set([
+      discovery.lastError, cycle.error, store.error, trending.lastError, trenches.lastError,
+    ].filter(value => typeof value === 'string' && value))];
+    runtime.append(el('p', 'policy-caption', 'GMGN 市场发现'),
+      kv('发现任务', `${status}${enabled && finite(discovery.intervalMs) ? ` · 基础间隔 ${Math.round(discovery.intervalMs / 1000)} 秒` : ''}`),
+      ...(discovery.pausedReason ? [kv('暂停原因', reasonNames[discovery.pausedReason] || scalar(discovery.pausedReason))] : []),
+      kv('Trending / Trenches 轮询', `${count(trending.polls)} / ${count(trenches.polls)}${finite(pollCount) ? ` · 合计 ${count(pollCount)}` : ''}`),
+      kv('Trending 接收 / 接受 / 去重 / 拒绝 / 截断', `${count(trending.received)} / ${count(trending.accepted)} / ${count(trending.deduplicated)} / ${count(trending.rejected)} / ${count(trending.truncated)}`),
+      kv('Trenches 接收 / 接受 / 去重 / 拒绝 / 截断', `${count(trenches.received)} / ${count(trenches.accepted)} / ${count(trenches.deduplicated)} / ${count(trenches.rejected)} / ${count(trenches.truncated)}`),
+      kv('Trending / Trenches 变化', `${count(trending.changes)} / ${count(trenches.changes)}`),
+      kv('Kline 待补轨迹', `${count(discovery.nominations ?? discovery.queueDepth)} / ${count(discovery.nominationCapacity)} · 淘汰 ${count(discovery.nominationEvictions)} · 拒绝 ${count(discovery.nominationRejected)}`),
+      kv('最近成功', `Trending ${date(trending.lastSuccessAt, true)} · Trenches ${date(trenches.lastSuccessAt, true)}`));
+    if (!compact || discovery.klineSupported || finite(discovery.klinePolls)) runtime.append(
+      kv('Kline 按需补轨迹', !enabled ? '未启用' : discovery.klineSupported === false ? '当前不支持' :
+        `${count(discovery.klinePolls)} 次 · 成功 ${count(discovery.klineSuccesses)} · 幂等 ${count(discovery.klineDuplicates)} · 错误 ${count(discovery.klineErrors)} · 最近 ${date(discovery.lastKlineAt, true)}`));
+    renderPersistentStore(runtime, 'GMGN 市场发现', {...store, enabled}, {
+      usedBytes: store.usedBytes ?? store.storageBytes,
+      records: store.observations,
+      maxRecords: store.maxObservations,
+      recordLabel: '变化记录 / 滚动保留上限',
+      rollingRecords: true,
+      errors: [...errors, store.capacityReached ? 'GMGN_MARKET_DISCOVERY_CAPACITY_REACHED' : undefined],
+    });
+    runtime.append(kv('当前 Feed / 窗口记录', count(store.current)),
+      kv('生命周期回退诊断', `${count(store.lifecycleRegressions)} · 最近 ${date(store.lastLifecycleRegressionAt, true)}`),
+      el('p', 'detail-small', '同一个代币可同时占用 Trending 与 Trenches 的不同窗口记录。生命周期回退只记录上游阶段倒退，不把旧阶段覆盖成当前状态。Trending 用于记录热度变化，Trenches 用于记录发射阶段，Kline 仅对已提名对象按需补充历史轨迹。这些数据只用于研究和钱包画像，不计入 DeBot / Ave 第 3 次通知，不直接下单，也不代替实时持仓报价或止盈止损。'));
+    if (errors.length) {
+      const warning = el('p', 'notice warning', `市场发现最近异常：${errors.map(sourceDiagnostic).join('；')}`);
+      warning.title = errors.join(' · '); runtime.append(warning);
     }
   }
   function renderDebotScanner(runtime, scanner, stream) {
@@ -2345,6 +2396,7 @@
       kv('来源账本滚动淘汰', finite(data.corroboration?.capacityEvictedEvents) ? `${count(data.corroboration.capacityEvictedEvents)} 条 · 保留自 ${date(data.corroboration.retainedFrom, true)}` : '等待状态'),
       kv('档案保留', finite(settings.scanRetentionDays) ? `${settings.scanRetentionDays} 天` : '—'), kv('条件后追踪窗口', finite(settings.trackingHours) ? `${settings.trackingHours} 小时` : '—'), kv('价格轮询间隔', finite(settings.sampleIntervalSec) ? `${settings.sampleIntervalSec} 秒 / 轮` : '—'));
     if (market.lastError || marketCycle.reason) runtime.append(el('p', 'detail-message detail-error', reasonNames[market.lastError || marketCycle.reason] || scalar(market.lastError || marketCycle.reason)));
+    renderGmgnMarketDiscovery(runtime, data.gmgnMarketDiscovery, true);
     if (tracking.lastCycle?.completedAt || tracking.lastAt) runtime.append(kv('最近价格轮询', date(tracking.lastCycle?.completedAt || tracking.lastAt, true)));
     const comparison = data.stats?.comparison;
     if (comparison) {

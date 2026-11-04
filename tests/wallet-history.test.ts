@@ -113,6 +113,56 @@ test('涨幅以首次已观察买入之后的实际价格为基线，不用未�
   } finally {history.close();}
 });
 
+test('GMGN 市场候选只登记研究目标，不伪造钱包交易或价格',()=>{
+  const {history}=fixture(),db=(history as unknown as {db:DatabaseSync}).db;
+  try {
+    const context={source:'gmgn_market_discovery',observedAt:iso(20),kind:'trenches' as const,reason:'category_transition:near_completion',
+      window:'lifecycle',changeKind:'category_transition' as const,category:'near_completion' as const,previousCategory:'new_creation' as const,
+      rank:4,smartDegenCount:7,renownedCount:2,smartDegenDelta:3,renownedDelta:1};
+    history.captureMarketCandidate(token,context);history.captureMarketCandidate(token,context);
+    const stats=history.stats();
+    assert.equal(stats.tokens,1);assert.equal(stats.observations,1);assert.equal(stats.wallets,0);assert.equal(stats.events,0);assert.equal(stats.prices,0);
+    assert.deepEqual(history.watchTargets(5),[token]);
+    const observation=JSON.parse(String(db.prepare("SELECT data FROM wh_observations WHERE kind='market_candidate'").get()!.data));
+    assert.deepEqual({feed:observation.feed,window:observation.window,changeKind:observation.changeKind,category:observation.stage,
+      previousCategory:observation.previousStage,rank:observation.rank,smart:observation.smartDegenCount,renowned:observation.renownedCount,
+      smartDelta:observation.smartDegenDelta,renownedDelta:observation.renownedDelta},
+    {feed:'trenches',window:'lifecycle',changeKind:'category_transition',category:'near_completion',previousCategory:'new_creation',
+      rank:4,smart:7,renowned:2,smartDelta:3,renownedDelta:1});
+    assert.equal(observation.scope,'research_nomination_only');assert.equal(observation.entryPermission,false);assert.equal(observation.countingEvent,false);
+    const priority=db.prepare('SELECT priority,nominated_at,priority_until FROM wh_market_research_targets WHERE chain=? AND address=?')
+      .get(token.chain,token.address)!;
+    assert.ok(Number(priority.priority)>0&&Number(priority.priority)<=100);assert.equal(priority.nominated_at,iso(20));
+    assert.equal(priority.priority_until,iso(20+30*60));
+  } finally {history.close();}
+});
+
+test('市场候选短时优先于既有积压，但每三次让出普通队列且过期后回到 FIFO',()=>{
+  const {history}=fixture();
+  try {
+    const ordinary={chain:'bsc' as const,address:address(8000)};
+    history.captureTokenRanks('bsc',[{address:ordinary.address,rank:1,interval:'1h',changeMetric:'1',changeUnit:'vendor_unspecified'}],
+      {source:'gmgn_rank',observedAt:iso(1)});
+    for(let index=0;index<4;index++)history.captureMarketCandidate({chain:'bsc',address:address(8100+index)},
+      {source:'gmgn_market_discovery',observedAt:iso(20+index),kind:'trending',window:'1m',changeKind:'first_seen',category:'trending',rank:index+1});
+    const chosen=[];
+    for(let turn=0;turn<5;turn++){const target=history.watchTargets(1,new Date(base+100_000),'bsc')[0];chosen.push(target.address);history.markTargetChecked(target,iso(100+turn));}
+    assert.deepEqual(chosen.slice(0,3).every(value=>value!==ordinary.address),true);
+    assert.equal(chosen[3],ordinary.address);assert.notEqual(chosen[4],ordinary.address);
+  } finally {history.close();}
+
+  const {history:decayed}=fixture();
+  try {
+    const ordinary={chain:'bsc' as const,address:address(8200)},candidate={chain:'bsc' as const,address:address(8201)};
+    decayed.captureTokenRanks('bsc',[{address:ordinary.address,rank:1,interval:'1h',changeMetric:'1',changeUnit:'vendor_unspecified'}],
+      {source:'gmgn_rank',observedAt:iso(1)});
+    decayed.captureMarketCandidate(candidate,{source:'gmgn_market_discovery',observedAt:iso(20),kind:'trending',window:'1m',
+      changeKind:'first_seen',category:'trending',rank:1});
+    assert.deepEqual(decayed.watchTargets(1,new Date(base+100_000),'bsc'),[candidate]);
+    assert.deepEqual(decayed.watchTargets(1,new Date(base+2_000_000),'bsc'),[ordinary]);
+  } finally {decayed.close();}
+});
+
 test('共同资金来源排除公共服务/冲突，协同行为至少双方各两笔独立交易且仅是线索',()=>{
   const {history}=fixture();
   try {

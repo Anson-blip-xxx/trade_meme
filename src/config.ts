@@ -45,6 +45,8 @@ export interface Config extends z.infer<typeof schema> {
   gmgnPlusArchive?:{enabled:boolean;database:string;maxBytes:number;intervalSec:number;
     chains:('sol'|'bsc'|'robinhood')[];maxCandidates:number};
   gmgnMarketSignals:{enabled:boolean;intervalMs:number;analysisConcurrency:number;queueCapacity:number};
+  gmgnMarketDiscovery?:{enabled:boolean;database:string;maxBytes:number;intervalSec:number;
+    maxCandidates:number;klineCooldownSec:number};
   scannerChains:Chain[]; ordersDatabase:string;debotSignalsDatabase:string;debotSignalsMaxBytes?:number;debotSessionPath:string;debotLoginEmail?:string;
   entryWallets:Partial<Record<Chain,string>>; entryAmounts:Partial<Record<Chain,string>>;
   entryInputTokens:Partial<Record<Chain,string>>;
@@ -189,6 +191,12 @@ export function readConfig(env:NodeJS.ProcessEnv=process.env): Config {
       intervalMs:z.coerce.number().int().min(1000).max(5000).parse(env.GMGN_MARKET_SIGNAL_INTERVAL_MS??1000),
       analysisConcurrency:z.coerce.number().int().min(1).max(4).parse(env.GMGN_MARKET_SIGNAL_ANALYSIS_CONCURRENCY??1),
       queueCapacity:z.coerce.number().int().min(16).max(2000).parse(env.GMGN_MARKET_SIGNAL_QUEUE_CAPACITY??256)},
+    gmgnMarketDiscovery:{enabled:z.enum(['true','false']).parse(env.GMGN_MARKET_DISCOVERY_ENABLED??'false')==='true',
+      database:z.string().trim().refine(isPersistentOrderPath).parse(env.GMGN_MARKET_DISCOVERY_DATABASE_PATH??'data/gmgn-market-discovery.sqlite'),
+      maxBytes:z.coerce.number().int().min(16).max(1024).parse(env.GMGN_MARKET_DISCOVERY_MAX_MB??128)*1024*1024,
+      intervalSec:z.coerce.number().int().min(10).max(3600).parse(env.GMGN_MARKET_DISCOVERY_INTERVAL_SEC??30),
+      maxCandidates:z.coerce.number().int().min(5).max(100).parse(env.GMGN_MARKET_DISCOVERY_MAX_CANDIDATES??20),
+      klineCooldownSec:z.coerce.number().int().min(30).max(86400).parse(env.GMGN_MARKET_KLINE_COOLDOWN_SEC??300)},
     walletIdentitiesPath:env.WALLET_IDENTITIES_PATH,
     scannerChains:z.array(z.enum(['bsc','solana','robinhood'])).min(1).parse([...new Set((env.SCANNER_CHAINS??'bsc,solana,robinhood').split(',').map(v=>v.trim()))]),
     // Raw research stays ephemeral; the dashboard retains only bounded compact summaries.

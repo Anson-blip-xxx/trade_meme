@@ -20,6 +20,12 @@ const BACKGROUND_FAIRNESS_INTERVAL_MS = 4_000;
 // request release the lane. This is capped again by MAX_QUEUE_WAIT_MS below,
 // so continuous live-entry traffic still cannot retain a queued job forever.
 const BACKGROUND_FAIRNESS_GRACE_MS = REQUEST_TIMEOUT_MS + 1_000;
+// Discovery is deliberately lower priority than the one-second Market Signal
+// poll, but an always-busy signal lane must not starve it forever. Grant one
+// bounded, signal-proof read per credential in this interval. Live entry can
+// still interrupt the read immediately.
+const DISCOVERY_FAIRNESS_INTERVAL_MS = 30_000;
+const DISCOVERY_SIGNAL_PROTECTION_MS = 3_000;
 // GMGN documents the plan bucket as weight units refilled per second
 // (Free 5/5, Plus 20/20, Pro 50/50). The 350 ms floor is intentionally
 // conservative enough for Free even when a route carries multiple units.
@@ -29,15 +35,18 @@ const MAX_OBSERVED_INTERVAL_MS = RATE_WINDOW_MS;
 const MAX_VALID_RATE_LIMIT = 100;
 // Only fixed read-only routes verified in the official OpenApiClient. No
 // writes, arbitrary URL, guessed funding endpoint, or redirects.
-const READ_ROUTES = new Map<string, number>([
-  ['/v1/token/info', 1], ['/v1/token/security', 1], ['/v1/token/pool_info', 1],
-  ['/v1/market/token_top_holders', 5], ['/v1/market/token_top_traders', 5],
-  ['/v1/market/token_kline', 2], ['/v1/market/rank', 3], ['/v1/market/search', 1],
-  ['/v1/user/kol', 1], ['/v1/user/smartmoney', 1],
-  ['/v1/user/wallet_stats', 3], ['/v1/user/wallet_activity', 3],
-  ['/v1/user/wallet_token_balance', 2], ['/v1/user/created_tokens', 2],
-  ['/v1/user/info', 2], ['/v1/user/follow_tokens', 3], ['/v1/user/follow_token_groups', 1],
-  ['/v1/trade/gas_price', 1], ['/v1/trade/quote', 10],
+const READ_ROUTES = new Map<string, Readonly<{method:'GET'|'POST';weight:number}>>([
+  ['/v1/token/info', {method:'GET',weight:1}], ['/v1/token/security', {method:'GET',weight:1}],
+  ['/v1/token/pool_info', {method:'GET',weight:1}],
+  ['/v1/market/token_top_holders', {method:'GET',weight:5}], ['/v1/market/token_top_traders', {method:'GET',weight:5}],
+  ['/v1/market/token_kline', {method:'GET',weight:2}], ['/v1/market/rank', {method:'GET',weight:3}],
+  ['/v1/trenches', {method:'POST',weight:2}], ['/v1/market/search', {method:'GET',weight:1}],
+  ['/v1/user/kol', {method:'GET',weight:1}], ['/v1/user/smartmoney', {method:'GET',weight:1}],
+  ['/v1/user/wallet_stats', {method:'GET',weight:3}], ['/v1/user/wallet_activity', {method:'GET',weight:3}],
+  ['/v1/user/wallet_token_balance', {method:'GET',weight:2}], ['/v1/user/created_tokens', {method:'GET',weight:2}],
+  ['/v1/user/info', {method:'GET',weight:2}], ['/v1/user/follow_tokens', {method:'GET',weight:3}],
+  ['/v1/user/follow_token_groups', {method:'GET',weight:1}], ['/v1/trade/gas_price', {method:'GET',weight:1}],
+  ['/v1/trade/quote', {method:'GET',weight:10}],
 ]);
 
 export type GmgnErrorReason = 'GMGN_API_KEY_MISSING' | 'GMGN_PATH_NOT_ALLOWED' | 'GMGN_QUERY_INVALID'
@@ -65,11 +74,17 @@ export class GmgnError extends Error {
 interface RateState {
   nextAt: number;
   cooldownUntil: number;
+  /** Quota window consumed by an aborted discovery read; urgent work may bypass it. */
+  preemptedReadDebtUntil?: number;
   observedIntervalMs: number;
   lastStartedAt?: number;
   lastCost?: number;
   /** Earliest next fairness grant after one protected archive turn starts. */
   nextBackgroundFairAt?: number;
+  /** Earliest next bounded turn for disposable Market discovery. */
+  nextDiscoveryFairAt?: number;
+  /** An earlier disposable read was cut short by Signal and is owed one bounded retry. */
+  discoverySignalProtectionPending?: boolean;
   /** Archive work is owed one full turn after a higher-priority interruption. */
   backgroundSignalProtectionPending?: boolean;
 }
@@ -92,14 +107,18 @@ interface ScheduledRequest<T> {
   reject: (error: unknown) => void;
   timer?: ReturnType<typeof setTimeout>;
   fairnessTimer?: ReturnType<typeof setTimeout>;
+  protectionTimer?: ReturnType<typeof setTimeout>;
   abort?: () => void;
   interrupt?: () => void;
+  rollbackPacing?: () => void;
   protectedFromSignalPoll?: boolean;
   interruptedBySignalPoll?: boolean;
   interruptedByLiveEntry?: boolean;
   backgroundFairAt?: number;
   backgroundFairTurn?: boolean;
   extendFairnessPromise?: boolean;
+  /** Disposable discovery reads never earn or consume archive fairness. */
+  disposableBackground?: boolean;
   started: boolean;
   settled: boolean;
 }
@@ -126,6 +145,7 @@ function removeScheduled(job: ScheduledRequest<unknown>): boolean {
 function cleanupScheduled(job: ScheduledRequest<unknown>): void {
   if (job.timer) clearTimeout(job.timer);
   if (job.fairnessTimer) clearTimeout(job.fairnessTimer);
+  if (job.protectionTimer) clearTimeout(job.protectionTimer);
   if (job.abort && job.signal) job.signal.removeEventListener('abort', job.abort);
 }
 function rejectScheduled(job: ScheduledRequest<unknown>, error: unknown): void {
@@ -166,10 +186,11 @@ function effectiveBackgroundFairAt(job:ScheduledRequest<unknown>):number {
 function laneHasBackgroundFairTurn(job:ScheduledRequest<unknown>):boolean {
   if(backgroundQueue.some(other=>other!==job&&other.lane===job.lane&&other.backgroundFairTurn))return true;
   const active=activeRequests.get(job.lane);
-  return active?.priority==='background'&&active.protectedFromSignalPoll===true;
+  return active?.priority==='background'&&!active.disposableBackground&&active.protectedFromSignalPoll===true;
 }
 function grantBackgroundFairTurn(job: ScheduledRequest<unknown>, now: number): boolean {
   if (job.started || job.settled || job.priority !== 'background' || job.backgroundFairTurn ||
+      job.disposableBackground ||
       !backgroundQueue.includes(job)) return false;
   const position=backgroundQueue.indexOf(job);
   if(backgroundQueue.slice(0,position).some(earlier=>earlier.lane===job.lane))return false;
@@ -225,14 +246,25 @@ function nextReadyBackground(now: number): {
   let wait = Number.POSITIVE_INFINITY;
   let unopposed: ScheduledRequest<unknown> | undefined;
   let fair: ScheduledRequest<unknown> | undefined;
+  let discoveryFair: ScheduledRequest<unknown> | undefined;
   for (const job of backgroundQueue) {
     if (activeLanes.has(job.lane)) continue;
     const pacingWait = Math.max(0, job.waitMs());
     if (pacingWait > 0) { wait = Math.min(wait, pacingWait); continue; }
+    const signalContended=signalPollQueue.some(signal=>signal.lane===job.lane);
+    // Disposable discovery receives one complete but time-bounded turn per
+    // credential only when Signal is actually contending (or cut its prior
+    // attempt short). Unopposed research neither consumes a slot nor gains a
+    // special timeout. This remains separate from durable archive fairness.
+    if(job.disposableBackground&&(signalContended||job.lane.discoverySignalProtectionPending) &&
+        now>=(job.lane.nextDiscoveryFairAt??Number.NEGATIVE_INFINITY)){
+      discoveryFair??=job;
+      continue;
+    }
     // Once a signal poll has cut an archive request short, the next archive
     // attempt must finish (or hit its own timeout) before more signal polls on
     // this credential. This prevents a 1 s poller from starving persistence.
-    if (job.lane.backgroundSignalProtectionPending || job.backgroundFairTurn)
+    if ((!job.disposableBackground && job.lane.backgroundSignalProtectionPending) || job.backgroundFairTurn)
       return {job, wait: 0, contended: true, protectedTurn: true};
     // Signal polling is intentionally above ordinary reads, but it still has
     // to yield one complete archive turn at the same bounded fairness boundary.
@@ -252,6 +284,7 @@ function nextReadyBackground(now: number): {
   // A fairness turn is complete, not merely permission to start. New signal
   // polls may queue behind it but cannot interrupt it; live entry still can.
   if (fair) return {job: fair, wait: 0, contended: true, protectedTurn: true};
+  if (discoveryFair) return {job: discoveryFair, wait: 0, contended: true, protectedTurn: true};
   if (unopposed) return {job: unopposed, wait: 0, contended: false, protectedTurn: false};
   return {wait, contended: false, protectedTurn: false};
 }
@@ -280,8 +313,17 @@ async function drainScheduler(): Promise<void> {
       removeScheduled(selected); selected.started = true; cleanupScheduled(selected); activeLanes.add(selected.lane);
       if (selected.priority === 'background') {
         selected.protectedFromSignalPoll = selected === background.job && background.protectedTurn;
-        if(selected.protectedFromSignalPoll)
-          selected.lane.nextBackgroundFairAt=now+BACKGROUND_FAIRNESS_INTERVAL_MS;
+        if(selected.protectedFromSignalPoll){
+          if(selected.disposableBackground){
+            selected.lane.nextDiscoveryFairAt=now+DISCOVERY_FAIRNESS_INTERVAL_MS;
+            selected.lane.discoverySignalProtectionPending=false;
+            // A slow upstream cannot hold Market Signal for the normal 12 s
+            // request timeout. Abort this research read at the explicit bound.
+            selected.protectionTimer=setTimeout(()=>{
+              if(activeRequests.get(selected.lane)===selected)selected.interrupt?.();
+            },DISCOVERY_SIGNAL_PROTECTION_MS);
+          }else selected.lane.nextBackgroundFairAt=now+BACKGROUND_FAIRNESS_INTERVAL_MS;
+        }
       }
       activeRequests.set(selected.lane,selected);
       void (async () => {
@@ -295,12 +337,12 @@ async function drainScheduler(): Promise<void> {
         // its own endpoint fails or times out. Only a live-entry preemption
         // preserves protection for the retry; a bad archive route must not
         // become a permanent blocker for signal polling.
-        if (selected.priority === 'background' && !selected.interruptedByLiveEntry &&
+        if (selected.priority === 'background' && !selected.disposableBackground && !selected.interruptedByLiveEntry &&
             (completed || selected.protectedFromSignalPoll))
           selected.lane.backgroundSignalProtectionPending = false;
         // Let a completed high-priority metadata read enqueue its dependent
         // holder reads before releasing this credential lane to background work.
-        await Promise.resolve(); activeLanes.delete(selected.lane); activeRequests.delete(selected.lane); kickScheduler();
+        await Promise.resolve();cleanupScheduled(selected);activeLanes.delete(selected.lane); activeRequests.delete(selected.lane); kickScheduler();
       })();
     }
   } finally { schedulerActive = false; }
@@ -330,7 +372,7 @@ function enqueueScheduled<T>(job: Omit<ScheduledRequest<T>, 'resolve'|'reject'|'
     scheduled.signal?.addEventListener('abort', scheduled.abort, {once: true});
     if (scheduled.signal?.aborted) { scheduled.abort(); return; }
     queue.push(scheduled as ScheduledRequest<unknown>);
-    if(scheduled.priority==='background')scheduled.fairnessTimer=setTimeout(()=>{
+    if(scheduled.priority==='background'&&!scheduled.disposableBackground)scheduled.fairnessTimer=setTimeout(()=>{
       grantBackgroundFairTurn(scheduled as ScheduledRequest<unknown>,Date.now());
       kickScheduler();
     },BACKGROUND_FAIRNESS_INTERVAL_MS);
@@ -338,7 +380,22 @@ function enqueueScheduled<T>(job: Omit<ScheduledRequest<T>, 'resolve'|'reject'|'
     // signal-proof turn, while live entry can always preempt either read lane.
     if(scheduled.priority==='signal_poll'||scheduled.priority==='live_entry') {
       const active=activeRequests.get(scheduled.lane);
-      if(active?.priority==='background'&&active.interrupt) {
+      // A typed market-discovery call remains disposable even if a caller
+      // supplies an unusual queue priority. Signal polling and live execution
+      // always cut it short; only durable archive reads participate in the
+      // background fairness contract below.
+      if(active?.disposableBackground&&active.interrupt) {
+        if(scheduled.priority==='live_entry'){
+          active.interruptedByLiveEntry=true;
+          active.rollbackPacing?.();
+          active.interrupt();
+        }else if(!active.protectedFromSignalPoll){
+          active.interruptedBySignalPoll=true;
+          active.lane.discoverySignalProtectionPending=true;
+          active.rollbackPacing?.();
+          active.interrupt();
+        }
+      } else if(active?.priority==='background'&&active.interrupt) {
         if(scheduled.priority==='live_entry') {
           active.interruptedByLiveEntry=true;
           // A live request can always preempt archive work. If that archive was
@@ -347,7 +404,11 @@ function enqueueScheduled<T>(job: Omit<ScheduledRequest<T>, 'resolve'|'reject'|'
           active.interrupt();
         } else if(!active.protectedFromSignalPoll&&!active.interruptedBySignalPoll) {
           active.interruptedBySignalPoll=true;
-          active.lane.backgroundSignalProtectionPending=true;
+          // Discovery snapshots are disposable and retried on their next
+          // scanner cycle. They must not mint the signal-proof retry reserved
+          // for durable archive work, otherwise a one-second Market Signal
+          // poll can be held behind every consecutive discovery request.
+          if(!active.disposableBackground)active.lane.backgroundSignalProtectionPending=true;
           active.interrupt();
         }
       } else if(scheduled.priority==='live_entry'&&active?.priority==='signal_poll') active.interrupt?.();
@@ -359,6 +420,158 @@ const rateStates = new Map<string, RateState>();
 const object = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value);
 type QueryValue=string|number|readonly string[];
+
+export type GmgnMarketChain='sol'|'bsc'|'base'|'eth'|'arbitrum'|'hyperevm'|'robinhood'|'arc'|'stable'|'avalanche';
+export type GmgnMarketDirection='asc'|'desc';
+export type GmgnMarketRange=Readonly<{min?:number;max?:number}>;
+export type GmgnMarketRanges<Metric extends string>=Readonly<Partial<Record<Metric,GmgnMarketRange>>>;
+export type GmgnTrendingInterval='1m'|'5m'|'1h'|'6h'|'24h';
+export type GmgnTrendingOrder='default'|'swaps'|'marketcap'|'history_highest_market_cap'|'liquidity'|'volume'|
+  'holder_count'|'smart_degen_count'|'renowned_count'|'gas_fee'|'price'|'change1m'|'change5m'|'change1h'|
+  'creation_timestamp';
+export type GmgnTrendingFilter='renounced'|'frozen'|'burn'|'token_burnt'|'has_social'|'not_social_dup'|
+  'not_image_dup'|'dexscr_update_link'|'not_wash_trading'|'is_internal_market'|'is_out_market'|
+  'not_honeypot'|'verified'|'locked';
+export type GmgnTrendingRangeMetric='volume'|'liquidity'|'marketcap'|'historyHighestMarketcap'|'swaps'|
+  'holderCount'|'gasFee'|'renownedCount'|'smartDegenCount'|'botDegenCount'|'visitingCount'|
+  'priceChangePercent'|'insiderRate'|'bundlerRate'|'entrapmentRatio'|'top10HolderRate'|
+  'top70SniperHoldRate'|'devTeamHoldRate';
+export interface GmgnMarketTrendingOptions {
+  interval:GmgnTrendingInterval;
+  limit?:number;
+  orderBy?:GmgnTrendingOrder;
+  direction?:GmgnMarketDirection;
+  filters?:readonly GmgnTrendingFilter[];
+  /** Platform names are shape-checked, not allowlisted, so newly supported launchpads remain visible. */
+  platforms?:readonly string[];
+  ranges?:GmgnMarketRanges<GmgnTrendingRangeMetric>;
+  /** Token age, not a timestamp. Unit suffix is mandatory. */
+  minAge?:`${number}${'m'|'h'|'d'}`;
+  /** Token age, not a timestamp. Unit suffix is mandatory. */
+  maxAge?:`${number}${'m'|'h'|'d'}`;
+}
+
+export type GmgnTrenchesCategory='new_creation'|'near_completion'|'completed';
+export type GmgnTrenchesRangeMetric='volume24h'|'netBuy24h'|'swaps24h'|'buys24h'|'sells24h'|
+  'visitingCount'|'progress'|'marketcap'|'liquidity'|'holderCount'|'topHolderRate'|'rugRatio'|
+  'bundlerRate'|'insiderRatio'|'entrapmentRatio'|'privateVaultHoldRate'|'top70SniperHoldRate'|
+  'botCount'|'botDegenRate'|'freshWalletRate'|'totalFee'|'smartDegenCount'|'renownedCount'|
+  'creatorBalanceRate'|'creatorCreatedCount'|'creatorCreatedOpenCount'|'creatorCreatedOpenRatio'|
+  'xFollower'|'twitterRenameCount'|'tgCallCount';
+export interface GmgnMarketTrenchesOptions {
+  categories?:readonly GmgnTrenchesCategory[];
+  platforms?:readonly string[];
+  /** GMGN applies this limit independently to each selected category. */
+  limit?:number;
+  ranges?:GmgnMarketRanges<GmgnTrenchesRangeMetric>;
+  /** Token age. Trenches accepts seconds or minutes. */
+  minAge?:`${number}${'s'|'m'}`;
+  /** Token age. Trenches accepts seconds or minutes. */
+  maxAge?:`${number}${'s'|'m'}`;
+}
+
+export type GmgnKlineResolution='30s'|'1m'|'5m'|'15m'|'1h'|'4h'|'1d';
+export interface GmgnMarketKlineOptions {
+  resolution:GmgnKlineResolution;
+  /** Inclusive Unix timestamp in seconds; the GMGN wire format uses milliseconds. */
+  from?:number;
+  /** Inclusive Unix timestamp in seconds; the GMGN wire format uses milliseconds. */
+  to?:number;
+}
+
+type RangeKind='nonnegative'|'signed'|'integer'|'ratio';
+const MARKET_CHAINS=new Set<GmgnMarketChain>(['sol','bsc','base','eth','arbitrum','hyperevm','robinhood','arc','stable','avalanche']);
+const TRENDING_INTERVALS=new Set<GmgnTrendingInterval>(['1m','5m','1h','6h','24h']);
+const TRENDING_ORDERS=new Set<GmgnTrendingOrder>(['default','swaps','marketcap','history_highest_market_cap',
+  'liquidity','volume','holder_count','smart_degen_count','renowned_count','gas_fee','price','change1m',
+  'change5m','change1h','creation_timestamp']);
+const TRENDING_SOL_FILTERS=new Set<GmgnTrendingFilter>(['renounced','frozen','burn','token_burnt','has_social',
+  'not_social_dup','not_image_dup','dexscr_update_link','not_wash_trading','is_internal_market','is_out_market']);
+const TRENDING_EVM_FILTERS=new Set<GmgnTrendingFilter>(['not_honeypot','verified','renounced','locked','token_burnt',
+  'has_social','not_social_dup','not_image_dup','dexscr_update_link','is_internal_market','is_out_market']);
+const TRENCHES_CATEGORIES=new Set<GmgnTrenchesCategory>(['new_creation','near_completion','completed']);
+const KLINE_RESOLUTIONS=new Set<GmgnKlineResolution>(['30s','1m','5m','15m','1h','4h','1d']);
+const MARKET_PLATFORM=/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const SOL_MARKET_ADDRESS=/^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+const EVM_MARKET_ADDRESS=/^0x[0-9a-f]{40}$/i;
+const MAX_MARKET_FILTER_VALUE=1e15,MAX_MARKET_FILTER_COUNT=1e9,MAX_UNIX_SECONDS=8_640_000_000_000;
+const TRENDING_RANGE_FIELDS:Readonly<Record<GmgnTrendingRangeMetric,readonly [string,RangeKind]>>={
+  volume:['volume','nonnegative'],liquidity:['liquidity','nonnegative'],marketcap:['marketcap','nonnegative'],
+  historyHighestMarketcap:['history_highest_marketcap','nonnegative'],swaps:['swaps','integer'],
+  holderCount:['holder_count','integer'],gasFee:['gas_fee','nonnegative'],renownedCount:['renowned_count','integer'],
+  smartDegenCount:['smart_degen_count','integer'],botDegenCount:['bot_degen_count','integer'],
+  visitingCount:['visiting_count','integer'],priceChangePercent:['price_change_percent','signed'],
+  insiderRate:['insider_rate','ratio'],bundlerRate:['bundler_rate','ratio'],entrapmentRatio:['entrapment_ratio','ratio'],
+  top10HolderRate:['top10_holder_rate','ratio'],top70SniperHoldRate:['top70_sniper_hold_rate','ratio'],
+  devTeamHoldRate:['dev_team_hold_rate','ratio'],
+};
+const TRENCHES_RANGE_FIELDS:Readonly<Record<GmgnTrenchesRangeMetric,readonly [string,RangeKind]>>={
+  volume24h:['volume_24h','nonnegative'],netBuy24h:['net_buy_24h','signed'],swaps24h:['swaps_24h','integer'],
+  buys24h:['buys_24h','integer'],sells24h:['sells_24h','integer'],visitingCount:['visiting_count','integer'],
+  progress:['progress','ratio'],marketcap:['marketcap','nonnegative'],liquidity:['liquidity','nonnegative'],
+  holderCount:['holder_count','integer'],topHolderRate:['top_holder_rate','ratio'],rugRatio:['rug_ratio','ratio'],
+  bundlerRate:['bundler_rate','ratio'],insiderRatio:['insider_ratio','ratio'],entrapmentRatio:['entrapment_ratio','ratio'],
+  privateVaultHoldRate:['private_vault_hold_rate','ratio'],top70SniperHoldRate:['top70_sniper_hold_rate','ratio'],
+  botCount:['bot_count','integer'],botDegenRate:['bot_degen_rate','ratio'],freshWalletRate:['fresh_wallet_rate','ratio'],
+  totalFee:['total_fee','nonnegative'],smartDegenCount:['smart_degen_count','integer'],
+  renownedCount:['renowned_count','integer'],creatorBalanceRate:['creator_balance_rate','ratio'],
+  creatorCreatedCount:['creator_created_count','integer'],creatorCreatedOpenCount:['creator_created_open_count','integer'],
+  creatorCreatedOpenRatio:['creator_created_open_ratio','ratio'],xFollower:['x_follower','integer'],
+  twitterRenameCount:['twitter_rename_count','integer'],tgCallCount:['tg_call_count','integer'],
+};
+
+function marketInput():never {throw new GmgnError('GMGN_QUERY_INVALID');}
+function strictOptions(value:unknown,allowed:readonly string[]):Record<string,unknown>{
+  if(!object(value)||Object.keys(value).some(key=>!allowed.includes(key)))return marketInput();
+  return value;
+}
+function marketChain(value:unknown):GmgnMarketChain {
+  if(typeof value!=='string'||!MARKET_CHAINS.has(value as GmgnMarketChain))return marketInput();
+  return value as GmgnMarketChain;
+}
+function marketAddress(chain:GmgnMarketChain,value:unknown):string {
+  if(typeof value!=='string'||!(chain==='sol'?SOL_MARKET_ADDRESS:EVM_MARKET_ADDRESS).test(value))return marketInput();
+  return value;
+}
+function uniqueStrings(value:unknown,max:number,valid:(item:string)=>boolean):string[]|undefined {
+  if(value===undefined)return undefined;
+  if(!Array.isArray(value)||value.length>max||value.some(item=>typeof item!=='string'||!valid(item)))return marketInput();
+  const unique=[...new Set(value as string[])];
+  if(unique.length>max)return marketInput();
+  return unique;
+}
+function validRangeValue(value:unknown,kind:RangeKind):value is number {
+  if(typeof value!=='number'||!Number.isFinite(value))return false;
+  if(kind==='ratio')return value>=0&&value<=1;
+  if(kind==='integer')return Number.isSafeInteger(value)&&value>=0&&value<=MAX_MARKET_FILTER_COUNT;
+  if(kind==='nonnegative')return value>=0&&value<=MAX_MARKET_FILTER_VALUE;
+  return Math.abs(value)<=MAX_MARKET_FILTER_VALUE;
+}
+function appendMarketRanges(query:Record<string,QueryValue>,value:unknown,
+  fields:Readonly<Record<string,readonly [string,RangeKind]>>):void {
+  if(value===undefined)return;
+  if(!object(value)||Object.keys(value).length>Object.keys(fields).length)return marketInput();
+  for(const [metric,raw] of Object.entries(value)){
+    const field=fields[metric];
+    if(!field||!object(raw)||Object.keys(raw).some(key=>key!=='min'&&key!=='max')||
+      !Object.hasOwn(raw,'min')&&!Object.hasOwn(raw,'max'))return marketInput();
+    const min=raw.min,max=raw.max;
+    if(min!==undefined&&!validRangeValue(min,field[1])||max!==undefined&&!validRangeValue(max,field[1])||
+      typeof min==='number'&&typeof max==='number'&&min>max)return marketInput();
+    if(typeof min==='number')query[`min_${field[0]}`]=min;
+    if(typeof max==='number')query[`max_${field[0]}`]=max;
+  }
+}
+function marketAge(value:unknown,units:readonly string[]):{wire:string;seconds:number}|undefined {
+  if(value===undefined)return undefined;
+  if(typeof value!=='string'||value.length>24)return marketInput();
+  const match=/^(?:0|[1-9]\d{0,14})(?:\.\d{1,6})?([smhd])$/.exec(value);
+  if(!match||!units.includes(match[1]))return marketInput();
+  const amount=Number(value.slice(0,-1)),factor=match[1]==='s'?1:match[1]==='m'?60:match[1]==='h'?3600:86400;
+  const seconds=amount*factor;
+  if(!Number.isFinite(seconds)||seconds>MAX_UNIX_SECONDS)return marketInput();
+  return {wire:value,seconds};
+}
 
 export interface GmgnClientOptions {
   apiKey?: string;
@@ -406,8 +619,8 @@ export class GmgnClient {
     scheduling: GmgnScheduleOptions = {}): Promise<unknown> {
     this.checkAborted();
     if (!this.apiKey) throw new GmgnError('GMGN_API_KEY_MISSING');
-    const routeWeight = READ_ROUTES.get(path);
-    if (routeWeight === undefined) throw new GmgnError('GMGN_PATH_NOT_ALLOWED');
+    const route = READ_ROUTES.get(path);
+    if (route?.method !== 'GET') throw new GmgnError('GMGN_PATH_NOT_ALLOWED');
     if (!object(query) || Object.keys(query).length > 40 ||
         Object.entries(query).some(([key, value]) => !/^[a-z][a-z0-9_]{0,63}$/.test(key) ||
           ['timestamp', 'client_id'].includes(key) ||
@@ -417,7 +630,7 @@ export class GmgnClient {
       throw new GmgnError('GMGN_QUERY_INVALID');
     }
     const safeQuery = {...query};
-    const cost = Math.max(routeWeight, Math.ceil(weight ?? routeWeight));
+    const cost = Math.max(route.weight, Math.ceil(weight ?? route.weight));
     return this.scheduleRequest(cost, () => this.request(path, safeQuery), scheduling);
   }
 
@@ -447,6 +660,80 @@ export class GmgnClient {
         // Keep them in their own group so they cannot crowd smart/KOL calls
         // out of GMGN's per-group 50-row response cap.
         {signal_type:[1,2,3,4,5,8,9]}]},signal,MAX_MARKET_SIGNAL_RESPONSE_BYTES));
+  }
+
+  /** Fixed read-only GMGN swap-activity ranking. */
+  async getMarketTrending(chain:GmgnMarketChain,options:GmgnMarketTrendingOptions,
+    scheduling:GmgnScheduleOptions=DEFAULT_BACKGROUND_SCHEDULING):Promise<unknown>{
+    this.checkAborted();if(!this.apiKey)throw new GmgnError('GMGN_API_KEY_MISSING');
+    const safeChain=marketChain(chain),raw=strictOptions(options,
+      ['interval','limit','orderBy','direction','filters','platforms','ranges','minAge','maxAge']);
+    if(typeof raw.interval!=='string'||!TRENDING_INTERVALS.has(raw.interval as GmgnTrendingInterval)||
+      raw.limit!==undefined&&(!Number.isSafeInteger(raw.limit)||Number(raw.limit)<1||Number(raw.limit)>100)||
+      raw.orderBy!==undefined&&(typeof raw.orderBy!=='string'||!TRENDING_ORDERS.has(raw.orderBy as GmgnTrendingOrder))||
+      raw.direction!==undefined&&!['asc','desc'].includes(String(raw.direction)))return marketInput();
+    const allowedFilters=safeChain==='sol'?TRENDING_SOL_FILTERS:TRENDING_EVM_FILTERS;
+    const filters=uniqueStrings(raw.filters,16,item=>allowedFilters.has(item as GmgnTrendingFilter));
+    const platforms=uniqueStrings(raw.platforms,32,item=>MARKET_PLATFORM.test(item));
+    const minAge=marketAge(raw.minAge,['m','h','d']),maxAge=marketAge(raw.maxAge,['m','h','d']);
+    if(minAge&&maxAge&&minAge.seconds>maxAge.seconds)return marketInput();
+    const query:Record<string,QueryValue>={chain:safeChain,interval:raw.interval,limit:(raw.limit as number|undefined)??100};
+    if(raw.orderBy!==undefined)query.order_by=raw.orderBy as string;
+    if(raw.direction!==undefined)query.direction=raw.direction as string;
+    if(filters?.length)query.filters=filters;
+    if(platforms?.length)query.platforms=platforms;
+    if(minAge)query.min_created=minAge.wire;
+    if(maxAge)query.max_created=maxAge.wire;
+    appendMarketRanges(query,raw.ranges,TRENDING_RANGE_FIELDS);
+    return this.backgroundRequest(READ_ROUTES.get('/v1/market/rank')!.weight,scheduling,
+      signal=>this.request('/v1/market/rank',query,false,'GET',undefined,signal,MAX_RESPONSE_BYTES),true);
+  }
+
+  /** Fixed read-only launchpad lifecycle listing. The server applies current platform defaults when omitted. */
+  async getMarketTrenches(chain:GmgnMarketChain,options:GmgnMarketTrenchesOptions={},
+    scheduling:GmgnScheduleOptions=DEFAULT_BACKGROUND_SCHEDULING):Promise<unknown>{
+    this.checkAborted();if(!this.apiKey)throw new GmgnError('GMGN_API_KEY_MISSING');
+    const safeChain=marketChain(chain),raw=strictOptions(options,
+      ['categories','platforms','limit','ranges','minAge','maxAge']);
+    if(raw.limit!==undefined&&(!Number.isSafeInteger(raw.limit)||Number(raw.limit)<1||Number(raw.limit)>80))return marketInput();
+    let categories:GmgnTrenchesCategory[]=['new_creation','near_completion','completed'];
+    if(raw.categories!==undefined){
+      const selected=uniqueStrings(raw.categories,3,item=>TRENCHES_CATEGORIES.has(item as GmgnTrenchesCategory));
+      if(!selected?.length)return marketInput();
+      categories=selected as GmgnTrenchesCategory[];
+    }
+    const platforms=uniqueStrings(raw.platforms,32,item=>MARKET_PLATFORM.test(item));
+    const minAge=marketAge(raw.minAge,['s','m']),maxAge=marketAge(raw.maxAge,['s','m']);
+    if(minAge&&maxAge&&minAge.seconds>maxAge.seconds)return marketInput();
+    const sectionFields:Record<string,QueryValue>={limit:(raw.limit as number|undefined)??80};
+    if(platforms?.length)sectionFields.launchpad_platform=platforms;
+    if(minAge)sectionFields.min_created=minAge.wire;
+    if(maxAge)sectionFields.max_created=maxAge.wire;
+    appendMarketRanges(sectionFields,raw.ranges,TRENCHES_RANGE_FIELDS);
+    const section={filters:['offchain','onchain'],launchpad_platform_v2:true,...sectionFields};
+    const body:Record<string,unknown>={version:'v2'};
+    for(const category of categories)body[category]={...section};
+    return this.backgroundRequest(READ_ROUTES.get('/v1/trenches')!.weight,scheduling,
+      signal=>this.request('/v1/trenches',{chain:safeChain},false,'POST',body,signal,MAX_RESPONSE_BYTES),true);
+  }
+
+  /** Standard-plan K-line data. The Pro-only 1s route is deliberately rejected rather than silently degraded. */
+  async getMarketKline(chain:GmgnMarketChain,address:string,options:GmgnMarketKlineOptions,
+    scheduling:GmgnScheduleOptions=DEFAULT_BACKGROUND_SCHEDULING):Promise<unknown>{
+    this.checkAborted();if(!this.apiKey)throw new GmgnError('GMGN_API_KEY_MISSING');
+    const safeChain=marketChain(chain),safeAddress=marketAddress(safeChain,address),raw=strictOptions(options,
+      ['resolution','from','to']);
+    if(typeof raw.resolution!=='string'||!KLINE_RESOLUTIONS.has(raw.resolution as GmgnKlineResolution))return marketInput();
+    for(const value of [raw.from,raw.to])if(value!==undefined&&
+      (!Number.isSafeInteger(value)||Number(value)<0||Number(value)>MAX_UNIX_SECONDS))return marketInput();
+    if(typeof raw.from==='number'&&typeof raw.to==='number'&&raw.from>raw.to)return marketInput();
+    const query:Record<string,QueryValue>={chain:safeChain,address:safeAddress,resolution:raw.resolution};
+    // The public CLI accepts Unix seconds but its OpenAPI client sends
+    // milliseconds. Keep this boundary explicit so callers cannot mix units.
+    if(typeof raw.from==='number')query.from=raw.from*1_000;
+    if(typeof raw.to==='number')query.to=raw.to*1_000;
+    return this.backgroundRequest(READ_ROUTES.get('/v1/market/token_kline')!.weight,scheduling,
+      signal=>this.request('/v1/market/token_kline',query,false,'GET',undefined,signal,MAX_RESPONSE_BYTES),true);
   }
 
   /** Latest or cursor page from GMGN's read-only global call-out feed. */
@@ -519,15 +806,16 @@ export class GmgnClient {
     return safe;
   }
 
-  private backgroundRequest<T>(weight:number,scheduling:GmgnScheduleOptions,run:(signal:AbortSignal)=>Promise<T>):Promise<T>{
+  private backgroundRequest<T>(weight:number,scheduling:GmgnScheduleOptions,run:(signal:AbortSignal)=>Promise<T>,
+    disposableBackground=false):Promise<T>{
     const controller=new AbortController();
     return this.scheduleRequest(weight,()=>run(controller.signal),scheduling,()=>controller.abort(),
-      scheduling===DEFAULT_BACKGROUND_SCHEDULING);
+      !disposableBackground&&scheduling===DEFAULT_BACKGROUND_SCHEDULING,disposableBackground);
   }
 
   /** Shared budget only: this does not expose a network write method or credentials. */
   async scheduleRequest<T>(weight: number, execute: () => Promise<T>, scheduling: GmgnScheduleOptions = {},
-    interrupt?:()=>void,extendFairnessPromise=false): Promise<T> {
+    interrupt?:()=>void,extendFairnessPromise=false,disposableBackground=false): Promise<T> {
     this.checkAborted();
     if (!this.apiKey) throw new GmgnError('GMGN_API_KEY_MISSING');
     if (!Number.isFinite(weight) || weight < 1 || weight > 100) throw new GmgnError('GMGN_QUERY_INVALID');
@@ -537,18 +825,42 @@ export class GmgnClient {
       scheduling.queueTimeoutMs < 1 || scheduling.queueTimeoutMs > MAX_QUEUE_WAIT_MS)) throw new GmgnError('GMGN_QUERY_INVALID');
     const cost = Math.ceil(weight), priority = scheduling.priority ?? 'normal';
     const queueTimeoutMs = Math.floor(scheduling.queueTimeoutMs ?? MAX_QUEUE_WAIT_MS);
+    let pacingReservation:Readonly<{previousNextAt:number;reservedNextAt:number;previousStartedAt?:number;
+      previousCost?:number;startedAt:number}>|undefined;
+    const rollbackPacing=disposableBackground?()=>{
+      const reservation=pacingReservation;
+      if(!reservation||this.state.lastStartedAt!==reservation.startedAt||this.state.lastCost!==cost)return;
+      // The request has already reached GMGN and may have consumed quota even
+      // though its response is discarded. Urgent signal/execution work can use
+      // the remaining Free-tier unit immediately, while every ordinary read
+      // keeps respecting the original weighted reservation. If response
+      // headers lengthened this request's reservation, retain that too.
+      this.state.preemptedReadDebtUntil=Math.max(this.state.preemptedReadDebtUntil??0,
+        reservation.reservedNextAt,this.state.nextAt);
+      // cooldownUntil is deliberately independent and is never reduced. The
+      // active-request identity guard prevents this disposable request from
+      // undoing pacing reserved by any later operation on the shared key.
+      this.state.nextAt=reservation.previousNextAt;
+      this.state.lastStartedAt=reservation.previousStartedAt;
+      this.state.lastCost=reservation.previousCost;
+      pacingReservation=undefined;
+    }:undefined;
     return enqueueScheduled<T>({lane:this.state,priority,expiresAt:Date.now()+queueTimeoutMs,signal:this.signal,interrupt,
-      extendFairnessPromise,
-      waitMs: () => Math.max(0, this.state.nextAt - this.now()), run: async () => {
+      rollbackPacing,extendFairnessPromise,disposableBackground,
+      waitMs: () => Math.max(0, Math.max(this.state.nextAt,
+        priority==='signal_poll'||priority==='live_entry'?0:this.state.preemptedReadDebtUntil??0)-this.now()), run: async () => {
       this.checkAborted();
       const now = this.now();
       if (this.state.cooldownUntil > now) {
         throw new GmgnError('GMGN_RATE_LIMITED', this.state.cooldownUntil, now);
       }
       this.checkAborted();
-      this.state.lastStartedAt = now;
-      this.state.lastCost = cost;
-      this.state.nextAt = now + Math.max(this.interval, this.state.observedIntervalMs) * cost;
+      const previousNextAt=this.state.nextAt,previousStartedAt=this.state.lastStartedAt,previousCost=this.state.lastCost,
+        reservedNextAt=now+Math.max(this.interval,this.state.observedIntervalMs)*cost;
+      this.state.lastStartedAt=now;
+      this.state.lastCost=cost;
+      this.state.nextAt=reservedNextAt;
+      if(disposableBackground)pacingReservation={previousNextAt,reservedNextAt,previousStartedAt,previousCost,startedAt:now};
       return execute();
     }});
   }

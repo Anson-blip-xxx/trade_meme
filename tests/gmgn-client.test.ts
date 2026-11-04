@@ -666,6 +666,402 @@ test('Market Signal alone has a bounded 4 MiB response allowance', async () => {
   }
 });
 
+test('typed Market methods use only fixed endpoints, exact weights and bounded normalized inputs', async () => {
+  const requests:{url:URL;init:RequestInit|undefined}[]=[],scheduled:{weight:number;scheduling:unknown;interrupt:boolean;
+    disposable:boolean}[]=[];
+  const client=new GmgnClient({apiKey:key(),minIntervalMs:0,fetcher:async(input,init)=>{
+    requests.push({url:new URL(String(input)),init});return response({code:0,data:{ok:true}});
+  }});
+  const original=client.scheduleRequest.bind(client);
+  client.scheduleRequest=(async(weight:number,execute:()=>Promise<unknown>,scheduling:unknown,interrupt?:()=>void,
+    _extendFairnessPromise?:boolean,disposableBackground?:boolean)=>{
+    scheduled.push({weight,scheduling,interrupt:typeof interrupt==='function',disposable:disposableBackground===true});
+    return execute();
+  }) as typeof original;
+  const trendingSchedule={priority:'background' as const,queueTimeoutMs:7_000};
+  assert.deepEqual(await client.getMarketTrending('sol',{
+    interval:'5m',limit:20,orderBy:'volume',direction:'desc',filters:['renounced','has_social','renounced'],
+    platforms:['Pump.fun'],minAge:'5m',maxAge:'6h',ranges:{liquidity:{min:10_000,max:1_000_000},
+      smartDegenCount:{min:1},bundlerRate:{max:0.3},priceChangePercent:{min:-25}},
+  },trendingSchedule),{ok:true});
+  assert.deepEqual(await client.getMarketTrenches('sol',{
+    categories:['new_creation','near_completion','new_creation'],platforms:['Pump.fun'],limit:25,
+    minAge:'30s',maxAge:'5m',ranges:{progress:{min:0.1,max:0.95},rugRatio:{max:0.3},
+      smartDegenCount:{min:1},netBuy24h:{min:-500}},
+  }),{ok:true});
+  assert.deepEqual(await client.getMarketKline('sol','So11111111111111111111111111111111111111112',
+    {resolution:'30s',from:1_800_000_000,to:1_800_000_300}),{ok:true});
+
+  assert.deepEqual(scheduled.map(item=>item.weight),[3,2,2]);
+  assert.equal(scheduled.every(item=>item.interrupt),true);
+  assert.equal(scheduled.every(item=>item.disposable),true);
+  assert.equal(scheduled[0].scheduling,trendingSchedule);
+  assert.deepEqual(scheduled.slice(1).map(item=>item.scheduling),[
+    {priority:'background',queueTimeoutMs:5_000},{priority:'background',queueTimeoutMs:5_000},
+  ]);
+
+  const trending=requests[0];
+  assert.equal(trending.url.pathname,'/v1/market/rank');assert.equal(trending.init?.method,'GET');
+  assert.equal(trending.url.searchParams.get('chain'),'sol');assert.equal(trending.url.searchParams.get('interval'),'5m');
+  assert.equal(trending.url.searchParams.get('limit'),'20');assert.equal(trending.url.searchParams.get('order_by'),'volume');
+  assert.deepEqual(trending.url.searchParams.getAll('filters'),['renounced','has_social']);
+  assert.deepEqual(trending.url.searchParams.getAll('platforms'),['Pump.fun']);
+  assert.equal(trending.url.searchParams.get('min_created'),'5m');assert.equal(trending.url.searchParams.get('max_created'),'6h');
+  assert.equal(trending.url.searchParams.get('min_liquidity'),'10000');
+  assert.equal(trending.url.searchParams.get('max_bundler_rate'),'0.3');
+  assert.equal(trending.url.searchParams.get('min_price_change_percent'),'-25');
+
+  const trenches=requests[1];
+  assert.equal(trenches.url.pathname,'/v1/trenches');assert.equal(trenches.init?.method,'POST');
+  assert.equal(trenches.url.searchParams.get('chain'),'sol');
+  const body=JSON.parse(String(trenches.init?.body));
+  assert.deepEqual(Object.keys(body),['version','new_creation','near_completion']);
+  assert.equal(body.version,'v2');assert.deepEqual(body.new_creation.filters,['offchain','onchain']);
+  assert.equal(body.new_creation.launchpad_platform_v2,true);assert.equal(body.new_creation.limit,25);
+  assert.deepEqual(body.new_creation.launchpad_platform,['Pump.fun']);assert.equal(body.new_creation.min_created,'30s');
+  assert.equal(body.new_creation.max_created,'5m');assert.equal(body.new_creation.max_rug_ratio,0.3);
+  assert.equal(body.new_creation.min_net_buy_24h,-500);assert.deepEqual(body.near_completion,body.new_creation);
+
+  const kline=requests[2];
+  assert.equal(kline.url.pathname,'/v1/market/token_kline');assert.equal(kline.init?.method,'GET');
+  assert.equal(kline.url.searchParams.get('resolution'),'30s');
+  assert.equal(kline.url.searchParams.get('from'),'1800000000000');
+  assert.equal(kline.url.searchParams.get('to'),'1800000300000');
+});
+
+test('typed Market methods reject malformed chains, addresses, options and filter bounds before fetching', async () => {
+  let calls=0;
+  const client=new GmgnClient({apiKey:key(),minIntervalMs:0,fetcher:async()=>{calls++;return response({code:0,data:{}});}});
+  const bad:Array<()=>Promise<unknown>>=[
+    ()=>client.getMarketTrending('polygon' as any,{interval:'1m'}),
+    ()=>client.getMarketTrending('sol',{interval:'30m' as any}),
+    ()=>client.getMarketTrending('sol',{interval:'1m',limit:101}),
+    ()=>client.getMarketTrending('sol',{interval:'1m',filters:['not_honeypot']}),
+    ()=>client.getMarketTrending('bsc',{interval:'1m',filters:['frozen']}),
+    ()=>client.getMarketTrending('sol',{interval:'1m',platforms:['Pump.fun&x=1']}),
+    ()=>client.getMarketTrending('sol',{interval:'1m',ranges:{liquidity:{min:Number.NaN}}}),
+    ()=>client.getMarketTrending('sol',{interval:'1m',ranges:{bundlerRate:{max:1.01}}}),
+    ()=>client.getMarketTrending('sol',{interval:'1m',ranges:{holderCount:{min:1.5}}}),
+    ()=>client.getMarketTrending('sol',{interval:'1m',ranges:{liquidity:{min:20,max:10}}}),
+    ()=>client.getMarketTrending('sol',{interval:'1m',minAge:'30' as any}),
+    ()=>client.getMarketTrending('sol',{interval:'1m',minAge:'2h',maxAge:'30m'}),
+    ()=>client.getMarketTrending('sol',{interval:'1m',unexpected:true} as any),
+    ()=>client.getMarketTrenches('sol',{categories:[]}),
+    ()=>client.getMarketTrenches('sol',{categories:['unknown' as any]}),
+    ()=>client.getMarketTrenches('sol',{limit:81}),
+    ()=>client.getMarketTrenches('sol',{platforms:['../pump']}),
+    ()=>client.getMarketTrenches('sol',{ranges:{rugRatio:{min:-0.1}}}),
+    ()=>client.getMarketTrenches('sol',{ranges:{swaps24h:{max:1.2}}}),
+    ()=>client.getMarketTrenches('sol',{ranges:{unknown:{min:1}}} as any),
+    ()=>client.getMarketTrenches('sol',{minAge:'2m',maxAge:'30s'}),
+    ()=>client.getMarketKline('sol','invalid',{resolution:'30s'}),
+    ()=>client.getMarketKline('bsc','0x1111',{resolution:'30s'}),
+    ()=>client.getMarketKline('sol','So11111111111111111111111111111111111111112',{resolution:'1s' as any}),
+    ()=>client.getMarketKline('sol','So11111111111111111111111111111111111111112',{resolution:'1m',from:-1}),
+    ()=>client.getMarketKline('sol','So11111111111111111111111111111111111111112',{resolution:'1m',from:2,to:1}),
+    ()=>client.getMarketKline('sol','So11111111111111111111111111111111111111112',{resolution:'1m',extra:true} as any),
+  ];
+  for(const run of bad)await assert.rejects(run(),rejects('GMGN_QUERY_INVALID'));
+  await assert.rejects(client.get('/v1/trenches',{}),rejects('GMGN_PATH_NOT_ALLOWED'));
+  assert.equal(calls,0);
+});
+
+test('typed Market discovery responses retain the standard 2 MiB ceiling', async () => {
+  const client=new GmgnClient({apiKey:key(),minIntervalMs:0,fetcher:async()=>
+    new Response('{}',{headers:{'content-length':String(2*1024*1024+1)}})});
+  await assert.rejects(client.getMarketTrenches('sol'),rejects('GMGN_RESPONSE_TOO_LARGE'));
+});
+
+test('continuous Market Signal work yields one complete disposable discovery turn',async()=>{
+  const firstSignalStarted=deferred<void>(),releaseFirstSignal=deferred<void>(),discoveryStarted=deferred<void>(),
+    releaseDiscovery=deferred<void>(),order:string[]=[];let signalAttempt=0;
+  const client=new GmgnClient({apiKey:key(),minIntervalMs:0,fetcher:async(input,init)=>{
+    const path=new URL(String(input)).pathname;
+    if(path==='/v1/market/token_signal'){
+      signalAttempt++;order.push(`signal-${signalAttempt}-start`);
+      if(signalAttempt===1){firstSignalStarted.resolve();await releaseFirstSignal.promise;}
+      return response({code:0,data:`signal-${signalAttempt}`});
+    }
+    order.push('discovery-start');discoveryStarted.resolve();
+    await new Promise<void>((resolve,reject)=>{
+      const abort=()=>reject(new Error('ABORTED'));
+      if(init?.signal?.aborted)abort();else init?.signal?.addEventListener('abort',abort,{once:true});
+      releaseDiscovery.promise.then(resolve);
+    });
+    order.push('discovery-finish');return response({code:0,data:'discovery'});
+  }});
+  const first=client.getMemeMarketSignals('sol',{priority:'signal_poll',queueTimeoutMs:15_000});
+  await firstSignalStarted.promise;
+  const discovery=client.getMarketTrending('sol',{interval:'1m'});
+  const queuedSignals=Array.from({length:3},()=>client.getMemeMarketSignals('sol',
+    {priority:'signal_poll',queueTimeoutMs:15_000}));
+  releaseFirstSignal.resolve();assert.equal(await first,'signal-1');await discoveryStarted.promise;
+  await new Promise(resolve=>setTimeout(resolve,20));
+  assert.deepEqual(order,['signal-1-start','discovery-start']);
+  releaseDiscovery.resolve();assert.equal(await discovery,'discovery');await Promise.all(queuedSignals);
+  assert.deepEqual(order.slice(0,3),['signal-1-start','discovery-start','discovery-finish']);
+});
+
+test('protected discovery leaves the four-second durable archive turn available',
+  {timeout:10_000},async()=>{
+  const firstSignalStarted=deferred<void>(),discoveryStarted=deferred<void>(),releaseDiscovery=deferred<void>(),
+    archiveStarted=deferred<void>();
+  const order:string[]=[];let signalAttempt=0,archiveAborted=false;
+  const client=new GmgnClient({apiKey:key(),minIntervalMs:0,fetcher:async(input,init)=>{
+    const path=new URL(String(input)).pathname;
+    if(path==='/v1/market/token_signal'){
+      signalAttempt++;order.push(`signal-${signalAttempt}-start`);
+      if(signalAttempt===1){
+        firstSignalStarted.resolve();
+        await new Promise(resolve=>setTimeout(resolve,3_100));
+      }
+      order.push(`signal-${signalAttempt}-finish`);
+      return response({code:0,data:`signal-${signalAttempt}`});
+    }
+    if(path==='/v1/market/rank'){
+      order.push('discovery-start');discoveryStarted.resolve();
+      await releaseDiscovery.promise;order.push('discovery-finish');
+      return response({code:0,data:'discovery'});
+    }
+    if(path==='/v1/callout/global'){
+      order.push('archive-start');archiveStarted.resolve();
+      await new Promise<void>((_resolve,reject)=>{
+        const abort=()=>{archiveAborted=true;order.push('archive-abort');reject(new Error('ABORTED'));};
+        if(init?.signal?.aborted)abort();else init?.signal?.addEventListener('abort',abort,{once:true});
+      });
+    }
+    order.push('live');return response({code:0,data:'live'});
+  }});
+
+  const firstSignal=client.getMemeMarketSignals('sol',{priority:'signal_poll',queueTimeoutMs:15_000});
+  await firstSignalStarted.promise;
+  const discovery=client.getMarketTrending('sol',{interval:'1m'});
+  const archiveQueuedAt=Date.now(),archive=client.getCalloutGlobal(['sol']);
+  const archiveOutcome=archive.then(value=>({value,error:undefined as unknown}),error=>({value:undefined,error}));
+  const queuedSignal=client.getMemeMarketSignals('sol',{priority:'signal_poll',queueTimeoutMs:15_000});
+
+  assert.equal(await firstSignal,'signal-1');await discoveryStarted.promise;
+  // Keep protected discovery active past the archive's original five-second
+  // queue deadline. Its four-second fair grant must already have extended that
+  // deadline even though another protected background request owns the lane.
+  await new Promise(resolve=>setTimeout(resolve,Math.max(0,archiveQueuedAt+5_150-Date.now())));
+  releaseDiscovery.resolve();assert.equal(await discovery,'discovery');
+  await new Promise<void>((resolve,reject)=>{
+    const timer=setTimeout(()=>reject(new Error('durable archive missed its protected turn')),1_000);
+    archiveStarted.promise.then(()=>{clearTimeout(timer);resolve();},reject);
+  });
+  assert.ok(Date.now()-archiveQueuedAt>=5_000);
+
+  // Signal remains behind the durable protected turn; live entry retains its
+  // stronger preemption guarantee.
+  const lateSignal=client.getMemeMarketSignals('sol',{priority:'signal_poll',queueTimeoutMs:15_000});
+  await new Promise(resolve=>setTimeout(resolve,20));assert.equal(archiveAborted,false);
+  const live=client.get('/v1/trade/quote',{chain:'sol',marker:'live'},10,{priority:'live_entry'});
+  const outcome=await archiveOutcome;
+  assert.equal(outcome.value,undefined);assert.equal(rejects('GMGN_REQUEST_ABORTED')(outcome.error),true);
+  assert.equal(await live,'live');await Promise.all([queuedSignal,lateSignal]);
+  assert.equal(archiveAborted,true);
+  assert.deepEqual(order.slice(0,7),['signal-1-start','signal-1-finish','discovery-start',
+    'discovery-finish','archive-start','archive-abort','live']);
+});
+
+test('only one disposable discovery read per controlled interval is signal-protected',async()=>{
+  const firstSignalStarted=deferred<void>(),releaseFirstSignal=deferred<void>(),secondStarted=deferred<void>();
+  let discoveryAttempt=0,signalAttempt=0,secondAborted=false;
+  const client=new GmgnClient({apiKey:key(),minIntervalMs:0,fetcher:async(input,init)=>{
+    const path=new URL(String(input)).pathname;
+    if(path==='/v1/market/rank'){
+      discoveryAttempt++;
+      if(discoveryAttempt===1)return response({code:0,data:'first'});
+      secondStarted.resolve();
+      await new Promise<void>((_resolve,reject)=>{
+        const abort=()=>{secondAborted=true;reject(new Error('ABORTED'));};
+        if(init?.signal?.aborted)abort();else init?.signal?.addEventListener('abort',abort,{once:true});
+      });
+    }
+    signalAttempt++;
+    if(signalAttempt===1){firstSignalStarted.resolve();await releaseFirstSignal.promise;}
+    return response({code:0,data:`signal-${signalAttempt}`});
+  }});
+  const firstSignal=client.getMemeMarketSignals('sol',{priority:'signal_poll',queueTimeoutMs:15_000});
+  await firstSignalStarted.promise;
+  const firstDiscovery=client.getMarketTrending('sol',{interval:'1m'});
+  const secondSignal=client.getMemeMarketSignals('sol',{priority:'signal_poll',queueTimeoutMs:15_000});
+  releaseFirstSignal.resolve();await firstSignal;
+  assert.equal(await firstDiscovery,'first');await secondSignal;
+  const second=client.getMarketTrending('sol',{interval:'1m'});await secondStarted.promise;
+  const signal=client.getMemeMarketSignals('sol',{priority:'signal_poll',queueTimeoutMs:15_000});
+  await assert.rejects(second,rejects('GMGN_REQUEST_ABORTED'));assert.equal(await signal,'signal-3');
+  assert.equal(secondAborted,true);
+});
+
+test('live entry immediately preempts a protected disposable discovery turn',async()=>{
+  const firstSignalStarted=deferred<void>(),releaseFirstSignal=deferred<void>(),discoveryStarted=deferred<void>();
+  let aborted=false,liveStartedAt=0,signalAttempt=0;
+  const client=new GmgnClient({apiKey:key(),minIntervalMs:0,fetcher:async(input,init)=>{
+    const path=new URL(String(input)).pathname;
+    if(path==='/v1/trenches'){
+      discoveryStarted.resolve();
+      await new Promise<void>((_resolve,reject)=>{
+        const abort=()=>{aborted=true;reject(new Error('ABORTED'));};
+        if(init?.signal?.aborted)abort();else init?.signal?.addEventListener('abort',abort,{once:true});
+      });
+    }
+    if(path==='/v1/market/token_signal'){
+      signalAttempt++;
+      if(signalAttempt===1){firstSignalStarted.resolve();await releaseFirstSignal.promise;}
+      return response({code:0,data:`signal-${signalAttempt}`});
+    }
+    liveStartedAt=Date.now();return response({code:0,data:'live'});
+  }});
+  const firstSignal=client.getMemeMarketSignals('sol',{priority:'signal_poll',queueTimeoutMs:15_000});
+  await firstSignalStarted.promise;
+  const discovery=client.getMarketTrenches('sol');
+  const queuedSignal=client.getMemeMarketSignals('sol',{priority:'signal_poll',queueTimeoutMs:15_000});
+  releaseFirstSignal.resolve();await firstSignal;await discoveryStarted.promise;
+  const queuedAt=Date.now(),live=client.get('/v1/trade/quote',{chain:'sol',marker:'live'},10,{priority:'live_entry'});
+  await assert.rejects(discovery,rejects('GMGN_REQUEST_ABORTED'));assert.equal(await live,'live');
+  await queuedSignal;
+  assert.equal(aborted,true);assert.ok(liveStartedAt-queuedAt<500);
+});
+
+test('protected discovery bounds Signal delay and preserves Free-tier weighted pacing',{timeout:8_000},async()=>{
+  const firstSignalStarted=deferred<void>(),releaseFirstSignal=deferred<void>(),discoveryStarted=deferred<void>(),
+    starts:{at:number;units:number;path:string}[]=[];let quotaBurst=false,signalAttempt=0,discoveryStartedAt=0;
+  const client=new GmgnClient({apiKey:key(),minIntervalMs:350,fetcher:async(input,init)=>{
+    const path=new URL(String(input)).pathname,units=path==='/v1/market/rank'?3:1,now=Date.now();
+    if(starts.filter(row=>now-row.at<1_000).reduce((sum,row)=>sum+row.units,0)+units>5)quotaBurst=true;
+    starts.push({at:now,units,path});
+    if(path==='/v1/market/rank'){
+      discoveryStartedAt=now;discoveryStarted.resolve();
+      await new Promise<void>((_resolve,reject)=>{
+        const abort=()=>reject(new Error('ABORTED'));
+        if(init?.signal?.aborted)abort();else init?.signal?.addEventListener('abort',abort,{once:true});
+      });
+    }
+    signalAttempt++;
+    if(signalAttempt===1){firstSignalStarted.resolve();await releaseFirstSignal.promise;}
+    return response({code:0,data:path});
+  }});
+  const firstSignal=client.getMemeMarketSignals('sol',{priority:'signal_poll',queueTimeoutMs:15_000});
+  await firstSignalStarted.promise;
+  const discovery=client.getMarketTrending('sol',{interval:'1m'});
+  const signal=client.getMemeMarketSignals('sol',{priority:'signal_poll',queueTimeoutMs:15_000});
+  releaseFirstSignal.resolve();await firstSignal;await discoveryStarted.promise;
+  await assert.rejects(discovery,rejects('GMGN_REQUEST_ABORTED'));await signal;
+  const signalStarts=starts.filter(row=>row.path==='/v1/market/token_signal');
+  const delay=signalStarts[1].at-discoveryStartedAt;
+  assert.ok(delay>=2_800&&delay<3_600,`Signal delayed ${delay}ms`);
+  assert.equal(quotaBurst,false);
+});
+
+test('Market Signal can preempt an in-flight typed Market discovery request', async () => {
+  const entered=deferred<void>(),order:string[]=[];
+  const client=new GmgnClient({apiKey:key(),minIntervalMs:0,fetcher:async(input,init)=>{
+    const path=new URL(String(input)).pathname;order.push(`${path}-start`);
+    if(path==='/v1/trenches'){
+      entered.resolve();
+      await new Promise<void>((_resolve,reject)=>{
+        const abort=()=>{order.push('/v1/trenches-abort');reject(new Error('ABORTED'));};
+        if(init?.signal?.aborted)abort();else init?.signal?.addEventListener('abort',abort,{once:true});
+      });
+    }
+    return response({code:0,data:path});
+  }});
+  const trenches=client.getMarketTrenches('sol',{}, {priority:'normal',queueTimeoutMs:5_000});await entered.promise;
+  const rejected=assert.rejects(trenches,rejects('GMGN_REQUEST_ABORTED'));
+  const signal=client.getMemeMarketSignals('sol',{priority:'signal_poll',queueTimeoutMs:15_000});
+  await rejected;assert.equal(await signal,'/v1/market/token_signal');
+  assert.deepEqual(order,['/v1/trenches-start','/v1/trenches-abort','/v1/market/token_signal-start']);
+});
+
+test('consecutive Market discovery reads never inherit an uninterruptible archive retry', async () => {
+  const firstStarted=deferred<void>(),secondStarted=deferred<void>(),order:string[]=[];
+  let discoveryAttempt=0,signalAttempt=0;
+  const client=new GmgnClient({apiKey:key(),minIntervalMs:0,fetcher:async(input,init)=>{
+    const path=new URL(String(input)).pathname;
+    if(path==='/v1/trenches'||path==='/v1/market/rank'){
+      discoveryAttempt++;order.push(`discovery-${discoveryAttempt}-start`);
+      (discoveryAttempt===1?firstStarted:secondStarted).resolve();
+      await new Promise<void>((_resolve,reject)=>{
+        const abort=()=>{order.push(`discovery-${discoveryAttempt}-abort`);reject(new Error('ABORTED'));};
+        if(init?.signal?.aborted)abort();else init?.signal?.addEventListener('abort',abort,{once:true});
+      });
+    }
+    signalAttempt++;order.push(`signal-${signalAttempt}`);
+    return response({code:0,data:`signal-${signalAttempt}`});
+  }});
+
+  const first=client.getMarketTrenches('sol',{}, {priority:'normal',queueTimeoutMs:5_000});await firstStarted.promise;
+  const firstSignal=client.getMemeMarketSignals('sol',{priority:'signal_poll',queueTimeoutMs:15_000});
+  await assert.rejects(first,rejects('GMGN_REQUEST_ABORTED'));assert.equal(await firstSignal,'signal-1');
+
+  // The first preemption must not set backgroundSignalProtectionPending for
+  // disposable discovery. A second discovery call is therefore preemptible by
+  // the very next one-second Market Signal poll as well.
+  const second=client.getMarketTrending('sol',{interval:'1m'},{priority:'normal',queueTimeoutMs:5_000});
+  await secondStarted.promise;
+  const secondSignal=client.getMemeMarketSignals('sol',{priority:'signal_poll',queueTimeoutMs:15_000});
+  await assert.rejects(second,rejects('GMGN_REQUEST_ABORTED'));assert.equal(await secondSignal,'signal-2');
+  assert.deepEqual(order,['discovery-1-start','discovery-1-abort','signal-1',
+    'discovery-2-start','discovery-2-abort','signal-2']);
+});
+
+test('preempting weight-3 discovery releases its local pacing reservation immediately', async t => {
+  for(const higherPriority of ['signal_poll','live_entry'] as const)await t.test(higherPriority,async()=>{
+    const discoveryStarted=deferred<void>();let discoveryStartedAt=0,higherStartedAt=0,followStartedAt=0;
+    const client=new GmgnClient({apiKey:key(),minIntervalMs:350,fetcher:async(input,init)=>{
+      const path=new URL(String(input)).pathname;
+      if(path==='/v1/market/rank'){
+        discoveryStartedAt=Date.now();
+        discoveryStarted.resolve();
+        await new Promise<void>((_resolve,reject)=>{
+          const abort=()=>reject(new Error('ABORTED'));
+          if(init?.signal?.aborted)abort();else init?.signal?.addEventListener('abort',abort,{once:true});
+        });
+      }
+      if(path==='/v1/market/token_signal')higherStartedAt=Date.now();
+      else followStartedAt=Date.now();
+      return response({code:0,data:path});
+    }});
+    const discovery=client.getMarketTrending('sol',{interval:'1m'},
+      {priority:'normal',queueTimeoutMs:5_000});await discoveryStarted.promise;
+    const queuedAt=Date.now(),higher=higherPriority==='signal_poll'?
+      client.getMemeMarketSignals('sol',{priority:'signal_poll',queueTimeoutMs:15_000}):
+      client.scheduleRequest(1,async()=>{higherStartedAt=Date.now();return 'live';},
+        {priority:'live_entry',queueTimeoutMs:15_000});
+    await assert.rejects(discovery,rejects('GMGN_REQUEST_ABORTED'));await higher;
+    const delay=higherStartedAt-queuedAt;
+    // Weight 3 reserves 1,050 ms at this configured pace. A generous 500 ms
+    // ceiling proves the reservation was withdrawn rather than merely waited.
+    assert.ok(delay<500,`${higherPriority} waited ${delay}ms after discovery preemption`);
+
+    // The upstream call may still have consumed its three units. Preserve that
+    // quota debt for the next non-urgent request even though urgent work was
+    // allowed through immediately. Cover both another discovery and normal IO.
+    if(higherPriority==='signal_poll')await client.getMarketTrenches('sol');
+    else await client.get(route,query);
+    const debtDelay=followStartedAt-discoveryStartedAt;
+    assert.ok(debtDelay>=950,`${higherPriority} follower started after only ${debtDelay}ms`);
+    assert.ok(debtDelay<1_600,`${higherPriority} follower remained blocked ${debtDelay}ms after debt expiry`);
+  });
+});
+
+test('discovery pacing rollback never clears an installed GMGN cooldown', async () => {
+  const readingBody=deferred<void>();let calls=0;
+  const client=new GmgnClient({apiKey:key(),minIntervalMs:350,fetcher:async()=>{
+    calls++;
+    return new Response(new ReadableStream({pull(){readingBody.resolve();return new Promise<void>(()=>{});}}),
+      {status:429,headers:{'retry-after':'60'}});
+  }});
+  const discovery=client.getMarketTrending('sol',{interval:'1m'},
+    {priority:'normal',queueTimeoutMs:5_000});await readingBody.promise;
+  const signal=client.getMemeMarketSignals('sol',{priority:'signal_poll',queueTimeoutMs:15_000});
+  await assert.rejects(discovery,rejects('GMGN_REQUEST_ABORTED'));
+  await assert.rejects(signal,rejects('GMGN_RATE_LIMITED'));
+  assert.equal(calls,1);
+});
+
 test('a fetch ignoring abort cannot hold the client queue forever', async t => {
   t.mock.timers.enable({apis: ['setTimeout']});
   let started = false;

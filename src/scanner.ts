@@ -96,21 +96,23 @@ export interface ScannerCycleReport {
 }
 export interface GmgnScannerOptions {
   client:GmgnScannerClient;chains:Chain[];intervalMs:number;maxAgeSec:number;
-  maxSignalsPerCycle?:number;onSignal:(signal:Signal)=>unknown|Promise<unknown>;now?:()=>Date;
+  maxSignalsPerCycle?:number;maxSignalConcurrency?:number;
+  onSignal:(signal:Signal)=>unknown|Promise<unknown>;now?:()=>Date;
   /** Observational only: receives every fetched page before buy/age/dedup/research-cap filters. */
   onFeed?:(page:GmgnFeedPage)=>unknown|Promise<unknown>;
 }
 export interface GmgnScannerStatus {
-  running:boolean;inFlight:boolean;seenEntries:number;cooldownUntil?:string;lastCycle?:ScannerCycleReport;
+  running:boolean;inFlight:boolean;seenEntries:number;signalConcurrency:number;cooldownUntil?:string;lastCycle?:ScannerCycleReport;
 }
 
-/** Read-only polling. Callbacks run in sequence; this class never places orders. */
+/** Read-only polling with bounded callback concurrency; this class never places orders. */
 export class GmgnScanner {
   private readonly client:GmgnScannerClient;
   private readonly routes:{chain:Chain;kind:GmgnFeedKind}[];
   private readonly intervalMs:number;
   private readonly maxAgeSec:number;
   private readonly maxSignals:number;
+  private readonly signalConcurrency:number;
   private readonly onSignal:GmgnScannerOptions['onSignal'];
   private readonly onFeed:GmgnScannerOptions['onFeed'];
   private readonly now:()=>Date;
@@ -125,13 +127,17 @@ export class GmgnScanner {
 
   constructor(options:GmgnScannerOptions) {
     const maxSignals=options.maxSignalsPerCycle??3;
+    const signalConcurrency=options.maxSignalConcurrency??1;
     if(!Array.isArray(options.chains)||options.chains.length===0||
       options.chains.some(chain=>!Object.hasOwn(GMGN_CHAINS,chain))||
       !Number.isSafeInteger(options.intervalMs)||options.intervalMs<1||options.intervalMs>3_600_000||
       !Number.isInteger(options.maxAgeSec)||options.maxAgeSec<1||options.maxAgeSec>86_400||
-      !Number.isInteger(maxSignals)||maxSignals<1||maxSignals>200) throw new Error('GMGN_SCANNER_CONFIG_INVALID');
+      !Number.isInteger(maxSignals)||maxSignals<1||maxSignals>200||
+      !Number.isInteger(signalConcurrency)||signalConcurrency<1||signalConcurrency>20)
+      throw new Error('GMGN_SCANNER_CONFIG_INVALID');
     this.client=options.client;this.intervalMs=options.intervalMs;this.maxAgeSec=options.maxAgeSec;
-    this.maxSignals=maxSignals;this.onSignal=options.onSignal;this.onFeed=options.onFeed;this.now=options.now??(()=>new Date());
+    this.maxSignals=maxSignals;this.signalConcurrency=Math.min(signalConcurrency,maxSignals);
+    this.onSignal=options.onSignal;this.onFeed=options.onFeed;this.now=options.now??(()=>new Date());
     this.routes=[...new Set(options.chains)].flatMap(chain=>
       (['kol','smartmoney'] as const).map(kind=>({chain,kind})));
   }
@@ -139,7 +145,7 @@ export class GmgnScanner {
   getStatus():GmgnScannerStatus {
     this.prune();
     this.readClientCooldown();
-    return {running:this.running,inFlight:!!this.inFlight,seenEntries:this.seen.size,
+    return {running:this.running,inFlight:!!this.inFlight,seenEntries:this.seen.size,signalConcurrency:this.signalConcurrency,
       ...(this.cooldownUntil>this.now().getTime()?{cooldownUntil:new Date(this.cooldownUntil).toISOString()}:{}),
       ...(this.lastCycle?{lastCycle:structuredClone(this.lastCycle)}:{})};
   }
@@ -172,10 +178,14 @@ export class GmgnScanner {
   private tick():void {
     if(!this.running) return;
     const generation=this.generation;
+    const startedAt=this.now().getTime();
     void this.runOnce().catch(()=>{}).finally(()=>{
       if(!this.running||generation!==this.generation) return;
       this.readClientCooldown();
-      const wait=Math.max(this.intervalMs,this.cooldownUntil-this.now().getTime());
+      const now=this.now().getTime();
+      // Keep the configured interval between cycle starts. Slow analysis no
+      // longer adds a second full interval before the next feed observation.
+      const wait=Math.max(0,this.intervalMs-Math.max(0,now-startedAt),this.cooldownUntil-now);
       // Long vendor cooldowns are rechecked without exceeding Node's timer range.
       this.timer=setTimeout(()=>this.tick(),Math.min(wait,2_147_483_647));
       this.timer.unref();
@@ -257,7 +267,7 @@ export class GmgnScanner {
       }
     }
     if(report.status==='cooldown') {report.deferred=candidates.length;return finish();}
-    let attempted=0;
+    const selected:Signal[]=[];
     for(const signal of candidates) {
       if(generation!==this.generation) {report.deferred++;continue;}
       this.readClientCooldown();
@@ -266,26 +276,41 @@ export class GmgnScanner {
         if(!report.reasons.includes('GMGN_RATE_LIMITED')) report.reasons.push('GMGN_RATE_LIMITED');
         continue;
       }
-      if(attempted>=this.maxSignals) {report.deferred++;continue;}
+      if(selected.length>=this.maxSignals) {report.deferred++;continue;}
       // Fetching and earlier callbacks may have consumed the remaining event lifetime.
       if(Date.parse(signal.occurredAt)<this.now().getTime()-this.maxAgeSec*1_000) {report.rejected++;continue;}
       this.prune();
-      if(this.seen.size>=MAX_SEEN) {
+      if(this.seen.size+selected.length>=MAX_SEEN) {
         report.deferred++;
         if(!report.reasons.includes('GMGN_DEDUP_CAPACITY')) report.reasons.push('GMGN_DEDUP_CAPACITY');
         continue;
       }
-      attempted++;
-      try {
-        await this.onSignal(signal);
-        this.seen.set(signal.sourceEventId,Date.parse(signal.occurredAt)+this.maxAgeSec*1_000);
-        report.emitted++;
-      } catch {
-        report.errors++;
-        if(!report.reasons.includes('GMGN_SIGNAL_CALLBACK_FAILED')) report.reasons.push('GMGN_SIGNAL_CALLBACK_FAILED');
-        // Failed callbacks are retried next cycle, at most once per event per cycle.
-      }
+      selected.push(signal);
     }
+    let next=0;
+    const worker=async()=>{
+      while(next<selected.length) {
+        const signal=selected[next++];
+        if(generation!==this.generation) {report.deferred++;continue;}
+        this.readClientCooldown();
+        if(this.cooldownUntil>this.now().getTime()) {
+          report.status='cooldown';report.deferred++;
+          if(!report.reasons.includes('GMGN_RATE_LIMITED'))report.reasons.push('GMGN_RATE_LIMITED');
+          continue;
+        }
+        if(Date.parse(signal.occurredAt)<this.now().getTime()-this.maxAgeSec*1_000) {report.rejected++;continue;}
+        try {
+          await this.onSignal(signal);
+          this.seen.set(signal.sourceEventId,Date.parse(signal.occurredAt)+this.maxAgeSec*1_000);
+          report.emitted++;
+        } catch {
+          report.errors++;
+          if(!report.reasons.includes('GMGN_SIGNAL_CALLBACK_FAILED')) report.reasons.push('GMGN_SIGNAL_CALLBACK_FAILED');
+          // Failed callbacks are retried next cycle, at most once per event per cycle.
+        }
+      }
+    };
+    await Promise.all(Array.from({length:Math.min(this.signalConcurrency,selected.length)},worker));
     return finish();
   }
 }

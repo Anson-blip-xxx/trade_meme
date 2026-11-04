@@ -18,7 +18,7 @@ const schema = z.object({
   walletSupportRequired:z.enum(['true','false']).default('true').transform(v=>v==='true'),
   scannerEnabled:z.enum(['true','false']).default('false').transform(v=>v==='true'),
   scannerIntervalSec:z.coerce.number().int().min(15).max(3600).default(60),
-  scannerMaxSignals:z.coerce.number().int().min(1).max(20).default(3),
+  scannerMaxSignals:z.coerce.number().int().min(1).max(20).default(20),
   debotScannerEnabled:z.enum(['true','false']).default('false').transform(v=>v==='true'),
   debotScannerIntervalSec:z.coerce.number().int().min(15).max(3600).default(30),
   debotTransport:z.enum(['authenticated_stream','anonymous_poll']).default('authenticated_stream'),
@@ -44,6 +44,7 @@ export interface Config extends z.infer<typeof schema> {
   gmgnApiKey?:string; gmgnPrivateKey?:string; walletIdentitiesPath?:string;
   gmgnPlusArchive?:{enabled:boolean;database:string;maxBytes:number;intervalSec:number;
     chains:('sol'|'bsc'|'robinhood')[];maxCandidates:number};
+  gmgnMarketSignals:{enabled:boolean;intervalMs:number;analysisConcurrency:number;queueCapacity:number};
   scannerChains:Chain[]; ordersDatabase:string;debotSignalsDatabase:string;debotSignalsMaxBytes?:number;debotSessionPath:string;debotLoginEmail?:string;
   entryWallets:Partial<Record<Chain,string>>; entryAmounts:Partial<Record<Chain,string>>;
   entryInputTokens:Partial<Record<Chain,string>>;
@@ -184,6 +185,10 @@ export function readConfig(env:NodeJS.ProcessEnv=process.env): Config {
       intervalSec:z.coerce.number().int().min(5).max(3600).parse(env.GMGN_PLUS_ARCHIVE_INTERVAL_SEC??15),
       chains:z.array(z.enum(['sol','bsc','robinhood'])).min(1).parse([...new Set((env.GMGN_PLUS_ARCHIVE_CHAINS??'sol,bsc,robinhood').split(',').map(v=>v.trim()))]),
       maxCandidates:z.coerce.number().int().min(100).max(100000).parse(env.GMGN_PLUS_ARCHIVE_MAX_CANDIDATES??20000)},
+    gmgnMarketSignals:{enabled:z.enum(['true','false']).parse(env.GMGN_MARKET_SIGNAL_ENABLED??'false')==='true',
+      intervalMs:z.coerce.number().int().min(1000).max(5000).parse(env.GMGN_MARKET_SIGNAL_INTERVAL_MS??1000),
+      analysisConcurrency:z.coerce.number().int().min(1).max(4).parse(env.GMGN_MARKET_SIGNAL_ANALYSIS_CONCURRENCY??2),
+      queueCapacity:z.coerce.number().int().min(16).max(2000).parse(env.GMGN_MARKET_SIGNAL_QUEUE_CAPACITY??256)},
     walletIdentitiesPath:env.WALLET_IDENTITIES_PATH,
     scannerChains:z.array(z.enum(['bsc','solana','robinhood'])).min(1).parse([...new Set((env.SCANNER_CHAINS??'bsc,solana,robinhood').split(',').map(v=>v.trim()))]),
     // Raw research stays ephemeral; the dashboard retains only bounded compact summaries.

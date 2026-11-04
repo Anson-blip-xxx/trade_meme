@@ -19,9 +19,13 @@ async function observe(observation:SourceResearchObservation):Promise<SourceObse
   if(options.testDelayMs)await new Promise(resolve=>setTimeout(resolve,options.testDelayMs));
   const result:SourceObservationResult={},signal=observation.signal;
   if(source){
+    // A GMGN Market Signal replay is recovery of the same vendor event, not a
+    // new notification. Keep retries and restart catch-up idempotent even when
+    // receivedAt changes; DeBot/Ave retain delivery-sensitive semantics.
+    const deliveryPayload=signal.source==='gmgn'?signal.sourceEventId:JSON.stringify(observation);
     const recorded=source.record(signal,observation.observedAt,{name:observation.name,
-      sourceUrl:signal.source==='ave'?'https://ave.ai/smart':'https://debot.ai/',
-      deliveryKey:createHash('sha256').update(JSON.stringify(observation)).digest('hex')});
+      sourceUrl:signal.source==='ave'?'https://ave.ai/smart':signal.source==='gmgn'?'https://gmgn.ai/':'https://debot.ai/',
+      deliveryKey:createHash('sha256').update(deliveryPayload).digest('hex')});
     if(!recorded.accepted)result.sourceError=recorded.reason??'SOURCE_EVIDENCE_CAPTURE_FAILED';
   }
   if(memeDb&&options.meme)try {

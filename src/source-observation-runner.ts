@@ -1,11 +1,14 @@
 import {Worker} from 'node:worker_threads';
 import {createRequire} from 'node:module';
 import {pathToFileURL} from 'node:url';
-import type {Chain} from './types.js';
+import type {Chain,Signal} from './types.js';
 import type {AveSignalObservation} from './providers/ave-signals.js';
 import type {DebotSignalObservation} from './providers/debot-signals.js';
 
-export type SourceResearchObservation=AveSignalObservation|DebotSignalObservation;
+export interface GmgnSourceResearchObservation {
+  id:string;signal:Signal;observedAt:string;name?:string;symbol?:string;
+}
+export type SourceResearchObservation=AveSignalObservation|DebotSignalObservation|GmgnSourceResearchObservation;
 export interface SourceObservationResult {
   sourceError?:string;memeError?:string;nominationError?:string;
 }

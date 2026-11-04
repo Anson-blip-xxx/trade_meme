@@ -82,6 +82,7 @@ import type {TelegramNotificationButtons} from './telegram-format.js';
 import {LatestWorkQueue} from './latest-work-queue.js';
 import {SourceObservationRunner,type SourceResearchObservation} from './source-observation-runner.js';
 import {GmgnPlusArchive,GmgnPlusArchiveRunner} from './gmgn-plus-archive.js';
+import {GmgnMarketArchiveError,GmgnMarketSignalScanner} from './gmgn-market-signal-scanner.js';
 
 export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;jevInvoke?:JevShadowOptions['invoke'];telegramFetcher?:typeof fetch;
   heldFetcher?:typeof fetch;entryFetcher?:typeof fetch;gmgnFetcher?:typeof fetch;
@@ -123,15 +124,27 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
   const gmgnPlusArchive=config.gmgnPlusArchive?.enabled?new GmgnPlusArchive({path:config.gmgnPlusArchive.database,
     maxBytes:config.gmgnPlusArchive.maxBytes,maxCandidates:config.gmgnPlusArchive.maxCandidates}):undefined;
   if(config.gmgnPlusArchive?.enabled)protectedPaths.push(config.gmgnPlusArchive.database);
+  let gmgnMarketScanner:GmgnMarketSignalScanner|undefined;
+  const dedicatedGmgnMarketChains=[...new Set(config.scannerChains.map(chain=>chain==='solana'?'sol':chain))] as ('sol'|'bsc'|'robinhood')[];
   const gmgnPlusRunner=gmgnPlusArchive&&config.gmgnApiKey?.trim()?new GmgnPlusArchiveRunner({archive:gmgnPlusArchive,client,
-    chains:config.gmgnPlusArchive!.chains,intervalMs:config.gmgnPlusArchive!.intervalSec*1000}):undefined;
-  const gmgnPlusStatus=()=>gmgnPlusRunner?.status()??(gmgnPlusArchive?{...gmgnPlusArchive.status(),running:false,
-    pausedReason:'GMGN_API_KEY_MISSING'}:{enabled:false});
+    chains:config.gmgnPlusArchive!.chains,intervalMs:config.gmgnPlusArchive!.intervalSec*1000,
+    dedicatedMarketChains:config.gmgnMarketSignals.enabled&&backgroundGmgnEnabled&&config.gmgnApiKey?.trim()?
+      dedicatedGmgnMarketChains:[]}):undefined;
+  const gmgnMarketStatus=()=>{
+    const status=gmgnMarketScanner?.status()??{enabled:config.gmgnMarketSignals.enabled,running:false,
+      chains:dedicatedGmgnMarketChains,entryPipeline:false,countingPipeline:false};
+    const pausedReason=!config.gmgnMarketSignals.enabled?'GMGN_MARKET_SIGNAL_DISABLED':
+      !backgroundGmgnEnabled?backgroundGmgnPausedReason:!config.gmgnApiKey?.trim()?'GMGN_API_KEY_MISSING':
+        !gmgnMarketScanner?'GMGN_MARKET_SIGNAL_UNAVAILABLE':undefined;
+    return {...status,...(pausedReason?{running:false,pausedReason}:{})};
+  };
+  const gmgnPlusStatus=()=>({...(gmgnPlusRunner?.status()??(gmgnPlusArchive?{...gmgnPlusArchive.status(),running:false,
+    pausedReason:'GMGN_API_KEY_MISSING'}:{enabled:false})),realtimeMarketSignals:gmgnMarketStatus()});
   if(config.telegram?.enabled&&config.telegram.token&&config.telegram.chatId&&
     [...protectedPaths,'.env',config.ave?.database,config.ave?.sessionPath,config.corroboration?.database,
       config.jev?.database,config.tokenRankResearch?.database,config.walletFast?.database].filter((path):path is string=>!!path)
       .some(path=>sameDatabase(path,config.telegram!.database)))throw new Error('TELEGRAM_DATABASE_CONFLICT');
-  for(const path of [...(config.corroboration&&(config.meme?.enabled||config.ave?.enabled)?[config.corroboration.database]:[]),
+  for(const path of [...(config.corroboration&&(config.meme?.enabled||config.ave?.enabled||config.gmgnMarketSignals.enabled)?[config.corroboration.database]:[]),
     ...(config.ave?.enabled?[config.ave.database,config.ave.sessionPath]:[])]){
     if(protectedPaths.some(existing=>sameDatabase(existing,path)))throw new Error('SOURCE_DATABASE_CONFLICT');
     protectedPaths.push(path);
@@ -188,7 +201,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
   let archiveCaptureError:string|undefined,walletCaptureError:string|undefined;
   let memeCaptureError:string|undefined;
   let sourceCaptureError:string|undefined,nominationCaptureError:string|undefined;
-  const sourceEvidence=config.corroboration&&(config.meme?.enabled||config.ave?.enabled)
+  const sourceEvidence=config.corroboration&&(config.meme?.enabled||config.ave?.enabled||config.gmgnMarketSignals.enabled)
     ?new SourceCorroboration(config.corroboration.database,{maxBytes:config.corroboration.maxBytes,maxEvents:config.corroboration.maxEvents}):undefined;
   let backgroundGmgnAbort:AbortController|undefined;
   if(config.meme?.enabled)assertMemePriceArchiveCapacity(config.meme.maxActive,config.meme.maxBytes);
@@ -215,20 +228,23 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
     catalyst:(signal,abort,snapshot)=>collectMemeCatalyst(signal,config,{signal:abort,snapshot}),
     corroboration:sourceEvidence?(token,now)=>sourceEvidence.assess(token,now):undefined,
     walletEvidence:(token,now)=>({evidence:walletHistory?.followupEvidence(token,new Date(now.getTime()-120000).toISOString(),now.toISOString())})}):undefined;
-  const sourceObservation=(config.ave?.enabled||config.debotScannerEnabled)&&(sourceEvidence||memeObserver||walletHistory&&config.ave?.enabled)
+  const sourceObservation=(config.ave?.enabled||config.debotScannerEnabled||config.gmgnMarketSignals.enabled)&&
+    (sourceEvidence||memeObserver||walletHistory&&config.ave?.enabled)
     ?new SourceObservationRunner({
       ...(sourceEvidence&&config.corroboration?{source:{database:config.corroboration.database,maxBytes:config.corroboration.maxBytes,
         maxEvents:config.corroboration.maxEvents}}:{}),
       ...(memeObserver&&config.meme?{meme:{database:config.meme.database,activeWindowSec:config.meme.activeWindowSec,chains:config.scannerChains}}:{}),
-      ...(walletHistory&&config.ave?.enabled?{wallet:{database:config.walletResearch.database,maxBytes:config.walletResearch.maxBytes}}:{})
+      ...(walletHistory&&config.ave?.enabled?{wallet:{database:config.walletResearch.database,maxBytes:config.walletResearch.maxBytes}}:{}),
+      capacity:config.gmgnMarketSignals.enabled?16:8
     }):undefined;
   const observeSourceResearch=async(observation:SourceResearchObservation)=>{
     try {
-      if(!sourceObservation){observeSignal(observation.signal,observation.observedAt,observation);return;}
+      if(!sourceObservation){observeSignal(observation.signal,observation.observedAt,observation);return {};}
       const result=await sourceObservation.submit(observation);
       sourceCaptureError=result.sourceError?'SOURCE_EVIDENCE_CAPTURE_FAILED':undefined;
       memeCaptureError=result.memeError?'MEME_SIGNAL_CAPTURE_FAILED':undefined;
       if(observation.signal.source==='ave')nominationCaptureError=result.nominationError?'WALLET_NOMINATION_CAPTURE_FAILED':undefined;
+      return result;
     }catch(error){
       sourceCaptureError='SOURCE_OBSERVATION_WORKER_UNAVAILABLE';
       memeCaptureError='SOURCE_OBSERVATION_WORKER_UNAVAILABLE';
@@ -242,7 +258,8 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
     ...(sourceEvidence?{sourceDatabase:config.corroboration!.database}:{})}):undefined;
   const captureSource=(signal:Signal,at?:string,display?:{name?:string})=>{
     if(!acceptsChain(signal.token.chain))return;
-    if(signal.source==='manual'||signal.source==='wallet'||signal.source==='gmgn'&&!signal.sourceEventId.startsWith('gmgn:trade:'))return;
+    if(signal.source==='manual'||signal.source==='wallet'||signal.source==='gmgn'&&
+      !signal.sourceEventId.startsWith('gmgn:trade:')&&!signal.sourceEventId.startsWith('gmgn:market:'))return;
     try {
       // This exact template is emitted by normalizeGmgnTrades only. The source
       // ledger validates reference formats again and never promotes ownership.
@@ -854,16 +871,37 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
   thirdEntry.recoverPrepared();
   const reconciler=new OrderReconciler(orders,entry);
   let closed=false,active=0,archiveMaintenanceError:string|undefined;
-  const onSignal=async(signal:Signal,firstReceivedAt?:string,context?:{detailsReady:Promise<void>;repeat?:boolean}):Promise<void>=>{
+  const researchAdmissionWaiters=new Set<()=>void>();
+  const waitForResearchAdmission=async(limit:number)=>{
+    while(active>=limit)await new Promise<void>(resolve=>researchAdmissionWaiters.add(resolve));
+  };
+  const releaseResearchAdmission=()=>{for(const resolve of researchAdmissionWaiters)resolve();researchAdmissionWaiters.clear();};
+  const analyzeSignal=async(signal:Signal,firstReceivedAt?:string,context?:{detailsReady:Promise<void>;repeat?:boolean},
+    options:{observe?:boolean;considerEntry?:boolean;admissionLimit?:number;shutdownDrain?:'gmgn_market'}={}):Promise<void>=>{
     if(!acceptsChain(signal.token.chain))return;
     backgroundGmgnAbort?.abort();
-    if(closed||active>=4) throw new Error('RESEARCH_BUSY');
-    observeSignal(signal,firstReceivedAt,undefined,false);
+    const marketShutdownDrain=options.shutdownDrain==='gmgn_market'&&options.considerEntry===false&&signal.source==='gmgn'&&
+      signal.sourceEventId.startsWith('gmgn:market:');
+    const admissionLimit=options.admissionLimit??4;
+    if(closed&&!marketShutdownDrain)throw new Error('RESEARCH_BUSY');
+    if(active>=admissionLimit){
+      if(!closed||!marketShutdownDrain)throw new Error('RESEARCH_BUSY');
+      // Already-admitted, research-only Market work waits for a shared slot
+      // during shutdown. It neither burns scanner retries nor exceeds the
+      // global evaluation cap, and considerEntry remains explicitly false.
+      await waitForResearchAdmission(admissionLimit);
+    }
+    if(options.observe!==false)observeSignal(signal,firstReceivedAt,undefined,false);
     store.prune(config.researchCacheTtlSec,config.researchCacheMax);
     const reserved=store.reserve(signal,undefined,'notification_copy',firstReceivedAt);
     if(reserved.conflict) throw new Error('EVENT_ID_PAYLOAD_CONFLICT');
-    if(!reserved.created) return;
-    const item=reserved.entry;active++;
+    let item=reserved.entry;
+    if(!reserved.created){
+      if(item.status==='completed')return;
+      if(item.status!=='interrupted')throw new Error('RESEARCH_BUSY');
+      const retried=store.retry(item.id);if(!retried)throw new Error('RESEARCH_BUSY');item=retried;
+    }
+    active++;
     try {
       if(signal.source==='debot')debotScanner?.bindReport(signal.sourceEventId,item.id);
       const report=await evaluate(signal,config,providers,{id:item.id,receivedAt:item.receivedAt,
@@ -872,10 +910,39 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       if(!store.finish(item.id,report,item.claimId!)) throw new Error('PROCESSING_CLAIM_EXPIRED');
       if(signal.source==='debot')debotScanner?.recordReport(signal.sourceEventId,report);
       if(signal.source==='ave')aveScanner?.recordReport(signal.sourceEventId,report);
-      if(!closed)await entry.consider(report);
+      if(!closed&&options.considerEntry!==false)await entry.consider(report);
     } catch(error) {store.interrupt(item.id,item.claimId!);throw error;}
-    finally {active--;}
+    finally {active--;releaseResearchAdmission();}
   };
+  const onSignal=(signal:Signal,firstReceivedAt?:string,context?:{detailsReady:Promise<void>;repeat?:boolean})=>
+    analyzeSignal(signal,firstReceivedAt,context);
+  if(config.gmgnMarketSignals.enabled&&config.gmgnApiKey?.trim()){
+    gmgnMarketScanner=new GmgnMarketSignalScanner({client,chains:dedicatedGmgnMarketChains,intervalMs:config.gmgnMarketSignals.intervalMs,
+      maxAgeSec:config.maxSignalAgeSec,dispatchConcurrency:config.gmgnMarketSignals.analysisConcurrency,
+      observationConcurrency:8,
+      dispatchCapacity:config.gmgnMarketSignals.queueCapacity,
+      knownIds:gmgnPlusArchive?(chain,ids)=>gmgnPlusArchive.knownMarketSignalIds(chain,ids):undefined,
+      knownProcessedIds:gmgnPlusArchive?(chain,ids)=>gmgnPlusArchive.knownProcessedMarketSignalIds(chain,ids):undefined,
+      markProcessed:gmgnPlusArchive?(chain,id)=>gmgnPlusArchive.markMarketSignalProcessed(chain,id):undefined,
+      onObservation:async(signal,receivedAt,observation)=>{
+        const result=await observeSourceResearch({id:observation.id,signal,observedAt:receivedAt,
+          ...(observation.name?{name:observation.name}:{}),...(observation.symbol?{symbol:observation.symbol}:{})});
+        if(result.sourceError||result.memeError||result.nominationError)throw new Error('GMGN_MARKET_SIGNAL_OBSERVATION_FAILED');
+      },
+      // Market Signal is research and corroboration. It cannot increment the
+      // DeBot/Ave N3 counter or submit an opening order.
+      onSignal:(signal,receivedAt)=>analyzeSignal(signal,receivedAt,undefined,
+        {observe:false,considerEntry:false,admissionLimit:4,shutdownDrain:'gmgn_market'}),
+      onArchive:gmgnPlusArchive?(chain,rows)=>{
+        let result;
+        try{result=gmgnPlusArchive.recordMarketSignals(chain,rows);}
+        catch(error){if(error instanceof Error&&/(?:SQLITE_SCHEMA|SQLITE_CORRUPT|no such (?:table|column)|database is closed|file is not a database)/i.test(error.message))
+          throw new GmgnMarketArchiveError('GMGN_MARKET_ARCHIVE_TERMINAL_SCHEMA');throw error;}
+        if(result.capacityReached)throw new GmgnMarketArchiveError('GMGN_MARKET_ARCHIVE_TERMINAL_CAPACITY');
+        if(result.received!==rows.length||result.accepted!==result.received||result.rejected!==0)
+          throw new GmgnMarketArchiveError('GMGN_MARKET_ARCHIVE_TERMINAL_PARTIAL_REJECTION');
+      }:undefined});
+  }
   if(config.walletFast?.enabled&&config.chainStream.enabled&&walletHistory){
     const fastTargets=new WalletFastTargets();
     const activityPath=config.walletFast.database??resolve(dirname(config.walletResearch.database),'wallet-activity.sqlite');
@@ -914,7 +981,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       }});
   }
   const scanner=new GmgnScanner({client,chains:config.scannerChains,intervalMs:config.scannerIntervalSec*1000,
-    maxAgeSec:config.maxSignalAgeSec,maxSignalsPerCycle:config.scannerMaxSignals,onSignal,
+    maxAgeSec:config.maxSignalAgeSec,maxSignalsPerCycle:config.scannerMaxSignals,maxSignalConcurrency:2,onSignal,
     onFeed:page=>{
       if(!page.errorReason)for(const signal of normalizeGmgnTrades(page.payload,page.chain,page.kind,
         {now:new Date(page.fetchedAt),maxAgeSec:config.maxSignalAgeSec}))captureSource(signal,page.fetchedAt);
@@ -1087,7 +1154,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
   };
   sourceObservation?.start();
   return {client,providers,store,orders,entry,dailyReview,scanner,debotScanner,debotStream,debotAuth,archive,followupReview,tracking,priceRouter,walletHistory,walletIndexRunner,walletObserver,walletResearchStatus,walletAssociationsStatus,walletProfiles,walletProfilesStatus,walletScreening,watchRechecker,exitShadow,chainMonitor,chainStreamStatus,walletFastResearch,memeObserver,sourceEvidence,sourceObservation,aveScanner,aveSession,tokenRankResearch,jevShadow,telegram,tradeNotifications,telegramStatus,heldMonitor,heldTracking,
-    signalCounting,telegramControls,telegramPositions,manualClose,directSell,manualNativeBuy,telegramTokenCard,
+    signalCounting,telegramControls,telegramPositions,manualClose,directSell,manualNativeBuy,telegramTokenCard,gmgnMarketScanner,
     executionStatus:()=>{const counting=signalCounting.status();return {
       configuredEntryMode:config.entryMode,configuredThirdSignalMode:config.thirdSignalExecutionMode,
       solanaExecutionProvider:config.solanaExecutionProvider,native:nativeTrading?.status(),nativeError:nativeTradingError,
@@ -1136,7 +1203,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
           'wallet_discovery_research','watch_rechecks'],
         retainedTasks:['signal_details_and_safety','positions','price_fallback','trading',
           'debot_ave_signals','chain_trade_classification','wallet_verified_buy_on_demand_research','local_wallet_profiles_and_indexes']},
-      gmgnPlusArchive:gmgnPlusStatus(),
+      gmgnPlusArchive:gmgnPlusStatus(),gmgnMarketSignals:gmgnMarketStatus(),
       scanner:{...scanner.getStatus(),enabled:backgroundGmgnEnabled&&config.scannerEnabled,pausedReason:backgroundGmgnPausedReason},
       debotScanner:debotScanner?.getStatus()??{enabled:false,running:false},
       debotStream:debotStream?.getStatus(),
@@ -1144,7 +1211,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       sourceObservation:sourceObservation?.status()??{enabled:false},
       ave:aveScanner?{...aveScanner.getStatus(),nominationCaptureError,session:aveSession?.getStatus()??{status:'required',authenticated:false,reason:'AVE_LOGIN_EMAIL_NOT_CONFIGURED'}}:{enabled:false},
       tokenRankResearch:tokenRankResearch?.status()??{enabled:false},
-      corroboration:sourceEvidence?{...sourceEvidence.status(),captureError:sourceCaptureError}:{enabled:false},
+      corroboration:sourceEvidence?{...sourceEvidence.status(),captureError:sourceCaptureError}:{enabled:false,captureError:sourceCaptureError},
       tracking:tracking?.getStatus(),priceRouter:{...priceRouter.getStatus(),captureError:priceTargetError},stats:archive?.stats(),archiveError:archiveCaptureError??store.observationError??archiveMaintenanceError,
       settings:dashboardSettings(config),balances:balances?.get()??[],system:system?.get(),walletResearch:walletResearchStatus(),exitProtection:protectionSummary(),chainStream:chainStreamStatus(),
       watchRecheck:watchRechecker?{enabled:backgroundGmgnEnabled,...watchRechecker.getStatus(),pausedReason:backgroundGmgnPausedReason}:{enabled:false}}),
@@ -1153,6 +1220,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       if(closed) return;
       walletStatsRunner?.start();
       gmgnPlusRunner?.start();
+      if(backgroundGmgnEnabled)gmgnMarketScanner?.start();
       walletIndexRunner?.start();
       followupReview?.start();
       jevStatusRunner?.start();
@@ -1212,12 +1280,17 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       }
     },
     async close(){
-      if(closed) return;closed=true;scanner.stop();clearInterval(sweep);clearInterval(reconcileTimer);clearInterval(debotSyncTimer);clearInterval(exitMaintenanceTimer);clearInterval(telegramTimer);
+      if(closed) return;closed=true;
+      // Establish the market poll fence before the first await in shutdown.
+      // The returned promise drains only work admitted before this point.
+      const gmgnMarketStop=gmgnMarketScanner?.stop();
+      scanner.stop();clearInterval(sweep);clearInterval(reconcileTimer);clearInterval(debotSyncTimer);clearInterval(exitMaintenanceTimer);clearInterval(telegramTimer);
       await telegramControls?.close();
       // Fence both sources before draining third-signal callbacks. Otherwise a
       // final socket/page event can be admitted after waitForDispatches returns.
       await debotStream?.stop();
       await Promise.all([aveScanner?.stop(),debotScanner?.stop()]);
+      await gmgnMarketStop;
       // No queued Ave sample may run after downstream price consumers begin stopping.
       priceFanout.close();
       await thirdEntry?.stop();await signalCounting.waitForDispatches();

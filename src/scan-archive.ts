@@ -49,6 +49,7 @@ export interface ScanWalletProfile {
 }
 export interface ScanRecord extends ScanToken {
   id:string;source:'debot'|'gmgn'|'ave'|'wallet'|'manual';status:Stored['status'];mode?:Report['mode'];policyVersion?:string;
+  researchOnly?:true;
   receivedAt:string;occurredAt:string;evaluatedAt?:string;decision?:Report['decision'];buyEligible?:boolean;validUntil?:string;
   name?:string;symbol?:string;reasons:string[];advisoryReasons?:string[];
   checks:{provenance:ScanCheck;safety:ScanCheck;narrative:ScanCheck;wallets:ScanCheck;flow:ScanCheck;market?:ScanCheck};
@@ -95,6 +96,9 @@ function token(value:ScanToken):ScanToken|undefined {
     if(value.chain==='solana') return bs58.decode(value.address).length===32?{chain:value.chain,address:value.address}:undefined;
     if(/^0x[0-9a-fA-F]{40}$/.test(value.address)) return {chain:value.chain,address:value.address.toLowerCase()};
   } catch { /* Malformed input cannot become a partial token identity. */ }
+}
+function researchOnlySignal(signal:Signal):boolean {
+  return signal.source==='gmgn'&&signal.sourceEventId.startsWith('gmgn:market:');
 }
 /** Retain only public identifiers needed to repeat the original investigation. */
 function watchSignal(signal:Signal):Signal|undefined {
@@ -299,7 +303,9 @@ export class ScanArchive {
         if(!insideTransaction)this.db.exec('COMMIT');return;
       }
       const blank=()=>compactCheck(undefined);
-      let result:ScanRecord=previous?{...previous,status:entry.status}:{id:entry.id,...identity,source:entry.signal.source,
+      const researchOnly=researchOnlySignal(entry.signal);
+      let result:ScanRecord=previous?{...previous,status:entry.status,...(researchOnly?{researchOnly:true as const}:{})}:{id:entry.id,...identity,source:entry.signal.source,
+        ...(researchOnly?{researchOnly:true as const}:{}),
         status:entry.status,receivedAt:received,occurredAt:occurred,reasons:[],
         checks:{provenance:blank(),safety:blank(),narrative:blank(),wallets:blank(),flow:blank()}};
       const report=entry.status==='completed'?entry.report:undefined;
@@ -360,6 +366,7 @@ export class ScanArchive {
     try {
       for(const row of this.db.prepare('SELECT record FROM scan_summaries ORDER BY received_at DESC,rowid DESC').all()) {
         const record=JSON.parse(String(row.record)) as ScanRecord;
+        if(record.researchOnly===true)continue;
         this.setWatchHead(record);
         if(record.mode!=='live'||record.decision!=='WATCH'||this.watchRow(record.id))continue;
         const ends=this.watchDeadline(record),endReason=this.futureWatch(record)?'SIGNAL_TIME_IN_FUTURE':
@@ -715,6 +722,10 @@ export class ScanArchive {
       .run(record.chain,record.address,record.id,record.receivedAt,record.occurredAt);
   }
   private captureWatch(entry:Stored,record:ScanRecord,isNew:boolean,now:Date):void {
+    // GMGN Market Signal is research-only. Keep its scan/archive record, but
+    // never let it own or supersede the per-token watch head that can later
+    // reach EntryController. Other GMGN sources retain the existing behavior.
+    if(record.researchOnly===true||researchOnlySignal(entry.signal))return;
     if(isNew)this.setWatchHead(record,true);
     const old=this.watchRow(record.id);
     if(old) {

@@ -3,9 +3,14 @@ import {abortable} from '../http.js';
 
 const HOST = 'https://openapi.gmgn.ai';
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
+// The fixed Market Signal request returns up to seven independent 50-row
+// groups. Its verified payload is already close to the generic 2 MiB ceiling,
+// so give only this route a larger, still bounded allowance.
+const MAX_MARKET_SIGNAL_RESPONSE_BYTES = 4 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 12_000;
 const MAX_QUEUE_WAIT_MS = 45_000;
 const MAX_LIVE_ENTRY_QUEUE = 16;
+const MAX_SIGNAL_POLL_QUEUE = 8;
 const MAX_NORMAL_QUEUE = 128;
 const MAX_BACKGROUND_QUEUE = 16;
 // A busy normal lane still yields one bounded opportunity to its own archive
@@ -60,8 +65,10 @@ interface RateState {
   lastStartedAt?: number;
   lastCost?: number;
   lastBackgroundStartedAt?: number;
+  /** A signal poll preempted archive work; its next attempt gets one full turn. */
+  backgroundSignalProtectionPending?: boolean;
 }
-export type GmgnRequestPriority = 'background' | 'normal' | 'live_entry';
+export type GmgnRequestPriority = 'background' | 'normal' | 'signal_poll' | 'live_entry';
 export interface GmgnScheduleOptions {
   priority?: GmgnRequestPriority;
   /** Queue budget only. Network requests retain their own fixed timeout. */
@@ -79,6 +86,9 @@ interface ScheduledRequest<T> {
   timer?: ReturnType<typeof setTimeout>;
   abort?: () => void;
   interrupt?: () => void;
+  protectedFromSignalPoll?: boolean;
+  interruptedBySignalPoll?: boolean;
+  interruptedByLiveEntry?: boolean;
   started: boolean;
   settled: boolean;
 }
@@ -86,6 +96,7 @@ interface ScheduledRequest<T> {
 // strictly serial and share weighted pacing/cooldown; separate credentials have
 // independent Plus quotas and therefore cannot head-of-line block each other.
 const liveEntryQueue: ScheduledRequest<unknown>[] = [];
+const signalPollQueue: ScheduledRequest<unknown>[] = [];
 const normalQueue: ScheduledRequest<unknown>[] = [];
 const backgroundQueue: ScheduledRequest<unknown>[] = [];
 const activeLanes = new Set<RateState>();
@@ -94,7 +105,8 @@ let schedulerActive = false;
 let schedulerWake: ReturnType<typeof setTimeout> | undefined;
 
 function removeScheduled(job: ScheduledRequest<unknown>): boolean {
-  const queue = job.priority === 'live_entry' ? liveEntryQueue : job.priority === 'background' ? backgroundQueue : normalQueue;
+  const queue = job.priority === 'live_entry' ? liveEntryQueue : job.priority === 'signal_poll' ? signalPollQueue :
+    job.priority === 'background' ? backgroundQueue : normalQueue;
   const index = queue.indexOf(job);
   if (index < 0) return false;
   queue.splice(index, 1);
@@ -133,20 +145,31 @@ function nextReady(queue: ScheduledRequest<unknown>[]): {job?: ScheduledRequest<
   }
   return {wait};
 }
-function nextReadyBackground(now: number): {job?: ScheduledRequest<unknown>; wait: number; contended: boolean} {
+function nextReadyBackground(now: number): {
+  job?: ScheduledRequest<unknown>; wait: number; contended: boolean; signalProtected: boolean;
+} {
   let wait = Number.POSITIVE_INFINITY;
+  let unopposed: ScheduledRequest<unknown> | undefined;
+  let fair: ScheduledRequest<unknown> | undefined;
   for (const job of backgroundQueue) {
     if (activeLanes.has(job.lane)) continue;
     const pacingWait = Math.max(0, job.waitMs());
     if (pacingWait > 0) { wait = Math.min(wait, pacingWait); continue; }
+    // Once a signal poll has cut an archive request short, the next archive
+    // attempt must finish (or hit its own timeout) before more signal polls on
+    // this credential. This prevents a 1 s poller from starving persistence.
+    if (job.lane.backgroundSignalProtectionPending)
+      return {job, wait: 0, contended: true, signalProtected: true};
     const contended = normalQueue.some(normal => normal.lane === job.lane);
-    if (!contended) return {job, wait: 0, contended: false};
+    if (!contended) { unopposed ??= job; continue; }
     const fairAt = (job.lane.lastBackgroundStartedAt ?? Number.NEGATIVE_INFINITY) + BACKGROUND_FAIRNESS_INTERVAL_MS;
     const fairnessWait = Math.max(0, fairAt - now);
-    if (fairnessWait === 0) return {job, wait: 0, contended: true};
+    if (fairnessWait === 0) { fair ??= job; continue; }
     wait = Math.min(wait, fairnessWait);
   }
-  return {wait, contended: false};
+  if (fair) return {job: fair, wait: 0, contended: true, signalProtected: false};
+  if (unopposed) return {job: unopposed, wait: 0, contended: false, signalProtected: false};
+  return {wait, contended: false, signalProtected: false};
 }
 async function drainScheduler(): Promise<void> {
   if (schedulerActive) return;
@@ -154,27 +177,42 @@ async function drainScheduler(): Promise<void> {
   try {
     for (;;) {
       const now = Date.now();
-      pruneQueue(liveEntryQueue, now); pruneQueue(normalQueue, now); pruneQueue(backgroundQueue, now);
+      pruneQueue(liveEntryQueue, now); pruneQueue(signalPollQueue, now); pruneQueue(normalQueue, now); pruneQueue(backgroundQueue, now);
       const live = nextReady(liveEntryQueue);
-      const normal = live.job ? {wait: Number.POSITIVE_INFINITY} : nextReady(normalQueue);
-      const background = live.job ? {wait: Number.POSITIVE_INFINITY, contended: false} : nextReadyBackground(now);
+      const signal = live.job ? {wait: Number.POSITIVE_INFINITY} : nextReady(signalPollQueue);
+      const background = live.job ? {wait: Number.POSITIVE_INFINITY, contended: false, signalProtected: false} :
+        nextReadyBackground(now);
+      const normal = live.job || signal.job || background.signalProtected ? {wait: Number.POSITIVE_INFINITY} : nextReady(normalQueue);
       // A contended background job is selected only at its per-credential
       // fairness boundary. Uncontended background work remains below normal
       // priority; the loop can start it concurrently once other lanes are busy.
-      const selected = live.job ?? (background.contended ? background.job : normal.job ?? background.job);
+      const selected = live.job ?? (background.signalProtected ? background.job : signal.job) ??
+        (background.contended ? background.job : normal.job ?? background.job);
       if (!selected) {
-        const wait = Math.min(live.wait, normal.wait, background.wait);
+        const wait = Math.min(live.wait, signal.wait, normal.wait, background.wait);
         if (Number.isFinite(wait)) schedulerWake = setTimeout(() => {schedulerWake = undefined; kickScheduler();}, wait);
         return;
       }
       removeScheduled(selected); selected.started = true; cleanupScheduled(selected); activeLanes.add(selected.lane);
-      if (selected.priority === 'background') selected.lane.lastBackgroundStartedAt = now;
+      if (selected.priority === 'background') {
+        selected.lane.lastBackgroundStartedAt = now;
+        selected.protectedFromSignalPoll = selected.lane.backgroundSignalProtectionPending === true;
+      }
       activeRequests.set(selected.lane,selected);
       void (async () => {
+        let completed = false;
         try {
           const value = await selected.run();
+          completed = true;
           if (!selected.settled) { selected.settled = true; selected.resolve(value); }
         } catch (error) { rejectScheduled(selected, error); }
+        // A protected archive attempt consumes its promised full turn even if
+        // its own endpoint fails or times out. Only a live-entry preemption
+        // preserves protection for the retry; a bad archive route must not
+        // become a permanent blocker for signal polling.
+        if (selected.priority === 'background' && !selected.interruptedByLiveEntry &&
+            (completed || selected.protectedFromSignalPoll))
+          selected.lane.backgroundSignalProtectionPending = false;
         // Let a completed high-priority metadata read enqueue its dependent
         // holder reads before releasing this credential lane to background work.
         await Promise.resolve(); activeLanes.delete(selected.lane); activeRequests.delete(selected.lane); kickScheduler();
@@ -185,9 +223,11 @@ async function drainScheduler(): Promise<void> {
 function enqueueScheduled<T>(job: Omit<ScheduledRequest<T>, 'resolve'|'reject'|'started'|'settled'>): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const scheduled: ScheduledRequest<T> = {...job, resolve, reject, started: false, settled: false};
-    const queue = scheduled.priority === 'live_entry' ? liveEntryQueue : scheduled.priority === 'background' ? backgroundQueue : normalQueue;
+    const queue = scheduled.priority === 'live_entry' ? liveEntryQueue : scheduled.priority === 'signal_poll' ? signalPollQueue :
+      scheduled.priority === 'background' ? backgroundQueue : normalQueue;
     pruneQueue(queue as ScheduledRequest<unknown>[], Date.now());
     const capacity = scheduled.priority === 'live_entry' ? MAX_LIVE_ENTRY_QUEUE :
+      scheduled.priority === 'signal_poll' ? MAX_SIGNAL_POLL_QUEUE :
       scheduled.priority === 'background' ? MAX_BACKGROUND_QUEUE : MAX_NORMAL_QUEUE;
     // Capacity belongs to the credential lane. One configured account must not
     // reject live work for another account that has its own quota and pacing.
@@ -207,12 +247,20 @@ function enqueueScheduled<T>(job: Omit<ScheduledRequest<T>, 'resolve'|'reject'|'
     scheduled.signal?.addEventListener('abort', scheduled.abort, {once: true});
     if (scheduled.signal?.aborted) { scheduled.abort(); return; }
     queue.push(scheduled as ScheduledRequest<unknown>);
-    // Background reads are observational. If an opening-order read arrives,
-    // cancel an interruptible background HTTP request on the same credential
-    // lane instead of making live work wait for its network timeout.
-    if(scheduled.priority==='live_entry') {
+    // The first signal poll may preempt archive work. Its retry gets one
+    // signal-proof turn, while live entry can always preempt either read lane.
+    if(scheduled.priority==='signal_poll'||scheduled.priority==='live_entry') {
       const active=activeRequests.get(scheduled.lane);
-      if(active?.priority==='background')active.interrupt?.();
+      if(active?.priority==='background'&&active.interrupt) {
+        if(scheduled.priority==='live_entry') {
+          active.interruptedByLiveEntry=true;
+          active.interrupt();
+        } else if(!active.protectedFromSignalPoll&&!active.interruptedBySignalPoll) {
+          active.interruptedBySignalPoll=true;
+          active.lane.backgroundSignalProtectionPending=true;
+          active.interrupt();
+        }
+      } else if(scheduled.priority==='live_entry'&&active?.priority==='signal_poll') active.interrupt?.();
     }
     kickScheduler();
   });
@@ -304,7 +352,11 @@ export class GmgnClient {
     // separate or a single busy category can silently crowd out the others.
     return this.backgroundRequest(1,scheduling,signal=>this.request('/v1/market/token_signal',{},false,'POST',
       {chain,groups:[{signal_type:[12]},{signal_type:[20]},{signal_type:[13,19]},
-        {signal_type:[6,7]},{signal_type:[10,11]},{signal_type:[17,18,21]}]},signal));
+        {signal_type:[6,7]},{signal_type:[10,11]},{signal_type:[17,18,21]},
+        // Meme heat and attention signals remain observation-only downstream.
+        // Keep them in their own group so they cannot crowd smart/KOL calls
+        // out of GMGN's per-group 50-row response cap.
+        {signal_type:[1,2,3,4,5,8,9]}]},signal,MAX_MARKET_SIGNAL_RESPONSE_BYTES));
   }
 
   /** Latest or cursor page from GMGN's read-only global call-out feed. */
@@ -387,7 +439,7 @@ export class GmgnClient {
     this.checkAborted();
     if (!this.apiKey) throw new GmgnError('GMGN_API_KEY_MISSING');
     if (!Number.isFinite(weight) || weight < 1 || weight > 100) throw new GmgnError('GMGN_QUERY_INVALID');
-    if (scheduling.priority !== undefined && !['background','normal','live_entry'].includes(scheduling.priority))
+    if (scheduling.priority !== undefined && !['background','normal','signal_poll','live_entry'].includes(scheduling.priority))
       throw new GmgnError('GMGN_QUERY_INVALID');
     if (scheduling.queueTimeoutMs !== undefined && (!Number.isFinite(scheduling.queueTimeoutMs) ||
       scheduling.queueTimeoutMs < 1 || scheduling.queueTimeoutMs > MAX_QUEUE_WAIT_MS)) throw new GmgnError('GMGN_QUERY_INVALID');
@@ -415,7 +467,8 @@ export class GmgnClient {
   }
 
   private async request(path: string, query: Record<string, QueryValue>, signed=false,
-    method:'GET'|'POST'='GET',body?:unknown,requestSignal?:AbortSignal): Promise<unknown> {
+    method:'GET'|'POST'='GET',body?:unknown,requestSignal?:AbortSignal,
+    maxResponseBytes=MAX_RESPONSE_BYTES): Promise<unknown> {
     const url = new URL(path, HOST);
     const authQuery:Record<string,QueryValue>={...query,timestamp:String(Math.floor(this.now()/1_000)),client_id:randomUUID()};
     for (const [key, value] of Object.entries(authQuery)) {
@@ -471,7 +524,7 @@ export class GmgnClient {
       let payload: unknown;
       try {
         const declaredSize = response.headers.get('content-length');
-        if (declaredSize && Number(declaredSize) > MAX_RESPONSE_BYTES) {
+        if (declaredSize && Number(declaredSize) > maxResponseBytes) {
           void response.body?.cancel().catch(() => {});
           throw new GmgnError('GMGN_RESPONSE_TOO_LARGE');
         }
@@ -484,7 +537,7 @@ export class GmgnClient {
             const {done, value} = await reader.read();
             if (done) break;
             length += value.byteLength;
-            if (length > MAX_RESPONSE_BYTES) throw new GmgnError('GMGN_RESPONSE_TOO_LARGE');
+            if (length > maxResponseBytes) throw new GmgnError('GMGN_RESPONSE_TOO_LARGE');
             chunks.push(value);
           }
         } catch (error) { void reader.cancel().catch(() => {}); throw error; }

@@ -92,6 +92,68 @@ test('new same-CA signals supersede older jobs across sources; stale completion 
   } finally {f.archive.close();}
 });
 
+test('GMGN Market research cannot supersede a DeBot or Ave trading watch head',()=>{
+  for(const source of ['debot','ave'] as const){
+    const f=fixture();try {
+      const incumbent=signal(`${source}-watch`,{source,sourceEventId:`${source}-watch`,occurredAt:iso(0)});
+      capture(f.archive,incumbent,incumbent.sourceEventId,iso(0),iso(1000));
+      const market=signal('gmgn:market:bsc:research-only-0001',{source:'gmgn',
+        sourceEventId:'gmgn:market:bsc:research-only-0001',occurredAt:iso(2000)}),marketId='market-research-1';
+      f.set(3000);capture(f.archive,market,marketId,iso(2000),iso(3000));
+      assert.equal(f.archive.get(marketId)!.decision,'WATCH','research result remains in the scan archive');
+      assert.equal(f.archive.get(marketId)!.researchOnly,true);
+      assert.equal(f.archive.get(marketId)!.observation,undefined,'research-only signal gets no trading watch job');
+      assert.equal(f.archive.get(incumbent.sourceEventId)!.observation!.state,'scheduled');
+      assert.equal(f.archive.get(incumbent.sourceEventId)!.observation!.endReason,undefined);
+      assert.equal(f.archive.watchStatus().scheduled,1);
+      f.set(121000);assert.equal(f.archive.claimWatch()!.id,incumbent.sourceEventId);
+    } finally {f.archive.close();}
+  }
+});
+
+test('GMGN Market research exclusion survives archive restart and watch migration',()=>{
+  for(const source of ['debot','ave'] as const){
+    const dir=mkdtempSync(join(tmpdir(),'market-watch-restart-')),path=join(dir,'scans.sqlite');let time=1000;
+    const now=()=>new Date(start+time);let archive:ScanArchive|undefined=new ScanArchive(path,{now});
+    try {
+      archive.configureWatch(config);
+      const incumbent=signal(`${source}-restart-watch`,{source,sourceEventId:`${source}-restart-watch`,occurredAt:iso(0)});
+      capture(archive,incumbent,incumbent.sourceEventId,iso(0),iso(1000));
+      const market=signal('gmgn:market:bsc:restart-research-0001',{source:'gmgn',
+        sourceEventId:'gmgn:market:bsc:restart-research-0001',occurredAt:iso(2000)}),marketId='market-restart-research';
+      time=3000;capture(archive,market,marketId,iso(2000),iso(3000));
+      assert.equal(archive.get(marketId)!.researchOnly,true);archive.close();archive=undefined;
+
+      archive=new ScanArchive(path,{now});archive.configureWatch(config);
+      assert.equal(archive.get(marketId)!.researchOnly,true);
+      assert.equal(archive.get(marketId)!.observation,undefined,'restart migration must not create a Market watch job');
+      assert.equal(archive.get(incumbent.sourceEventId)!.observation!.state,'scheduled');
+      assert.equal(archive.get(incumbent.sourceEventId)!.observation!.endReason,undefined);
+      assert.equal(archive.watchStatus().scheduled,1);
+      time=121000;assert.equal(archive.claimWatch()!.id,incumbent.sourceEventId);
+    } finally {archive?.close();rmSync(dir,{recursive:true,force:true});}
+  }
+});
+
+test('GMGN Market WATCH cannot reach recheck entry even when evaluation would become a candidate',async()=>{
+  const f=fixture();let evaluations=0,entries=0;
+  try {
+    const market=signal('gmgn:market:bsc:research-only-0002',{source:'gmgn',
+      sourceEventId:'gmgn:market:bsc:research-only-0002'}),marketId='market-research-2';
+    capture(f.archive,market,marketId,iso(0),iso(1000));
+    assert.equal(f.archive.get(marketId)!.decision,'WATCH');
+    assert.equal(f.archive.get(marketId)!.observation,undefined);
+    assert.deepEqual(f.archive.watchStatus(),{scheduled:0,processing:0,ended:0,due:0});
+    f.set(121000);
+    const worker=new WatchRechecker({archive:f.archive,now:f.now,evaluate:async(s,id)=>{
+      evaluations++;return report(s,id.id,id.receivedAt,f.now().toISOString(),{decision:'BUY_CANDIDATE',buyEligible:true});
+    },entry:async()=>{entries++;}});
+    await worker.runOnce();
+    assert.equal(evaluations,0);assert.equal(entries,0);
+    assert.equal(f.archive.get(marketId)!.decision,'WATCH');
+  } finally {f.archive.close();}
+});
+
 test('a later received older-completing signal cannot replace the actual newest signal head',()=>{
   const f=fixture();
   try {

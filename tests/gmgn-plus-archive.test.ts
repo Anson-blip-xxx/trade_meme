@@ -37,16 +37,44 @@ test('market and callout rows are normalized, deduplicated and seed bounded wall
       assert.equal(Number(db.prepare('SELECT count(*) AS n FROM gpa_wallet_candidates').get()!.n),2);
       assert.equal(Number(db.prepare('SELECT sum(occurrences) AS n FROM gpa_wallet_candidates').get()!.n),2,
         'candidate occurrences equal unique event-wallet evidence, not poll count');
-      assert.equal(Number(db.prepare('SELECT count(*) AS n FROM gpa_event_wallets').get()!.n),3,'roles remain available as separate evidence rows');
+      assert.equal(Number(db.prepare('SELECT count(*) AS n FROM gpa_event_wallets').get()!.n),2,'only the wallet array matching the signal type becomes evidence');
       const caller=db.prepare('SELECT source_mask,occurrences FROM gpa_wallet_candidates WHERE address=?').get(wallet(3))!;
       assert.deepEqual({sourceMask:Number(caller.source_mask),occurrences:Number(caller.occurrences)},{sourceMask:3,occurrences:1});
       const signalWallet=db.prepare('SELECT source_mask,occurrences FROM gpa_wallet_candidates WHERE address=?').get(wallet(2))!;
-      assert.deepEqual({sourceMask:Number(signalWallet.source_mask),occurrences:Number(signalWallet.occurrences)},{sourceMask:12,occurrences:1},
-        'the same event+wallet counts once even when it has two roles');
+      assert.deepEqual({sourceMask:Number(signalWallet.source_mask),occurrences:Number(signalWallet.occurrences)},{sourceMask:4,occurrences:1});
       assert.equal(db.prepare('SELECT last_seen_at FROM gpa_wallet_candidates WHERE address=?').get(wallet(2))!.last_seen_at,
         new Date(at).toISOString(),'re-polling stale evidence does not make the candidate look recent');
       assert.equal(archive.calloutCursor('global'),'cursor-one','the first latest page freezes the historical frontier');
       assert.equal(archive.calloutFrontier('global'),'cursor-two');
+    }finally{db.close();archive.close();}
+  }finally{f.close();}
+});
+
+test('market signal identity lookup is bounded and exact for restart deduplication',()=>{
+  const f=fixture();try{const archive=f.create();archive.recordMarketSignals('sol',[signal('signal-known-0001')]);
+    assert.deepEqual([...archive.knownMarketSignalIds('sol',['signal-known-0001','signal-missing-0002'])],['signal-known-0001']);
+    assert.deepEqual([...archive.knownMarketSignalIds('bsc',['signal-known-0001'])],[]);
+    assert.deepEqual([...archive.knownProcessedMarketSignalIds('sol',['signal-known-0001'])],[]);
+    archive.markMarketSignalProcessed('sol','signal-known-0001');
+    assert.deepEqual([...archive.knownProcessedMarketSignalIds('sol',['signal-known-0001','signal-missing-0002'])],['signal-known-0001']);
+    assert.deepEqual([...archive.knownProcessedMarketSignalIds('bsc',['signal-known-0001'])],[]);
+    const db=new DatabaseSync(f.path,{readOnly:true});try{
+      const plan=String(db.prepare(`EXPLAIN QUERY PLAN SELECT upstream_id FROM gpa_events
+        WHERE kind='market_signal' AND chain=? AND upstream_id IN (?,?)`).get('sol','signal-known-0001','signal-missing-0002')!.detail);
+      assert.match(plan,/gpa_market_signal_identity/,'large archives must use the covering market identity index');
+    }finally{db.close();}archive.close();
+  }finally{f.close();}
+});
+
+test('market archive binds data identity and imports only the wallet feed matching the signal type',()=>{
+  const f=fixture();try{const archive=f.create(),base=signal('signal-identity-0001');
+    assert.equal(archive.recordMarketSignals('sol',[{...base,data:{...base.data,address:wallet(9)}}]).accepted,0);
+    const kol={...signal('signal-kol-0000002'),signal_type:20,data:{...base.data,smart_degen_wallets:base.data.smart_degen_wallets,
+      kol_wallets:[{address:wallet(5),buy_timestamp:at/1000-31,buy_amount:30},{address:wallet(6),buy_timestamp:at/1000,buy_amount:0}]}};
+    assert.equal(archive.recordMarketSignals('sol',[kol]).accepted,1);
+    const db=new DatabaseSync(f.path,{readOnly:true});try{
+      assert.equal(Number(db.prepare('SELECT count(*) AS n FROM gpa_event_wallets').get()!.n),0);
+      assert.equal(Number(db.prepare('SELECT count(*) AS n FROM gpa_wallet_candidates').get()!.n),0);
     }finally{db.close();archive.close();}
   }finally{f.close();}
 });
@@ -88,7 +116,7 @@ test('a pruned candidate is rehydrated from distinct durable event evidence with
     const db=new DatabaseSync(f.path);db.prepare('DELETE FROM gpa_wallet_candidates WHERE address=?').run(wallet(2));db.close();f.advance(60_000);
     assert.equal(archive.recordMarketSignals('sol',[signal()]).candidates,0);
     const check=new DatabaseSync(f.path,{readOnly:true});try{const row=check.prepare('SELECT source_mask,occurrences FROM gpa_wallet_candidates WHERE address=?').get(wallet(2))!;
-      assert.deepEqual({sourceMask:Number(row.source_mask),occurrences:Number(row.occurrences)},{sourceMask:12,occurrences:1});
+      assert.deepEqual({sourceMask:Number(row.source_mask),occurrences:Number(row.occurrences)},{sourceMask:4,occurrences:1});
     }finally{check.close();archive.close();}
   }finally{f.close();}
 });
@@ -232,6 +260,17 @@ test('runner advances one durable low-volume task at a time and never sends arch
     for(let i=0;i<7;i++)await runner.runOnce();
     assert.deepEqual(calls,['market:sol','market:bsc','market:robinhood','callout:false:latest','callout:true:latest','callout:false:next','callout:true:next']);
     assert.equal(runner.status().runnerCursor,7);assert.equal(runner.status().entryPipeline,false);await runner.stop();
+  }finally{f.close();}
+});
+
+test('dedicated Sol market polling removes only Sol from archive rotation',async()=>{
+  const f=fixture();try{const archive=f.create(),calls:string[]=[];const client={cooldownUntil:0,
+    getMemeMarketSignals:async(chain:string)=>{calls.push(chain);return [];},getCalloutGlobal:async()=>({list:[]}),
+    getWalletStats:async()=>({}),getWalletProfits:async()=>({list:[]}),getWalletActivity:async()=>({activities:[]})};
+    const runner=new GmgnPlusArchiveRunner({archive,client:client as never,chains:['sol','bsc','robinhood'],intervalMs:5000,
+      dedicatedMarketChains:['sol'],now:f.now});
+    await runner.runOnce();await runner.runOnce();assert.deepEqual(calls,['bsc','robinhood']);
+    assert.deepEqual(runner.status().dedicatedMarketChains,['sol']);assert.equal(runner.status().entryPipeline,false);await runner.stop();
   }finally{f.close();}
 });
 

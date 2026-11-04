@@ -110,6 +110,18 @@ test('本轮回调数量有界，未处理事件下轮可继续；跨轮和跨fe
   assert.equal((await scanner.runOnce()).emitted,0);assert.equal(seen.length,3);
 });
 
+test('完整分析使用显式有界并发，且状态公开实际并发数',async()=>{
+  const release=deferred();let active=0,peak=0,started=0;
+  const scanner=new GmgnScanner({...options({get:async()=>({list:Array.from({length:6},(_,i)=>sequence(i+1))})},async()=>{
+    started++;peak=Math.max(peak,++active);await release.promise;active--;
+  }),maxSignalsPerCycle:6,maxSignalConcurrency:3});
+  const cycle=scanner.runOnce();
+  while(started<3)await new Promise<void>(resolve=>setImmediate(resolve));
+  assert.equal(started,3);assert.equal(peak,3);assert.equal(scanner.getStatus().signalConcurrency,3);
+  release.resolve();const report=await cycle;
+  assert.equal(report.emitted,6);assert.equal(peak,3);assert.equal(active,0);
+});
+
 test('单个回调失败不会永久吞掉信号，同轮不重复重试且失败也计入数量上限',async()=>{
   let attempts=0;
   const scanner=new GmgnScanner({...options({get:async()=>({list:[trade(),sequence(1)]})},()=>{

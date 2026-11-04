@@ -43,10 +43,11 @@ export interface SourceCorroborationOptions {now?:()=>Date;windowSec?:number;max
 export interface SourceCorroborationMetadata {name?:string;txRefs?:SourceTransactionReference[];sourceUrl?:string;deliveryKey?:string;}
 type Row=Record<string,any>;
 const SOURCES:readonly CorroborationSource[]=['ave','debot','gmgn'];
-const RETENTION_DAYS=30,DEFAULT_MAX_EVENTS=100000,MAX_REFS=20,ASSESS_EVENTS_PER_SOURCE=64;
+const RETENTION_DAYS=30,DEFAULT_MAX_EVENTS=100000,MAX_REFS=20,ASSESS_EVENTS_PER_SOURCE=64,MAX_CAPACITY_PRUNE_BATCH=1000;
 const RETENTION_MS=RETENTION_DAYS*86400000;
-const STATUS_META_VERSION='1';
-const STATUS_META_KEYS={version:'status_version',events:'events',deliveries:'deliveries',latest:'latest_observed_at'} as const;
+const STATUS_META_VERSION='2';
+const STATUS_META_KEYS={version:'status_version',events:'events',deliveries:'deliveries',latest:'latest_observed_at',
+  earliest:'earliest_recorded_at',capacityEvicted:'capacity_evicted_events'} as const;
 const iso=(n:number)=>new Date(n).toISOString();
 function millis(value:unknown):number {
   return typeof value==='string'&&value.length<=40&&/^\d{4}-\d\d-\d\dT/.test(value)?Date.parse(value):NaN;
@@ -63,6 +64,11 @@ function sameToken(left:Token,right:Token):boolean {
 function eventId(value:unknown):value is string {return typeof value==='string'&&/^[A-Za-z0-9_.:-]{1,160}$/.test(value);}
 function windowSeconds(value=300):number {
   if(!Number.isInteger(value)||value<1||value>3600)throw new Error('SOURCE_WINDOW_INVALID');return value;
+}
+function retainedFrom(db:DatabaseSync,at:number):string {
+  const cutoff=iso(at-RETENTION_MS),row=db.prepare('SELECT value FROM source_corroboration_meta WHERE key=?').get(STATUS_META_KEYS.earliest),
+    earliest=typeof row?.value==='string'?row.value:'';
+  return earliest&&earliest>cutoff?earliest:cutoff;
 }
 function txHash(value:unknown,token:Token):string|undefined {
   if(typeof value!=='string')return;
@@ -120,7 +126,7 @@ export class SourceCorroborationReader {
   }
   assess(value:Token,now:Date):SourceCorroborationAssessment {
     const token=normalizedToken(value),at=now.getTime();if(!token||!Number.isFinite(at))throw new Error('SOURCE_ASSESSMENT_INVALID');
-    const end=iso(at),start=iso(at-this.windowSec*1000),retention=iso(at-RETENTION_MS),observations:SourceNotificationEvidence[]=[],
+    const end=iso(at),start=iso(at-this.windowSec*1000),retention=retainedFrom(this.db,at),observations:SourceNotificationEvidence[]=[],
       notificationCounts:Partial<Record<CorroborationSource,number>>={};let truncated=false;
     for(const source of SOURCES){
       const rows=this.db.prepare(`SELECT * FROM source_notifications WHERE chain=? AND address=? AND source=? AND recorded_at<=? AND recorded_at>=?
@@ -154,7 +160,9 @@ export class SourceCorroborationReader {
       windows:{last1m:{startExclusive:minute,endInclusive:end},last5m:{startExclusive:five,endInclusive:end},previous5m:{startExclusive:ten,endInclusive:five}},
       sources,historyComplete:false,retainedFrom,referenceSampleTruncated,limitations:['RETAINED_NOTIFICATIONS_ONLY',
         'OBSERVED_STREAM_SAMPLE_NOT_FULL_PROVIDER_HISTORY','EVENT_IDS_NOT_INDEPENDENT_WALLETS_OR_TRADES','ZERO_COUNT_DOES_NOT_PROVE_SOURCE_INACTIVE',
-        'COLLECTION_GAPS_UNKNOWN','SOURCE_COUNT_DOES_NOT_CHANGE_SCORE',...(ten<retainedFrom?['ACTIVITY_WINDOW_OUTSIDE_RETENTION']:[]),
+        'COLLECTION_GAPS_UNKNOWN','SOURCE_COUNT_DOES_NOT_CHANGE_SCORE',
+        ...(retainedFrom>iso(at-RETENTION_MS)?['EVENT_CAPACITY_ROLLING_RETENTION']:[]),
+        ...(ten<retainedFrom?['ACTIVITY_WINDOW_OUTSIDE_RETENTION']:[]),
         ...(referenceSampleTruncated?['REFERENCE_SAMPLE_LIMIT_DOES_NOT_TRUNCATE_ACTIVITY_COUNTS']:[])]};
   }
 }
@@ -240,7 +248,8 @@ export class SourceCorroboration {
       CREATE INDEX IF NOT EXISTS source_notifications_history ON source_notifications(chain,address,recorded_at DESC,source,event_id);
       CREATE INDEX IF NOT EXISTS source_notifications_first_observed ON source_notifications(first_observed_at DESC);
       CREATE TABLE IF NOT EXISTS source_corroboration_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
-      INSERT OR IGNORE INTO source_corroboration_meta VALUES('pruned_events','0');`);
+      INSERT OR IGNORE INTO source_corroboration_meta VALUES('pruned_events','0');
+      INSERT OR IGNORE INTO source_corroboration_meta VALUES('${STATUS_META_KEYS.capacityEvicted}','0');`);
     if(!this.db.prepare('PRAGMA table_info(source_notifications)').all().some(row=>row.name==='delivery_key'))
       this.db.exec('ALTER TABLE source_notifications ADD COLUMN delivery_key TEXT');
     this.initializeStatusMetadata();
@@ -277,9 +286,7 @@ export class SourceCorroboration {
           if(this.error!=='SOURCE_LEDGER_CAPACITY_REACHED')this.error=undefined;
           return {accepted:true,duplicate:true};
         }
-        if(this.metaNumber(STATUS_META_KEYS.events)>=this.maxEvents){
-          this.db.exec('RELEASE source_notification_record');this.error='SOURCE_LEDGER_CAPACITY_REACHED';return reject(this.error);
-        }
+        if(this.metaNumber(STATUS_META_KEYS.events)>=this.maxEvents)this.pruneForCapacity();
         const refs=references(metadata.txRefs,token);
         this.db.prepare(`INSERT INTO source_notifications(source,event_id,chain,address,occurred_at,first_observed_at,recorded_at,
           last_delivery_at,last_recorded_at,delivery_count,conflict_at,name,source_url,tx_refs,delivery_key)
@@ -293,7 +300,8 @@ export class SourceCorroboration {
         throw error;
       }
     }catch(error){
-      this.error=error instanceof Error&&/database or disk is full/i.test(error.message)?'SOURCE_LEDGER_CAPACITY_REACHED':'SOURCE_LEDGER_WRITE_FAILED';
+      this.error=error instanceof Error&&(error.message==='SOURCE_LEDGER_CAPACITY_REACHED'||/database or disk is full/i.test(error.message))?
+        'SOURCE_LEDGER_CAPACITY_REACHED':'SOURCE_LEDGER_WRITE_FAILED';
       return reject(this.error);
     }
   }
@@ -307,7 +315,7 @@ export class SourceCorroboration {
     if(this.closed)throw new Error('SOURCE_LEDGER_CLOSED');
     const token=normalizedToken(value),at=now.getTime();
     if(!token||!Number.isFinite(at)||at>this.now().getTime())throw new Error('SOURCE_ASSESSMENT_INVALID');
-    const end=iso(at),start=iso(at-this.windowSec*1000),retention=iso(this.now().getTime()-RETENTION_MS);
+    const end=iso(at),start=iso(at-this.windowSec*1000),retention=retainedFrom(this.db,this.now().getTime());
     const observations:SourceNotificationEvidence[]=[],notificationCounts:Partial<Record<CorroborationSource,number>>={};let truncated=false;
     for(const source of SOURCES){
       // Prefer fresh candidates before limiting reference comparisons. A burst of stale/future copies cannot hide a fresh source.
@@ -349,6 +357,7 @@ export class SourceCorroboration {
       limitations:['RETAINED_NOTIFICATIONS_ONLY','OBSERVED_STREAM_SAMPLE_NOT_FULL_PROVIDER_HISTORY',
         'EVENT_IDS_NOT_INDEPENDENT_WALLETS_OR_TRADES','ZERO_COUNT_DOES_NOT_PROVE_SOURCE_INACTIVE',
         'COLLECTION_GAPS_UNKNOWN','SOURCE_COUNT_DOES_NOT_CHANGE_SCORE',
+        ...(retainedFrom>iso(at-RETENTION_MS)?['EVENT_CAPACITY_ROLLING_RETENTION']:[]),
         ...(ten<retainedFrom?['ACTIVITY_WINDOW_OUTSIDE_RETENTION']:[]),
         ...(referenceSampleTruncated?['REFERENCE_SAMPLE_LIMIT_DOES_NOT_TRUNCATE_ACTIVITY_COUNTS']:[])]};
   }
@@ -357,7 +366,8 @@ export class SourceCorroboration {
     const token=normalizedToken(value),limit=options.limit??20,offset=options.offset??0,now=this.now().getTime(),asOf=options.asOf??iso(now),at=millis(asOf);
     if(!token||!Number.isInteger(limit)||limit<1||limit>100||!Number.isInteger(offset)||offset<0||offset>1000000||
       !Number.isFinite(at)||iso(at)!==asOf||at>now)throw new Error('INVALID_FILTER');
-    const earliest=iso(now-RETENTION_MS),where='chain=? AND address=? AND recorded_at<=? AND recorded_at>=?',args=[token.chain,token.address,asOf,earliest];
+    const cutoff=iso(now-RETENTION_MS),earliest=retainedFrom(this.db,now),
+      where='chain=? AND address=? AND recorded_at<=? AND recorded_at>=?',args=[token.chain,token.address,asOf,earliest];
     const total=Number(this.db.prepare(`SELECT count(*) AS n FROM source_notifications WHERE ${where}`).get(...args)!.n);
     const rows=this.db.prepare(`SELECT * FROM source_notifications WHERE ${where} ORDER BY recorded_at DESC,source,event_id LIMIT ? OFFSET ?`).all(...args,limit,offset);
     const items=rows.map(row=>{
@@ -370,18 +380,21 @@ export class SourceCorroboration {
     return {token,asOf,total,limit,offset,hasMore:offset+items.length<total,items,retentionDays:RETENTION_DAYS,maxEvents:this.maxEvents,
       retainedFrom:earliest,scope:'source_notifications_not_independent_wallets' as const,
       limitations:['RETAINED_NOTIFICATIONS_ONLY','FIRST_NOTIFICATION_METADATA_FROZEN',
+        ...(earliest>cutoff?['EVENT_CAPACITY_ROLLING_RETENTION']:[]),
         ...(items.some(item=>item.deliveryCount===null)?['HISTORICAL_DELIVERY_COUNT_UNKNOWN']:[])]};
   }
   status(){
     if(this.closed)return {enabled:false,closed:true,researchOnly:true,error:'SOURCE_LEDGER_CLOSED'};
-    const rows=this.db.prepare(`SELECT key,value FROM source_corroboration_meta WHERE key IN (?,?,?,?,?)`).all(
-      STATUS_META_KEYS.events,STATUS_META_KEYS.deliveries,STATUS_META_KEYS.latest,'pruned_events',STATUS_META_KEYS.version);
+    const rows=this.db.prepare(`SELECT key,value FROM source_corroboration_meta WHERE key IN (?,?,?,?,?,?,?)`).all(
+      STATUS_META_KEYS.events,STATUS_META_KEYS.deliveries,STATUS_META_KEYS.latest,STATUS_META_KEYS.earliest,
+      STATUS_META_KEYS.capacityEvicted,'pruned_events',STATUS_META_KEYS.version);
     const meta=new Map(rows.map(row=>[String(row.key),String(row.value)]));
     const pages=Number(this.db.prepare('PRAGMA page_count').get()!.page_count),latest=meta.get(STATUS_META_KEYS.latest);
     return {enabled:true,researchOnly:true,scoreEffect:0,windowSec:this.windowSec,
       events:Number(meta.get(STATUS_META_KEYS.events)),deliveries:Number(meta.get(STATUS_META_KEYS.deliveries)),
       latestObservedAt:latest||undefined,retentionDays:RETENTION_DAYS,maxEvents:this.maxEvents,maxBytes:this.maxBytes,bytes:pages*this.pageSize,
-      prunedEvents:Number(meta.get('pruned_events')),
+      retainedFrom:meta.get(STATUS_META_KEYS.earliest)||undefined,retentionMode:'rolling_latest' as const,
+      prunedEvents:Number(meta.get('pruned_events')),capacityEvictedEvents:Number(meta.get(STATUS_META_KEYS.capacityEvicted)),
       rejected:this.rejected,error:this.error,scope:'source_notifications_not_independent_wallets'};
   }
   private metaNumber(key:string):number {
@@ -398,12 +411,16 @@ export class SourceCorroboration {
       const version=this.db.prepare('SELECT value FROM source_corroboration_meta WHERE key=?').get(STATUS_META_KEYS.version)?.value;
       if(version!==STATUS_META_VERSION){
         const row=this.db.prepare(`SELECT count(*) AS events,COALESCE(sum(delivery_count),0) AS deliveries,
-          COALESCE(max(first_observed_at),'') AS latest FROM source_notifications`).get()!;
+          COALESCE(max(first_observed_at),'') AS latest,COALESCE(min(recorded_at),'') AS earliest FROM source_notifications`).get()!;
         const upsert=this.db.prepare('INSERT OR REPLACE INTO source_corroboration_meta(key,value) VALUES(?,?)');
         upsert.run(STATUS_META_KEYS.events,String(row.events));
         upsert.run(STATUS_META_KEYS.deliveries,String(row.deliveries));
         upsert.run(STATUS_META_KEYS.latest,String(row.latest));
+        upsert.run(STATUS_META_KEYS.earliest,String(row.earliest));
         upsert.run(STATUS_META_KEYS.version,STATUS_META_VERSION);
+        this.db.exec(`DROP TRIGGER IF EXISTS source_notifications_status_insert;
+          DROP TRIGGER IF EXISTS source_notifications_status_update;
+          DROP TRIGGER IF EXISTS source_notifications_status_delete;`);
       }
       this.db.exec(`
         CREATE TRIGGER IF NOT EXISTS source_notifications_status_insert AFTER INSERT ON source_notifications BEGIN
@@ -411,6 +428,8 @@ export class SourceCorroboration {
           UPDATE source_corroboration_meta SET value=CAST(CAST(value AS INTEGER)+NEW.delivery_count AS TEXT) WHERE key='${STATUS_META_KEYS.deliveries}';
           UPDATE source_corroboration_meta SET value=CASE WHEN value='' OR NEW.first_observed_at>value THEN NEW.first_observed_at ELSE value END
             WHERE key='${STATUS_META_KEYS.latest}';
+          UPDATE source_corroboration_meta SET value=CASE WHEN value='' OR NEW.recorded_at<value THEN NEW.recorded_at ELSE value END
+            WHERE key='${STATUS_META_KEYS.earliest}';
         END;
         CREATE TRIGGER IF NOT EXISTS source_notifications_status_update AFTER UPDATE OF delivery_count,first_observed_at ON source_notifications BEGIN
           UPDATE source_corroboration_meta SET value=CAST(MAX(0,CAST(value AS INTEGER)+NEW.delivery_count-OLD.delivery_count) AS TEXT)
@@ -438,12 +457,32 @@ export class SourceCorroboration {
     this.db.exec('SAVEPOINT source_notification_prune');
     try {
       const result=this.db.prepare('DELETE FROM source_notifications WHERE recorded_at<?').run(iso(now-RETENTION_MS));
-      if(result.changes)this.db.prepare("UPDATE source_corroboration_meta SET value=CAST(value AS INTEGER)+? WHERE key='pruned_events'").run(Number(result.changes));
+      if(result.changes){
+        this.db.prepare("UPDATE source_corroboration_meta SET value=CAST(value AS INTEGER)+? WHERE key='pruned_events'").run(Number(result.changes));
+        this.refreshEarliest();
+      }
       this.db.exec('RELEASE source_notification_prune');this.nextPrune=now+60000;
     }catch(error){
       try{this.db.exec('ROLLBACK TO source_notification_prune; RELEASE source_notification_prune');}catch {/* Already rolled back. */}
       throw error;
     }
+  }
+  private pruneForCapacity():void {
+    const events=this.metaNumber(STATUS_META_KEYS.events);if(events<this.maxEvents)return;
+    const headroom=Math.min(this.maxEvents,Math.max(1,Math.min(MAX_CAPACITY_PRUNE_BATCH,Math.ceil(this.maxEvents/100)))),
+      count=Math.min(events,Math.max(events-this.maxEvents+1,headroom));
+    const result=this.db.prepare(`DELETE FROM source_notifications WHERE rowid IN (
+      SELECT rowid FROM source_notifications INDEXED BY source_notifications_recorded
+      ORDER BY recorded_at ASC,rowid ASC LIMIT ?)` ).run(count);
+    if(!result.changes)throw new Error('SOURCE_LEDGER_CAPACITY_REACHED');
+    this.db.prepare("UPDATE source_corroboration_meta SET value=CAST(value AS INTEGER)+? WHERE key='pruned_events'").run(Number(result.changes));
+    this.db.prepare(`UPDATE source_corroboration_meta SET value=CAST(value AS INTEGER)+?
+      WHERE key='${STATUS_META_KEYS.capacityEvicted}'`).run(Number(result.changes));
+    this.refreshEarliest();
+  }
+  private refreshEarliest():void {
+    this.db.prepare(`UPDATE source_corroboration_meta SET value=COALESCE((SELECT min(recorded_at) FROM source_notifications),'')
+      WHERE key=?`).run(STATUS_META_KEYS.earliest);
   }
   close():void {if(this.closed)return;this.closed=true;this.db.close();}
 }

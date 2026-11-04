@@ -170,8 +170,10 @@ test('legacy ledgers backfill status metadata once, then restart and status read
     const migrated=new DatabaseSync(f.database,{readOnly:true});
     try {
       const meta=new Map(migrated.prepare(`SELECT key,value FROM source_corroboration_meta
-        WHERE key IN ('status_version','events','deliveries','latest_observed_at')`).all().map(row=>[String(row.key),String(row.value)]));
-      assert.deepEqual(Object.fromEntries(meta),{deliveries:'3',events:'2',latest_observed_at:at(10),status_version:'1'});
+        WHERE key IN ('status_version','events','deliveries','latest_observed_at','earliest_recorded_at','capacity_evicted_events')`)
+        .all().map(row=>[String(row.key),String(row.value)]));
+      assert.deepEqual(Object.fromEntries(meta),{capacity_evicted_events:'0',deliveries:'3',earliest_recorded_at:at(),events:'2',
+        latest_observed_at:at(10),status_version:'2'});
     } finally {migrated.close();}
     assert.deepEqual(ledger.record(signal('debot',10)),{accepted:true,duplicate:true});
     assert.equal(ledger.status().events,2);assert.equal(ledger.status().deliveries,4);
@@ -244,50 +246,26 @@ test('database size limit fails closed with a bounded error and keeps previously
   }finally{f.close();}
 });
 
-test('100000-event limit retains existing dedup identities instead of evicting them and treating replays as new alerts',()=>{
+test('event capacity rolls the oldest batch while preserving recent cross-source evidence and bounded status metadata',()=>{
   const f=fixture();try {
-    const ledger=f.create();ledger.record(signal('ave',0,'seed'));
-    const db=new DatabaseSync(f.database);
-    try {
-      db.exec(`WITH RECURSIVE sequence(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM sequence WHERE n<99999)
-        INSERT INTO source_notifications SELECT 'ave','filled-'||n,chain,address,occurred_at,first_observed_at,
-          recorded_at,last_delivery_at,last_recorded_at,delivery_count,conflict_at,name,source_url,tx_refs,NULL
-        FROM sequence CROSS JOIN source_notifications WHERE event_id='seed'`);
+    let ledger=f.create(101);
+    for(let second=0;second<=100;second++){f.advance(second);assert.equal(ledger.record(signal('ave',second,`filled-${second}`)).accepted,true);}
+    f.advance(101);assert.deepEqual(ledger.record(signal('debot',101,'recent-debot')),{accepted:true,duplicate:false});
+    assert.deepEqual(ledger.record(signal('ave',100,'filled-100'),at(101)),{accepted:true,duplicate:true});
+    const status=ledger.status(),history=ledger.history(token);
+    assert.equal(status.events,100);assert.equal(status.maxEvents,101);assert.equal(status.error,undefined);
+    assert.equal(status.prunedEvents,2);assert.equal(status.capacityEvictedEvents,2);assert.equal(status.retainedFrom,at(2));
+    assert.equal(status.retentionMode,'rolling_latest');assert.equal(history.total,100);assert.equal(history.retainedFrom,at(2));
+    assert.ok(history.limitations.includes('EVENT_CAPACITY_ROLLING_RETENTION'));
+    assert.equal(ledger.assess(token).classification,'cross_source');
+    ledger.close();ledger=f.create(101);
+    assert.equal(ledger.status().retainedFrom,at(2));assert.equal(ledger.status().capacityEvictedEvents,2);
+    assert.equal(ledger.history(token).items.some(item=>item.eventId==='filled-0'||item.eventId==='filled-1'),false);
+    assert.equal(ledger.history(token).items.some(item=>item.eventId==='recent-debot'),true);
+    const db=new DatabaseSync(f.database,{readOnly:true});try {
+      const trigger=String(db.prepare("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='source_notifications_status_delete'").get()!.sql);
+      assert.doesNotMatch(trigger,/min\s*\(\s*recorded_at\s*\)/i,'batch deletion refreshes earliest metadata once outside the row trigger');
     }finally{db.close();}
-    assert.equal(ledger.record(signal('debot')).reason,'SOURCE_LEDGER_CAPACITY_REACHED');
-    assert.equal(ledger.record(signal('ave',0,'seed')).duplicate,true);
-    assert.equal(ledger.status().events,100000);assert.equal(ledger.status().error,'SOURCE_LEDGER_CAPACITY_REACHED');assert.equal(ledger.status().maxEvents,100000);
-    assert.equal(ledger.history(token,{limit:1}).total,100000);assert.equal(ledger.history(token,{limit:1}).maxEvents,100000);
-  }finally{f.close();}
-});
-
-test('reopening a capped ledger with a larger event budget admits a new notification without evicting or reclassifying duplicates',()=>{
-  const f=fixture();try {
-    let ledger=f.create(1);
-    const target={chain:'solana' as const,address:bs58.encode(new Uint8Array(32).fill(9))},
-      wallet=bs58.encode(new Uint8Array(32).fill(7)),txHash=bs58.encode(new Uint8Array(64).fill(8)),
-      initial=signal('ave',0,'ave:signal:'+ '1'.repeat(64),target);
-    assert.deepEqual(ledger.record(initial,at(),{name:'first'}),{accepted:true,duplicate:false});
-    f.advance(60);
-    const fresh={...signal('gmgn',60,'gmgn:trade:'+ '2'.repeat(64),target),
-      text:`GMGN 链上买入记录；交易 ${txHash}；钱包 ${wallet}；CA ${target.address}。`},
-      metadata={txRefs:[{txHash,wallet,side:'buy' as const}],sourceUrl:'https://gmgn.ai/'};
-    assert.equal(ledger.record(fresh,at(60),metadata).reason,'SOURCE_LEDGER_CAPACITY_REACHED');
-    assert.deepEqual(ledger.record(initial,at(60),{name:'changed'}),{accepted:true,duplicate:true});
-    assert.equal(ledger.status().events,1);assert.equal(ledger.status().error,'SOURCE_LEDGER_CAPACITY_REACHED');
-    ledger.close();ledger=f.create(2);
-    assert.deepEqual(ledger.record(fresh,at(60),metadata),{accepted:true,duplicate:false});
-    assert.deepEqual(ledger.record(fresh,at(60),metadata),{accepted:true,duplicate:true});
-    const history=ledger.history(target),first=history.items.find(item=>item.eventId===initial.sourceEventId)!,
-      added=history.items.find(item=>item.eventId===fresh.sourceEventId)!;
-    assert.equal(history.total,2);assert.equal(history.maxEvents,2);assert.equal(ledger.status().maxEvents,2);
-    assert.equal(ledger.status().events,2);assert.equal(ledger.status().error,undefined);assert.equal(ledger.status().prunedEvents,0);
-    assert.equal(first.firstObservedAt,at());assert.equal(first.name,'first');assert.equal(first.deliveryCount,2);
-    assert.equal(added.firstObservedAt,at(60));assert.equal(added.deliveryCount,2);assert.deepEqual(added.txRefs,metadata.txRefs);
-    assert.equal(ledger.record(signal('debot',60,'third',target)).reason,'SOURCE_LEDGER_CAPACITY_REACHED');
-    ledger.close();ledger=f.create(1);
-    assert.equal(ledger.status().events,2);assert.equal(ledger.record(initial,at(60)).duplicate,true);
-    assert.equal(ledger.record(signal('debot',60,'third',target)).reason,'SOURCE_LEDGER_CAPACITY_REACHED');
   }finally{f.close();}
 });
 

@@ -4,6 +4,7 @@ import {mkdtempSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {performance} from 'node:perf_hooks';
+import {DatabaseSync} from 'node:sqlite';
 import {SourceObservationRunner} from '../src/source-observation-runner.js';
 import {SourceCorroboration} from '../src/source-corroboration.js';
 import {MemeObserver} from '../src/meme-observer.js';
@@ -49,4 +50,20 @@ test('a timed-out source observation terminates the worker and rejects its pendi
     await assert.rejects(runner.submit(observation()),/SOURCE_OBSERVATION_WORKER_TIMEOUT/);
     assert.equal(runner.status().inFlight,0);assert.equal(runner.status().error,'SOURCE_OBSERVATION_WORKER_TIMEOUT');
   }finally{await runner.stop();source.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('GMGN restart replay uses a stable delivery key and does not create a new notification delivery',async()=>{
+  const dir=mkdtempSync(join(tmpdir(),'source-observation-gmgn-replay-')),sourcePath=join(dir,'source.sqlite');
+  const runner=new SourceObservationRunner({source:{database:sourcePath,maxBytes:8*1024*1024,maxEvents:1000}});
+  const occurredAt=new Date(Date.now()-1000).toISOString(),signal={source:'gmgn' as const,sourceEventId:'gmgn:market:sol:stable-replay-0001',
+    token:{chain:'bsc' as const,address},occurredAt,text:'same upstream event',evidenceUrls:[],claim:'unspecified' as const};
+  try{
+    runner.start();await waitFor(()=>runner.status().ready);
+    await runner.submit({id:'stable-replay-0001',signal,observedAt:new Date().toISOString(),name:'Stable'});
+    await new Promise(resolve=>setTimeout(resolve,5));
+    await runner.submit({id:'stable-replay-0001',signal,observedAt:new Date().toISOString(),name:'Stable'});
+    const db=new DatabaseSync(sourcePath,{readOnly:true});
+    try{const row=db.prepare('SELECT delivery_count FROM source_notifications WHERE source=? AND event_id=?')
+      .get('gmgn',signal.sourceEventId);assert.equal(Number(row?.delivery_count),1);}finally{db.close();}
+  }finally{await runner.stop();rmSync(dir,{recursive:true,force:true});}
 });

@@ -65,6 +65,7 @@ export class GmgnPlusArchive {
       CREATE INDEX IF NOT EXISTS gpa_events_time ON gpa_events(event_at DESC);
       CREATE INDEX IF NOT EXISTS gpa_events_token ON gpa_events(chain,token_address,event_at DESC);
       CREATE INDEX IF NOT EXISTS gpa_events_wallet ON gpa_events(chain,wallet_address,event_at DESC);
+      CREATE INDEX IF NOT EXISTS gpa_market_signal_identity ON gpa_events(kind,chain,upstream_id);
       CREATE TABLE IF NOT EXISTS gpa_wallet_candidates(
         chain TEXT NOT NULL,address TEXT NOT NULL,source_mask INTEGER NOT NULL,occurrences INTEGER NOT NULL,
         first_seen_at TEXT NOT NULL,last_seen_at TEXT NOT NULL,last_stats_at TEXT,last_profits_at TEXT,last_activity_at TEXT,
@@ -84,6 +85,9 @@ export class GmgnPlusArchive {
         event_key TEXT NOT NULL,chain TEXT NOT NULL,wallet_address TEXT NOT NULL,role TEXT NOT NULL,buy_at TEXT,buy_amount REAL,
         raw_json TEXT NOT NULL,PRIMARY KEY(event_key,wallet_address,role));
       CREATE INDEX IF NOT EXISTS gpa_event_wallets_wallet ON gpa_event_wallets(chain,wallet_address,buy_at);
+      CREATE TABLE IF NOT EXISTS gpa_market_processing(
+        chain TEXT NOT NULL,upstream_id TEXT NOT NULL,completed_at TEXT NOT NULL,
+        PRIMARY KEY(chain,upstream_id));
       CREATE TABLE IF NOT EXISTS gpa_wallet_activity(
         event_key TEXT PRIMARY KEY,chain TEXT NOT NULL,wallet_address TEXT NOT NULL,tx_hash TEXT NOT NULL,event_type TEXT NOT NULL,
         token_address TEXT NOT NULL,event_at TEXT NOT NULL,amount_usd TEXT,observed_at TEXT NOT NULL,raw_json TEXT NOT NULL);
@@ -114,16 +118,46 @@ export class GmgnPlusArchive {
     const rows=Array.isArray(input)?input.slice(0,1000):[];return this.write(rows,chain,'market_signal',undefined,(row,at)=>{
       if(!object(row)||typeof row.id!=='string'||!/^[A-Za-z0-9-]{8,100}$/.test(row.id)||!object(row.data)||
         apiChain(row.data.chain)!==chain)return;
-      const token=chainAddress(row.token_address,chain),when=iso(Number(row.trigger_at)*1000),type=finite(row.signal_type),raw=rawJson(row);
-      if(!token||!when||type===undefined||!Number.isInteger(type)||type<1||type>99||!raw)return;
+      const token=chainAddress(row.token_address,chain),dataToken=chainAddress(row.data.address,chain),triggerAt=finite(row.trigger_at),
+        when=triggerAt===undefined?undefined:iso(triggerAt*1000),type=finite(row.signal_type),raw=rawJson(row);
+      if(!token||dataToken!==token||!when||triggerAt===undefined||type===undefined||!Number.isInteger(type)||type<1||type>99||!raw)return;
       const candidates:{address:string;mask:number;role:string;buyAt?:string;buyAmount?:number;raw?:string}[]=[];
-      for(const [key,mask] of [['smart_degen_wallets',4],['kol_wallets',8]] as const)for(const item of Array.isArray(row.data[key])?row.data[key]!.slice(0,100):[]){
-        const address=object(item)?chainAddress(item.address,chain):undefined;if(address)candidates.push({address,mask,
-          role:key==='smart_degen_wallets'?'smart_degen':'kol',buyAt:iso(Number(item.buy_timestamp)*1000),
-          buyAmount:finite(item.buy_amount),raw:rawJson(item,16_384)});}
+      const walletFeed=type===12?(['smart_degen_wallets',4,'smart_degen'] as const):
+        type===20?(['kol_wallets',8,'kol'] as const):undefined;
+      if(walletFeed){const [key,mask,role]=walletFeed;for(const item of Array.isArray(row.data[key])?row.data[key]!.slice(0,100):[]){
+        const address=object(item)?chainAddress(item.address,chain):undefined,boughtAt=object(item)?finite(item.buy_timestamp):undefined,
+          amount=object(item)?finite(item.buy_amount):undefined,buyAt=boughtAt===undefined?undefined:iso(boughtAt*1000);
+        if(address&&buyAt&&boughtAt!==undefined&&boughtAt>=triggerAt-30&&boughtAt<=triggerAt&&amount!==undefined&&amount>0)
+          candidates.push({address,mask,role,buyAt,buyAmount:amount,raw:rawJson(item,16_384)});}}
       return {values:[`market:${chain}:${row.id}`,'market_signal',null,chain,row.id,token,null,when,type,
         text(row.data.symbol,128)??null,finite(row.trigger_mc)??null,null,null,null,null,null,null,null,at,at,1,raw],candidates};
     });
+  }
+
+  knownMarketSignalIds(chain:GmgnArchiveChain,ids:readonly string[]):ReadonlySet<string>{
+    if(!['sol','bsc','robinhood'].includes(chain)||!Array.isArray(ids)||ids.length>1000)throw new Error('GMGN_MARKET_SIGNAL_IDS_INVALID');
+    const safe=[...new Set(ids.filter(id=>typeof id==='string'&&/^[A-Za-z0-9-]{8,100}$/.test(id)))],known=new Set<string>();
+    for(let offset=0;offset<safe.length;offset+=500){const part=safe.slice(offset,offset+500);if(!part.length)continue;
+      for(const row of this.db.prepare(`SELECT upstream_id FROM gpa_events WHERE kind='market_signal' AND chain=? AND upstream_id IN (${part.map(()=>'?').join(',')})`)
+        .all(chain,...part))known.add(String(row.upstream_id));}
+    return known;
+  }
+
+  knownProcessedMarketSignalIds(chain:GmgnArchiveChain,ids:readonly string[]):ReadonlySet<string>{
+    if(!['sol','bsc','robinhood'].includes(chain)||!Array.isArray(ids)||ids.length>1000)throw new Error('GMGN_MARKET_SIGNAL_IDS_INVALID');
+    const safe=[...new Set(ids.filter(id=>typeof id==='string'&&/^[A-Za-z0-9-]{8,100}$/.test(id)))],known=new Set<string>();
+    for(let offset=0;offset<safe.length;offset+=500){const part=safe.slice(offset,offset+500);if(!part.length)continue;
+      for(const row of this.db.prepare(`SELECT upstream_id FROM gpa_market_processing WHERE chain=? AND upstream_id IN (${part.map(()=>'?').join(',')})`)
+        .all(chain,...part))known.add(String(row.upstream_id));}
+    return known;
+  }
+
+  markMarketSignalProcessed(chain:GmgnArchiveChain,id:string,at=this.now()):void {
+    if(!['sol','bsc','robinhood'].includes(chain)||typeof id!=='string'||!/^[A-Za-z0-9-]{8,100}$/.test(id)||!Number.isFinite(at.getTime()))
+      throw new Error('GMGN_MARKET_SIGNAL_CHECKPOINT_INVALID');
+    this.db.prepare(`INSERT INTO gpa_market_processing(chain,upstream_id,completed_at) VALUES(?,?,?)
+      ON CONFLICT(chain,upstream_id) DO UPDATE SET completed_at=MAX(completed_at,excluded.completed_at)`)
+      .run(chain,id,at.toISOString());
   }
 
   recordCallouts(feed:GmgnCalloutFeed,input:unknown):ArchiveWrite{
@@ -329,22 +363,27 @@ export class GmgnPlusArchive {
 }
 
 export interface GmgnPlusArchiveRunnerOptions {archive:GmgnPlusArchive;client:Pick<GmgnClient,'getMemeMarketSignals'|'getCalloutGlobal'|'getWalletStats'|'getWalletProfits'|'getWalletActivity'|'cooldownUntil'>;
-  chains:GmgnArchiveChain[];intervalMs:number;now?:()=>Date;}
+  chains:GmgnArchiveChain[];intervalMs:number;now?:()=>Date;dedicatedMarketChains?:GmgnArchiveChain[];}
 type Task={kind:'market';chain:GmgnArchiveChain}|{kind:'callout_latest'|'callout_backfill';feed:GmgnCalloutFeed}|{kind:'stats'|'profits'|'activity'};
 
 export class GmgnPlusArchiveRunner {
   private readonly tasks:Task[];private readonly now:()=>Date;private running=false;private inFlight?:Promise<void>;private timer?:ReturnType<typeof setTimeout>;
   private lastTask?:string;private lastError?:string;
   constructor(private readonly options:GmgnPlusArchiveRunnerOptions){
-    if(!options.chains.length||options.chains.some(chain=>!['sol','bsc','robinhood'].includes(chain))||!Number.isSafeInteger(options.intervalMs)||options.intervalMs<5_000||options.intervalMs>3_600_000)
+    if(!options.chains.length||options.chains.some(chain=>!['sol','bsc','robinhood'].includes(chain))||
+      options.dedicatedMarketChains?.some(chain=>!['sol','bsc','robinhood'].includes(chain))||
+      !Number.isSafeInteger(options.intervalMs)||options.intervalMs<5_000||options.intervalMs>3_600_000)
       throw new Error('GMGN_PLUS_ARCHIVE_RUNNER_CONFIG_INVALID');
-    this.now=options.now??(()=>new Date());this.tasks=[...[...new Set(options.chains)].map(chain=>({kind:'market' as const,chain})),
+    this.now=options.now??(()=>new Date());const dedicated=new Set(options.dedicatedMarketChains??[]),marketTasks:Task[]=
+      [...new Set(options.chains)].filter(chain=>!dedicated.has(chain)).map(chain=>({kind:'market' as const,chain}));this.tasks=[...marketTasks,
       {kind:'callout_latest',feed:'global'},{kind:'callout_latest',feed:'declaration'},
       {kind:'callout_backfill',feed:'global'},{kind:'callout_backfill',feed:'declaration'},
       {kind:'stats'},{kind:'profits'},{kind:'activity'}];
   }
   status(){return {...this.options.archive.status(),running:this.running,inFlight:!!this.inFlight,lastTask:this.lastTask,lastError:this.lastError,
-    intervalMs:this.options.intervalMs,tasks:this.tasks.length,coverage:'deduplicated_latest_feeds_plus_cursor_backfill',entryPipeline:false};}
+    intervalMs:this.options.intervalMs,tasks:this.tasks.length,dedicatedMarketChains:[...new Set(this.options.dedicatedMarketChains??[])],
+    marketSignals:this.options.dedicatedMarketChains?.length?'hybrid_dedicated_and_round_robin':'round_robin',
+    coverage:'deduplicated_latest_feeds_plus_cursor_backfill',entryPipeline:false};}
   start(){if(this.running)return;this.running=true;this.tick(0);}
   async stop(){this.running=false;clearTimeout(this.timer);this.timer=undefined;await this.inFlight?.catch(()=>{});this.options.archive.close();}
   runOnce(){if(this.inFlight)return this.inFlight;const run=this.execute();this.inFlight=run;void run.then(

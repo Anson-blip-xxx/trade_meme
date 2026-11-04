@@ -166,7 +166,11 @@ test('failure of one research archive cannot suppress the independent observatio
     try {sourceFault.exec("CREATE TRIGGER fail_source_worker BEFORE INSERT ON source_notifications BEGIN SELECT RAISE(ABORT,'private-token-must-not-leak'); END;");}
     finally{sourceFault.close();}
     runtime.aveScanner!.acceptPage(ave());
-    await eventually(()=>runtime.memeObserver!.list().total===1);
+    // The meme write is visible in SQLite before the worker's completion
+    // message is necessarily delivered to the main thread. Wait for both
+    // independent outcomes rather than racing the status callback.
+    await eventually(()=>runtime.memeObserver!.list().total===1&&
+      runtime.dashboardOverview().corroboration.captureError==='SOURCE_EVIDENCE_CAPTURE_FAILED',5000);
     const status=runtime.dashboardOverview().corroboration;assert.ok('captureError' in status);
     assert.equal(status.captureError,'SOURCE_EVIDENCE_CAPTURE_FAILED');
     assert.equal(JSON.stringify(runtime.dashboardOverview()).includes('private-token'),false);

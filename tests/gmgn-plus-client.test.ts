@@ -14,7 +14,8 @@ test('Plus research POSTs use fixed endpoint, exact grouped signal body and repe
   await client.getMemeMarketSignals('sol');await client.getWalletStats('sol',[sol,'22222222222222222222222222222222']);
   assert.equal(requests[0].url.pathname,'/v1/market/token_signal');assert.equal(requests[0].init?.method,'POST');
   assert.deepEqual(JSON.parse(String(requests[0].init?.body)),{chain:'sol',groups:[{signal_type:[12]},{signal_type:[20]},
-    {signal_type:[13,19]},{signal_type:[6,7]},{signal_type:[10,11]},{signal_type:[17,18,21]}]});
+    {signal_type:[13,19]},{signal_type:[6,7]},{signal_type:[10,11]},{signal_type:[17,18,21]},
+    {signal_type:[1,2,3,4,5,8,9]}]});
   assert.equal(requests[1].url.pathname,'/v1/user/wallet_stats');
   assert.deepEqual(requests[1].url.searchParams.getAll('wallet_address'),[sol,'22222222222222222222222222222222']);
 });

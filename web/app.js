@@ -1457,7 +1457,21 @@
   function renderOverview() {
     const data = state.overview || {};
     if (state.view === 'system') { renderBalances(Array.isArray(data.balances) ? data.balances : []); renderScanner(data.scanner); renderSystemOverview(); renderSystem(); }
-    if (state.view === 'sources') { renderDebotAuth(); renderAveStatus(); const runtime = $('source-runtime'); runtime.replaceChildren(); renderDebotScanner(runtime,data.debotScanner,data.debotStream); const cycle = data.scanner?.lastCycle || {}; for (const item of cycle.diagnostics || []) runtime.append(kv(`${chainName(item.chain)} · ${scalar(item.kind)}`, {ok:'正常',empty:'暂无新记录',invalid_response:'响应异常',unavailable:'暂不可用',rate_limited:'限流'}[item.status] || scalar(item.status))); }
+    if (state.view === 'sources') {
+      renderDebotAuth(); renderAveStatus(); const runtime = $('source-runtime'); runtime.replaceChildren();
+      renderDebotScanner(runtime,data.debotScanner,data.debotStream);
+      const market = data.gmgnMarketSignals || {}, marketCycle = market.lastCycle || {}, marketLatency = market.latencyMs || {};
+      runtime.append(kv('GMGN Market Signal', !market.enabled ? '未启用' : market.running ? '实时轮询中' : '未运行'));
+      if (market.enabled) runtime.append(kv('Market 轮询 / 调度优先级', `${count(market.totals?.polls)} 轮 · ${market.priority === 'normal' ? '普通实时' : scalar(market.priority)}`),
+        kv('Market 观察队列 / 活跃', `${count(market.observationQueueDepth)} / ${count(market.activeObservation)}`),
+        kv('Market 分析队列 / 活跃', `${count(market.analysisQueueDepth ?? market.queueDepth)} / ${count(market.activeAnalysis ?? market.activeDispatch)}`),
+        kv('Market 最近原始新增 / 实时新增 / 路由分析', `${count(marketCycle.newEvents)} / ${count(marketCycle.liveNewEvents)} / ${count(marketCycle.queued)}`),
+        kv('Market 请求 P50 / P95', `${finite(marketLatency.request?.p50) ? `${marketLatency.request.p50} ms` : '—'} / ${finite(marketLatency.request?.p95) ? `${marketLatency.request.p95} ms` : '—'}`),
+        kv('Market 实时新增：接收至观察 P95', finite(marketLatency.liveNewReceiveToObservation?.p95 ?? marketLatency.receiveToObservation?.p95) ? `${marketLatency.liveNewReceiveToObservation?.p95 ?? marketLatency.receiveToObservation.p95} ms` : '等待实时新增样本'));
+      if (market.lastError || marketCycle.reason) runtime.append(el('p', 'detail-message detail-error', reasonNames[market.lastError || marketCycle.reason] || scalar(market.lastError || marketCycle.reason)));
+      const cycle = data.scanner?.lastCycle || {};
+      for (const item of cycle.diagnostics || []) runtime.append(kv(`${chainName(item.chain)} · ${scalar(item.kind)}`, {ok:'正常',empty:'暂无新记录',invalid_response:'响应异常',unavailable:'暂不可用',rate_limited:'限流'}[item.status] || scalar(item.status)));
+    }
   }
   function renderBalances(balances) {
     const container = $('balance-list'); container.replaceChildren();
@@ -1493,16 +1507,19 @@
   }
   function statusDot(id, tone) { $(id).className = `tiny-dot status-dot ${tone}`; }
   function renderSystemOverview() {
-    const data = state.overview || {}, system = data.system || {}, scanner = data.scanner || {}, research = data.walletResearch || state.walletStatus || {};
+    const data = state.overview || {}, system = data.system || {}, scanner = data.scanner || {}, market = data.gmgnMarketSignals || {}, research = data.walletResearch || state.walletStatus || {};
     const balances = Array.isArray(data.balances) ? data.balances : [], cycle = scanner.lastCycle || {}, observer = research.observer || {}, walletCycle = observer.lastCycle || {}, store = research.store || {};
     const cooling = scanner.cooldownUntil && Date.parse(scanner.cooldownUntil) > Date.now();
     const scannerPaused = scanner.pausedReason === 'GMGN_BACKGROUND_RESEARCH_DISABLED';
+    const marketCycle = market.lastCycle || {}, marketRunning = market.enabled === true && market.running === true;
+    const marketPaused = ['GMGN_BACKGROUND_RESEARCH_DISABLED', 'GMGN_MARKET_SIGNAL_DISABLED'].includes(market.pausedReason);
+    const marketProblem = Boolean(market.enabled && !marketPaused && (!market.running || market.lastError || ['cooldown', 'unavailable'].includes(marketCycle.status)));
     const watch = data.watchRecheck, watchProblem = Boolean(watch?.enabled && (watch.lastError || !watch.running || ['GMGN_API_KEY_MISSING', 'GMGN_RATE_LIMITED'].includes(watch.deferredReason)));
-    const scanProblem = Boolean(cooling || !scannerPaused && (!scanner.running || cycle.status === 'partial' || cycle.errors > 0) || watchProblem);
-    text('status-scanner', cooling ? '限流冷却中' : scannerPaused ? scalar(data.gmgnUsage?.label, '交易与按需查询') : scanner.running ? scanner.inFlight ? '正在扫描' : '持续运行中' : '未运行');
-    text('status-scanner-note', cooling ? `恢复时间 ${time(scanner.cooldownUntil)}` : scannerPaused ? 'GMGN 后台研究已暂停；DeBot / Ave 继续接收信号' : cycle.completedAt ? `最近 ${time(cycle.completedAt)} · 接收 ${count(cycle.received)} 条` : '等待第一轮扫描完成');
+    const scanProblem = Boolean(cooling || !scannerPaused && (!scanner.running || cycle.status === 'partial' || cycle.errors > 0) || marketProblem || watchProblem);
+    text('status-scanner', marketRunning ? 'GMGN 实时信号运行中' : cooling ? '限流冷却中' : scannerPaused ? scalar(data.gmgnUsage?.label, '交易与按需查询') : scanner.running ? scanner.inFlight ? '正在扫描' : '持续运行中' : '未运行');
+    text('status-scanner-note', marketRunning ? `Market 最近 ${time(marketCycle.completedAt)} · 实时新增 ${count(marketCycle.liveNewEvents)} 条 · 间隔 ${count(market.intervalMs)} ms` : cooling ? `恢复时间 ${time(scanner.cooldownUntil)}` : scannerPaused ? 'GMGN 后台研究已暂停；DeBot / Ave 继续接收信号' : cycle.completedAt ? `最近 ${time(cycle.completedAt)} · 接收 ${count(cycle.received)} 条` : '等待第一轮扫描完成');
     text('status-watch-note', `复评：${watchRecheckLabel(watch)}${watch?.enabled ? ` · 待复评 ${count(watch.queue?.scheduled)} 条${watch.queue?.due > 0 ? `（到期排队 ${count(watch.queue.due)}）` : ''}` : ''}`);
-    statusDot('status-scanner-dot', scanProblem ? 'watch' : scannerPaused ? 'neutral' : 'pass');
+    statusDot('status-scanner-dot', scanProblem ? 'watch' : scannerPaused && !marketRunning ? 'neutral' : 'pass');
     const walletError = store.error || research.captureError || observer.feedError;
     const walletCooling = observer.cooldownUntil && Date.parse(observer.cooldownUntil) > Date.now();
     const observerPaused = observer.pausedReason === 'GMGN_BACKGROUND_RESEARCH_DISABLED';
@@ -2313,7 +2330,21 @@
       runtime.append(kv('价格观察上限 / 每轮查询数', `${count(capacity.observationTargetLimit)} / ${count(capacity.maxTokensPerCycle)}`), kv('真实订单优先观察代币', count(capacity.activeOrderTokens)), kv('最多同时开仓', count(capacity.maxOpenPositions)));
       runtime.append(el('p', 'detail-small', '真实订单优先查询价格。观察上限不代表每个代币都能实时刷新；GMGN 条件回读和实际成交状态在订单中单独记录。'));
     }
-    runtime.append(kv('服务端开仓模式', mode), kv('GMGN 扫描任务', scannerPaused ? '按配置暂停' : scanner.running ? '运行中' : '未运行'), kv('当前扫描', scannerPaused ? '新通知按需分析' : scanner.inFlight ? '正在处理' : '等待下一轮'), kv('最近扫描结束', date(cycle.completedAt, true)), kv('最近一轮接收 / 输出', finite(cycle.received) ? `${cycle.received} / ${scalar(cycle.emitted)}` : '—'), kv('最近一轮错误数', cycle.errors), kv('档案保留', finite(settings.scanRetentionDays) ? `${settings.scanRetentionDays} 天` : '—'), kv('条件后追踪窗口', finite(settings.trackingHours) ? `${settings.trackingHours} 小时` : '—'), kv('价格轮询间隔', finite(settings.sampleIntervalSec) ? `${settings.sampleIntervalSec} 秒 / 轮` : '—'));
+    const market = data.gmgnMarketSignals || {}, marketCycle = market.lastCycle || {}, marketLatency = market.latencyMs || {}, plus = data.gmgnPlusArchive || {};
+    runtime.append(kv('服务端开仓模式', mode), kv('GMGN 扫描任务', scannerPaused ? '按配置暂停' : scanner.running ? '运行中' : '未运行'), kv('当前扫描', scannerPaused ? '新通知按需分析' : scanner.inFlight ? '正在处理' : '等待下一轮'), kv('最近扫描结束', date(cycle.completedAt, true)), kv('最近一轮接收 / 输出', finite(cycle.received) ? `${cycle.received} / ${scalar(cycle.emitted)}` : '—'), kv('最近一轮错误数', cycle.errors),
+      kv('GMGN Market 实时通道', !market.enabled ? '未启用' : market.running ? `运行中 · ${count(market.intervalMs)} ms / 轮` : '未运行'),
+      kv('Market 最近轮询 / 原始新增 / 实时新增', `${date(marketCycle.completedAt, true)} · ${count(marketCycle.newEvents)} / ${count(marketCycle.liveNewEvents)}`),
+      kv('Market 观察队列 / 活跃', `${count(market.observationQueueDepth)} / ${count(market.activeObservation)}`),
+      kv('Market 分析队列 / 活跃', `${count(market.analysisQueueDepth ?? market.queueDepth)} / ${count(market.activeAnalysis ?? market.activeDispatch)}`),
+      kv('Market 停机延后 / 已入队重放', `${count(market.totals?.shutdownDeferred)} / ${count(market.totals?.replayed)}`),
+      kv('Market 基线积压 / 迟到回填 / 重放候选', `${count(market.totals?.baselineEvents)} / ${count(market.totals?.lateBackfillEvents)} / ${count(market.totals?.replayCandidates)}`),
+      kv('Market 调度等待 + HTTP P50 / P95', `${finite(marketLatency.request?.p50) ? `${marketLatency.request.p50} ms` : '—'} / ${finite(marketLatency.request?.p95) ? `${marketLatency.request.p95} ms` : '—'}`),
+      kv('Market 实时新增：源到接收 P50 / P95', `${finite(marketLatency.liveNewSourceToReceive?.p50 ?? marketLatency.sourceToReceive?.p50) ? `${marketLatency.liveNewSourceToReceive?.p50 ?? marketLatency.sourceToReceive.p50} ms` : '—'} / ${finite(marketLatency.liveNewSourceToReceive?.p95 ?? marketLatency.sourceToReceive?.p95) ? `${marketLatency.liveNewSourceToReceive?.p95 ?? marketLatency.sourceToReceive.p95} ms` : '—'}`),
+      kv('Market 实时新增：接收到观察 P50 / P95', `${finite(marketLatency.liveNewReceiveToObservation?.p50 ?? marketLatency.receiveToObservation?.p50) ? `${marketLatency.liveNewReceiveToObservation?.p50 ?? marketLatency.receiveToObservation.p50} ms` : '—'} / ${finite(marketLatency.liveNewReceiveToObservation?.p95 ?? marketLatency.receiveToObservation?.p95) ? `${marketLatency.liveNewReceiveToObservation?.p95 ?? marketLatency.receiveToObservation.p95} ms` : '—'}`),
+      kv('GMGN 研究档案', plus.enabled ? `${count(plus.events)} 条 · ${bytes(plus.storageBytes)} / ${bytes(plus.maxBytes)}` : '未启用'),
+      kv('来源账本滚动淘汰', finite(data.corroboration?.capacityEvictedEvents) ? `${count(data.corroboration.capacityEvictedEvents)} 条 · 保留自 ${date(data.corroboration.retainedFrom, true)}` : '等待状态'),
+      kv('档案保留', finite(settings.scanRetentionDays) ? `${settings.scanRetentionDays} 天` : '—'), kv('条件后追踪窗口', finite(settings.trackingHours) ? `${settings.trackingHours} 小时` : '—'), kv('价格轮询间隔', finite(settings.sampleIntervalSec) ? `${settings.sampleIntervalSec} 秒 / 轮` : '—'));
+    if (market.lastError || marketCycle.reason) runtime.append(el('p', 'detail-message detail-error', reasonNames[market.lastError || marketCycle.reason] || scalar(market.lastError || marketCycle.reason)));
     if (tracking.lastCycle?.completedAt || tracking.lastAt) runtime.append(kv('最近价格轮询', date(tracking.lastCycle?.completedAt || tracking.lastAt, true)));
     const comparison = data.stats?.comparison;
     if (comparison) {

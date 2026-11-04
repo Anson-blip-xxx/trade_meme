@@ -125,6 +125,171 @@ test('live-entry work passes queued normal work without bypassing the global in-
   assert.deepEqual(order.slice(0, 2), ['in-flight', 'live-entry']);
 });
 
+test('Market Signal polling passes queued analysis reads but remains behind live-entry work', async () => {
+  const entered = deferred<void>(), release = deferred<void>(), order: string[] = [];
+  const client = new GmgnClient({apiKey: key(), minIntervalMs: 0, fetcher: async input => {
+    const url=new URL(String(input));
+    const marker=url.pathname==='/v1/market/token_signal'?'market':url.searchParams.get('marker')!;
+    order.push(marker);
+    if(marker==='blocker'){entered.resolve();await release.promise;}
+    return response({code:0,data:marker});
+  }});
+  const blocker=client.get(route,{...query,marker:'blocker'});await entered.promise;
+  const normal=client.get(route,{...query,marker:'analysis'});
+  const market=client.getMemeMarketSignals('sol',{priority:'signal_poll',queueTimeoutMs:15_000});
+  const live=client.get('/v1/trade/quote',{chain:'sol',marker:'live'},10,{priority:'live_entry'});
+  release.resolve();await Promise.all([blocker,normal,market,live]);
+  assert.deepEqual(order,['blocker','live','market','analysis']);
+});
+
+test('Market Signal polling interrupts an in-flight background archive request', async () => {
+  const entered=deferred<void>(),order:string[]=[];
+  const client=new GmgnClient({apiKey:key(),minIntervalMs:0,fetcher:async(input,init)=>{
+    const url=new URL(String(input)),marker=url.pathname==='/v1/callout/global'?'archive':
+      url.pathname==='/v1/market/token_signal'?'market':url.pathname;
+    order.push(`${marker}-start`);
+    if(marker==='archive'){
+      entered.resolve();
+      await new Promise<void>((_resolve,reject)=>{
+        const abort=()=>{order.push('archive-abort');reject(new Error('ABORTED'));};
+        if(init?.signal?.aborted)abort();else init?.signal?.addEventListener('abort',abort,{once:true});
+      });
+    }
+    return response({code:0,data:marker});
+  }});
+  const archive=client.getCalloutGlobal(['sol']);await entered.promise;
+  const rejected=assert.rejects(archive,rejects('GMGN_REQUEST_ABORTED'));
+  const market=client.getMemeMarketSignals('sol',{priority:'signal_poll',queueTimeoutMs:15_000});
+  await rejected;assert.equal(await market,'market');
+  assert.deepEqual(order,['archive-start','archive-abort','market-start']);
+});
+
+test('continuous Market Signal polls yield one non-preemptible retry to background archive work', async () => {
+  const archiveStarted=deferred<void>(),firstPollStarted=deferred<void>(),releaseFirstPoll=deferred<void>();
+  const protectedStarted=deferred<void>(),releaseProtected=deferred<void>(),order:string[]=[];
+  let archiveAttempt=0,marketAttempt=0,protectedAborted=false;
+  const client=new GmgnClient({apiKey:key(),minIntervalMs:0,fetcher:async(input,init)=>{
+    const path=new URL(String(input)).pathname;
+    if(path==='/v1/callout/global'){
+      archiveAttempt++;order.push(`archive-${archiveAttempt}-start`);
+      if(archiveAttempt===1){
+        archiveStarted.resolve();
+        await new Promise<void>((_resolve,reject)=>{
+          const abort=()=>{order.push('archive-1-abort');reject(new Error('ABORTED'));};
+          if(init?.signal?.aborted)abort();else init?.signal?.addEventListener('abort',abort,{once:true});
+        });
+      }else{
+        protectedStarted.resolve();
+        await new Promise<void>((resolve,reject)=>{
+          const abort=()=>{protectedAborted=true;reject(new Error('ABORTED'));};
+          if(init?.signal?.aborted)abort();else init?.signal?.addEventListener('abort',abort,{once:true});
+          releaseProtected.promise.then(resolve,reject);
+        });
+        order.push('archive-2-finish');
+      }
+      return response({code:0,data:`archive-${archiveAttempt}`});
+    }
+    marketAttempt++;order.push(`market-${marketAttempt}`);
+    if(marketAttempt===1){firstPollStarted.resolve();await releaseFirstPoll.promise;}
+    return response({code:0,data:`market-${marketAttempt}`});
+  }});
+
+  const firstArchive=client.getCalloutGlobal(['sol']);await archiveStarted.promise;
+  const firstPoll=client.getMemeMarketSignals('sol',{priority:'signal_poll',queueTimeoutMs:15_000});
+  await assert.rejects(firstArchive,rejects('GMGN_REQUEST_ABORTED'));await firstPollStarted.promise;
+  const queuedPolls=Array.from({length:3},()=>client.getMemeMarketSignals('sol',
+    {priority:'signal_poll',queueTimeoutMs:15_000}));
+  const retry=client.getCalloutGlobal(['sol']);
+  releaseFirstPoll.resolve();await protectedStarted.promise;
+  // This poll arrives while the protected retry is active. It must queue
+  // without aborting the archive request.
+  const latePoll=client.getMemeMarketSignals('sol',{priority:'signal_poll',queueTimeoutMs:15_000});
+  await Promise.resolve();assert.equal(protectedAborted,false);
+  releaseProtected.resolve();
+  assert.equal(await retry,'archive-2');
+  await Promise.all([firstPoll,...queuedPolls,latePoll]);
+  assert.equal(protectedAborted,false);
+  assert.deepEqual(order.slice(0,5),['archive-1-start','archive-1-abort','market-1','archive-2-start','archive-2-finish']);
+  assert.equal(order.filter(item=>item.startsWith('market-')).length,5);
+});
+
+test('live entry can still preempt a signal-protected background retry', async () => {
+  const firstStarted=deferred<void>(),protectedStarted=deferred<void>();let archiveAttempt=0;
+  const order:string[]=[];
+  const client=new GmgnClient({apiKey:key(),minIntervalMs:0,fetcher:async(input,init)=>{
+    const url=new URL(String(input));
+    if(url.pathname==='/v1/callout/global'){
+      archiveAttempt++;order.push(`archive-${archiveAttempt}-start`);
+      (archiveAttempt===1?firstStarted:protectedStarted).resolve();
+      await new Promise<void>((_resolve,reject)=>{
+        const abort=()=>{order.push(`archive-${archiveAttempt}-abort`);reject(new Error('ABORTED'));};
+        if(init?.signal?.aborted)abort();else init?.signal?.addEventListener('abort',abort,{once:true});
+      });
+    }
+    const marker=url.pathname==='/v1/market/token_signal'?'market':url.searchParams.get('marker')??url.pathname;
+    order.push(marker);return response({code:0,data:marker});
+  }});
+
+  const first=client.getCalloutGlobal(['sol']);await firstStarted.promise;
+  const poll=client.getMemeMarketSignals('sol',{priority:'signal_poll',queueTimeoutMs:15_000});
+  await assert.rejects(first,rejects('GMGN_REQUEST_ABORTED'));assert.equal(await poll,'market');
+  const protectedRetry=client.getCalloutGlobal(['sol']);await protectedStarted.promise;
+  const live=client.get('/v1/trade/quote',{chain:'sol',marker:'live'},10,{priority:'live_entry'});
+  await assert.rejects(protectedRetry,rejects('GMGN_REQUEST_ABORTED'));assert.equal(await live,'live');
+  assert.deepEqual(order,['archive-1-start','archive-1-abort','market','archive-2-start','archive-2-abort','live']);
+});
+
+test('a protected background failure consumes its turn instead of blocking later signal polls', async () => {
+  const firstStarted=deferred<void>(),thirdStarted=deferred<void>();let archiveAttempt=0,marketAttempt=0;
+  const order:string[]=[];
+  const client=new GmgnClient({apiKey:key(),minIntervalMs:0,fetcher:async(input,init)=>{
+    const path=new URL(String(input)).pathname;
+    if(path==='/v1/callout/global'){
+      archiveAttempt++;order.push(`archive-${archiveAttempt}-start`);
+      if(archiveAttempt===2)return response({message:'archive unavailable'},500);
+      (archiveAttempt===1?firstStarted:thirdStarted).resolve();
+      await new Promise<void>((_resolve,reject)=>{
+        const abort=()=>{order.push(`archive-${archiveAttempt}-abort`);reject(new Error('ABORTED'));};
+        if(init?.signal?.aborted)abort();else init?.signal?.addEventListener('abort',abort,{once:true});
+      });
+    }
+    marketAttempt++;order.push(`market-${marketAttempt}`);return response({code:0,data:`market-${marketAttempt}`});
+  }});
+
+  const first=client.getCalloutGlobal(['sol']);await firstStarted.promise;
+  const firstPoll=client.getMemeMarketSignals('sol',{priority:'signal_poll',queueTimeoutMs:15_000});
+  await assert.rejects(first,rejects('GMGN_REQUEST_ABORTED'));assert.equal(await firstPoll,'market-1');
+  await assert.rejects(client.getCalloutGlobal(['sol']),rejects('GMGN_HTTP_ERROR'));
+
+  const third=client.getCalloutGlobal(['sol']);await thirdStarted.promise;
+  const secondPoll=client.getMemeMarketSignals('sol',{priority:'signal_poll',queueTimeoutMs:15_000});
+  await assert.rejects(third,rejects('GMGN_REQUEST_ABORTED'));assert.equal(await secondPoll,'market-2');
+  assert.deepEqual(order,['archive-1-start','archive-1-abort','market-1','archive-2-start',
+    'archive-3-start','archive-3-abort','market-2']);
+});
+
+test('live-entry work interrupts an in-flight Market Signal poll', async () => {
+  const entered=deferred<void>(),order:string[]=[];
+  const client=new GmgnClient({apiKey:key(),minIntervalMs:0,fetcher:async(input,init)=>{
+    const url=new URL(String(input));
+    if(url.pathname==='/v1/market/token_signal'){
+      order.push('market-start');entered.resolve();
+      await new Promise<void>((_resolve,reject)=>{
+        const abort=()=>{order.push('market-abort');reject(new Error('ABORTED'));};
+        if(init?.signal?.aborted)abort();else init?.signal?.addEventListener('abort',abort,{once:true});
+      });
+    }
+    const marker=url.searchParams.get('marker')??url.pathname;order.push(marker);
+    return response({code:0,data:marker});
+  }});
+  const market=client.getMemeMarketSignals('sol',{priority:'signal_poll',queueTimeoutMs:15_000});
+  await entered.promise;
+  const rejected=assert.rejects(market,rejects('GMGN_REQUEST_ABORTED'));
+  const live=client.get('/v1/trade/quote',{chain:'sol',marker:'live'},10,{priority:'live_entry'});
+  await rejected;assert.equal(await live,'live');
+  assert.deepEqual(order,['market-start','market-abort','live']);
+});
+
 test('live-entry quote interrupts an in-flight archive request and passes the normal backlog', async () => {
   const entered = deferred<void>(), order: string[] = [];
   const client = new GmgnClient({apiKey: key(), minIntervalMs: 0, fetcher: async (input, init) => {
@@ -360,6 +525,23 @@ test('streamed response limit applies even without content-length', async () => 
       controller.enqueue(new Uint8Array(1)); controller.close();
     }}))});
   await assert.rejects(client.get(route, query), rejects('GMGN_RESPONSE_TOO_LARGE'));
+});
+
+test('Market Signal alone has a bounded 4 MiB response allowance', async () => {
+  const accepted='x'.repeat(3*1024*1024);
+  const client=new GmgnClient({apiKey:key(),minIntervalMs:0,
+    fetcher:async()=>response({code:0,data:accepted})});
+  assert.equal(String(await client.getMemeMarketSignals('sol')).length,accepted.length);
+
+  for(const fetcher of [
+    async()=>new Response('{}',{headers:{'content-length':String(4*1024*1024+1)}}),
+    async()=>new Response(new ReadableStream({start(controller){
+      controller.enqueue(new Uint8Array(4*1024*1024));controller.enqueue(new Uint8Array(1));controller.close();
+    }})),
+  ] satisfies (typeof fetch)[]){
+    const oversized=new GmgnClient({apiKey:key(),minIntervalMs:0,fetcher});
+    await assert.rejects(oversized.getMemeMarketSignals('sol'),rejects('GMGN_RESPONSE_TOO_LARGE'));
+  }
 });
 
 test('a fetch ignoring abort cannot hold the client queue forever', async t => {

@@ -43,7 +43,7 @@ export interface Config extends z.infer<typeof schema> {
   ingestToken?:string; database:string; host:string; port:number;
   gmgnApiKey?:string; gmgnPrivateKey?:string; walletIdentitiesPath?:string;
   gmgnPlusArchive?:{enabled:boolean;database:string;maxBytes:number;intervalSec:number;
-    chains:('sol'|'bsc'|'robinhood')[];maxCandidates:number};
+    chains:('sol'|'bsc'|'robinhood')[];maxCandidates:number;marketEnabled:boolean};
   gmgnMarketSignals:{enabled:boolean;intervalMs:number;analysisConcurrency:number;queueCapacity:number};
   gmgnMarketDiscovery?:{enabled:boolean;database:string;maxBytes:number;intervalSec:number;
     maxCandidates:number;klineCooldownSec:number};
@@ -182,6 +182,7 @@ export function readConfig(env:NodeJS.ProcessEnv=process.env): Config {
     trackedIds:(env.TRACKED_X_IDS??'').split(',').filter(Boolean),
     gmgnApiKey:env.GMGN_API_KEY,gmgnPrivateKey:gmgnPrivateKey?.replace(/\\n/g,'\n'),exitPolicy,
     gmgnPlusArchive:{enabled:z.enum(['true','false']).parse(env.GMGN_PLUS_ARCHIVE_ENABLED??'false')==='true',
+      marketEnabled:z.enum(['true','false']).parse(env.GMGN_PLUS_ARCHIVE_MARKET_ENABLED??'true')==='true',
       database:z.string().trim().refine(isPersistentOrderPath).parse(env.GMGN_PLUS_ARCHIVE_DATABASE_PATH??'data/gmgn-plus-archive.sqlite'),
       maxBytes:z.coerce.number().int().min(16).max(4096).parse(env.GMGN_PLUS_ARCHIVE_MAX_MB??256)*1024*1024,
       intervalSec:z.coerce.number().int().min(5).max(3600).parse(env.GMGN_PLUS_ARCHIVE_INTERVAL_SEC??15),

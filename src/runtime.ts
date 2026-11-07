@@ -134,6 +134,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
   const dedicatedGmgnMarketChains=[...new Set(config.scannerChains.map(chain=>chain==='solana'?'sol':chain))] as ('sol'|'bsc'|'robinhood')[];
   const gmgnPlusRunner=gmgnPlusArchive&&config.gmgnApiKey?.trim()?new GmgnPlusArchiveRunner({archive:gmgnPlusArchive,client,
     chains:config.gmgnPlusArchive!.chains,intervalMs:config.gmgnPlusArchive!.intervalSec*1000,
+    marketEnabled:config.gmgnPlusArchive!.marketEnabled,
     dedicatedMarketChains:config.gmgnMarketSignals.enabled&&backgroundGmgnEnabled&&config.gmgnApiKey?.trim()?
       dedicatedGmgnMarketChains:[]}):undefined;
   const gmgnMarketStatus=()=>{

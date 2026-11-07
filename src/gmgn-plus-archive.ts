@@ -383,7 +383,7 @@ export class GmgnPlusArchive {
 }
 
 export interface GmgnPlusArchiveRunnerOptions {archive:GmgnPlusArchive;client:Pick<GmgnClient,'getMemeMarketSignals'|'getCalloutGlobal'|'getWalletStats'|'getWalletProfits'|'getWalletActivity'|'cooldownUntil'>;
-  chains:GmgnArchiveChain[];intervalMs:number;now?:()=>Date;dedicatedMarketChains?:GmgnArchiveChain[];}
+  chains:GmgnArchiveChain[];intervalMs:number;now?:()=>Date;dedicatedMarketChains?:GmgnArchiveChain[];marketEnabled?:boolean;}
 type Task={kind:'market';chain:GmgnArchiveChain}|{kind:'callout_latest'|'callout_backfill';feed:GmgnCalloutFeed}|{kind:'stats'|'profits'|'activity'};
 const PREEMPTION_RETRY_MS=100;
 const expectedPreemption=(error:unknown):error is GmgnError=>error instanceof GmgnError&&error.reason==='GMGN_REQUEST_ABORTED';
@@ -397,7 +397,7 @@ export class GmgnPlusArchiveRunner {
       !Number.isSafeInteger(options.intervalMs)||options.intervalMs<5_000||options.intervalMs>3_600_000)
       throw new Error('GMGN_PLUS_ARCHIVE_RUNNER_CONFIG_INVALID');
     this.now=options.now??(()=>new Date());const dedicated=new Set(options.dedicatedMarketChains??[]),marketTasks:Task[]=
-      [...new Set(options.chains)].filter(chain=>!dedicated.has(chain)).map(chain=>({kind:'market' as const,chain}));this.tasks=[...marketTasks,
+      options.marketEnabled===false?[]:[...new Set(options.chains)].filter(chain=>!dedicated.has(chain)).map(chain=>({kind:'market' as const,chain}));this.tasks=[...marketTasks,
       {kind:'callout_latest',feed:'global'},{kind:'callout_latest',feed:'declaration'},
       {kind:'callout_backfill',feed:'global'},{kind:'callout_backfill',feed:'declaration'},
       {kind:'stats'},{kind:'profits'},{kind:'activity'}];
@@ -405,7 +405,8 @@ export class GmgnPlusArchiveRunner {
   status(){return {...this.options.archive.status(),running:this.running,inFlight:!!this.inFlight,lastTask:this.lastTask,lastError:this.lastError,
     preemptions:this.preemptions,lastPreemptedAt:this.lastPreemptedAt,
     intervalMs:this.options.intervalMs,tasks:this.tasks.length,dedicatedMarketChains:[...new Set(this.options.dedicatedMarketChains??[])],
-    marketSignals:this.options.dedicatedMarketChains?.length?'hybrid_dedicated_and_round_robin':'round_robin',
+    marketEnabled:this.options.marketEnabled!==false,
+    marketSignals:this.options.marketEnabled===false?'disabled':this.options.dedicatedMarketChains?.length?'hybrid_dedicated_and_round_robin':'round_robin',
     coverage:'deduplicated_latest_feeds_plus_cursor_backfill',entryPipeline:false};}
   start(){if(this.running)return;this.running=true;this.tick(0);}
   async stop(){this.running=false;clearTimeout(this.timer);this.timer=undefined;await this.inFlight?.catch(()=>{});this.options.archive.close();}

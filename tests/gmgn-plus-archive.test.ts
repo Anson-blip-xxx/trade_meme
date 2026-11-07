@@ -7,6 +7,7 @@ import {DatabaseSync} from 'node:sqlite';
 import bs58 from 'bs58';
 import {GmgnPlusArchive,GmgnPlusArchiveRunner} from '../src/gmgn-plus-archive.js';
 import {GmgnError} from '../src/providers/gmgn-client.js';
+import {readConfig} from '../src/config.js';
 
 const wallet=(n:number)=>bs58.encode(Buffer.alloc(32,n));
 const tx=(n:number)=>bs58.encode(Buffer.alloc(64,n));
@@ -352,6 +353,32 @@ test('runner advances one durable low-volume task at a time and never sends arch
     assert.deepEqual(calls,['market:sol','market:bsc','market:robinhood','callout:false:latest','callout:true:latest','callout:false:next','callout:true:next']);
     assert.equal(runner.status().runnerCursor,7);assert.equal(runner.status().entryPipeline,false);await runner.stop();
   }finally{f.close();}
+});
+
+test('market-disabled runner skips every market task but keeps callout and wallet research rotation',async()=>{
+  const f=fixture();try{const archive=f.create(),calls:string[]=[];archive.recordCallouts('global',{list:[callout()]});
+    const client={cooldownUntil:0,
+      getMemeMarketSignals:async(chain:string)=>{calls.push(`market:${chain}`);return [];},
+      getCalloutGlobal:async(_chains:unknown,options:{onlyDeclaration?:boolean;pageToken?:string})=>{
+        calls.push(`callout:${!!options.onlyDeclaration}:${options.pageToken??'latest'}`);return {list:[]};},
+      getWalletStats:async()=>{calls.push('stats');return {};},getWalletProfits:async()=>{calls.push('profits');return {list:[]};},
+      getWalletActivity:async()=>{calls.push('activity');return {activities:[],next:''};}};
+    const runner=new GmgnPlusArchiveRunner({archive,client:client as never,chains:['sol','bsc','robinhood'],intervalMs:5000,
+      marketEnabled:false,now:f.now});
+    const tasks:string[]=[];for(let i=0;i<7;i++){await runner.runOnce();tasks.push(runner.status().lastTask!);}
+    assert.deepEqual(tasks,['callout_latest:global','callout_latest:declaration','callout_backfill:global',
+      'callout_backfill:declaration','stats','profits','activity']);
+    assert.deepEqual(calls,['callout:false:latest','callout:true:latest','stats']);
+    assert.equal(calls.some(call=>call.startsWith('market:')),false);
+    assert.equal(runner.status().marketEnabled,false);assert.equal(runner.status().marketSignals,'disabled');
+    assert.equal(runner.status().tasks,7);assert.equal(runner.status().runnerCursor,7);await runner.stop();
+  }finally{f.close();}
+});
+
+test('Plus archive market polling is enabled by default and accepts an explicit independent disable',()=>{
+  assert.equal(readConfig({}).gmgnPlusArchive?.marketEnabled,true);
+  assert.equal(readConfig({GMGN_PLUS_ARCHIVE_MARKET_ENABLED:'false'}).gmgnPlusArchive?.marketEnabled,false);
+  assert.throws(()=>readConfig({GMGN_PLUS_ARCHIVE_MARKET_ENABLED:'0'}));
 });
 
 test('dedicated Sol market polling removes only Sol from archive rotation',async()=>{

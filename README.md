@@ -85,7 +85,7 @@ Kline 读取官方 `/v1/market/token_kline`，只对已提名的候选按需取�
 
 市场发现是独立研究输入：不增加 DeBot／Ave 的通知次数，不触发第三次通知策略，不直接创建订单，不改变自动开仓风控，也不代替持仓长连接报价。SQLite 只保存规范化后的紧凑快照与变化字段，不保存 GMGN 原始响应；默认最多 128 MiB，变化记录保留 30 天或最多 50,000 条。9528 的“信号来源”和“运行状态”展示两路轮询次数、变化数、Kline 补轨迹次数、待处理候选、最近错误和存储容量。
 
-DeBot 配置为 `DEBOT_SCANNER_ENABLED=true`、`DEBOT_TRANSPORT=authenticated_stream`。在 9528 控制台“信号来源 → DeBot 登录”中发送邮箱验证码，并输入邮箱验证码和 Google Authenticator 当前动态码。邮箱由服务器 `DEBOT_LOGIN_EMAIL` 固定配置；两个验证码仅用于当次请求，不存入数据库、日志或浏览器存储。通过官方 `/api/user/info` 验证后，会话原子保存到 `DEBOT_SESSION_PATH`（默认 `data/debot/session.json`，目录 0700、文件 0600）。该凭据文件仅留在服务器，禁止提交到 Git。
+DeBot 配置为 `DEBOT_SCANNER_ENABLED=true`、`DEBOT_TRANSPORT=authenticated_stream`。在 9528 控制台“信号来源 → DeBot 登录”中发送邮箱验证码，并输入邮箱验证码和 Google Authenticator 当前动态码。邮箱由服务器 `DEBOT_LOGIN_EMAIL` 固定配置；两个验证码仅用于当次请求，不存入数据库、日志或浏览器存储。通过官方 `/api/user/info` 验证后，会话原子保存到 `DEBOT_SESSION_PATH`（默认 `data/debot/session.json`，目录 0700、文件 0600）。该凭据文件仅留在服务器，禁止提交到 Git。认证会话失效时系统继续轮询 DeBot 公共延迟页；这类记录标为 `public_delayed_poll`，只进入历史和研究，不进入第三次通知计数，也不能触发开仓。认证恢复后自动停止公共回退并切回实时流。
 
 2026-10-18 核验官方 [ai-trading-skills 固定版本](https://github.com/debot-ai/ai-trading-skills/tree/9aa1647880c90f03006d3decad97d03b91b188e3)：当前仅发布 `debot-trade`（CLI v0.0.2），使用 API Key 与 Secret，提供绑定钱包、交易、固定止盈止损和交易签名广播；实时行情、钱包监控与 AI 信号仍列为后续开放能力。因此该技能目前不能替代本系统实时信号的会话认证，也未将交易凭据复用到网页接口。其 `buy-tpsl` 卖出比例按原买入量计算，与本系统“按剩余持仓”不同，不能直接复制档位参数。本系统尚未安装或调用 DeBot 交易 CLI。
 
@@ -437,8 +437,8 @@ npm run orders -- <订单ID>
 | `GMGN_MARKET_DISCOVERY_MAX_CANDIDATES` | 20；单路单轮最多接受的规范化候选数 |
 | `GMGN_MARKET_KLINE_COOLDOWN_SEC` | 300；同一 CA 两次按需补 Kline 的最短间隔 |
 | `SCANNER_INTERVAL_SEC` / `SCANNER_MAX_SIGNALS` | 60 / 3 |
-| `DEBOT_SCANNER_ENABLED` / `DEBOT_SCANNER_INTERVAL_SEC` | false / 30；启用信号来源，间隔仅用于匿名诊断模式；认证流每 60 秒补数 |
-| `DEBOT_TRANSPORT` | `authenticated_stream`；匿名轮询仅供诊断 |
+| `DEBOT_SCANNER_ENABLED` / `DEBOT_SCANNER_INTERVAL_SEC` | false / 30；启用信号来源；该间隔用于认证失效后的公共延迟回退，认证流每 60 秒补数 |
+| `DEBOT_TRANSPORT` | `authenticated_stream`；会话失效时自动启用只研究、不可交易的公共延迟回退 |
 | `DEBOT_LOGIN_EMAIL` | 固定 DeBot 登录邮箱，控制台不能改成其他账户 |
 | `DEBOT_SESSION_PATH` | `data/debot/session.json`；私有登录会话，不能与任何数据库共用路径 |
 | `DEBOT_SIGNALS_DATABASE_PATH` | `data/debot-signals.sqlite`；与其他数据库使用不同路径 |

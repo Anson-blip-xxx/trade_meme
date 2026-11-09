@@ -16,6 +16,8 @@ const object=(value:unknown):value is Record<string,unknown>=>
 
 export interface DebotSignalObservation {
   id:string;signal:Signal;observedAt:string;
+  /** Anonymous pages are delayed research evidence and never authorize trading. */
+  delivery?:'public_delayed_poll';
   /** Display-only labels from metadata already bound to this exact chain and CA. */
   name?:string;symbol?:string;
   /** Vendor-reported entries, not independently verified buyers or wallet ownership. */

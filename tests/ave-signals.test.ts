@@ -107,7 +107,7 @@ test('bounded first-page normalization does not follow pagination or accept fail
 
 test('public HTTP uses fixed GET endpoint, bounded chain query, no credentials, no redirect or second page',async()=>{
   let calls=0;const result=await fetchAveSignalPage(['bsc','solana','bsc'],{now:()=>now,fetcher:async(input,init)=>{
-    calls++;const u=new URL(String(input));assert.equal(u.origin,'https://yiyulu.com');
+    calls++;const u=new URL(String(input));assert.equal(u.origin,'https://sdzrby.com');
     assert.equal(u.pathname,'/v2api/signals/v2/public/multi_chain/list');
     assert.equal(u.searchParams.get('chain'),'bsc,solana');assert.equal(u.searchParams.get('pageSize'),'20');
     assert.equal(init?.method,'GET');assert.equal(init?.credentials,'omit');assert.equal(init?.redirect,'error');

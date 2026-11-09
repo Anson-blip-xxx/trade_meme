@@ -8,7 +8,7 @@ import type {Fetcher} from '../src/http.js';
 import {fetchAveSignalPage,AveSignalError} from '../src/providers/ave-signals.js';
 
 const NOW=Date.parse('2026-10-16T10:00:00Z'),EMAIL='owner@example.test';
-const FEED='https://yiyulu.com/v2api/signals/v2/public/multi_chain/list?pageSize=20&chain=bsc,solana,robinhood';
+const FEED='https://sdzrby.com/v2api/signals/v2/public/multi_chain/list?pageSize=20&chain=bsc,solana,robinhood';
 const WALLETS='/botapi/user/getWalletsAllChain',USER='/botapi/user/getUserInfoByGuid',REFRESH='/botapi/user/refreshNewToken';
 const EVM='0x1111111111111111111111111111111111111111',SOL='So11111111111111111111111111111111111111112';
 const jwt=(expiry=NOW+3600000,issued=NOW-3600000)=>`unsigned.${Buffer.from(JSON.stringify({exp:expiry/1000,iat:issued/1000,email:'not-authentication-proof@example.test'})).toString('base64url')}.private-signature`;
@@ -136,11 +136,11 @@ test('precise fixed signal URL allowlist forbids trade, mnemonic, login, refresh
   const f=fixture();let calls=0;
   try {
     const client=new AveSessionClient({path:f.path,email:EMAIL,fetcher:async()=>{calls++;return success({});}});
-    const rejected=[FEED.replace('https:','http:'),FEED.replace('yiyulu.com','yiyulu.com.evil.test'),FEED.replace('yiyulu.com','user:password@yiyulu.com'),
-      FEED.replace('yiyulu.com','yiyulu.com:444'),`${FEED}#fragment`,`${FEED}&page_token=secret`,`${FEED}&chain=bsc`,`${FEED}&wallet_address=${EVM}`,
+    const rejected=[FEED.replace('https:','http:'),FEED.replace('sdzrby.com','sdzrby.com.evil.test'),FEED.replace('sdzrby.com','user:password@sdzrby.com'),
+      FEED.replace('sdzrby.com','sdzrby.com:444'),`${FEED}#fragment`,`${FEED}&page_token=secret`,`${FEED}&chain=bsc`,`${FEED}&wallet_address=${EVM}`,
       FEED.replace('pageSize=20','pageSize=10000'),FEED.replace('bsc,solana,robinhood','ethereum'),
-      `https://yiyulu.com${REFRESH}?type=acc`,`https://yiyulu.com${USER}?guid=other`,
-      'https://yiyulu.com/botapi/swap/createSwapEvmTxV2','https://yiyulu.com/botapi/user/emailCodeLogin','https://yiyulu.com/botapi/user/getMnemonic'];
+      `https://sdzrby.com${REFRESH}?type=acc`,`https://sdzrby.com${USER}?guid=other`,
+      'https://sdzrby.com/botapi/swap/createSwapEvmTxV2','https://sdzrby.com/botapi/user/emailCodeLogin','https://sdzrby.com/botapi/user/getMnemonic'];
     for(const url of rejected)await assert.rejects(client.fetcher(url),reason('REQUEST_REJECTED'));
     for(const init of [{method:'POST'},{method:'DELETE'},{redirect:'follow'},{body:'secret'}] as RequestInit[])
       await assert.rejects(client.fetcher(FEED,init),reason('REQUEST_REJECTED'));

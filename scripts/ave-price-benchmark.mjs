@@ -27,7 +27,7 @@ const quantiles=values=>{
   return {n:a.length,p50:q(.5),p95:q(.95),p99:q(.99),max:a.at(-1)??null};
 };
 const round=value=>Number.isFinite(value)?Math.round(value*1000)/1000:null;
-const report={startedAt:new Date().toISOString(),endpoint:'wss://yiyulu.com/ws',topic:'pricev2',
+const report={startedAt:new Date().toISOString(),endpoint:'wss://sdzrby.com/ws',topic:'pricev2',
   subscriptionMode,
   boundaries:{network:'One read-only public WebSocket; no HTTP requests; no reconnect; no account authentication.',
     maxTokens:200,stageSeconds:seconds,productionDatabaseReadOnly:true,noSignerOrTradeImports:true,noProductionConfigChanges:true},

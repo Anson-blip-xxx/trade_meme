@@ -20,7 +20,7 @@ interface Cycle {
 export interface DebotScannerOptions {
   database:string;chains:Chain[];intervalSec?:number;maxAgeSec:number;maxBytes?:number;
   mode?:'anonymous_poll'|'authenticated_stream';
-  onSignal:(signal:Signal,observedAt:string,context?:{detailsReady:Promise<void>;repeat?:boolean})=>Promise<unknown>;shouldDefer?:()=>string|undefined;
+  onSignal:(signal:Signal,observedAt:string,context?:{detailsReady:Promise<void>;repeat?:boolean;researchOnly?:boolean})=>Promise<unknown>;shouldDefer?:()=>string|undefined;
   repeatCooldownSec?:number;
   /** Page-priority callback. When configured, the durable inbox forwards the
    * whole page here before any notification/research persistence begins. A
@@ -768,6 +768,9 @@ export class DebotScanner {
   }
 
   private notifyPriorityObservation(observation:DebotSignalObservation):boolean {
+    // Anonymous DeBot pages arrive roughly ten minutes late. Persist and study
+    // them, but never let them increment the live N3 counter.
+    if(observation.delivery==='public_delayed_poll')return true;
     try {
       if(this.options.onPriorityObservation)this.options.onPriorityObservation(observation);
       else if(this.options.onPriorityObservations)this.options.onPriorityObservations([observation]);
@@ -818,8 +821,11 @@ export class DebotScanner {
     const pending=[...claimed].filter(([,forwarded])=>!forwarded).map(([observation])=>observation);
     if(!pending.length)return;
     let delivered=pending;
-    if(this.options.onPriorityObservations)try {this.options.onPriorityObservations(pending.map(observation=>structuredClone(observation)));}
-    catch{delivered=[];}
+    if(this.options.onPriorityObservations){
+      const eligible=pending.filter(observation=>observation.delivery!=='public_delayed_poll');
+      try {if(eligible.length)this.options.onPriorityObservations(eligible.map(observation=>structuredClone(observation)));}
+      catch{delivered=pending.filter(observation=>observation.delivery==='public_delayed_poll');}
+    }
     else delivered=pending.filter(observation=>this.notifyPriorityObservation(observation));
     const ids=[...new Set(delivered.map(observation=>observation.signal.sourceEventId))];
     if(!ids.length)return;
@@ -1162,7 +1168,8 @@ export class DebotScanner {
         .run(JSON.stringify(incremental.evidence.vendorChanges.map(({address,observedAt})=>({address,observedAt}))),row.id);
       mark(previous?'reassessment':'first_analysis',
         [...(incremental?.reasons??['DEBOT_INITIAL_ANALYSIS']),...(freshNotification?['DEBOT_FRESH_NOTIFICATION_REASSESSMENT']:[])],incremental?.evidence);
-      await this.options.onSignal(evaluationSignal,observation.observedAt,{detailsReady,repeat:!!previous});
+      await this.options.onSignal(evaluationSignal,observation.observedAt,{detailsReady,repeat:!!previous,
+        ...(observation.delivery==='public_delayed_poll'?{researchOnly:true}:{})});
       this.db.prepare("UPDATE debot_signals SET state='completed',analyzed=1,completed_at=? WHERE id=?")
         .run(this.now().toISOString(),row.id);
     } catch {

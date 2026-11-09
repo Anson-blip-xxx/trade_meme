@@ -5,7 +5,9 @@ import {createHash,randomUUID} from 'node:crypto';
 import bs58 from 'bs58';
 import {abortable,scopedFetcher,type Fetcher} from '../http.js';
 
-const ORIGIN='https://yiyulu.com',FEED='/v2api/signals/v2/public/multi_chain/list';
+// Ave's current web client uses this origin for both identity and signal APIs.
+// Keep it aligned with providers/ave-signals.ts and AveScanner's websocket.
+const ORIGIN='https://sdzrby.com',FEED='/v2api/signals/v2/public/multi_chain/list';
 const WALLETS='/botapi/user/getWalletsAllChain',USER='/botapi/user/getUserInfoByGuid',REFRESH='/botapi/user/refreshNewToken';
 const MAX_FILE=64*1024,MAX_RESPONSE=2*1024*1024;
 const object=(value:unknown):value is Record<string,unknown>=>!!value&&typeof value==='object'&&!Array.isArray(value);

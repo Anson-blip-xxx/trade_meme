@@ -357,6 +357,26 @@ test('authenticated stream has a 120-second freshness ceiling and allows only ex
   }finally{await noFallback.close();}
 });
 
+test('public delayed fallback persists research but cannot reach counting or entry',async()=>{
+  let priority=0,batchPriority=0,research=0;const contexts:Array<{researchOnly?:boolean}|undefined>=[];
+  const f=fixture({mode:'authenticated_stream',onPriorityObservation:()=>{priority++;},
+    onPriorityObservations:observations=>{batchPriority+=observations.length;},
+    onObservation:()=>{research++;},onSignal:async(_signal,_at,context)=>{contexts.push(context);}});
+  try {
+    const scanner=f.create(),delayed={...observation(1),delivery:'public_delayed_poll' as const};
+    scanner.start();scanner.acceptPage(page(delayed));
+    await waitFor(()=>research===1&&contexts.length===1,'public delayed research');
+    assert.equal(priority,0);assert.equal(batchPriority,0);assert.equal(research,1);assert.equal(contexts.length,1);
+    assert.equal(contexts[0]?.researchOnly,true);
+    const stored=JSON.parse(String(f.rows()[0].payload)) as DebotSignalObservation;
+    assert.equal(stored.delivery,'public_delayed_poll');
+
+    scanner.acceptPage(page(observation(2)));
+    await waitFor(()=>research===2&&contexts.length===2,'authenticated research');
+    assert.equal(priority,0);assert.equal(batchPriority,1);assert.equal(research,2);assert.equal(contexts[1]?.researchOnly,undefined);
+  }finally{await f.close();}
+});
+
 test('stream arrivals begin immediately and queued arrivals drain serially when the active analysis finishes',async()=>{
   const started=deferred<void>(),release=deferred<void>();let active=0,maxActive=0;
   const received:string[]=[];

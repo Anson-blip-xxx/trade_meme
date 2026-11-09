@@ -4,7 +4,7 @@
 
 ## 独立价格来源
 
-- Ave：复用现有 `wss://yiyulu.com/ws`，订阅 `pricev2`。只读取 `is_main_pair=true`、链与完整 CA 一致、`token=target_token` 的 `uprice`，用响应 `time` 作为更新时间。订阅集合最多 200 个，重连恢复。
+- Ave：复用现有 `wss://sdzrby.com/ws`，订阅 `pricev2`。只读取 `is_main_pair=true`、链与完整 CA 一致、`token=target_token` 的 `uprice`，用响应 `time` 作为更新时间。订阅集合最多 200 个，重连恢复。
 - DexScreener：按链调用 `/tokens/v1/{chainId}/{tokenAddresses}`，每批最多 30 个完整 CA；校验基础代币、链、池子和价格，比较主要池价格分歧。
 - DeBot：`GET /api/market/token/info?chain=...&token=...`，复用已验证登录态，校验 `data.meta.chain/address`，只读 `data.market.price`。接口没有价格事件时钟，因此使用 HTTP 响应时间并扣除 `Age`，不声称这是链上成交时间。
 - GMGN：`/v1/token/info` 的 `price.price`，只做有界回退，每轮最多一个请求，排队也包含在取消期限内。

@@ -19,6 +19,7 @@ export interface DebotStreamOptions {
   getSession:()=>Promise<{subToken:string;cookieHeader?:string}>;
   onPage:(page:NormalizedDebotSignals)=>unknown|Promise<unknown>;
   onAuthorized?:()=>unknown|Promise<unknown>;
+  onAuthRequired?:(reason:string)=>unknown|Promise<unknown>;
   now?:()=>Date;
   socketFactory?:DebotSocketFactory;
 }
@@ -202,6 +203,7 @@ export class DebotStream {
   private rejectAuthorization(reason:string):void {
     this.running=false;this.generation++;clearTimeout(this.retryTimer);this.retryTimer=undefined;
     this.detach();this.state='auth_required';this.lastError=reason;
+    try {void Promise.resolve(this.options.onAuthRequired?.(reason)).catch(()=>{});}catch {/* Diagnostics cannot block fallback. */}
   }
   private retry(reason:string,state:'disconnected'|'error',minimumDelay=0):void {
     if(!this.running)return;

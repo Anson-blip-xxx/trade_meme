@@ -160,7 +160,7 @@ test('stable pagination and chain filtering do not change historical baseline',a
 test('public websocket sends only observed subscription; other channels and malformed/large frames do not feed research',async()=>{
   const socket=new Socket();let url='';const {scanner,observations}=setup({socketFactory:u=>{url=u;return socket;},
     fetcher:async()=>Response.json({status:1,data:{list:[]}})});try{
-    scanner.start();assert.equal(url,'wss://yiyulu.com/ws');socket.emit('open');
+    scanner.start();assert.equal(url,'wss://sdzrby.com/ws');socket.emit('open');
     assert.deepEqual(JSON.parse(socket.sent[0]),{jsonrpc:'2.0',method:'subscribe',params:['signalsv2_public_monitor','bsc,solana,robinhood'],id:1});
     assert.equal(scanner.getStatus().mode,'public_signal_stream');assert.equal(scanner.getStatus().connected,true);
     socket.emit('message',{data:'pong'});assert.equal(scanner.getStatus().lastMessageAt,new Date(base).toISOString());

@@ -562,7 +562,7 @@ export class AveScanner {
     if(!this.running||this.closed||this.stopped)return;
     const generation=this.generation;this.connectionState='connecting';
     let socket:AveSocket;
-    try {socket=(this.options.socketFactory??(url=>new WebSocket(url)))('wss://yiyulu.com/ws');}
+    try {socket=(this.options.socketFactory??(url=>new WebSocket(url)))('wss://sdzrby.com/ws');}
     catch {this.reconnect('AVE_STREAM_CONNECT_FAILED');return;}
     this.socket=socket;this.connectedAtMs=this.now().getTime();
     const on=(type:string,listener:(event:any)=>void)=>{this.socketListeners.push([type,listener]);socket.addEventListener(type,listener);};

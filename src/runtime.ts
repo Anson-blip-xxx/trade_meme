@@ -15,6 +15,7 @@ import {GmgnEntryHolderReader} from './providers/gmgn-entry-holders.js';
 import {GmgnScanner,normalizeGmgnTrades} from './scanner.js';
 import {DebotScanner} from './debot-scanner.js';
 import {DebotStream} from './debot-stream.js';
+import {DebotPublicFallback} from './debot-public-fallback.js';
 import {DebotSessionClient,DebotSessionError} from './providers/debot-session.js';
 import {DebotAuthManager} from './providers/debot-auth.js';
 import {fetchDebotSignalPage,fetchDebotWalletDetails} from './providers/debot-signals.js';
@@ -977,8 +978,9 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
     } catch(error) {store.interrupt(item.id,item.claimId!);throw error;}
     finally {active--;releaseResearchAdmission();}
   };
-  const onSignal=(signal:Signal,firstReceivedAt?:string,context?:{detailsReady:Promise<void>;repeat?:boolean})=>
-    analyzeSignal(signal,firstReceivedAt,context);
+  const onSignal=(signal:Signal,firstReceivedAt?:string,
+    context?:{detailsReady:Promise<void>;repeat?:boolean;researchOnly?:boolean})=>
+    analyzeSignal(signal,firstReceivedAt,context,{considerEntry:context?.researchOnly!==true});
   if(config.gmgnMarketSignals.enabled&&config.gmgnApiKey?.trim()){
     gmgnMarketScanner=new GmgnMarketSignalScanner({client,chains:dedicatedGmgnMarketChains,intervalMs:config.gmgnMarketSignals.intervalMs,
       maxAgeSec:config.maxSignalAgeSec,dispatchConcurrency:config.gmgnMarketSignals.analysisConcurrency,
@@ -1053,6 +1055,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       walletObserver?.observeFeed(page);
     }});
   let debotAuth:DebotAuthManager|undefined;
+  let debotPublicFallback:DebotPublicFallback|undefined;
   const aveSession=config.ave?.enabled&&config.ave.email?new AveSessionClient({path:config.ave.sessionPath,email:config.ave.email}):undefined;
   const aveScanner=config.ave?.enabled?new AveScanner({database:config.ave.database,chains:config.scannerChains,
     onPriceFrame:(payload,receivedAt)=>{priceRouter.ingestAvePriceFrame(payload,receivedAt,sample=>{
@@ -1069,7 +1072,9 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
     onSignal,shouldDefer:()=>closed?'SERVICE_STOPPING':backgroundGmgnEnabled&&!config.gmgnApiKey?.trim()?'GMGN_API_KEY_MISSING':
       backgroundGmgnEnabled&&client.cooldownUntil>Date.now()?'GMGN_RATE_LIMITED':active>=2?'RESEARCH_BUSY':scanner.getStatus().inFlight?'SCANNER_BUSY':undefined}):undefined;
   const debotSession=config.debotScannerEnabled&&config.debotTransport==='authenticated_stream'?new DebotSessionClient({
-    path:config.debotSessionPath,onAuthRequired:()=>{debotAuth?.setAuthenticated(false);debotStream?.invalidateSession();}}):undefined;
+    path:config.debotSessionPath,onAuthRequired:()=>{
+      debotAuth?.setAuthenticated(false);debotStream?.invalidateSession();debotPublicFallback?.poke();
+    }}):undefined;
   const debotScanner:DebotScanner|undefined=config.debotScannerEnabled?new DebotScanner({database:config.debotSignalsDatabase,mode:config.debotTransport,
     maxBytes:config.debotSignalsMaxBytes,
     chains:config.scannerChains,intervalSec:config.debotScannerIntervalSec,
@@ -1099,7 +1104,11 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
           'DEBOT_SESSION_FILE_PERMISSIONS','DEBOT_SESSION_AUTH_REQUIRED'].includes(error.reason))debotAuth?.setAuthenticated(false);
         throw error;
       }
-    },onPage:page=>debotScanner.acceptPage(page),onAuthorized:()=>debotScanner.runOnce()}):undefined;
+    },onPage:page=>debotScanner.acceptPage(page),onAuthorized:()=>debotScanner.runOnce(),
+    onAuthRequired:()=>debotPublicFallback?.poke()}):undefined;
+  if(debotStream&&debotScanner)debotPublicFallback=new DebotPublicFallback({chains:config.scannerChains,
+    intervalMs:config.debotScannerIntervalSec*1000,shouldPoll:()=>debotStream.getStatus().state==='auth_required',
+    onPage:page=>debotScanner.acceptPage(page)});
   if(debotStream&&config.debotLoginEmail)debotAuth=new DebotAuthManager({email:config.debotLoginEmail,
     sessionPath:config.debotSessionPath,onAuthenticated:async()=>{
       await debotStream.stop();if(!closed)void debotStream.start();
@@ -1218,7 +1227,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
     }catch{priceTargetError='PRICE_STREAM_TARGET_REFRESH_FAILED';}
   };
   sourceObservation?.start();
-  return {client,providers,store,orders,entry,dailyReview,scanner,debotScanner,debotStream,debotAuth,archive,followupReview,tracking,priceRouter,walletHistory,walletIndexRunner,walletObserver,walletResearchStatus,walletAssociationsStatus,walletProfiles,walletProfilesStatus,walletScreening,watchRechecker,exitShadow,chainMonitor,chainStreamStatus,walletFastResearch,memeObserver,sourceEvidence,sourceObservation,aveScanner,aveSession,tokenRankResearch,jevShadow,telegram,tradeNotifications,telegramStatus,heldMonitor,heldTracking,
+  return {client,providers,store,orders,entry,dailyReview,scanner,debotScanner,debotStream,debotPublicFallback,debotAuth,archive,followupReview,tracking,priceRouter,walletHistory,walletIndexRunner,walletObserver,walletResearchStatus,walletAssociationsStatus,walletProfiles,walletProfilesStatus,walletScreening,watchRechecker,exitShadow,chainMonitor,chainStreamStatus,walletFastResearch,memeObserver,sourceEvidence,sourceObservation,aveScanner,aveSession,tokenRankResearch,jevShadow,telegram,tradeNotifications,telegramStatus,heldMonitor,heldTracking,
     signalCounting,telegramControls,telegramPositions,manualClose,directSell,manualNativeBuy,telegramTokenCard,gmgnMarketScanner,
     gmgnMarketDiscovery,gmgnMarketDiscoveryStore,
     executionStatus:()=>{const counting=signalCounting.status();return {
@@ -1273,6 +1282,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       scanner:{...scanner.getStatus(),enabled:backgroundGmgnEnabled&&config.scannerEnabled,pausedReason:backgroundGmgnPausedReason},
       debotScanner:debotScanner?.getStatus()??{enabled:false,running:false},
       debotStream:debotStream?.getStatus(),
+      debotPublicFallback:debotPublicFallback?.status(),
       meme:memeObserver?{...memeObserver.runtimeStatus(),captureError:memeCaptureError}:{enabled:false},
       sourceObservation:sourceObservation?.status()??{enabled:false},
       ave:aveScanner?{...aveScanner.getStatus(),nominationCaptureError,session:aveSession?.getStatus()??{status:'required',authenticated:false,reason:'AVE_LOGIN_EMAIL_NOT_CONFIGURED'}}:{enabled:false},
@@ -1336,6 +1346,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       debotScanner?.start();
       aveScanner?.start();
       if(debotStream) {
+        debotPublicFallback?.start();
         void debotStream.start();
         debotSyncTimer=setInterval(()=>{if(debotStream.getStatus().authorized)void debotScanner?.runOnce();},60_000);
         debotSyncTimer.unref();
@@ -1357,6 +1368,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       // Fence both sources before draining third-signal callbacks. Otherwise a
       // final socket/page event can be admitted after waitForDispatches returns.
       await debotStream?.stop();
+      await debotPublicFallback?.stop();
       await Promise.all([aveScanner?.stop(),debotScanner?.stop()]);
       await gmgnMarketStop;
       await gmgnMarketDiscoveryDrain;

@@ -153,7 +153,7 @@ async function boundedJson(response:Response,signal:AbortSignal):Promise<unknown
 export async function fetchAveSignalPage(chains:readonly Chain[]=CHAINS,
   options:{fetcher?:Fetcher;now?:()=>Date;signal?:AbortSignal}={}):Promise<NormalizedAveSignals> {
   if(!chains.length||chains.some(chain=>!CHAINS.includes(chain)))throw new AveSignalError('AVE_SIGNAL_INPUT_INVALID');
-  const now=options.now??(()=>new Date()),url=new URL('https://yiyulu.com/v2api/signals/v2/public/multi_chain/list');
+  const now=options.now??(()=>new Date()),url=new URL('https://sdzrby.com/v2api/signals/v2/public/multi_chain/list');
   url.searchParams.set('pageSize',String(PAGE_SIZE));url.searchParams.set('chain',[...new Set(chains)].join(','));
   const timeout=AbortSignal.timeout(10_000),signal=options.signal?AbortSignal.any([options.signal,timeout]):timeout;
   try {

@@ -5,7 +5,7 @@ const db=new DatabaseSync('data/ave-signals.sqlite',{readOnly:true});
 const tokens=db.prepare("SELECT address,max(observed_at) latest FROM ave_signals WHERE chain='solana' GROUP BY address ORDER BY latest DESC LIMIT 20").all();db.close();
 if(tokens.length!==20)throw Error('INSUFFICIENT_TOKENS');
 const a=tokens.slice(0,10).map(t=>t.address),b=tokens.slice(10).map(t=>t.address),groups=new Map([...a.map(t=>[t,'A']),...b.map(t=>[t,'B'])]);
-const report={startedAt:new Date().toISOString(),readOnly:true,endpoint:'wss://yiyulu.com/ws',purpose:'Test whether a second pricev2 subscribe replaces or adds topics; no HTTP/login/trade.',groups:{A:a,B:b},phases:[],errors:[],frames:0};
+const report={startedAt:new Date().toISOString(),readOnly:true,endpoint:'wss://sdzrby.com/ws',purpose:'Test whether a second pricev2 subscribe replaces or adds topics; no HTTP/login/trade.',groups:{A:a,B:b},phases:[],errors:[],frames:0};
 let stage,finished=false,aborted=false;
 const socket=new WebSocket(report.endpoint);
 socket.addEventListener('error',()=>{report.errors.push('WS_ERROR');aborted=true;});

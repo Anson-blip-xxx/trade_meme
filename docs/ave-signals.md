@@ -4,7 +4,7 @@
 
 ## 采集与账户
 
-`AVE_SCANNER_ENABLED=true` 启用独立采集器。`wss://yiyulu.com/ws` 订阅 `signalsv2_public_monitor`，按配置选择 BSC、Solana、Robinhood。已实测公开连接收到新信号；界面将“公开流连接”和“账号验证”分别显示，不把公开连接算成登录，也不假定匿名 Ave 与 DeBot 一样延迟十分钟。心跳、指数退避重连和 60 秒 HTTP 补数独立于页面刷新。
+`AVE_SCANNER_ENABLED=true` 启用独立采集器。`wss://sdzrby.com/ws` 订阅 `signalsv2_public_monitor`，按配置选择 BSC、Solana、Robinhood。已实测公开连接收到新信号；界面将“公开流连接”和“账号验证”分别显示，不把公开连接算成登录，也不假定匿名 Ave 与 DeBot 一样延迟十分钟。心跳、指数退避重连和 60 秒 HTTP 补数独立于页面刷新。
 
 邮箱验证码通过 Ave 正常登录页使用。服务器只保留 `AVE_SESSION_PATH` 中的最小会话字段：`version`、固定邮箱、`savedAt`、access/refresh token、网站 X-Auth。目录 0700，文件 0600，不进入 Git。登录态通过当前账号钱包关联的用户信息核验邮箱，不能仅凭 JWT 内容宣称认证成功。读取信号不获取助记词、私钥，也不请求交易或签名。
 

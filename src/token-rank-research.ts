@@ -350,7 +350,7 @@ export class TokenRankResearch {
     if(this.closed)throw new Error('TOKEN_RANK_RESEARCH_CLOSED');
     // Capacity recovery must run before the full-state short circuit. It only removes verified duplicate display
     // payloads, then SQLite reuses those pages without growing the physical file.
-    try{this.reclaimWalletCopies();}catch{if(this.error===CAPACITY)return this.status();}
+    try{this.reclaimWalletCopies(this.error===CAPACITY?64:16);}catch{if(this.error===CAPACITY)return this.status();}
     if(this.error===CAPACITY){
       if(bytes(this.db)+65536>=this.maxBytes)return this.status();
       this.setMeta('error','');this.error=undefined;

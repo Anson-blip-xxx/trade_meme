@@ -115,10 +115,42 @@ function pnl(row:Row,target:Token,now:string):{wallet:string;pnl:TokenRankPnl}|u
     verification:'vendor_claim',scope:'token_cumulative',...(stamp(d.firstAcquiredAt)&&d.firstAcquiredAt<=d.observedAt?{vendorFirstAcquiredAt:d.firstAcquiredAt}:{})}};
 }
 function readonly(path:string):DatabaseSync {const db=new DatabaseSync(path,{readOnly:true});db.exec('PRAGMA busy_timeout=1000; PRAGMA query_only=ON');return db;}
-const bytes=(db:DatabaseSync)=>Number(db.prepare('PRAGMA page_count').get()!.page_count)*Number(db.prepare('PRAGMA page_size').get()!.page_size);
+function storage(db:DatabaseSync){
+  const pageSize=Number(db.prepare('PRAGMA page_size').get()!.page_size),pages=Number(db.prepare('PRAGMA page_count').get()!.page_count),
+    freePages=Number(db.prepare('PRAGMA freelist_count').get()!.freelist_count),allocatedBytes=pages*pageSize,reclaimableBytes=freePages*pageSize;
+  return {usedBytes:Math.max(0,allocatedBytes-reclaimableBytes),allocatedBytes,reclaimableBytes};
+}
+// Capacity is the live page budget. Deleted overflow pages remain in the SQLite file and are reused; treating those
+// pages as occupied permanently stalls a healthy database after bounded maintenance has made room.
+const bytes=(db:DatabaseSync)=>storage(db).usedBytes;
 const bounds=(v:unknown,fallback:number,max:number)=>typeof v==='number'&&Number.isSafeInteger(v)?Math.max(1,Math.min(max,v)):fallback;
 const walletPagePath=(database:string)=>database===':memory:'?undefined:`${database}.wallet-pages.sqlite`;
 const WALLET_PAGE_SCHEMA='1';
+
+function displayWallets(values:TokenRankWallet[]){
+  const members=[...values].sort((a,b)=>(a.entry?.eventAt??'z').localeCompare(b.entry?.eventAt??'z')||a.address.localeCompare(b.address)),
+    profit=[...values].filter(value=>value.pnl).sort((a,b)=>(b.pnl!.realizedProfitUsd??-Infinity)-(a.pnl!.realizedProfitUsd??-Infinity)||a.address.localeCompare(b.address)),
+    selected=new Set([...members.filter(value=>value.entry).slice(0,100),...profit.slice(0,100),...members].map(value=>value.address).slice(0,MAX_WALLETS));
+  return members.filter(value=>selected.has(value.address));
+}
+
+/** Rebuild the bounded token card from the smaller, append-only per-wallet evidence rows. */
+function tokenWalletSnapshot(db:DatabaseSync,target:Token,computedAt:string,members?:string[]){
+  const rows=db.prepare(`SELECT v.data FROM tr_wallet_current c JOIN tr_wallet_token_versions v ON v.id=(
+      SELECT x.id FROM tr_wallet_token_versions x WHERE x.chain=c.chain AND x.address=c.address
+        AND x.token_address=c.token_address AND x.computed_at<=? ORDER BY x.computed_at DESC,x.id DESC LIMIT 1)
+    WHERE c.chain=? AND c.token_address=? AND v.present=1 ORDER BY c.address`).all(computedAt,target.chain,target.address),
+    values=rows.map(row=>parse(row.data)).filter((value):value is TokenRankWallet=>object(value)&&value.chain===target.chain&&value.tokenAddress===target.address);
+  if(members){const byAddress=new Map(values.map(value=>[value.address,value]));return members.flatMap(value=>byAddress.get(value)??[]);}
+  return displayWallets(values);
+}
+
+function compactMembers(value:unknown,chain:Chain):string[]|undefined{
+  if(!Array.isArray(value)||!value.every(item=>typeof item==='string'))return;
+  const normalized=value.map(item=>address(item,chain));
+  if(normalized.some(item=>!item)||new Set(normalized).size!==normalized.length)return;
+  return normalized as string[];
+}
 
 /** Derived research only. Sources are opened read-only; runBatch belongs in a worker. */
 export class TokenRankResearch {
@@ -153,12 +185,12 @@ export class TokenRankResearch {
     if(!columns.some(c=>c.name==='dirty_live'))this.db.exec('ALTER TABLE tr_tokens ADD COLUMN dirty_live INTEGER NOT NULL DEFAULT 0');
     if(!columns.some(c=>c.name==='live_at'))this.db.exec('ALTER TABLE tr_tokens ADD COLUMN live_at TEXT');
     this.db.exec('CREATE INDEX IF NOT EXISTS tr_tokens_live ON tr_tokens(dirty_live,live_at)');
-    const oldMax=Number(this.meta('max_bytes'));this.setMeta('max_bytes',String(this.maxBytes));
+    this.setMeta('max_bytes',String(this.maxBytes));
     // These tables only append. Seed exact durable counters once when upgrading an
     // existing database; subsequent batches update them in the same transaction as
     // the inserted rows. status() therefore never scans the large evidence tables.
     this.initializeCount('token_count','tr_tokens');this.initializeCount('wallet_count','tr_wallets');
-    if(this.meta('error')===CAPACITY&&this.maxBytes>oldMax&&bytes(this.db)+65536<this.maxBytes)this.setMeta('error','');
+    if(this.meta('error')===CAPACITY&&bytes(this.db)+65536<this.maxBytes)this.setMeta('error','');
     this.error=this.meta('error')||undefined;
     for(const kind of KINDS)if(!this.meta(`${kind}_ceiling`)){
       const max=Number(this.history.prepare('SELECT rowid AS id FROM wh_observations INDEXED BY wh_observations_kind WHERE kind=? ORDER BY rowid DESC LIMIT 1').get(kind)?.id??0);
@@ -179,6 +211,38 @@ export class TokenRankResearch {
     const stored=this.meta(key),value=Number(stored);
     if(!/^(0|[1-9]\d*)$/.test(stored)||!Number.isSafeInteger(value))
       this.setMeta(key,String(this.db.prepare(`SELECT count(*) AS n FROM ${table}`).get()!.n));
+  }
+  /**
+   * Older versions duplicated the same wallet facts in a token-card JSON array and in the normalized wallet evidence
+   * table. Remove only copies that can be reproduced byte-for-byte, in a small committed batch. The original evidence
+   * rows and every historical computation timestamp remain untouched.
+   */
+  private reclaimWalletCopies(limit=16){
+    if(this.meta('wallet_copy_reclaim_complete')==='1')return;
+    const cursor=Number(this.meta('wallet_copy_cursor')||0),bounded=bounds(limit,16,128);let writing=false;
+    try {
+      this.db.exec('BEGIN IMMEDIATE');writing=true;
+      const rows=this.db.prepare('SELECT id,chain,address,computed_at,wallets FROM tr_token_versions WHERE id>? ORDER BY id LIMIT ?').all(cursor,bounded),
+        update=this.db.prepare('UPDATE tr_token_versions SET wallets=? WHERE id=?'),
+        last=Number(rows.at(-1)?.id??cursor);let reclaimed=0,reclaimedBytes=0,unverified=0;
+      for(const row of rows){
+        if(typeof row.wallets!=='string'){unverified++;continue;}
+        const retained=parse(row.wallets),target=token(row.chain,row.address),rebuilt=target&&stamp(row.computed_at)?tokenWalletSnapshot(this.db,target,row.computed_at):[];
+        if(target&&compactMembers(retained,target.chain))continue;
+        if(!Array.isArray(retained)||!target||!isDeepStrictEqual(retained,rebuilt)){unverified++;continue;}
+        const compact=JSON.stringify(retained.map(value=>(value as TokenRankWallet).address));
+        update.run(compact,row.id);reclaimed++;reclaimedBytes+=Math.max(0,Buffer.byteLength(row.wallets)-Buffer.byteLength(compact));
+      }
+      if(rows.length){
+        this.setMeta('wallet_copy_cursor',String(last));
+        this.setMeta('wallet_copy_reclaimed_rows',String(Number(this.meta('wallet_copy_reclaimed_rows')||0)+reclaimed));
+        this.setMeta('wallet_copy_reclaimed_bytes',String(Number(this.meta('wallet_copy_reclaimed_bytes')||0)+reclaimedBytes));
+        this.setMeta('wallet_copy_unverified_rows',String(Number(this.meta('wallet_copy_unverified_rows')||0)+unverified));
+      }
+      const max=Number(this.db.prepare('SELECT max(id) AS n FROM tr_token_versions').get()!.n??0);
+      this.setMeta('wallet_copy_reclaim_complete',last>=max?'1':'0');
+      this.db.exec('COMMIT');writing=false;
+    }catch(error){if(writing)try{this.db.exec('ROLLBACK');}catch{}throw error;}
   }
   private pageMeta(key:string){return String(this.walletPages?.prepare('SELECT value FROM tr_wallet_page_meta WHERE key=?').get(key)?.value??'');}
   private setPageMeta(key:string,value:string){this.walletPages!.prepare('INSERT INTO tr_wallet_page_meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key,value);}
@@ -283,7 +347,14 @@ export class TokenRankResearch {
     }catch(error){pages.exec('ROLLBACK');throw error;}
   }
   runBatch(limit=500){
-    if(this.closed)throw new Error('TOKEN_RANK_RESEARCH_CLOSED');if(this.error===CAPACITY)return this.status();
+    if(this.closed)throw new Error('TOKEN_RANK_RESEARCH_CLOSED');
+    // Capacity recovery must run before the full-state short circuit. It only removes verified duplicate display
+    // payloads, then SQLite reuses those pages without growing the physical file.
+    try{this.reclaimWalletCopies();}catch{if(this.error===CAPACITY)return this.status();}
+    if(this.error===CAPACITY){
+      if(bytes(this.db)+65536>=this.maxBytes)return this.status();
+      this.setMeta('error','');this.error=undefined;
+    }
     this.openOptional();const now=this.now().toISOString(),n=bounds(limit,500,5000),perLane=Math.max(1,Math.floor(n/6));
     if(!stamp(now))throw new Error('TOKEN_RANK_RESEARCH_CLOCK_INVALID');
     const sources=[this.history,...(this.meme?[this.meme]:[]),...(this.signals?[this.signals]:[])];let writing=false;
@@ -335,8 +406,10 @@ export class TokenRankResearch {
         if(fingerprint===row.input_hash)continue;
         const encoded=JSON.stringify(value),room=Buffer.byteLength(encoded)*4+65536;
         if(bytes(this.db)+room>=this.maxBytes)throw new Error(CAPACITY);
+        // Per-wallet versions are the durable evidence. Token versions retain
+        // only the exact bounded membership needed to reconstruct this card.
         this.db.prepare('INSERT INTO tr_token_versions(chain,address,computed_at,data,wallets) VALUES(?,?,?,?,?)')
-          .run(row.chain,row.address,now,JSON.stringify(value.token),JSON.stringify(value.wallets));
+          .run(row.chain,row.address,now,JSON.stringify(value.token),JSON.stringify(value.wallets.map(wallet=>wallet.address)));
         this.db.prepare('UPDATE tr_tokens SET input_hash=? WHERE chain=? AND address=?').run(fingerprint,row.chain,row.address);
         // The bounded source/display windows must never delete accumulated wallet facts.
         for(const w of value.updates){
@@ -567,10 +640,12 @@ function outputStatus(db:DatabaseSync|undefined,error?:string,maxBytes?:number){
   const base={ready:!!db,researchOnly:true as const,tradingEnabled:false as const,scoreEffect:0 as const};
   if(!db)return {...base,tokens:0,wallets:0,pending:0,initialComplete:false,error,processed:0,changed:0,
     bootstrap:{rankRowsTotal:0,rankRowsProcessed:0,rankDiscoveryComplete:false,tradeHistoryMode:'indexed_per_ranked_token_sample' as const},
-    lastRunAt:undefined as string|undefined,bytes:0,maxBytes:maxBytes??0,
+    lastRunAt:undefined as string|undefined,bytes:0,allocatedBytes:0,reclaimableBytes:0,maxBytes:maxBytes??0,
+    maintenance:{walletCopiesReclaimed:0,walletCopyBytesReclaimed:0,walletCopiesUnverified:0,walletCopyReclaimComplete:false},
     watermarks:Object.fromEntries(KINDS.map(k=>[k,{initial:0,live:0}])),maxTokensPerBatch:MAX_TOKEN_BATCH,
     scope:'retained_ranked_tokens_and_sampled_vendor_transactions' as const};
   const meta=(k:string)=>String(db.prepare('SELECT value FROM tr_meta WHERE key=?').get(k)?.value??'');
+  const space=storage(db);
   const durableCount=(key:string,table:'tr_tokens'|'tr_wallets')=>{const raw=meta(key),value=Number(raw);
     return /^(0|[1-9]\d*)$/.test(raw)&&Number.isSafeInteger(value)?value:Number(db.prepare(`SELECT count(*) AS n FROM ${table}`).get()!.n);};
   return {...base,tokens:durableCount('token_count','tr_tokens'),wallets:durableCount('wallet_count','tr_wallets'),
@@ -578,7 +653,10 @@ function outputStatus(db:DatabaseSync|undefined,error?:string,maxBytes?:number){
     initialComplete:KINDS.every(k=>meta(`${k}_complete`)==='1'),processed:Number(meta('processed')||0),changed:Number(meta('changed')||0),
     bootstrap:{rankRowsTotal:Number(meta('rank_history_total')||0),rankRowsProcessed:Number(meta('rank_history_processed')||0),
       rankDiscoveryComplete:meta('token_rank_complete')==='1',tradeHistoryMode:'indexed_per_ranked_token_sample' as const},
-    lastRunAt:meta('last_run_at')||undefined,bytes:bytes(db),maxBytes:maxBytes??Number(meta('max_bytes')||0),
+    lastRunAt:meta('last_run_at')||undefined,bytes:space.usedBytes,allocatedBytes:space.allocatedBytes,reclaimableBytes:space.reclaimableBytes,
+    maxBytes:maxBytes??Number(meta('max_bytes')||0),maintenance:{walletCopiesReclaimed:Number(meta('wallet_copy_reclaimed_rows')||0),
+      walletCopyBytesReclaimed:Number(meta('wallet_copy_reclaimed_bytes')||0),walletCopiesUnverified:Number(meta('wallet_copy_unverified_rows')||0),
+      walletCopyReclaimComplete:meta('wallet_copy_reclaim_complete')==='1'},
     error:error??(meta('error')||undefined),watermarks:Object.fromEntries(KINDS.map(k=>[k,{initial:Number(meta(`${k}_initial`)||0),live:Number(meta(`${k}_live`)||0)}])),
     maxTokensPerBatch:MAX_TOKEN_BATCH,scope:'retained_ranked_tokens_and_sampled_vendor_transactions' as const};
 }
@@ -642,9 +720,11 @@ export class TokenRankResearchReader {
   }
   detail(chain:Chain,value:string,options:TokenRankResearchPage={}){
     const target=token(chain,value);if(!target)throw new Error('INVALID_FILTER');
-    const page=this.page(options),db=this.ready(),row=db?.prepare('SELECT data,wallets FROM tr_token_versions WHERE chain=? AND address=? AND computed_at<=? ORDER BY computed_at DESC,id DESC LIMIT 1')
+    const page=this.page(options),db=this.ready(),row=db?.prepare('SELECT computed_at,data,wallets FROM tr_token_versions WHERE chain=? AND address=? AND computed_at<=? ORDER BY computed_at DESC,id DESC LIMIT 1')
       .get(target.chain,target.address,page.asOf);
-    const all=(parse(row?.wallets)??[]) as TokenRankWallet[],items=all.slice(page.offset,page.offset+page.limit);
+    const materialized=parse(row?.wallets),members=compactMembers(materialized,target.chain),
+      all=Array.isArray(materialized)&&materialized.length&&!members?materialized as TokenRankWallet[]:
+        db&&stamp(row?.computed_at)?tokenWalletSnapshot(db,target,row.computed_at,members):[],items=all.slice(page.offset,page.offset+page.limit);
     return {...page,ready:!!db,token:parse(row?.data) as TokenRankToken|undefined,total:all.length,hasMore:page.offset+items.length<all.length,items};
   }
   wallets(options:TokenRankWalletPage={}){

@@ -486,14 +486,145 @@ test('容量达到后停止追加并保留旧研究，重启仍报错，增大�
   let history=new WalletHistory(path,{maxBytes:1_000_000,now:()=>new Date(base+100_000)});
   try {
     history.recordTrade(trade());assert.equal(history.stats().events,1);
-    history.recordTrades(Array.from({length:2000},(_,n)=>trade({wallet:address(n+10),txHash:hash(n+100),amount:'9'.repeat(90),usd:'9'.repeat(90)})));
+    const db=(history as unknown as {db:DatabaseSync}).db;
+    db.exec('CREATE TABLE capacity_fixture(data BLOB)');db.prepare('INSERT INTO capacity_fixture VALUES(?)').run(Buffer.alloc(1_200_000));
+    db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+    history.recordTrade(trade({txHash:hash(2)}));
     assert.equal(history.stats().error,'WALLET_HISTORY_CAPACITY_REACHED');assert.equal(history.stats().events,1);
-    history.recordTrade(trade({txHash:hash(2)}));assert.equal(history.stats().events,1);
     history.close();history=new WalletHistory(path,{maxBytes:1_000_000,now:()=>new Date(base+100_000)});
     assert.equal(history.stats().error,'WALLET_HISTORY_CAPACITY_REACHED');assert.equal(history.stats().events,1);
     history.close();history=new WalletHistory(path,{maxBytes:8_000_000,now:()=>new Date(base+100_000)});
     assert.equal(history.stats().error,undefined);history.recordTrade(trade({txHash:hash(2)}));assert.equal(history.stats().events,2);
   } finally {history.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('分层保留只合并不变供应商快照的中间副本，保留首尾、交易和状态变化',()=>{
+  const {history,setNow}=fixture();setNow(1_000);const db=(history as unknown as {db:DatabaseSync}).db;
+  try {
+    for(let i=0;i<5;i++) {
+      history.captureAnalysis(token,analysis([wallet()],iso(10+i)),{source:'gmgn_analysis',observedAt:iso(100+i)});
+      history.recordCollection({source:'gmgn_wallet_page',chain:'bsc',startedAt:iso(200+i*2),completedAt:iso(201+i*2),
+        status:'ok',requests:1,accepted:1,coverage:'one_page_sample',hasMore:false});
+    }
+    assert.equal(db.prepare("SELECT count(*) AS n FROM wh_observations WHERE kind='holding'").get()!.n,5);
+    assert.equal(db.prepare("SELECT count(*) AS n FROM wh_observations WHERE kind='stats'").get()!.n,5);
+    assert.equal(db.prepare("SELECT count(*) AS n FROM wh_observations WHERE kind='collection'").get()!.n,5);
+    assert.equal(db.prepare('SELECT count(*) AS n FROM wh_funding').get()!.n,5);
+    const result=history.maintainRetention({scanLimit:32});
+    assert.equal(result.deleted,9);assert.equal(result.observationsDeleted,9);
+    for(const kind of ['holding','stats','collection'])assert.equal(
+      db.prepare('SELECT count(*) AS n FROM wh_observations WHERE kind=?').get(kind)!.n,2);
+    assert.equal(db.prepare('SELECT count(*) AS n FROM wh_funding').get()!.n,5);
+    assert.equal(history.stats().events,1);assert.equal(db.prepare("SELECT count(*) AS n FROM wh_observations WHERE kind='trade'").get()!.n,1);
+    assert.deepEqual(history.getWallet('bsc',address(1))!.holdings.map(item=>item.snapshotAt),[iso(14),iso(10)]);
+
+    history.captureAnalysis(token,analysis([wallet(1,{holding:{amount:'10',usd:'20',supplyRatio:0.01,currentlyHolding:false}})],iso(20)),
+      {source:'gmgn_transition',observedAt:iso(120)});
+    history.captureAnalysis(token,analysis([wallet(1,{holding:{amount:'10',usd:'20',supplyRatio:0.01,currentlyHolding:true}})],iso(21)),
+      {source:'gmgn_transition',observedAt:iso(121)});
+    history.captureAnalysis(token,analysis([wallet(1,{holding:{amount:'10',usd:'20',supplyRatio:0.01,currentlyHolding:false}})],iso(22)),
+      {source:'gmgn_transition',observedAt:iso(122)});
+    history.maintainRetention({scanLimit:32});
+    assert.equal(db.prepare("SELECT count(*) AS n FROM wh_observations WHERE kind='holding' AND source='gmgn_transition'").get()!.n,3,
+      'withdrawal and restoration transitions are evidence, even when a prior state later repeats');
+  } finally {history.close();}
+});
+
+test('重复快照只在固定时间桶内合并，跨桶观测保留 as-of 新鲜度',()=>{
+  const {history,setNow}=fixture();setNow(200_000);const db=(history as unknown as {db:DatabaseSync}).db;
+  try {
+    for(const seconds of [0,3_600,7_200,21_600,25_200,28_800]){
+      const observedAt=iso(seconds);
+      history.captureLeaders('bsc',[{address:address(7),period:'7d',realizedProfitUsd:'100'}],{source:'gmgn_bucket',observedAt});
+    }
+    for(const seconds of [0,3_600,7_200,86_400,90_000,93_600]){
+      const observedAt=iso(seconds);
+      history.recordCollection({source:'gmgn_bucket_page',chain:'bsc',startedAt:observedAt,completedAt:observedAt,
+        status:'ok',requests:1,accepted:1,coverage:'one_page_sample',hasMore:false});
+    }
+    const result=history.maintainRetention({scanLimit:32});
+    assert.equal(result.deleted,4,'each unchanged run keeps first/last independently in every fixed bucket');
+    assert.equal(db.prepare("SELECT count(*) AS n FROM wh_observations WHERE kind='stats' AND source='gmgn_bucket'").get()!.n,4);
+    assert.equal(db.prepare("SELECT count(*) AS n FROM wh_observations WHERE kind='collection' AND source='gmgn_bucket_page'").get()!.n,4);
+  } finally {history.close();}
+});
+
+test('保留批次扫描和删除都有硬上限，游标不触碰资金冲突及不可删证据',()=>{
+  const {history,setNow}=fixture();setNow(1_000);const db=(history as unknown as {db:DatabaseSync}).db;
+  try {
+    for(let i=0;i<100;i++)history.captureAnalysis(token,analysis([wallet()],iso(10+i)),
+      {source:'gmgn_bounded',observedAt:iso(200+i)});
+    history.captureFunding(token,address(2),{address:address(501),conflict:false},{source:'gmgn_conflict',observedAt:iso(400),snapshotAt:iso(300)});
+    history.captureFunding(token,address(2),{address:address(501),conflict:true},{source:'gmgn_conflict',observedAt:iso(401),snapshotAt:iso(301)});
+    history.captureFunding(token,address(2),{address:address(501),conflict:false},{source:'gmgn_conflict',observedAt:iso(402),snapshotAt:iso(302)});
+    const beforeEvents=history.stats().events,beforeTrades=Number(db.prepare("SELECT count(*) AS n FROM wh_observations WHERE kind='trade'").get()!.n);
+    const result=history.maintainRetention({scanLimit:32});
+    assert.ok(result.scanned<=64);assert.ok(result.deleted<=60);
+    assert.ok(Number(db.prepare("SELECT value FROM wh_meta WHERE key='retention_observation_cursor_v1'").get()!.value)>0);
+    assert.equal(db.prepare("SELECT count(*) AS n FROM wh_funding WHERE json_extract(data,'$.source')='gmgn_conflict'").get()!.n,3);
+    assert.equal(history.stats().events,beforeEvents);assert.equal(db.prepare("SELECT count(*) AS n FROM wh_observations WHERE kind='trade'").get()!.n,beforeTrades);
+  } finally {history.close();}
+});
+
+test('容量告警可由有界重复快照回收恢复，SQLite复用页面后重新接受事实交易',()=>{
+  const dir=mkdtempSync(join(tmpdir(),'wallet-retention-capacity-')),path=join(dir,'research.sqlite'),maxBytes=1_000_000,
+    start=base-1_000_000;let history=new WalletHistory(path,{maxBytes,now:()=>new Date(base+100_000)});
+  try {
+    for(let i=0;i<2_000&&!history.stats().error;i++){
+      const observedAt=new Date(start+i*1_000).toISOString();
+      history.captureLeaders('bsc',[{address:address(1),period:'7d',realizedProfitUsd:'100'}],{source:'gmgn_stats',observedAt});
+      history.recordCollection({source:'gmgn_wallet_page',chain:'bsc',startedAt:observedAt,completedAt:observedAt,
+        status:'ok',requests:1,accepted:1,coverage:'one_page_sample',hasMore:false});
+    }
+    assert.equal(history.stats().error,'WALLET_HISTORY_CAPACITY_REACHED');
+    const result=history.maintainRetention({scanLimit:2_048});
+    assert.ok(result.deleted>0);assert.equal(result.capacityRecovered,true);assert.equal(history.stats().error,undefined);
+    const before=history.stats().events;
+    history.recordTrade(trade({txHash:hash(2222),observedAt:iso(100)}));
+    assert.equal(history.stats().events,before+1);
+    const internals=history as unknown as {db:DatabaseSync;error?:string};
+    internals.db.prepare("UPDATE wh_meta SET value='WALLET_HISTORY_CAPACITY_REACHED' WHERE key='error'").run();
+    internals.error='WALLET_HISTORY_CAPACITY_REACHED';
+    const markerRecovery=history.maintainRetention({scanLimit:32});
+    assert.equal(markerRecovery.deleted,0);assert.equal(markerRecovery.capacityRecovered,true,
+      'a stale persisted marker clears after prior freelist/WAL recovery even when this pass deletes nothing');
+    assert.ok(statSync(path).size<=maxBytes,'bounded retention reuses the existing main database instead of growing it');
+  } finally {history.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('容量预算包含长读事务阻塞检查点时的 WAL 与 SHM 文件',()=>{
+  const dir=mkdtempSync(join(tmpdir(),'wallet-retention-wal-')),path=join(dir,'research.sqlite'),
+    history=new WalletHistory(path,{maxBytes:8_000_000,now:()=>new Date(base+200_000)}),reader=new DatabaseSync(path);
+  try {
+    reader.exec('BEGIN');reader.prepare('SELECT count(*) FROM wh_observations').get();
+    for(let i=0;i<20;i++)history.recordCollection({source:'gmgn_wal_page',chain:'bsc',startedAt:iso(i),completedAt:iso(i),
+      status:'ok',requests:1,accepted:1,coverage:'one_page_sample',hasMore:false});
+    const internals=history as unknown as {db:DatabaseSync;activeBytes:()=>number},db=internals.db,
+      mainActive=(Number(db.prepare('PRAGMA page_count').get()!.page_count)-Number(db.prepare('PRAGMA freelist_count').get()!.freelist_count))*
+        Number(db.prepare('PRAGMA page_size').get()!.page_size),
+      sidecars=[`${path}-wal`,`${path}-shm`].reduce((sum,file)=>{try{return sum+statSync(file).size;}catch{return sum;}},0);
+    assert.ok(sidecars>0);assert.equal(internals.activeBytes(),mainActive+sidecars);
+  } finally {try{reader.exec('ROLLBACK');}catch{}reader.close();history.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('容量维护在长读事务释放后即使没有新删除也会截断已完成的 WAL',()=>{
+  const dir=mkdtempSync(join(tmpdir(),'wallet-retention-wal-release-')),path=join(dir,'research.sqlite'),
+    history=new WalletHistory(path,{maxBytes:32_000_000,now:()=>new Date(base+300_000)}),reader=new DatabaseSync(path),
+    internals=history as unknown as {db:DatabaseSync;error?:string;maxBytes:number;activeBytes:()=>number};
+  try {
+    reader.exec('BEGIN');reader.prepare('SELECT count(*) FROM wh_observations').get();
+    for(let i=0;i<500;i++)history.recordCollection({source:'gmgn_wal_release',chain:'bsc',startedAt:iso(i),completedAt:iso(i),
+      status:'ok',requests:1,accepted:1,coverage:'one_page_sample',hasMore:false});
+    const db=internals.db,pageSize=Number(db.prepare('PRAGMA page_size').get()!.page_size),
+      mainActive=(Number(db.prepare('PRAGMA page_count').get()!.page_count)-Number(db.prepare('PRAGMA freelist_count').get()!.freelist_count))*pageSize;
+    internals.maxBytes=mainActive+65_536;internals.error='WALLET_HISTORY_CAPACITY_REACHED';
+    db.prepare("UPDATE wh_meta SET value='WALLET_HISTORY_CAPACITY_REACHED' WHERE key='error'").run();
+    const blocked=history.maintainRetention({scanLimit:2_048});
+    assert.ok(blocked.deleted>0);assert.equal(blocked.capacityReached,true);
+    reader.exec('ROLLBACK');
+    const recovered=history.maintainRetention({scanLimit:2_048});
+    assert.equal(recovered.deleted,0);assert.equal(recovered.capacityRecovered,true);assert.equal(recovered.capacityReached,false);
+  } finally {try{reader.exec('ROLLBACK');}catch{}reader.close();history.close();rmSync(dir,{recursive:true,force:true});}
 });
 
 test('至少1000钱包排序先SQL分页，未知利润/涨幅排最后且列表不触发图自连接',()=>{

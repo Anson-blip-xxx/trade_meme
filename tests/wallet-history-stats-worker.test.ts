@@ -47,3 +47,23 @@ test('wallet-history stats advance exact append-only counts without a historical
     assert.equal(next.firstObservedAt,next.lastObservedAt);assert.equal(next.snapshots,0);
   } finally {await runner.stop();history.close();rmSync(directory,{recursive:true,force:true});}
 });
+
+test('wallet-history stats recount retained kinds after bounded snapshot coalescing',async()=>{
+  const directory=mkdtempSync(join(tmpdir(),'wallet-history-stats-retention-')),database=join(directory,'history.sqlite'),
+    history=new WalletHistory(database),maxBytes=history.stats().maxBytes,base=Date.now()-60_000;
+  for(let i=0;i<5;i++){
+    const observedAt=new Date(base+i*2_000).toISOString();
+    history.captureLeaders('bsc',[{address:'0x'+'1'.repeat(40),period:'7d',realizedProfitUsd:'100'}],
+      {source:'gmgn_stats',observedAt});
+    history.recordCollection({source:'gmgn_wallet_page',chain:'bsc',startedAt:observedAt,
+      completedAt:new Date(base+i*2_000+1_000).toISOString(),status:'ok',requests:1,accepted:1,
+      coverage:'one_page_sample',hasMore:false});
+  }
+  const runner=new WalletHistoryStatsRunner({database,maxBytes,intervalMs:100,staleAfterMs:2_000});
+  try {
+    runner.start();await waitFor(()=>runner.snapshot().store?.snapshots===5&&runner.snapshot().store?.collections===5);
+    const first=runner.snapshot().computedAt;const result=history.maintainRetention({scanLimit:32});assert.equal(result.deleted,6);
+    await waitFor(()=>runner.snapshot().computedAt!==first&&runner.snapshot().store?.snapshots===2&&runner.snapshot().store?.collections===2);
+    assert.equal(runner.snapshot().store?.observations,4);
+  } finally {await runner.stop();history.close();rmSync(directory,{recursive:true,force:true});}
+});

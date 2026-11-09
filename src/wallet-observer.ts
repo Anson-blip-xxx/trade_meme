@@ -150,7 +150,8 @@ export interface WalletObserverOptions {
   history: Pick<WalletHistory, 'recordTrades' | 'captureAnalysis' | 'captureLeaders' | 'captureTokenRanks' |
     'captureTokenTraders' | 'recordCollection' | 'watchTargets' | 'markTargetChecked' | 'recordPrice'> &
     Partial<Pick<WalletHistory, 'associationTargets' | 'markAssociationTargetChecked' | 'captureFunding' |
-      'getWalletObserverCursor' | 'setWalletObserverCursor' | 'researchSeedTarget' | 'markResearchSeedChecked'>>;
+      'getWalletObserverCursor' | 'setWalletObserverCursor' | 'researchSeedTarget' | 'markResearchSeedChecked' |
+      'prepareWriteCapacity'>>;
   client: Pick<GmgnClient, 'get' | 'cooldownUntil'> & Partial<Pick<GmgnClient, 'recordRateLimit'>>;
   config?: Config;
   chains?: Chain[];
@@ -302,7 +303,9 @@ export class WalletObserver {
       const unfinished = new Map(this.pendingByChain); this.restoreCursor(checkpoint); this.pendingByChain = unfinished;
       // A failed chain keeps its target, but cannot monopolize the scheduler.
       // Shared cooldown with no request and cancelled cycles do not consume a turn.
-      if (generation === this.generation && report.requests > 0) {
+      const storageBlocked = report.reasons.includes('WALLET_HISTORY_CAPACITY_REACHED') ||
+        report.reasons.includes('WALLET_HISTORY_MAINTENANCE_FAILED');
+      if (generation === this.generation && report.requests > 0 && !storageBlocked) {
         this.cursor = checkpoint.cursor + 1;
         try {this.saveCursor(this.cursorState());}
         catch {this.cursor = checkpoint.cursor; if (!report.reasons.includes('WALLET_OBSERVER_CURSOR_WRITE_FAILED')) report.reasons.push('WALLET_OBSERVER_CURSOR_WRITE_FAILED');}
@@ -333,8 +336,22 @@ export class WalletObserver {
       accepted: 0, reasons: [], coverage: 'one_page_sample', collectionMode: 'market_wallets'};
     const reason = (value: string) => {if (!report.reasons.includes(value)) report.reasons.push(value);};
     let halted = false;
+    // Reclaim bounded exact duplicates only after the store has actually
+    // reached capacity. Check before every read as an earlier write in this
+    // same cycle can fill the store.
+    const storageReady = () => {
+      if (generation !== this.generation || halted) return false;
+      try {
+        if (this.history.prepareWriteCapacity?.() !== false) return true;
+        report.status = 'cooldown'; reason('WALLET_HISTORY_CAPACITY_REACHED'); halted = true; return false;
+      } catch {
+        report.status = 'cooldown'; reason('WALLET_HISTORY_MAINTENANCE_FAILED'); halted = true; return false;
+      }
+    };
+    if (!storageReady()) return report;
     const request = async (path: string, query: Record<string, string | number>, weight?: number): Promise<unknown> => {
       if (generation !== this.generation || halted) throw new ObserverHalt();
+      if (!storageReady()) throw new ObserverHalt();
       if (this.resetAt() > this.now().getTime()) {report.status = 'cooldown'; reason('GMGN_RATE_LIMITED'); halted = true; throw new ObserverHalt();}
       if (report.requests >= this.maxRequests) {reason('WALLET_REQUEST_BUDGET_REACHED'); halted = true; throw new ObserverHalt();}
       try {report.requests++; const raw = await this.client.get(path, query, weight);

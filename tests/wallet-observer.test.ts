@@ -79,6 +79,32 @@ test('wrong chains, mismatched scope, malformed transaction IDs and future times
   assert.equal(sol.trades.length, 1);
 });
 
+test('capacity maintenance runs before network access and preserves the observer turn while storage remains full', async () => {
+  const f = fixture(), p = provider(); let checks = 0, blocked = true;
+  f.history.prepareWriteCapacity = () => {checks++; return !blocked;};
+  const observer = new WalletObserver({history: f.history, client: p.client, now});
+  const first = await observer.runOnce();
+  assert.equal(checks, 1); assert.equal(p.calls.length, 0);
+  assert.equal(first.status, 'cooldown');
+  assert.deepEqual(first.reasons, ['WALLET_HISTORY_CAPACITY_REACHED']);
+  blocked = false;
+  const second = await observer.runOnce();
+  assert.equal(first.chain, second.chain);
+  assert.ok(p.calls.length > 0);
+});
+
+test('capacity reached during a cycle stops later reads and does not advance to another chain', async () => {
+  const f = fixture(), p = provider(); let checks = 0;
+  f.history.prepareWriteCapacity = () => ++checks < 3;
+  const observer = new WalletObserver({history: f.history, client: p.client, now});
+  const first = await observer.runOnce();
+  assert.equal(first.status, 'cooldown'); assert.equal(first.requests, 1); assert.equal(p.calls.length, 1);
+  assert.ok(first.reasons.includes('WALLET_HISTORY_CAPACITY_REACHED'));
+  f.history.prepareWriteCapacity = () => false;
+  const second = await observer.runOnce();
+  assert.equal(first.chain, second.chain); assert.equal(p.calls.length, 1);
+});
+
 test('unknown numeric data remains null and input page processing is bounded', () => {
   const parsed = normalizeWalletFeed(page([{...row(), amount_usd: '', token_amount: true, price_usd: 'Infinity'},
     ...Array.from({length: 205}, () => row())]));

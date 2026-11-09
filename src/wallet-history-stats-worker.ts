@@ -10,28 +10,38 @@ db.exec('PRAGMA query_only=ON; PRAGMA busy_timeout=5000');
 let stopping=false,timer:ReturnType<typeof setTimeout>|undefined;
 let cached:WalletHistoryStats|undefined,cachedDataVersion=-1;
 
-// Wallet history is append-only: evidence rows are never deleted or rewritten.
-// Its ordinary rowids are therefore contiguous durable high-water marks.  Do
-// not COUNT the multi-gigabyte JSON tables whenever an unrelated derived row
-// changes; max(rowid) is an indexed lookup and remains the exact row count.
-const appendOnlyCount=(table:string)=>Number(db.prepare(`SELECT COALESCE(max(rowid),0) AS n FROM ${table}`).get()!.n);
+// Canonical evidence remains append-only. Retention can remove only exact
+// middle copies from unchanged vendor snapshot runs; its durable counters keep
+// max(rowid) an O(1), exact retained-row count without rescanning JSON tables.
+const deleted=(key:string)=>{
+  const value=Number(db.prepare('SELECT value FROM wh_meta WHERE key=?').get(key)?.value??0);
+  return Number.isSafeInteger(value)&&value>=0?value:0;
+};
+const retainedCount=(table:string,deletedKey?:string)=>Math.max(0,
+  Number(db.prepare(`SELECT COALESCE(max(rowid),0) AS n FROM ${table}`).get()!.n)-(deletedKey?deleted(deletedKey):0));
 const OBSERVATION_KINDS=['holding','stats','token_trader','token_rank','collection','vendor_nomination'] as const;
 const observationCounts=new Map<string,number>();
-let observationCursor=-1;
-const refreshObservationCounts=(cursor:number)=>{
-  if(observationCursor<0||cursor<observationCursor){
+let observationCursor=-1,observationDeleted=-1;
+const refreshObservationCounts=(cursor:number,deletedCount:number)=>{
+  if(observationCursor<0||cursor<observationCursor||deletedCount!==observationDeleted){
     observationCounts.clear();observationCursor=0;
   }
-  if(cursor===observationCursor)return;
+  if(cursor===observationCursor){observationDeleted=deletedCount;return;}
   const count=db.prepare(`SELECT count(*) AS n FROM wh_observations INDEXED BY wh_observations_kind
     WHERE kind=? AND rowid>? AND rowid<=?`);
   for(const kind of OBSERVATION_KINDS)
     observationCounts.set(kind,(observationCounts.get(kind)??0)+Number(count.get(kind,observationCursor,cursor)!.n));
   observationCursor=cursor;
+  observationDeleted=deletedCount;
 };
 const bytes=()=>{
   let total=0;
   for(const path of [options.database,`${options.database}-wal`,`${options.database}-shm`])try{total+=statSync(path).size;}catch{/* inactive WAL */}
+  return total;
+};
+const sidecarBytes=()=>{
+  let total=0;
+  for(const path of [`${options.database}-wal`,`${options.database}-shm`])try{total+=statSync(path).size;}catch{/* inactive WAL */}
   return total;
 };
 const seedStatus=():WalletResearchSeedStatus=>{
@@ -53,9 +63,13 @@ const seedStatus=():WalletResearchSeedStatus=>{
     sampling:{maxRequestsPerTurn:1,minChainIntervalSec:1800,eligibleEveryChainTurns:4,withinExistingObserverBudget:true,robinhoodRequiresObservedTrades:true}};
 };
 const read=():WalletHistoryStats=>{
-  const wallets=appendOnlyCount('wh_wallets'),events=appendOnlyCount('wh_events'),observations=appendOnlyCount('wh_observations'),
-    tokens=appendOnlyCount('wh_tokens'),prices=appendOnlyCount('wh_prices'),fundingLinks=appendOnlyCount('wh_funding');
-  refreshObservationCounts(observations);
+  const observationHighWater=retainedCount('wh_observations'),observationDeletedCount=deleted('retention_observation_deleted_v1'),
+    wallets=retainedCount('wh_wallets'),events=retainedCount('wh_events'),
+    observations=Math.max(0,observationHighWater-observationDeletedCount),
+    tokens=retainedCount('wh_tokens'),prices=retainedCount('wh_prices'),
+    fundingLinks=retainedCount('wh_funding');
+  refreshObservationCounts(observationHighWater,observationDeletedCount);
+  const kindCount=(kind:string)=>observationCounts.get(kind)??0;
   // last_at has a covering index. first_at is a narrow 181k-row projection in
   // production; keeping it separate avoids loading profile JSON or the other
   // evidence tables. It is allowed to move earlier on a late observation.
@@ -65,11 +79,14 @@ const read=():WalletHistoryStats=>{
   // semantics without the old OR plan that scanned all wh_metrics rows.
   const dirty=Number(db.prepare('SELECT count(*) AS n FROM wh_metrics WHERE coordination_dirty=1').get()!.n),
     uncheckedClean=Number(db.prepare('SELECT count(*) AS n FROM wh_metrics WHERE coordination_dirty=0 AND coordination_checked_at IS NULL').get()!.n);
-  const usedBytes=bytes(),persistedError=String(db.prepare("SELECT value FROM wh_meta WHERE key='error'").get()?.value??'')||undefined;
-  const error=persistedError??(usedBytes>=options.maxBytes?'WALLET_HISTORY_CAPACITY_REACHED':undefined);
+  const usedBytes=bytes(),persistedError=String(db.prepare("SELECT value FROM wh_meta WHERE key='error'").get()?.value??'')||undefined,
+    pageSize=Number(db.prepare('PRAGMA page_size').get()!.page_size),pageCount=Number(db.prepare('PRAGMA page_count').get()!.page_count),
+    freePages=Number(db.prepare('PRAGMA freelist_count').get()!.freelist_count),
+    activeBytes=Math.max(0,pageCount-freePages)*pageSize+sidecarBytes();
+  const error=persistedError??(activeBytes>=options.maxBytes?'WALLET_HISTORY_CAPACITY_REACHED':undefined);
   return {wallets,events,observations,tokens,prices,
-    snapshots:['holding','stats','token_trader','token_rank'].reduce((sum,kind)=>sum+(observationCounts.get(kind)??0),0),fundingLinks,
-    collections:observationCounts.get('collection')??0,nominations:observationCounts.get('vendor_nomination')??0,
+    snapshots:['holding','stats','token_trader','token_rank'].reduce((sum,kind)=>sum+kindCount(kind),0),fundingLinks,
+    collections:kindCount('collection'),nominations:kindCount('vendor_nomination'),
     coordinationPending:dirty+uncheckedClean,
     firstObservedAt:first?String(first):undefined,lastObservedAt:last?String(last):undefined,
     bytes:usedBytes,maxBytes:options.maxBytes,error,sampleOnly:true,exactRealizedPnl:false,researchSeeds:seedStatus()};

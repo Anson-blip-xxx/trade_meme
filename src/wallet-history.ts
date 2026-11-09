@@ -14,6 +14,11 @@ import {WalletResearchSeeds,type WalletResearchSeedSnapshot,type WalletResearchS
 
 export interface WalletHistoryToken {chain:Chain;address:string;}
 export interface WalletHistoryOptions {maxBytes?:number;now?:()=>Date;}
+export interface WalletHistoryRetentionOptions {scanLimit?:number;}
+export interface WalletHistoryRetentionResult {
+  scanned:number;deleted:number;observationsDeleted:number;
+  reusableBytes:number;capacityRecovered:boolean;capacityReached:boolean;
+}
 export interface WalletHistoryContext {source:string;observedAt:string;}
 export interface WalletMarketCandidateContext extends WalletHistoryContext {
   kind:'trending'|'trenches';reason?:string;window?:string;
@@ -131,6 +136,10 @@ const labels=(v:unknown):string[]=>Array.isArray(v)?[...new Set(v.filter((x):x i
 const twitter=(v:unknown):string|undefined=>typeof v==='string'&&/^@?[A-Za-z0-9_]{1,100}$/.test(v)?v.replace(/^@/,''):undefined;
 const code=(v:unknown):string|undefined=>typeof v==='string'&&/^[A-Z][A-Z0-9_]{0,99}$/.test(v)?v:undefined;
 const CAPACITY='WALLET_HISTORY_CAPACITY_REACHED';
+const RETENTION_OBSERVATION_KINDS=new Set(['holding','stats','collection']);
+const RETENTION_OBSERVATION_BUCKET_MS={holding:6*60*60*1_000,stats:6*60*60*1_000,collection:24*60*60*1_000} as const;
+const RETENTION_OBSERVATION_CURSOR='retention_observation_cursor_v1';
+const RETENTION_OBSERVATION_DELETED='retention_observation_deleted_v1';
 
 function walletCoordinationSummary(evidence:WalletHistoryDetail['coordinationEvidence'],status:WalletHistorySummary['coordination']['status'],
   checkedAt?:string):WalletHistorySummary['coordination'] {
@@ -294,7 +303,7 @@ export const WALLET_COORDINATION_INVALIDATION_SQL=`UPDATE wh_metrics SET coordin
   WHERE f.chain=? AND f.funding_address=a.value
     AND m.chain=f.chain AND m.address=f.wallet)`;
 
-/** Long-lived research evidence. Never uses this data as a trading permission or deletes history to make space. */
+/** Long-lived research evidence; bounded retention coalesces only unchanged vendor refreshes. */
 export class WalletHistory {
   private readonly db:DatabaseSync;
   private readonly now:()=>Date;
@@ -403,7 +412,7 @@ export class WalletHistory {
     this.db.exec('CREATE INDEX IF NOT EXISTS wh_funding_asof ON wh_funding(chain,wallet,funding_address,snapshot_at,observed_at)');
     this.error=String(this.db.prepare("SELECT value FROM wh_meta WHERE key='error'").get()?.value??'')||undefined;
     const previousLimit=Number(this.db.prepare("SELECT value FROM wh_meta WHERE key='capacity_limit'").get()?.value??0);
-    if(this.error===CAPACITY&&this.maxBytes>previousLimit&&this.bytes()+32_768<this.maxBytes) {
+    if(this.error===CAPACITY&&this.maxBytes>previousLimit&&this.activeBytes()+32_768<this.maxBytes) {
       this.error=undefined;this.db.prepare("UPDATE wh_meta SET value='' WHERE key='error'").run();
     }
     this.associations=new WalletAssociations(this.db,(evidence,write)=>this.append(evidence,write),this.now);
@@ -411,7 +420,7 @@ export class WalletHistory {
     this.db.exec('CREATE INDEX IF NOT EXISTS wh_assoc_candidate ON wh_assoc_relations(chain,candidate,first_at)');
     this.db.exec(`CREATE INDEX IF NOT EXISTS wh_stream_relations ON wh_assoc_relations(chain,token_count DESC,forward_count DESC,updated_at DESC,candidate,leader) WHERE token_count>0 AND dirty=0;
       CREATE INDEX IF NOT EXISTS wh_stream_recent_wallets ON wh_wallets(chain,last_at DESC,address);`);
-    if(this.bytes()>=this.maxBytes) this.error=CAPACITY;
+    if(this.activeBytes()>=this.maxBytes) this.error=CAPACITY;
   }
 
   recordTrade(input:WalletTradeObservation):void {this.recordTrades([input]);}
@@ -937,6 +946,62 @@ export class WalletHistory {
       lastObservedAt:time.last?String(time.last):undefined,bytes:this.bytes(),maxBytes:this.maxBytes,error:this.error,
       sampleOnly:true,exactRealizedPnl:false,researchSeeds:this.researchSeeds.status()};
   }
+
+  /**
+   * Incrementally coalesces only exact, repeated vendor snapshots.  Each
+   * bounded window keeps the first and last copy of every unchanged run in a
+   * fixed UTC time bucket (six hours for holding/stats, one day for collection), so a
+   * state transition, conflict, withdrawal, transaction, funding change or
+   * cursor is never removed.  Freed SQLite pages are reused in place; no
+   * VACUUM or unbounded DELETE is performed here.
+   */
+  maintainRetention(options:WalletHistoryRetentionOptions={}):WalletHistoryRetentionResult {
+    const scanLimit=Number.isSafeInteger(options.scanLimit)?Math.max(32,Math.min(2_048,options.scanLimit!)):2_048;
+    let observationsDeleted=0,scanned=0;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const observationCursor=this.retentionCursor(RETENTION_OBSERVATION_CURSOR);
+      const observations=this.db.prepare(`SELECT rowid,kind,chain,wallet,token_address,source,observed_at,data
+        FROM wh_observations WHERE rowid>? AND kind IN ('holding','stats','collection')
+        ORDER BY rowid LIMIT ?`).all(observationCursor,scanLimit);
+      const observationDelete=this.redundantObservationRows(observations);
+      const observationKinds=new Map(observations.map(row=>[Number(row.rowid),String(row.kind)]));
+      const deletedKinds=new Map<string,number>();
+      const deleteObservation=this.db.prepare('DELETE FROM wh_observations WHERE rowid=?');
+      for(const rowid of observationDelete) {
+        const changed=Number(deleteObservation.run(rowid).changes);observationsDeleted+=changed;
+        const kind=observationKinds.get(rowid);if(changed&&kind)deletedKinds.set(kind,(deletedKinds.get(kind)??0)+changed);
+      }
+      if(observations.length)this.setRetentionCursor(RETENTION_OBSERVATION_CURSOR,this.nextRetentionCursor(observations,scanLimit));
+      if(observationsDeleted) {
+        this.addRetentionDeleted(RETENTION_OBSERVATION_DELETED,observationsDeleted);
+        for(const [kind,n] of deletedKinds)this.addRetentionDeleted(`retention_observation_deleted_${kind}_v1`,n);
+      }
+      scanned+=observations.length;
+      this.db.exec('COMMIT');
+    } catch(error) {this.db.exec('ROLLBACK');throw error;}
+    if(observationsDeleted||this.error===CAPACITY)try{
+      const checkpoint=this.db.prepare('PRAGMA wal_checkpoint(PASSIVE)').get();
+      // TRUNCATE is attempted only after PASSIVE proves every frame is already
+      // checkpointed, so this cannot wait on a long-lived dashboard reader.
+      if(Number(checkpoint?.busy)===0&&Number(checkpoint?.log)===Number(checkpoint?.checkpointed))
+        this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+    }catch{/* Readers may defer checkpointing; reusable pages remain valid. */}
+    const reusableBytes=this.reusableBytes();
+    let capacityRecovered=false;
+    if(this.error===CAPACITY&&this.activeBytes()+65_536<this.maxBytes) {
+      this.error=undefined;this.db.prepare("UPDATE wh_meta SET value='' WHERE key='error'").run();capacityRecovered=true;
+    }
+    return {scanned,deleted:observationsDeleted,observationsDeleted,reusableBytes,capacityRecovered,
+      capacityReached:this.error===CAPACITY};
+  }
+
+  /** Cheap preflight for collectors; maintenance runs only after capacity was actually reached. */
+  prepareWriteCapacity():boolean {
+    if(this.error!==CAPACITY)return true;
+    this.maintainRetention({scanLimit:2_048});
+    return this.error!==CAPACITY;
+  }
   close():void {this.db.close();}
 
   /** Bounded background refresh; listing wallets never performs graph self-joins. */
@@ -1091,17 +1156,34 @@ export class WalletHistory {
     let total=0;for(const path of [this.path,`${this.path}-wal`,`${this.path}-shm`]) {try {total+=statSync(path).size;} catch { /* An inactive WAL may not exist. */ }}
     return total;
   }
+  private activeBytes():number {
+    const pages=Number(this.db.prepare('PRAGMA page_count').get()!.page_count),
+      free=Number(this.db.prepare('PRAGMA freelist_count').get()!.freelist_count),
+      size=Number(this.db.prepare('PRAGMA page_size').get()!.page_size);
+    return Math.max(0,pages-free)*size+this.sidecarBytes();
+  }
+  private sidecarBytes():number {
+    if(this.path===':memory:')return 0;
+    let total=0;for(const path of [`${this.path}-wal`,`${this.path}-shm`])try{total+=statSync(path).size;}catch{/* inactive WAL */}
+    return total;
+  }
+  private reusableBytes():number {
+    return Number(this.db.prepare('PRAGMA freelist_count').get()!.freelist_count)*
+      Number(this.db.prepare('PRAGMA page_size').get()!.page_size);
+  }
   private append(evidence:unknown,write:()=>unknown):boolean {
-    // Reserve growth for indexes/WAL rather than filling the configured budget to
-    // its last byte. Capacity errors are observable and never evict old research.
-    if(this.error===CAPACITY) return false;
     const estimate=Buffer.byteLength(JSON.stringify(evidence)??'')*3+32_768;
-    if(this.bytes()+estimate>this.maxBytes) {this.capacity();return false;}
+    // At capacity, make one bounded pass over exact duplicate vendor snapshots.
+    // Transactions, contrary copies and state changes are outside this policy.
+    if(this.error===CAPACITY) {
+      this.maintainRetention();
+      if(this.error===CAPACITY)return false;
+    }
+    if(this.activeBytes()+estimate>this.maxBytes) {this.capacity();return false;}
     this.db.exec('BEGIN IMMEDIATE');
     try {
       write();
-      const pages=Number(this.db.prepare('PRAGMA page_count').get()!.page_count)*Number(this.db.prepare('PRAGMA page_size').get()!.page_size);
-      if(Math.max(pages,this.bytes())+16_384>this.maxBytes) {this.db.exec('ROLLBACK');this.capacity();return false;}
+      if(this.activeBytes()+16_384>this.maxBytes) {this.db.exec('ROLLBACK');this.capacity();return false;}
       this.db.exec('COMMIT');
       return true;
     } catch(error) {this.db.exec('ROLLBACK');throw error;}
@@ -1112,5 +1194,55 @@ export class WalletHistory {
     if(this.db.prepare("SELECT value FROM wh_meta WHERE key='error'").get()?.value!==CAPACITY)
       {this.db.prepare("UPDATE wh_meta SET value=? WHERE key='error'").run(CAPACITY);
         this.db.prepare("UPDATE wh_meta SET value=? WHERE key='capacity_limit'").run(String(this.maxBytes));}
+  }
+
+  private retentionCursor(key:string):number {
+    const value=Number(this.db.prepare('SELECT value FROM wh_meta WHERE key=?').get(key)?.value??0);
+    return Number.isSafeInteger(value)&&value>=0?value:0;
+  }
+  private setRetentionCursor(key:string,value:number):void {
+    this.db.prepare('INSERT INTO wh_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value')
+      .run(key,String(value));
+  }
+  private addRetentionDeleted(key:string,value:number):void {
+    this.db.prepare(`INSERT INTO wh_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE
+      SET value=CAST(COALESCE(NULLIF(wh_meta.value,''),'0') AS INTEGER)+CAST(excluded.value AS INTEGER)`).run(key,String(value));
+  }
+  private nextRetentionCursor(rows:Record<string,any>[],limit:number):number {
+    // Half-window overlap lets an unchanged run that crosses a batch boundary
+    // be coalesced on the next pass without a per-wallet state table.
+    const position=rows.length===limit?Math.max(0,Math.floor(rows.length/2)-1):rows.length-1;
+    return Number(rows[position].rowid);
+  }
+  private retentionSemantic(data:unknown,collection=false):string|undefined {
+    let parsed:Record<string,unknown>;
+    try {const value=JSON.parse(String(data));if(!object(value))return;parsed={...value};}catch{return;}
+    delete parsed.observedAt;delete parsed.snapshotAt;
+    if(collection){delete parsed.startedAt;delete parsed.completedAt;}
+    return digest(parsed);
+  }
+  private redundantObservationRows(rows:Record<string,any>[]):number[] {
+    const groups=new Map<string,{hash:string;first:number;last:number}>(),remove:number[]=[],byId=new Map(rows.map(row=>[Number(row.rowid),row])),
+      referencedStats=this.db.prepare('SELECT 1 FROM wh_metrics WHERE chain=? AND address=? AND profit_data=? LIMIT 1');
+    for(const row of rows) {
+      const kind=String(row.kind);if(!RETENTION_OBSERVATION_KINDS.has(kind))continue;
+      let value:Record<string,unknown>;try{const parsed=JSON.parse(String(row.data));if(!object(parsed))continue;value=parsed;}catch{continue;}
+      if(value.source!==row.source||value.observedAt!==row.observed_at||
+        value.chain!==undefined&&value.chain!==row.chain||value.wallet!==undefined&&value.wallet!==row.wallet||
+        value.tokenAddress!==undefined&&value.tokenAddress!==row.token_address)continue;
+      const hash=this.retentionSemantic(row.data,kind==='collection');if(!hash)continue;
+      const duration=RETENTION_OBSERVATION_BUCKET_MS[kind as keyof typeof RETENTION_OBSERVATION_BUCKET_MS],stamp=Date.parse(String(row.observed_at));
+      if(!duration||!Number.isFinite(stamp))continue;
+      const scope=JSON.stringify([kind,row.chain??null,row.wallet??null,row.token_address??null,row.source,Math.floor(stamp/duration)]);
+      const rowid=Number(row.rowid),state=groups.get(scope);
+      if(!state||state.hash!==hash){groups.set(scope,{hash,first:rowid,last:rowid});continue;}
+      if(state.last!==state.first) {
+        const previous=byId.get(state.last),referenced=previous?.kind==='stats'&&previous.wallet&&
+          !!referencedStats.get(previous.chain,previous.wallet,previous.data);
+        if(!referenced)remove.push(state.last);
+      }
+      state.last=rowid;
+    }
+    return remove;
   }
 }

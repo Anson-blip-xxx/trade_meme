@@ -122,12 +122,16 @@ export class GmgnPlusArchive {
   meta(key:string):string|undefined{return this.db.prepare('SELECT value FROM gpa_meta WHERE key=?').get(key)?.value as string|undefined;}
   setMeta(key:string,value:string){if(!/^[a-z][a-z0-9_]{0,63}$/.test(key)||value.length>4096)throw new Error('GMGN_PLUS_ARCHIVE_META_INVALID');
     this.db.prepare('INSERT INTO gpa_meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key,value);}
-  storageBytes(){return Number(this.db.prepare('PRAGMA page_count').get()!.page_count)*Number(this.db.prepare('PRAGMA page_size').get()!.page_size);}
-  capacityReached(extraBytes=0){return this.storageBytes()+Math.max(0,extraBytes)+1_048_576>=this.maxBytes;}
+  private storage(){const pages=Number(this.db.prepare('PRAGMA page_count').get()!.page_count),
+    freePages=Number(this.db.prepare('PRAGMA freelist_count').get()!.freelist_count),
+    pageSize=Number(this.db.prepare('PRAGMA page_size').get()!.page_size);
+    return {storageBytes:pages*pageSize,usedBytes:(pages-freePages)*pageSize,reusableBytes:freePages*pageSize};}
+  storageBytes(){return this.storage().storageBytes;}
+  capacityReached(extraBytes=0){return this.storage().usedBytes+Math.max(0,extraBytes)+1_048_576>=this.maxBytes;}
   status(){
     const counts=Object.fromEntries(this.db.prepare('SELECT table_name,row_count FROM gpa_table_counts').all().map(row=>
-      [String(row.table_name),Number(row.row_count)])),storageBytes=this.storageBytes();
-    return {enabled:true,maxBytes:this.maxBytes,storageBytes,capacityReached:storageBytes+1_048_576>=this.maxBytes,
+      [String(row.table_name),Number(row.row_count)])),storage=this.storage();
+    return {enabled:true,maxBytes:this.maxBytes,...storage,capacityReached:storage.usedBytes+1_048_576>=this.maxBytes,
       events:counts.gpa_events,candidates:counts.gpa_wallet_candidates,walletSnapshots:counts.gpa_wallet_snapshots,
       walletHoldingPages:counts.gpa_wallet_holding_pages,candidateEvidence:counts.gpa_event_wallets,walletActivities:counts.gpa_wallet_activity,
       runnerCursor:Number(this.meta('runner_cursor')??0),lastSuccessAt:this.meta('last_success_at'),
@@ -386,11 +390,13 @@ export interface GmgnPlusArchiveRunnerOptions {archive:GmgnPlusArchive;client:Pi
   chains:GmgnArchiveChain[];intervalMs:number;now?:()=>Date;dedicatedMarketChains?:GmgnArchiveChain[];marketEnabled?:boolean;}
 type Task={kind:'market';chain:GmgnArchiveChain}|{kind:'callout_latest'|'callout_backfill';feed:GmgnCalloutFeed}|{kind:'stats'|'profits'|'activity'};
 const PREEMPTION_RETRY_MS=100;
+const ARCHIVE_CAPACITY='GMGN_PLUS_ARCHIVE_CAPACITY_REACHED';
 const expectedPreemption=(error:unknown):error is GmgnError=>error instanceof GmgnError&&error.reason==='GMGN_REQUEST_ABORTED';
+const requireArchiveCapacity=(result:{capacityReached?:boolean})=>{if(result.capacityReached)throw new Error(ARCHIVE_CAPACITY);return result;};
 
 export class GmgnPlusArchiveRunner {
   private readonly tasks:Task[];private readonly now:()=>Date;private running=false;private inFlight?:Promise<void>;private timer?:ReturnType<typeof setTimeout>;
-  private lastTask?:string;private lastError?:string;private retryAfterPreemption=false;private preemptions=0;private lastPreemptedAt?:string;
+  private lastTask?:string;private lastError?:string;private capacityLatched=false;private retryAfterPreemption=false;private preemptions=0;private lastPreemptedAt?:string;
   constructor(private readonly options:GmgnPlusArchiveRunnerOptions){
     if(!options.chains.length||options.chains.some(chain=>!['sol','bsc','robinhood'].includes(chain))||
       options.dedicatedMarketChains?.some(chain=>!['sol','bsc','robinhood'].includes(chain))||
@@ -403,7 +409,7 @@ export class GmgnPlusArchiveRunner {
       {kind:'stats'},{kind:'profits'},{kind:'activity'}];
   }
   status(){return {...this.options.archive.status(),running:this.running,inFlight:!!this.inFlight,lastTask:this.lastTask,lastError:this.lastError,
-    preemptions:this.preemptions,lastPreemptedAt:this.lastPreemptedAt,
+    capacityLatched:this.capacityLatched,preemptions:this.preemptions,lastPreemptedAt:this.lastPreemptedAt,
     intervalMs:this.options.intervalMs,tasks:this.tasks.length,dedicatedMarketChains:[...new Set(this.options.dedicatedMarketChains??[])],
     marketEnabled:this.options.marketEnabled!==false,
     marketSignals:this.options.marketEnabled===false?'disabled':this.options.dedicatedMarketChains?.length?'hybrid_dedicated_and_round_robin':'round_robin',
@@ -416,42 +422,46 @@ export class GmgnPlusArchiveRunner {
     if(!this.running)return;const cooldown=Math.max(0,this.options.client.cooldownUntil-this.now().getTime()),retry=this.retryAfterPreemption;
     this.retryAfterPreemption=false;this.tick(retry?Math.max(PREEMPTION_RETRY_MS,cooldown):Math.max(this.options.intervalMs,cooldown));});},delay);this.timer.unref();}
   private async execute(){
-    if(this.options.archive.capacityReached()){this.lastError='GMGN_PLUS_ARCHIVE_CAPACITY_REACHED';return;}
+    if(this.capacityLatched||this.options.archive.capacityReached()){this.lastError=ARCHIVE_CAPACITY;return;}
     if(this.options.client.cooldownUntil>this.now().getTime()){this.lastError='GMGN_RATE_LIMITED';return;}
     let cursor=Number(this.options.archive.meta('runner_cursor')??0);if(!Number.isSafeInteger(cursor)||cursor<0)cursor=0;
     const task=this.tasks[cursor%this.tasks.length],taskId=task.kind+('chain'in task?`_${task.chain}`:'feed'in task?`_${task.feed}`:'');
     const breakerKey=`task_failure_${taskId}`;this.lastTask=task.kind+('chain'in task?`:${task.chain}`:'feed'in task?`:${task.feed}`:'');
     try{
-      if(task.kind==='market')this.options.archive.recordMarketSignals(task.chain,await this.options.client.getMemeMarketSignals(task.chain));
+      if(task.kind==='market')requireArchiveCapacity(this.options.archive.recordMarketSignals(task.chain,await this.options.client.getMemeMarketSignals(task.chain)));
       else if(task.kind==='callout_latest'){
         let page=this.options.archive.calloutLatestCursor(task.feed);for(let i=0;i<10;i++){
-          this.options.archive.commitCalloutPage(task.feed,await this.options.client.getCalloutGlobal(this.options.chains,
-            {limit:50,pageToken:page,onlyDeclaration:task.feed==='declaration'}),'latest',page);
+          requireArchiveCapacity(this.options.archive.commitCalloutPage(task.feed,await this.options.client.getCalloutGlobal(this.options.chains,
+            {limit:50,pageToken:page,onlyDeclaration:task.feed==='declaration'}),'latest',page));
           const next=this.options.archive.calloutLatestCursor(task.feed);if(!next)break;page=next;
         }
       }
       else if(task.kind==='callout_backfill'){
         const page=this.options.archive.calloutCursor(task.feed);
-        if(page)this.options.archive.commitCalloutPage(task.feed,await this.options.client.getCalloutGlobal(this.options.chains,
-          {limit:50,pageToken:page,onlyDeclaration:task.feed==='declaration'}),'backfill');
+        if(page)requireArchiveCapacity(this.options.archive.commitCalloutPage(task.feed,await this.options.client.getCalloutGlobal(this.options.chains,
+          {limit:50,pageToken:page,onlyDeclaration:task.feed==='declaration'}),'backfill'));
       }else if(task.kind==='stats'){
         const batch=this.options.archive.candidateBatch('stats',1,6*60*60*1000);if(batch.addresses.length){
-          try{this.options.archive.recordWalletStats(batch.chain,batch.addresses,await this.options.client.getWalletStats(batch.chain,batch.addresses));}
-          catch(error){if(!expectedPreemption(error))this.options.archive.deferCandidates(batch.chain,batch.addresses);throw error;}}
+          try{requireArchiveCapacity(this.options.archive.recordWalletStats(batch.chain,batch.addresses,await this.options.client.getWalletStats(batch.chain,batch.addresses)));}
+          catch(error){if(!expectedPreemption(error)&&!(error instanceof Error&&error.message===ARCHIVE_CAPACITY))
+            this.options.archive.deferCandidates(batch.chain,batch.addresses);throw error;}}
       }else if(task.kind==='profits'){
         const batch=this.options.archive.candidateBatch('profits',20,6*60*60*1000);if(batch.addresses.length){
-          try{this.options.archive.recordWalletProfits(batch.chain,batch.addresses,await this.options.client.getWalletProfits(batch.chain,batch.addresses));}
-          catch(error){if(!expectedPreemption(error))this.options.archive.deferCandidates(batch.chain,batch.addresses);throw error;}}
+          try{requireArchiveCapacity(this.options.archive.recordWalletProfits(batch.chain,batch.addresses,await this.options.client.getWalletProfits(batch.chain,batch.addresses)));}
+          catch(error){if(!expectedPreemption(error)&&!(error instanceof Error&&error.message===ARCHIVE_CAPACITY))
+            this.options.archive.deferCandidates(batch.chain,batch.addresses);throw error;}}
       }else{
         const batch=this.options.archive.candidateBatch('activity',1,24*60*60*1000),wallet=batch.addresses[0];if(wallet){
-          try{this.options.archive.recordWalletActivity(batch.chain,wallet,await this.options.client.getWalletActivity(batch.chain,wallet,
-            this.options.archive.activityCursor(batch.chain,wallet)));}
+          try{requireArchiveCapacity(this.options.archive.recordWalletActivity(batch.chain,wallet,await this.options.client.getWalletActivity(batch.chain,wallet,
+            this.options.archive.activityCursor(batch.chain,wallet))));}
           catch(error){if(error instanceof GmgnError&&error.reason==='GMGN_CURSOR_INVALID')
-            this.options.archive.resetActivityCursor(batch.chain,wallet);else if(!expectedPreemption(error))this.options.archive.deferCandidates(batch.chain,batch.addresses);throw error;}}
+            this.options.archive.resetActivityCursor(batch.chain,wallet);else if(!expectedPreemption(error)&&
+              !(error instanceof Error&&error.message===ARCHIVE_CAPACITY))this.options.archive.deferCandidates(batch.chain,batch.addresses);throw error;}}
       }
       this.options.archive.setMeta('runner_cursor',String(cursor+1));this.options.archive.setMeta('last_success_at',this.now().toISOString());
-      this.options.archive.setMeta('last_error','');this.options.archive.setMeta(breakerKey,'0');this.lastError=undefined;
+      this.options.archive.setMeta('last_error','');this.options.archive.setMeta(breakerKey,'0');this.capacityLatched=false;this.lastError=undefined;
     }catch(error){
+      if(error instanceof Error&&error.message===ARCHIVE_CAPACITY){this.capacityLatched=true;this.lastError=ARCHIVE_CAPACITY;return;}
       if(expectedPreemption(error)){
         this.preemptions++;this.lastPreemptedAt=this.now().toISOString();
         if(this.running)this.retryAfterPreemption=true;

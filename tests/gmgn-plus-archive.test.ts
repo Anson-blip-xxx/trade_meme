@@ -400,3 +400,24 @@ test('capacity guard refuses a batch before writing and leaves existing rows rea
     assert.equal(archive.status().events,before,'a full batch rolls back without losing prior rows');archive.close();
   }finally{f.close();}
 });
+
+test('a capacity refusal after fetch keeps the durable runner cursor on the same page',async()=>{
+  const f=fixture();try{const archive=f.create(),original=archive.recordMarketSignals.bind(archive);let calls=0;
+    archive.recordMarketSignals=(()=>({received:1,accepted:0,rejected:0,candidates:0,capacityReached:true})) as typeof original;
+    const client={cooldownUntil:0,getMemeMarketSignals:async()=>{calls++;return [signal()];},getCalloutGlobal:async()=>({list:[]}),
+      getWalletStats:async()=>({}),getWalletProfits:async()=>({list:[]}),getWalletActivity:async()=>({activities:[]})};
+    const runner=new GmgnPlusArchiveRunner({archive,client:client as never,chains:['sol'],intervalMs:5000,now:f.now});
+    await runner.runOnce();await runner.runOnce();assert.equal(calls,1,'capacity latch must block a repeated API fetch');
+    assert.equal(runner.status().runnerCursor,0);assert.equal(runner.status().capacityLatched,true);
+    assert.equal(runner.status().lastError,'GMGN_PLUS_ARCHIVE_CAPACITY_REACHED');await runner.stop();
+  }finally{f.close();}
+});
+
+test('capacity accounting reuses deleted SQLite pages instead of treating the file as full',()=>{
+  const f=fixture();try{let archive=f.create();archive.close();const db=new DatabaseSync(f.path);
+    try{db.exec('CREATE TABLE capacity_padding(value BLOB)');db.prepare('INSERT INTO capacity_padding VALUES(?)').run(Buffer.alloc(8*1024*1024));
+      db.exec('DELETE FROM capacity_padding');}finally{db.close();}
+    archive=f.create();const status=archive.status();assert.ok(status.reusableBytes>4*1024*1024);
+    assert.ok(status.storageBytes>status.usedBytes);assert.equal(archive.capacityReached(1024*1024),false);archive.close();
+  }finally{f.close();}
+});

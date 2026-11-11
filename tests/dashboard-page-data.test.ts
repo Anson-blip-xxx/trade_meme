@@ -60,7 +60,7 @@ test('exit display metrics migrate history and throttle closed comparison sample
     shadow.recordPrice(quote(100),seed);at+=60000;shadow.recordPrice(quote(30),seed);
     at+=60000;shadow.recordPrice(quote(1000),seed);at+=600000;shadow.recordPrice(quote(200),seed);
     const before=shadow.list().items[0];assert.equal(before.phase,'triggered');
-    assert.equal(before.peakGainPct,900);assert.equal(before.maxGapSec,600);
+    assert.equal(before.peakGainPct,100);assert.equal(before.maxGapSec,660);
     shadow.close();
     const old=new DatabaseSync(path);old.exec('DROP TABLE exit_shadow_metrics');old.close();
     shadow=new ExitShadow(path,{now});
@@ -70,14 +70,14 @@ test('exit display metrics migrate history and throttle closed comparison sample
     const closedPolicy=storedPolicy();
     at+=1000;shadow.recordPrice(quote(3000),seed);
     const throttled=shadow.list().items[0];
-    assert.equal(throttled.peakGainPct,900);assert.equal(throttled.latestPriceUsd,200);
-    assert.equal(throttled.lastPriceAt,before.lastPriceAt);assert.equal(shadow.detail(before.id)!.sampleCount,4);
+    assert.equal(throttled.peakGainPct,100);assert.equal(throttled.latestPriceUsd,200);
+    assert.equal(throttled.lastPriceAt,before.lastPriceAt);assert.equal(shadow.detail(before.id)!.sampleCount,3);
     assert.equal(storedPolicy(),closedPolicy);
     at+=59000;shadow.recordPrice(quote(2000),seed);
-    const after=shadow.list().items[0];assert.equal(after.peakGainPct,1900);assert.equal(after.maxGapSec,600);
+    const after=shadow.list().items[0];assert.equal(after.peakGainPct,1900);assert.equal(after.maxGapSec,660);
     assert.equal(after.remainingPct,0);assert.equal(after.triggerPeakGainPct,before.triggerPeakGainPct);
     assert.equal(after.phase,'triggered');assert.equal(after.latestPriceUsd,2000);
-    assert.equal(shadow.detail(after.id)!.sampleCount,5);assert.equal(storedPolicy(),closedPolicy);
+    assert.equal(shadow.detail(after.id)!.sampleCount,4);assert.equal(storedPolicy(),closedPolicy);
     shadow.recordPrice(quote(1,'robinhood'),{...seed,candidateId:'second'});
     const first=shadow.page({limit:1,offset:0}),second=shadow.page({limit:1,offset:1});
     assert.equal(first.total,2);assert.equal(first.hasMore,true);assert.equal(second.hasMore,false);

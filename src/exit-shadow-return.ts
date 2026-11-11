@@ -1,4 +1,4 @@
-import {adaptiveExitPolicy,type AdaptiveExitState} from './adaptive-exit.js';
+import {adaptiveExitPolicy,validAdaptiveExitState,type AdaptiveExitState} from './adaptive-exit.js';
 
 interface ExitEvent {
   at:string;kind:string;observationOnly:true;sellPct?:number;priceUsd?:number;remainingPct?:number;
@@ -24,18 +24,19 @@ const close=(left:number,right:number)=>Math.abs(left-right)<=1e-8;
 export function shadowReturn(state:AdaptiveExitState,events:readonly ExitEvent[],quote:{priceUsd:number;at:string;health:'fresh'|'stale'|'unavailable'}):ShadowReturn {
   const base={mode:'shadow' as const,execution:'observation_only' as const,basis:'initial_principal_pct' as const,costsIncluded:false as const};
   const invalid=(reason:ShadowReturn['reason']):ShadowReturn=>({...base,status:'unavailable',valuationStatus:'unavailable',reason,exits:[]});
-  const policy=adaptiveExitPolicy(state.policyVersion),baselineAt=time(state.baselineAt),lastAt=time(state.lastObservedAt);
-  if(!policy||!positive(state.baselinePriceUsd)||!finite(baselineAt)||!finite(lastAt)||lastAt<baselineAt||
-    !finite(state.remainingPctOfInitial)||state.remainingPctOfInitial<0||state.remainingPctOfInitial>100||
-    typeof state.shadowClosed!=='boolean'||(state.remainingPctOfInitial===0)!==state.shadowClosed||
-    !Array.isArray(state.suggestedStages)||new Set(state.suggestedStages).size!==state.suggestedStages.length||
-    state.suggestedStages.some(gain=>!policy.partialExits.some(stage=>stage.gainPct===gain))||events.length>32)
+  const version=state&&typeof state==='object'?(state as AdaptiveExitState).policyVersion:undefined;
+  const policy=typeof version==='string'?adaptiveExitPolicy(version):undefined;
+  if(!policy||!validAdaptiveExitState(state,policy)||events.length>32)
     return invalid('RETURN_HISTORY_INVALID');
+  const baselineAt=time(state.baselineAt),lastAt=time(state.lastObservedAt);
   // The state retains completed stages even after closure. This detects a lost
   // partial event before a full exit, whose recorded remaining percentage is 0.
   let expectedPartialRemaining=100;
   for(const stage of policy.partialExits)if(state.suggestedStages.includes(stage.gainPct))expectedPartialRemaining*=1-stage.sellPctRemaining/100;
-  if(state.runnerProtection!==undefined&&policy.version!=='adaptive-shadow-v4')return invalid('RETURN_HISTORY_INVALID');
+  if(policy.version==='adaptive-shadow-v5'&&state.runnerProtection?.phase==='tail')
+    expectedPartialRemaining=policy.tailRetentionPctOfInitial!;
+  if(state.runnerProtection!==undefined&&!['adaptive-shadow-v4','adaptive-shadow-v5'].includes(policy.version))
+    return invalid('RETURN_HISTORY_INVALID');
   let remaining=100,realized=0,previousAt=baselineAt,fullExit:ShadowReturnExit|undefined;
   const exits:ShadowReturnExit[]=[],seen=new Map<string,string>();
   for(const event of events){

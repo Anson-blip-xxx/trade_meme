@@ -440,6 +440,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       }
     },
     enqueue:telegram?event=>telegram!.enqueue(event):undefined});
+  let syncLiveLatencyPriority=()=>{};
   let telegramControls:TelegramControls|undefined,telegramControlError:string|undefined;
   let heldMonitor:HeldPositionMonitor|undefined,heldCaptureError:string|undefined;
   const heldWallet=config.entryWallets.solana;
@@ -716,7 +717,10 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       database:config.telegram.database,fetcher:dependencies.telegramFetcher,enqueue:event=>telegram!.enqueue(event),
       countingMode:config.thirdSignalExecutionMode,
       onAction:action=>{
-        if(action!=='status')signalCounting.control(action,'tg');
+        if(action!=='status'){
+          signalCounting.control(action,'tg');
+          syncLiveLatencyPriority();
+        }
         return signalCounting.controlText();
       },onPositions:page=>telegramPositions.page(page),
       ...((manualClose||directSell||nativeTrading)?{onClose:()=>({text:'【持仓卖出】\n平仓操作已更新，请刷新持仓，直接选择 25%、50%、75% 或 100%。',
@@ -791,6 +795,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       !order.exit?.positionClosed&&!positionClosed(order.id);
     const next=active?`${order.chain}:${order.tokenAddress}`:undefined;
     if(next)priceOrderIdentities.set(order.id,next);else priceOrderIdentities.delete(order.id);
+    syncLiveLatencyPriority();
     if(previous!==next)refreshPriceSubscriptions();
     else if(next)schedulePriceOrderRefresh();
   };
@@ -801,6 +806,19 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
     try{tokens.push(...heldMonitor?.tokens()??[]);}catch{heldCaptureError='HELD_PRICE_TARGETS_UNAVAILABLE';}
     return [...new Map(tokens.map(token=>[`${token.chain}:${token.address}`,token])).values()];
   };
+  let liveLatencyPriority:boolean|undefined;
+  syncLiveLatencyPriority=()=>{
+    const next=signalCounting.executionState().running||positionPriceTokens().length>0;
+    if(next===liveLatencyPriority)return;
+    liveLatencyPriority=next;
+    walletIndexRunner?.setLivePriority(next);
+    walletProfiles?.setLivePriority(next);
+    tokenRankResearch?.setLivePriority(next);
+    memeObserver?.setLivePriority(next);
+  };
+  // Persisted counting state and recovered holdings must own CPU/IO priority
+  // before any optional research worker begins its first cycle.
+  syncLiveLatencyPriority();
   const telegramStatus=()=>{
     try{return {enabled:config.telegram?.enabled??false,configured:!!telegram,
       ...telegram?.status(),events:tradeNotifications?.status(),captureError:telegramCaptureError,
@@ -1217,6 +1235,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       error:positionPriceHealthError};
   };
   const maintainProtection=()=>{
+    try{syncLiveLatencyPriority();}catch{/* Protection still runs; store health exposes the underlying failure. */}
     try{exitShadow?.tick();}catch{exitCaptureError='EXIT_SHADOW_MAINTENANCE_FAILED';}
     try{
       const targets=streamPriceTokens();
@@ -1230,13 +1249,15 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
   return {client,providers,store,orders,entry,dailyReview,scanner,debotScanner,debotStream,debotPublicFallback,debotAuth,archive,followupReview,tracking,priceRouter,walletHistory,walletIndexRunner,walletObserver,walletResearchStatus,walletAssociationsStatus,walletProfiles,walletProfilesStatus,walletScreening,watchRechecker,exitShadow,chainMonitor,chainStreamStatus,walletFastResearch,memeObserver,sourceEvidence,sourceObservation,aveScanner,aveSession,tokenRankResearch,jevShadow,telegram,tradeNotifications,telegramStatus,heldMonitor,heldTracking,
     signalCounting,telegramControls,telegramPositions,manualClose,directSell,manualNativeBuy,telegramTokenCard,gmgnMarketScanner,
     gmgnMarketDiscovery,gmgnMarketDiscoveryStore,
-    executionStatus:()=>{const counting=signalCounting.status();return {
+    executionStatus:()=>{const counting=signalCounting.executionState();return {
       configuredEntryMode:config.entryMode,configuredThirdSignalMode:config.thirdSignalExecutionMode,
-      solanaExecutionProvider:config.solanaExecutionProvider,native:nativeTrading?.status(),nativeError:nativeTradingError,
-      manualNativeBuy:{enabled:!!manualNativeBuy,readiness:manualNativeBuy?.readiness(),error:manualNativeBuyError},
       executionEnabled:counting.executionEnabled,countingRunning:counting.running,executionReady:counting.executionReady};},
     signalCountingPage:(options:{limit?:number;offset?:number}={})=>({...signalCounting.page(options),controls:telegramControls?.status()}),
-    signalCountingControl:(action:'start'|'stop',actor:'web')=>signalCounting.control(action,actor),
+    signalCountingControl:(action:'start'|'stop',actor:'web')=>{
+      const result=signalCounting.control(action,actor);
+      syncLiveLatencyPriority();
+      return result;
+    },
     jevStatus:()=>{const summary=jevStatusRunner?.snapshot();return {...jevShadow?.status(summary?.aggregate??null),captureError:jevCaptureError,
       summaryState:summary?.state??'disabled',summaryComputedAt:summary?.aggregate?.computedAt,summaryStale:summary?.stale??false,
       summaryError:summary?.error,summaryWorker:summary?.worker};},
@@ -1294,6 +1315,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
     dashboardOrders:(options:DashboardPageOptions={limit:20,offset:0})=>dashboardOrders(orders,options),
     start(){
       if(closed) return;
+      syncLiveLatencyPriority();
       walletStatsRunner?.start();
       gmgnPlusRunner?.start();
       if(backgroundGmgnEnabled)gmgnMarketScanner?.start();

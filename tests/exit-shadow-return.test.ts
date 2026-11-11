@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {ADAPTIVE_SHADOW_V3,stepAdaptiveExit,type AdaptiveExitState} from '../src/adaptive-exit.js';
+import {ADAPTIVE_SHADOW_V3,ADAPTIVE_SHADOW_V5,stepAdaptiveExit,type AdaptiveExitState} from '../src/adaptive-exit.js';
 import {shadowReturn} from '../src/exit-shadow-return.js';
 import type {ShadowEvent} from '../src/exit-shadow.js';
 
@@ -87,4 +87,17 @@ test('tiny token prices must exactly match the persisted model observation rathe
   const wrongQuote=shadowReturn(open.state,open.events,{priceUsd:9e-9,at:open.state.lastObservedAt,health:'fresh'});
   assert.equal(wrongQuote.unrealizedGainPct,undefined);assert.equal(wrongQuote.totalGainPct,undefined);
   assert.equal(wrongQuote.reason,'RETURN_QUOTE_UNAVAILABLE');
+});
+test('return projection rejects the same malformed V5 runner state as the state machine',()=>{
+  const address=`0x${'b'.repeat(40)}`,firstAt=new Date(origin).toISOString(),secondAt=new Date(origin+3000).toISOString();
+  const first=stepAdaptiveExit(undefined,{chain:'bsc',address,priceUsd:100,observedAt:firstAt,evaluatedAt:firstAt,
+    source:'gmgn_token_info_sample',poolAddress:`0x${'c'.repeat(40)}`},undefined,ADAPTIVE_SHADOW_V5).state!;
+  const runner=stepAdaptiveExit(first,{chain:'bsc',address,priceUsd:200,observedAt:secondAt,evaluatedAt:secondAt,
+    source:'gmgn_token_info_sample',poolAddress:`0x${'c'.repeat(40)}`},undefined,ADAPTIVE_SHADOW_V5).state!;
+  for(const value of [null,42,'bad',[]]){
+    const corrupt={...runner,runnerProtection:value} as unknown as AdaptiveExitState;
+    const projected=shadowReturn(corrupt,[],{priceUsd:200,at:secondAt,health:'fresh'});
+    assert.equal(projected.status,'unavailable');assert.equal(projected.reason,'RETURN_HISTORY_INVALID');
+    assert.equal(projected.totalGainPct,undefined);
+  }
 });

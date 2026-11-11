@@ -425,7 +425,7 @@ test('failed stop or start transactions keep the memory gate closed until a fres
  }finally{s.close();f.close();}
 });
 
-test('count control changes only the current strategy run while source capture and research stay enabled',async()=>{
+test('count control keeps source capture enabled while optional research yields live latency priority',async()=>{
  const dir=mkdtempSync(join(tmpdir(),'signal-counting-runtime-'));
  const config=readConfig({ENTRY_MODE:'off',GMGN_BACKGROUND_RESEARCH_ENABLED:'false',
    DASHBOARD_ENABLED:'false',WATCH_RECHECK_ENABLED:'false',EXIT_SHADOW_ENABLED:'false',CHAIN_STREAM_ENABLED:'false',
@@ -439,11 +439,11 @@ test('count control changes only the current strategy run while source capture a
    WALLET_PROFILES_DATABASE_PATH:join(dir,'profiles.sqlite'),TOKEN_RANK_RESEARCH_DATABASE_PATH:join(dir,'rank.sqlite')});
  const runtime=createRuntime(config);try {
    runtime.signalCountingControl('start','web');
-   assert.equal(runtime.walletIndexRunner?.snapshot().livePriority,false);
-   assert.equal(runtime.walletProfiles?.status().livePriority,false);
-   assert.equal(runtime.tokenRankResearch?.status().livePriority,false);
-   assert.equal(runtime.memeObserver?.status().livePriority,false);
-   assert.equal(runtime.memeObserver?.status().marketBatchLimit,30);
+   assert.equal(runtime.walletIndexRunner?.snapshot().livePriority,true);
+   assert.equal(runtime.walletProfiles?.status().livePriority,true);
+   assert.equal(runtime.tokenRankResearch?.status().livePriority,true);
+   assert.equal(runtime.memeObserver?.status().livePriority,true);
+   assert.equal(runtime.memeObserver?.status().marketBatchLimit,3);
    for(let i=0;i<3;i++){
      runtime.debotScanner!.acceptPage({observations:[observation()],received:1,rejected:0});
      runtime.aveScanner!.acceptPage({observations:[observation('ave')],received:1,rejected:0});
@@ -468,7 +468,28 @@ test('count control changes only the current strategy run while source capture a
  }finally{await runtime.close();rmSync(dir,{recursive:true,force:true});}
 });
 
-test('runtime restart keeps collection workers independent from a persisted active count run',async()=>{
+test('constant-time execution state avoids exact strategy counter queries',()=>{
+ const f=fixture(),counting=new SignalCounting(f.options);
+ const exact=counting.strategy.status;
+ try {
+   counting.control('start','web');
+   counting.strategy.status=(()=>{throw Error('EXACT_COUNTER_QUERY_FORBIDDEN');}) as typeof counting.strategy.status;
+   assert.deepEqual(counting.executionState(),{running:true,executionEnabled:false,executionReady:false});
+ }finally{counting.strategy.status=exact;counting.close();f.close();}
+});
+
+test('execution state keeps a restored simulation run non-live until an explicit live restart',()=>{
+ const f=fixture();let counting=new SignalCounting(f.options);
+ try {
+   counting.control('start','web');counting.close();
+   counting=new SignalCounting({...f.options,executionMode:'live',onCandidate:()=>{},executionReady:()=>({ready:true})});
+   assert.deepEqual(counting.executionState(),{running:true,executionEnabled:false,executionReady:true});
+   counting.control('start','web');
+   assert.deepEqual(counting.executionState(),{running:true,executionEnabled:true,executionReady:true});
+ }finally{counting.close();f.close();}
+});
+
+test('runtime restart restores live latency priority from a persisted active count run',async()=>{
  const dir=mkdtempSync(join(tmpdir(),'signal-counting-priority-restart-'));
  const config=readConfig({ENTRY_MODE:'off',GMGN_BACKGROUND_RESEARCH_ENABLED:'false',SCANNER_ENABLED:'false',
    DASHBOARD_ENABLED:'false',WATCH_RECHECK_ENABLED:'false',EXIT_SHADOW_ENABLED:'false',CHAIN_STREAM_ENABLED:'false',
@@ -483,17 +504,17 @@ test('runtime restart keeps collection workers independent from a persisted acti
    runtime.signalCountingControl('start','web');await runtime.close();
    runtime=createRuntime(config);assert.equal(runtime.signalCounting.status().running,true);
    runtime.start();
-   assert.equal(runtime.memeObserver?.status().livePriority,false);
-   assert.equal(runtime.memeObserver?.status().marketBatchLimit,30);
+   assert.equal(runtime.memeObserver?.status().livePriority,true);
+   assert.equal(runtime.memeObserver?.status().marketBatchLimit,3);
    const deadline=Date.now()+15_000;
-   while(runtime.walletIndexRunner?.snapshot().workerLivePriority!==false||
-     runtime.walletProfiles?.status().workerLivePriority!==false||runtime.tokenRankResearch?.status().workerLivePriority!==false){
-     assert.ok(Date.now()<deadline,'collection workers did not remain in normal mode');
+   while(runtime.walletIndexRunner?.snapshot().workerLivePriority!==true||
+     runtime.walletProfiles?.status().workerLivePriority!==true||runtime.tokenRankResearch?.status().workerLivePriority!==true){
+     assert.ok(Date.now()<deadline,'research workers did not yield live latency priority');
      await new Promise(resolve=>setTimeout(resolve,50));
    }
-   assert.equal(runtime.walletIndexRunner?.snapshot().livePriority,false);
-   assert.equal(runtime.walletProfiles?.status().livePriority,false);
-   assert.equal(runtime.tokenRankResearch?.status().livePriority,false);
+   assert.equal(runtime.walletIndexRunner?.snapshot().livePriority,true);
+   assert.equal(runtime.walletProfiles?.status().livePriority,true);
+   assert.equal(runtime.tokenRankResearch?.status().livePriority,true);
  } finally {await runtime.close();rmSync(dir,{recursive:true,force:true});}
 });
 

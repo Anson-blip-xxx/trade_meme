@@ -692,9 +692,9 @@ test('owner TG start enables SOL third-signal live entry with attached exits, du
    const started=await pollTelegram(runtime,config.telegram!.database,tg,[privateMessage(11,'启动计数')]);
    assert.ok(started.some(message=>message.text.includes('达标自动实盘买入')));
    assert.equal(runtime.signalCounting.status().executionEnabled,true);assert.equal(runtime.telegramControls!.status().countingMode,'live');
-   assert.equal(runtime.walletIndexRunner?.snapshot().livePriority,false);
-   assert.equal(runtime.walletProfiles?.status().livePriority,false);
-   assert.equal(runtime.tokenRankResearch?.status().livePriority,false);
+   assert.equal(runtime.walletIndexRunner?.snapshot().livePriority,true);
+   assert.equal(runtime.walletProfiles?.status().livePriority,true);
+   assert.equal(runtime.tokenRankResearch?.status().livePriority,true);
    for(let n=0;n<3;n++){observe('debot');observe('ave');}
    await runtime.signalCounting.waitForDispatches();
    assert.equal(state.posts,1);assert.equal(state.quotes,1);assert.equal(state.balanceReads,2);
@@ -710,9 +710,11 @@ test('owner TG start enables SOL third-signal live entry with attached exits, du
    const events=runtime.signalCounting.status().events;
    for(let n=0;n<3;n++)observe('debot',otherMint);
    await runtime.signalCounting.waitForDispatches();assert.equal(state.posts,1);assert.equal(runtime.signalCounting.status().events,events);
-   assert.equal(runtime.walletIndexRunner?.snapshot().livePriority,false);
-   assert.equal(runtime.walletProfiles?.status().livePriority,false);
-   assert.equal(runtime.tokenRankResearch?.status().livePriority,false);
+   // Stopping fresh entries does not demote an existing holding's quote and
+   // exit-protection latency below optional wallet/rank research.
+   assert.equal(runtime.walletIndexRunner?.snapshot().livePriority,true);
+   assert.equal(runtime.walletProfiles?.status().livePriority,true);
+   assert.equal(runtime.tokenRankResearch?.status().livePriority,true);
    assert.equal(runtime.signalCounting.status().executionEnabled,false);assert.equal(runtime.orders.list().length,1);
    assert.equal(globalNetwork.mock.callCount(),0);
  }finally{await runtime.close();rmSync(dir,{recursive:true,force:true});}

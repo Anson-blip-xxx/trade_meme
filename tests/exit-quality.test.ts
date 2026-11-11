@@ -91,16 +91,16 @@ test('read-only review selects actual closures within the persisted time window 
   const dir=mkdtempSync(join(tmpdir(),'meme-exit-quality-')),path=join(dir,'shadow.sqlite');let now=start;
   const store=new ExitShadow(path,{now:()=>new Date(now)});
   t.after(()=>{store.close();rmSync(dir,{recursive:true,force:true});});
-  for(const [index,priceUsd] of [100,600,1100,800,790].entries()){
-    now=start+index*60_000;
+  for(const [index,priceUsd] of [100,400,270,269].entries()){
+    now=start+index*3_000;
     store.recordPrice({chain:'bsc',address,priceUsd,observedAt:iso(now),source:'gmgn_token_info_sample',market:{poolAddress:pool.toUpperCase().replace('0X','0x')}},
       index===0?{candidateId:'first',eligibleAt:iso(start),endsAt:iso(start+86400_000)}:undefined);
   }
   const closedAt=now,id=store.list().items[0].id;
   now=closedAt+300_000;store.recordPrice({chain:'bsc',address,priceUsd:900,observedAt:iso(now),source:'gmgn_token_info_sample',market:{poolAddress:pool}},undefined);
-  const detail=store.detail(id)!;assert.ok(Math.abs(detail.quality.equityPeak.givebackPct!-111.6)<1e-8);
-  assert.ok(Math.abs(detail.quality.afterExit[0].impactOnInitialPrincipalPct!-39.6)<1e-8);
-  for(const [index,priceUsd] of [100,45].entries()){
+  const detail=store.detail(id)!;assert.ok(Math.abs(detail.quality.equityPeak.givebackPct!-65.5)<1e-8);
+  assert.ok(Math.abs(detail.quality.afterExit[0].impactOnInitialPrincipalPct!-315.5)<1e-8);
+  for(const [index,priceUsd] of [100,40].entries()){
     now=closedAt+400_000+index*60_000;
     store.recordPrice({chain:'bsc',address:otherPool,priceUsd,observedAt:iso(now),source:'gmgn_token_info_sample'},
       index===0?{candidateId:'second',eligibleAt:iso(now),endsAt:iso(now+86400_000)}:undefined);
@@ -124,13 +124,13 @@ test('read-only review selects actual closures within the persisted time window 
 test('old missing-pool observations are not retroactively assigned a new provider pool',t=>{
   const dir=mkdtempSync(join(tmpdir(),'meme-exit-quality-old-')),path=join(dir,'shadow.sqlite');let now=start;
   const store=new ExitShadow(path,{now:()=>new Date(now)});t.after(()=>{store.close();rmSync(dir,{recursive:true,force:true});});
-  for(const [index,priceUsd] of [100,45].entries()){
+  for(const [index,priceUsd] of [100,40].entries()){
     now=start+index*60_000;store.recordPrice({chain:'bsc',address,priceUsd,observedAt:iso(now),source:'gmgn_token_info_sample'},
       index===0?{candidateId:'legacy',eligibleAt:iso(start),endsAt:iso(start+86400_000)}:undefined);
   }
   const id=store.list().items[0].id;now+=300_000;
   store.recordPrice({chain:'bsc',address,priceUsd:900,observedAt:iso(now),source:'gmgn_token_info_sample',market:{poolAddress:pool}},undefined);
-  const quality=store.detail(id)!.quality;assert.ok(Math.abs(quality.finalGainPct!+55)<1e-8);assert.equal(quality.equityPeak.reason,'POOL_PROVENANCE_UNKNOWN');
+  const quality=store.detail(id)!.quality;assert.ok(Math.abs(quality.finalGainPct!+60)<1e-8);assert.equal(quality.equityPeak.reason,'POOL_PROVENANCE_UNKNOWN');
   assert.equal(quality.afterExit[0].status,'provenance_unknown');assert.equal(quality.afterExit[0].impactOnInitialPrincipalPct,undefined);
 });
 
@@ -139,7 +139,7 @@ test('the reader caps large pre-exit sample ranges without losing separately bou
   const store=new ExitShadow(path,{now:()=>new Date(now)});t.after(()=>{store.close();rmSync(dir,{recursive:true,force:true});});
   store.recordPrice({chain:'bsc',address,priceUsd:100,observedAt:iso(now),source:'gmgn_token_info_sample',market:{poolAddress:pool}},
     {candidateId:'many-samples',eligibleAt:iso(start),endsAt:iso(start+86400_000)});
-  now=start+10_000;store.recordPrice({chain:'bsc',address,priceUsd:45,observedAt:iso(now),source:'gmgn_token_info_sample',market:{poolAddress:pool}},undefined);
+  now=start+10_000;store.recordPrice({chain:'bsc',address,priceUsd:40,observedAt:iso(now),source:'gmgn_token_info_sample',market:{poolAddress:pool}},undefined);
   const id=store.list().items[0].id,db=new DatabaseSync(path);
   try {
     db.exec('BEGIN');const insert=db.prepare('INSERT INTO exit_shadow_samples VALUES(?,?,?,?,?)');
@@ -149,6 +149,6 @@ test('the reader caps large pre-exit sample ranges without losing separately bou
   now+=300_000;store.recordPrice({chain:'bsc',address,priceUsd:90,observedAt:iso(now),source:'gmgn_token_info_sample',market:{poolAddress:pool}},undefined);
   const review=readExitQualityReview(path,{asOf:iso(now+3600_000),sinceAt:iso(start)}),quality=review.cases[0].quality;
   assert.equal(quality.equityPeak.samples,2000);assert.equal(quality.equityPeak.reason,'PRE_EXIT_SAMPLE_LIMIT');
-  assert.equal(quality.afterExit[0].status,'valid');assert.equal(quality.afterExit[0].tokenMovePct,100);
+  assert.equal(quality.afterExit[0].status,'valid');assert.equal(quality.afterExit[0].tokenMovePct,125);
   assert.equal(review.summary.equityGiveback.denominator,0);assert.equal(review.summary.afterExit[0].denominator,1);
 });

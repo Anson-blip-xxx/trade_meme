@@ -60,6 +60,7 @@ export class SignalCounting {
    * SQLite for an incoming source event; a failed best-effort capture latches
    * this gate shut so a later event cannot trade from an incomplete run. */
   private acceptingObservations=false;
+  private activeRunMode:ThirdSignalMode='simulation';
   private captureDegraded=false;
   private historyError?:string;
   private readonly imported=new Set<string>();
@@ -93,7 +94,8 @@ export class SignalCounting {
       this.captureError='SIGNAL_COUNTING_STORAGE_UNAVAILABLE';this.captureDegraded=true;
       return;
     }
-    this.acceptingObservations=this.strategy.status().running;
+    const restored=this.strategy.status();
+    this.acceptingObservations=restored.running;this.activeRunMode=restored.mode;
     try{this.importHistory();}catch{this.historyError='SIGNAL_COUNTING_OPENING_HISTORY_UNAVAILABLE';}
     this.scheduleForwardTargetReconciliation();
   }
@@ -144,6 +146,16 @@ export class SignalCounting {
       return result.ready?{ready:true}:{ready:false,reason:result.reason&&/^[A-Z][A-Z0-9_]{1,100}$/.test(result.reason)?result.reason:'THIRD_SIGNAL_EXECUTION_UNAVAILABLE'};
     }catch{return {ready:false,reason:'THIRD_SIGNAL_EXECUTION_UNAVAILABLE'};}
   }
+  /** Constant-time execution gate for health checks and runtime scheduling.
+   * Exact run counters remain available through status()/page(). */
+  executionState() {
+    const captureReady=!this.captureDegraded,ready=this.readiness();
+    const running=!this.storageUnavailable&&captureReady&&this.acceptingObservations;
+    return {running,executionEnabled:running&&this.activeRunMode==='live'&&ready.ready,
+      executionReady:ready.ready&&captureReady,
+      ...(this.captureDegraded?{readinessReason:'SIGNAL_COUNTING_CAPTURE_FAILED'}:
+        ready.reason?{readinessReason:ready.reason}:{})};
+  }
   status() {const status:ThirdSignalStatus=this.storageUnavailable?{mode:'simulation',executionEnabled:false,running:false,
       ttlMs:6*60*60*1000,maxSignalAgeMs:120000,triggerCount:3 as const,maxMarketCapUsd:100000,
       groups:0,events:0,candidates:0,repeatBlocked:0,globalClaims:0}:this.strategy.status(),
@@ -178,7 +190,8 @@ export class SignalCounting {
       try {
         if(this.captureDegraded)this.strategy.stop(actor);
         const started=this.strategy.start(actor,this.options.executionMode??'simulation');
-        this.acceptingObservations=started.running;this.captureDegraded=false;this.captureError=undefined;
+        this.acceptingObservations=started.running;this.activeRunMode=started.mode;
+        this.captureDegraded=false;this.captureError=undefined;
       } catch(error) {
         this.captureError='SIGNAL_COUNTING_CAPTURE_FAILED';this.captureDegraded=true;this.acceptingObservations=false;throw error;
       }
@@ -186,7 +199,7 @@ export class SignalCounting {
       // Revoke permission before touching SQLite so a busy stop transaction is
       // still fail-closed for every subsequently arriving source event.
       this.acceptingObservations=false;
-      try{this.strategy.stop(actor);}
+      try{const stopped=this.strategy.stop(actor);this.activeRunMode=stopped.mode;}
       catch(error){this.captureError='SIGNAL_COUNTING_CAPTURE_FAILED';this.captureDegraded=true;throw error;}
     }
     else throw Error('SIGNAL_COUNTING_ACTION_INVALID');

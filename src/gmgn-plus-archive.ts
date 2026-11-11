@@ -67,6 +67,10 @@ export class GmgnPlusArchive {
       CREATE INDEX IF NOT EXISTS gpa_events_token ON gpa_events(chain,token_address,event_at DESC);
       CREATE INDEX IF NOT EXISTS gpa_events_wallet ON gpa_events(chain,wallet_address,event_at DESC);
       CREATE INDEX IF NOT EXISTS gpa_market_signal_identity ON gpa_events(kind,chain,upstream_id);
+      CREATE INDEX IF NOT EXISTS gpa_callout_global_latest ON gpa_events(event_at DESC,upstream_id DESC)
+        WHERE kind='callout';
+      CREATE INDEX IF NOT EXISTS gpa_callout_declaration_latest ON gpa_events(event_at DESC,upstream_id DESC)
+        WHERE kind='callout' AND is_declaration=1;
       CREATE TABLE IF NOT EXISTS gpa_wallet_candidates(
         chain TEXT NOT NULL,address TEXT NOT NULL,source_mask INTEGER NOT NULL,occurrences INTEGER NOT NULL,
         first_seen_at TEXT NOT NULL,last_seen_at TEXT NOT NULL,last_stats_at TEXT,last_profits_at TEXT,last_activity_at TEXT,
@@ -245,7 +249,7 @@ export class GmgnPlusArchive {
       input.next_page_token!==undefined&&input.next_page_token!==''&&!cursorToken(input.next_page_token))
       throw new Error('GMGN_PLUS_ARCHIVE_CALLOUT_PAGE_INVALID');
     if(pageToken!==undefined&&!cursorToken(pageToken))throw new Error('GMGN_PLUS_ARCHIVE_CALLOUT_PAGE_INVALID');
-    const known=mode==='latest'?this.meta(`callout_${feed}_latest_high_water`)??this.storedCalloutHighWater(feed):undefined;
+    const known=mode==='latest'?this.calloutLatestHighWater(feed):undefined;
     const result=this.recordCallouts(feed,input);if(result.capacityReached)return result;
     if(result.received>0&&result.accepted===0)throw new Error('GMGN_PLUS_ARCHIVE_CALLOUT_PAGE_REJECTED');
     const next=cursorToken(input.next_page_token)?input.next_page_token:'';
@@ -277,8 +281,21 @@ export class GmgnPlusArchive {
   resetCalloutCursor(feed:GmgnCalloutFeed){const frontier=this.calloutFrontier(feed)??'';
     this.setMeta(`callout_${feed}_backfill_cursor`,frontier);this.setMeta(`callout_${feed}_backfill_complete`,frontier?'0':'1');}
   resetCalloutLatest(feed:GmgnCalloutFeed){this.setMeta(`callout_${feed}_latest_cursor`,'');this.setMeta(`callout_${feed}_latest_pending_high_water`,'');}
-  private storedCalloutHighWater(feed:GmgnCalloutFeed){return this.db.prepare(`SELECT upstream_id FROM gpa_events WHERE kind='callout'
-    AND (?='global' OR is_declaration=1) ORDER BY event_at DESC,upstream_id DESC LIMIT 1`).get(feed)?.upstream_id as string|undefined;}
+  private calloutLatestHighWater(feed:GmgnCalloutFeed){
+    const key=`callout_${feed}_latest_high_water`,persisted=this.meta(key);if(persisted!==undefined)return persisted||undefined;
+    // Older archives may have a durable cursor without the boundary that cursor
+    // is walking toward. Freeze one boundary before recording the next page so
+    // every page in this catch-up run compares against the same event. A pending
+    // head is already durable and avoids an unnecessary legacy lookup.
+    const known=this.meta(`callout_${feed}_latest_pending_high_water`)||this.storedCalloutHighWater(feed);
+    if(known)this.setMeta(key,known);return known;
+  }
+  private storedCalloutHighWater(feed:GmgnCalloutFeed){
+    const row=feed==='global'?
+      this.db.prepare("SELECT upstream_id FROM gpa_events INDEXED BY gpa_callout_global_latest WHERE kind='callout' ORDER BY event_at DESC,upstream_id DESC LIMIT 1").get():
+      this.db.prepare("SELECT upstream_id FROM gpa_events INDEXED BY gpa_callout_declaration_latest WHERE kind='callout' AND is_declaration=1 ORDER BY event_at DESC,upstream_id DESC LIMIT 1").get();
+    return row?.upstream_id as string|undefined;
+  }
 
   candidateBatch(kind:'stats'|'profits'|'activity',limit:number,refreshMs:number):{chain:GmgnArchiveChain;addresses:string[]} {
     if(!Number.isSafeInteger(limit)||limit<1||limit>20)return {chain:'sol',addresses:[]};

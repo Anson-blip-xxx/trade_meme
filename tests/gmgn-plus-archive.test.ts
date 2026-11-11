@@ -162,6 +162,37 @@ test('latest callouts page forward until the previous high water is found when m
   }finally{f.close();}
 });
 
+test('legacy latest catch-up freezes one high water before recording additional pages',async()=>{
+  const f=fixture();try{const archive=f.create(),known=callout('aaa-known-callout-legacy-000001');
+    archive.recordCallouts('global',{list:[known]});
+    assert.equal(archive.meta('callout_global_latest_high_water'),undefined,'legacy rows have no durable latest boundary');
+    const incoming=Array.from({length:60},(_,i)=>callout(`zzz-new-callout-${String(i).padStart(3,'0')}`)),requested:(string|undefined)[]=[];
+    const client={cooldownUntil:0,getMemeMarketSignals:async()=>[],
+      getCalloutGlobal:async(_chains:unknown,options:{pageToken?:string})=>{requested.push(options.pageToken);
+        if(options.pageToken==='unexpected-third-page')throw new Error('MOVING_HIGH_WATER');
+        return options.pageToken?{list:[...incoming.slice(50),known],next_page_token:'unexpected-third-page'}:
+          {list:incoming.slice(0,50),next_page_token:'legacy-overflow-page-2'};},
+      getWalletStats:async()=>({}),getWalletProfits:async()=>({list:[]}),getWalletActivity:async()=>({activities:[]})};
+    const runner=new GmgnPlusArchiveRunner({archive,client:client as never,chains:['sol'],intervalMs:5000,
+      marketEnabled:false,now:f.now});await runner.runOnce();
+    assert.deepEqual(requested,[undefined,'legacy-overflow-page-2'],
+      'the second page still compares with the boundary captured before page one');
+    assert.equal(archive.calloutLatestCursor('global'),undefined);
+    assert.equal(archive.meta('callout_global_latest_high_water'),incoming[0]!.ulid);await runner.stop();
+  }finally{f.close();}
+});
+
+test('latest callout boundary lookups use ordered partial indexes without a temp sort',()=>{
+  const f=fixture();try{const archive=f.create(),db=new DatabaseSync(f.path,{readOnly:true});try{
+    const global=db.prepare(`EXPLAIN QUERY PLAN SELECT upstream_id FROM gpa_events INDEXED BY gpa_callout_global_latest WHERE kind='callout'
+      ORDER BY event_at DESC,upstream_id DESC LIMIT 1`).all().map(row=>String(row.detail)).join('\n');
+    const declaration=db.prepare(`EXPLAIN QUERY PLAN SELECT upstream_id FROM gpa_events INDEXED BY gpa_callout_declaration_latest WHERE kind='callout' AND is_declaration=1
+      ORDER BY event_at DESC,upstream_id DESC LIMIT 1`).all().map(row=>String(row.detail)).join('\n');
+    assert.match(global,/gpa_callout_global_latest/);assert.doesNotMatch(global,/TEMP B-TREE/);
+    assert.match(declaration,/gpa_callout_declaration_latest/);assert.doesNotMatch(declaration,/TEMP B-TREE/);
+  }finally{db.close();archive.close();}}finally{f.close();}
+});
+
 test('a pruned candidate is rehydrated from distinct durable event evidence without inflating occurrences',()=>{
   const f=fixture();try{const archive=f.create();archive.recordMarketSignals('sol',[signal()]);
     const db=new DatabaseSync(f.path);db.prepare('DELETE FROM gpa_wallet_candidates WHERE address=?').run(wallet(2));db.close();f.advance(60_000);

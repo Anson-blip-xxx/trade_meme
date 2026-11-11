@@ -33,10 +33,20 @@ export interface AdaptiveExitPolicy {
   readonly momentumMinimumSamples?:number;
   readonly momentumMaxChangePct?:number;
   readonly momentumMinDrawdownPct?:number;
-  /** V4 only: a realized profit stage starts the independently protected runner. */
+  /** V4/V5: a realized profit stage starts the independently protected runner. */
   readonly runnerActivationGainPct?:number;
-  /** V4 only: fresh, consecutive breach samples required to close the runner. */
+  /** V4/V5: consecutive breach samples required to close the runner. */
   readonly protectionExitConfirmations?:number;
+  /** V5 only: reliable breach observations must be neither burst duplicates nor delayed samples. */
+  readonly protectionConfirmationMinGapMs?:number;
+  readonly protectionConfirmationMaxGapMs?:number;
+  readonly protectionMaxPriceAgeMs?:number;
+  /** V5 only: high-multiple runners retain a small tail after their first protected reduction. */
+  readonly tailEligibilityPeakGainPct?:number;
+  readonly tailRetentionPctOfInitial?:number;
+  readonly tailReaccelerationGainPct?:number;
+  /** V5 only: an isolated extreme quote is quarantined until a persistent follow-up arrives. */
+  readonly outlierJumpRatio?:number;
   readonly partialExits: readonly Readonly<{gainPct: number; sellPctRemaining: number}>[];
 }
 
@@ -84,12 +94,29 @@ export const ADAPTIVE_SHADOW_V4:AdaptiveExitPolicy=Object.freeze({...ADAPTIVE_SH
     Object.freeze({gainPct:1000,sellPctRemaining:10}),
   ]),
 });
+/**
+ * New episodes only. V5 leaves V1-V4 frozen, aligns the shadow hard stop with
+ * the current -60% live rule and preserves a 10% initial-principal tail only
+ * for runners that have already reached +500%. Protection evidence must be
+ * fresh, pool-bound and source-consistent.
+ */
+export const ADAPTIVE_SHADOW_V5:AdaptiveExitPolicy=Object.freeze({...ADAPTIVE_SHADOW_V4,
+  version:'adaptive-shadow-v5',hardStopDropPct:60,
+  // This is the observed collection-cadence window, not permission to use an old quote.
+  // Each quote must still be at most 15 seconds old when evaluated.
+  protectionConfirmationMinGapMs:2_000,protectionConfirmationMaxGapMs:90_000,
+  protectionMaxPriceAgeMs:15_000,tailEligibilityPeakGainPct:500,
+  tailRetentionPctOfInitial:10,tailReaccelerationGainPct:50,outlierJumpRatio:20,
+});
 export function adaptiveExitPolicy(version:string):AdaptiveExitPolicy|undefined {
   return version===ADAPTIVE_SHADOW_V1.version?ADAPTIVE_SHADOW_V1:version===ADAPTIVE_SHADOW_V2.version?ADAPTIVE_SHADOW_V2:
-    version===ADAPTIVE_SHADOW_V3.version?ADAPTIVE_SHADOW_V3:version===ADAPTIVE_SHADOW_V4.version?ADAPTIVE_SHADOW_V4:undefined;
+    version===ADAPTIVE_SHADOW_V3.version?ADAPTIVE_SHADOW_V3:version===ADAPTIVE_SHADOW_V4.version?ADAPTIVE_SHADOW_V4:
+      version===ADAPTIVE_SHADOW_V5.version?ADAPTIVE_SHADOW_V5:undefined;
 }
-const momentumPolicy=(policy:AdaptiveExitPolicy)=>policy.version===ADAPTIVE_SHADOW_V2.version||policy.version===ADAPTIVE_SHADOW_V3.version||policy.version===ADAPTIVE_SHADOW_V4.version;
-const runnerPolicy=(policy:AdaptiveExitPolicy)=>policy.version===ADAPTIVE_SHADOW_V4.version;
+const momentumPolicy=(policy:AdaptiveExitPolicy)=>policy.version===ADAPTIVE_SHADOW_V2.version||policy.version===ADAPTIVE_SHADOW_V3.version||
+  policy.version===ADAPTIVE_SHADOW_V4.version||policy.version===ADAPTIVE_SHADOW_V5.version;
+const runnerPolicy=(policy:AdaptiveExitPolicy)=>policy.version===ADAPTIVE_SHADOW_V4.version||policy.version===ADAPTIVE_SHADOW_V5.version;
+const reliableRunnerPolicy=(policy:AdaptiveExitPolicy)=>policy.version===ADAPTIVE_SHADOW_V5.version;
 export interface AdaptiveExitDeadline {dueAt:string;reason:'MAX_HOLDING_TIME_OBSERVED'|'OBSERVATION_WINDOW_END_OBSERVED';}
 
 export interface PriceObservation {
@@ -101,6 +128,8 @@ export interface PriceObservation {
   /** Injected current clock, making freshness checks deterministic and free of IO. */
   evaluatedAt: string;
   source: string;
+  /** Canonical pool selected by the quote router, when the source exposes it. */
+  poolAddress?:string;
   metadata?:PriceEvidence;
   /** Legacy v2 only. V3 ignores observation horizons when deciding exits. */
   observationEndsAt?:string;
@@ -179,7 +208,7 @@ export interface AdaptiveExitState {
   /** Historical v2 audit field; never an exit deadline under v3. */
   observationEndsAt?:string;
   momentumObservations?:{observedAt:string;priceUsd:number}[];
-  /** V4 runner state. It starts only after the configured profit stage has actually reduced exposure. */
+  /** V4/V5 runner state. It starts only after the configured profit stage has actually reduced exposure. */
   runnerProtection?:{
     activatedAt:string;
     activationStageGainPct:number;
@@ -190,6 +219,22 @@ export interface AdaptiveExitState {
     /** Breaches after activation; the activation sample itself is deliberately excluded. */
     consecutiveBreaches:number;
     confirmingSince?:string;
+    /** V5 runner lifecycle and provenance-bound confirmation state. */
+    phase?:'runner'|'tail';
+    confirmationSource?:string;
+    confirmationPool?:string;
+    lastBreachAt?:string;
+    tailCreatedAt?:string;
+    tailCreatedPeakPriceUsd?:number;
+    reacceleratedAt?:string;
+  };
+  /** V5-only reliable breach evidence before the +100% runner is created. */
+  preRunnerProtection?:{
+    consecutiveBreaches:number;
+    confirmingSince:string;
+    confirmationSource:string;
+    confirmationPool:string;
+    lastBreachAt:string;
   };
 }
 
@@ -235,6 +280,8 @@ export interface AdaptiveExitStep {
 const sourceSet = new Set<WalletTradeSource>(['gmgn_wallet_activity', 'gmgn_token_trades',
   'gmgn_kol_feed', 'gmgn_smartmoney_feed', 'gmgn_association_candidate_activity',
   'gmgn_association_leader_activity', 'gmgn_association_wallet_activity', 'chain_transaction']);
+const quoteSourceSet=new Set(['gmgn_token_info_sample','chain_pool_sample','dexscreener_token_pairs_sample',
+  'ave_price_stream_sample','debot_token_info_sample']);
 const object = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
 const positive = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value) && value > 0;
@@ -302,15 +349,28 @@ function validState(state: AdaptiveExitState, policy: AdaptiveExitPolicy): boole
       !nonnegative(state.lastSampleGapMs) || !nonnegative(state.maxSampleGapMs) || state.maxSampleGapMs < state.lastSampleGapMs ||
       !nonnegative(state.remainingPctOfInitial) || state.remainingPctOfInitial > 100 ||
       (state.remainingPctOfInitial === 0) !== state.shadowClosed || !Array.isArray(state.suggestedStages) ||
-      state.suggestedStages.some(gain => !policy.partialExits.some(stage => stage.gainPct === gain)) ||
-      new Set(state.suggestedStages).size !== state.suggestedStages.length || !validPressureSummary(state.walletPressure)) return false;
+      state.suggestedStages.some((gain,index) => policy.partialExits[index]?.gainPct !== gain) ||
+      state.suggestedStages.some(gain => (state.peakPriceUsd/state.baselinePriceUsd-1)*100 < gain) ||
+      !validPressureSummary(state.walletPressure)) return false;
   const baseline = time(state.baselineAt), last = time(state.lastObservedAt), peak = time(state.peakAt), evaluated = time(state.lastEvaluatedAt);
   if (![baseline, last, peak, evaluated].every(Number.isFinite) || baseline > peak || peak > last || last > evaluated) return false;
   if (!state.protectionActive && state.protectionPriceUsd !== state.hardStopPriceUsd) return false;
   if (!state.shadowClosed) {
     let remaining = 100;
     for (const stage of policy.partialExits) if (state.suggestedStages.includes(stage.gainPct)) remaining *= 1 - stage.sellPctRemaining / 100;
+    if(reliableRunnerPolicy(policy)&&state.runnerProtection?.phase==='tail')remaining=policy.tailRetentionPctOfInitial!;
     if (Math.abs(remaining - state.remainingPctOfInitial) > 1e-9) return false;
+  }
+  if(state.preRunnerProtection!==undefined){
+    const confirmation=state.preRunnerProtection;
+    if(!object(confirmation))return false;
+    const first=time(confirmation.confirmingSince),latest=time(confirmation.lastBreachAt);
+    if(!reliableRunnerPolicy(policy)||state.runnerProtection||
+      !integer(confirmation.consecutiveBreaches)||confirmation.consecutiveBreaches<1||
+      confirmation.consecutiveBreaches>policy.protectionExitConfirmations!||
+      !state.shadowClosed&&confirmation.consecutiveBreaches>=policy.protectionExitConfirmations!||
+      !Number.isFinite(first)||first<=baseline||!Number.isFinite(latest)||latest<first||latest>last||
+      !quoteSourceSet.has(confirmation.confirmationSource)||!address(confirmation.confirmationPool,state.chain))return false;
   }
   if(momentumPolicy(policy)){
     const effective=time(state.policyEffectiveAt),momentumEffective=policy.version===ADAPTIVE_SHADOW_V2.version?effective:time(state.momentumEffectiveAt);
@@ -320,17 +380,23 @@ function validState(state: AdaptiveExitState, policy: AdaptiveExitPolicy): boole
         (policy.version===ADAPTIVE_SHADOW_V2.version?time(state.observationEndsAt)<=effective:time(state.observationEndsAt)<=baseline))||
       !Array.isArray(state.momentumObservations)||state.momentumObservations.length>32)return false;
     let previous=-Infinity;
-    for(const sample of state.momentumObservations){const at=time(sample.observedAt);
+    for(const sample of state.momentumObservations){
+      if(!object(sample))return false;
+      const at=time(sample.observedAt);
       if(!positive(sample.priceUsd)||!Number.isFinite(at)||at<momentumEffective||at>last||at<=previous)return false;previous=at;}
   }
   if(runnerPolicy(policy)){
     const runner=state.runnerProtection;
+    const peakGainPct=(state.peakPriceUsd/state.baselinePriceUsd-1)*100;
+    if(reliableRunnerPolicy(policy)&&runner?.phase!=='tail'&&
+      policy.partialExits.some(stage=>stage.gainPct<=peakGainPct&&!state.suggestedStages.includes(stage.gainPct)))return false;
     if(state.suggestedStages.includes(policy.runnerActivationGainPct!) !== (runner !== undefined))return false;
     if(runner!==undefined){
       if(!object(runner)||runner.activationStageGainPct!==policy.runnerActivationGainPct||
         !state.suggestedStages.includes(runner.activationStageGainPct)||
         !positive(runner.cyclePeakPriceUsd)||runner.cyclePeakPriceUsd>state.peakPriceUsd||
-        runner.cyclePeakPriceUsd<state.lastPriceUsd||!positive(runner.cycleProtectionPriceUsd)||
+        runner.cyclePeakPriceUsd<state.lastPriceUsd&&!(reliableRunnerPolicy(policy)&&runner.phase==='tail'&&!runner.reacceleratedAt)||
+        !positive(runner.cycleProtectionPriceUsd)||
         runner.cycleProtectionPriceUsd!==state.protectionPriceUsd||
         runner.cycleProtectionPriceUsd<state.hardStopPriceUsd||runner.cycleProtectionPriceUsd>runner.cyclePeakPriceUsd||
         !integer(runner.consecutiveBreaches)||
@@ -341,9 +407,41 @@ function validState(state: AdaptiveExitState, policy: AdaptiveExitPolicy): boole
         !Number.isFinite(cyclePeakAt)||cyclePeakAt<activated||cyclePeakAt>last||
         (runner.consecutiveBreaches===0)!==(runner.confirmingSince===undefined)||
         runner.consecutiveBreaches>0&&(!Number.isFinite(confirming)||confirming<=activated||confirming>last))return false;
+      if(reliableRunnerPolicy(policy)){
+        const hasConfirmation=runner.consecutiveBreaches>0,lastBreach=time(runner.lastBreachAt);
+        if(!['runner','tail'].includes(runner.phase??'')||
+          hasConfirmation&&(!runner.confirmationSource||!runner.confirmationPool||!Number.isFinite(lastBreach))||
+          !hasConfirmation&&(runner.confirmationSource!==undefined||runner.confirmationPool!==undefined||runner.lastBreachAt!==undefined)||
+          hasConfirmation&&(runner.confirmingSince!==runner.lastBreachAt&&runner.consecutiveBreaches===1)||
+          hasConfirmation&&(!quoteSourceSet.has(runner.confirmationSource!)||!address(runner.confirmationPool,state.chain))||
+          Number.isFinite(lastBreach)&&(lastBreach<time(runner.confirmingSince)||lastBreach>last))return false;
+        const tail=runner.phase==='tail',tailAt=time(runner.tailCreatedAt),reaccelerated=time(runner.reacceleratedAt);
+        const tailPeakGain=positive(runner.tailCreatedPeakPriceUsd)?
+          (runner.tailCreatedPeakPriceUsd/state.baselinePriceUsd-1)*100:NaN;
+        const eligibilityStagesComplete=policy.partialExits.filter(stage=>stage.gainPct<=policy.tailEligibilityPeakGainPct!)
+          .every(stage=>state.suggestedStages.includes(stage.gainPct));
+        if(tail&&(!runner.tailCreatedAt||!positive(runner.tailCreatedPeakPriceUsd))||
+          !tail&&(runner.tailCreatedAt!==undefined||runner.tailCreatedPeakPriceUsd!==undefined)||
+          tail&&(!Number.isFinite(tailAt)||tailAt<activated||tailAt>last||runner.tailCreatedPeakPriceUsd!>state.peakPriceUsd||
+            !Number.isFinite(tailPeakGain)||tailPeakGain<policy.tailEligibilityPeakGainPct!||!eligibilityStagesComplete)||
+          !tail&&(runner.reacceleratedAt!==undefined)||
+          runner.reacceleratedAt!==undefined&&(!Number.isFinite(reaccelerated)||reaccelerated<=tailAt||reaccelerated>last)||
+          runner.reacceleratedAt!==undefined&&(runner.cyclePeakPriceUsd<runner.tailCreatedPeakPriceUsd!*
+            (1+policy.tailReaccelerationGainPct!/100)||cyclePeakAt<reaccelerated)||
+          tail&&runner.reacceleratedAt===undefined&&(runner.cyclePeakPriceUsd!==runner.tailCreatedPeakPriceUsd||cyclePeakAt>tailAt)||
+          !tail&&(runner.cyclePeakPriceUsd!==state.peakPriceUsd||runner.cyclePeakAt!==state.peakAt)||
+          tail&&runner.reacceleratedAt===undefined&&runner.consecutiveBreaches!==0)return false;
+      }else if(runner.phase!==undefined||runner.confirmationSource!==undefined||runner.confirmationPool!==undefined||
+        runner.lastBreachAt!==undefined||runner.tailCreatedAt!==undefined||runner.tailCreatedPeakPriceUsd!==undefined||runner.reacceleratedAt!==undefined)return false;
     }
   }else if(state.runnerProtection!==undefined)return false;
+  if(!reliableRunnerPolicy(policy)&&state.preRunnerProtection!==undefined)return false;
   return true;
+}
+
+/** Shared persisted-state validation for shadow arithmetic and read models. */
+export function validAdaptiveExitState(value:unknown,policy:AdaptiveExitPolicy):value is AdaptiveExitState {
+  return supportedPolicy(policy)&&validState(value as AdaptiveExitState,policy);
 }
 
 /** A deadline is an intent, never an execution or an observed price. */
@@ -429,9 +527,12 @@ export function stepAdaptiveExit(
   if (state !== undefined && !validState(state, policy)) return ignore('STATE_INVALID');
   if (state && state.policyVersion !== policy.version) return ignore('STATE_POLICY_MISMATCH');
   if (!object(observation) || !address(observation.address, observation.chain) || !positive(observation.priceUsd) ||
-      !['gmgn_token_info_sample','chain_pool_sample','dexscreener_token_pairs_sample','ave_price_stream_sample','debot_token_info_sample'].includes(observation.source)) return ignore('PRICE_INVALID');
+      !quoteSourceSet.has(observation.source)) return ignore('PRICE_INVALID');
+  if(reliableRunnerPolicy(policy)&&observation.poolAddress!==undefined&&!address(observation.poolAddress,observation.chain))
+    return ignore('PRICE_INVALID');
   if (observation.source==='chain_pool_sample'&&!priceEvidence(observation)) return ignore('PRICE_INVALID');
   const observed = time(observation.observedAt), evaluated = time(observation.evaluatedAt);
+  const observedPool=observation.poolAddress===undefined?undefined:normalized(observation.poolAddress,observation.chain);
   if (![observed, evaluated].every(Number.isFinite)) return ignore('TIME_INVALID');
   if (observed > evaluated) return ignore('PRICE_FROM_FUTURE');
   if (evaluated - observed > policy.maxPriceAgeMs) return ignore('PRICE_STALE');
@@ -487,16 +588,28 @@ export function stepAdaptiveExit(
   const drawdown = clamp(policy.baseDrawdownPct + Math.min(policy.maxVolatilityWideningPct,
     volatility * policy.volatilityDrawdownMultiplier) - gainTightening - walletTightening,
     policy.minDrawdownPct, policy.maxDrawdownPct);
-  const runnerCyclePeak=state.runnerProtection?Math.max(state.runnerProtection.cyclePeakPriceUsd,observation.priceUsd):undefined;
-  const protection = state.runnerProtection
-    ? Math.max(state.runnerProtection.cycleProtectionPriceUsd,state.hardStopPriceUsd,
-      active?runnerCyclePeak!*(1-drawdown/100):0)
+  const dormantTail=reliableRunnerPolicy(policy)&&state.runnerProtection?.phase==='tail'&&!state.runnerProtection.reacceleratedAt;
+  const reliableTailReacceleration=evaluated-observed<=policy.protectionMaxPriceAgeMs!&&!!observedPool;
+  const tailReacceleratedNow=!!(dormantTail&&reliableTailReacceleration&&
+    observation.priceUsd>=state.runnerProtection!.tailCreatedPeakPriceUsd!*
+    (1+policy.tailReaccelerationGainPct!/100));
+  const runnerCyclePeak=state.runnerProtection
+    ?dormantTail&&!tailReacceleratedNow?state.runnerProtection.cyclePeakPriceUsd:
+      tailReacceleratedNow?observation.priceUsd:Math.max(state.runnerProtection.cyclePeakPriceUsd,observation.priceUsd)
+    :undefined;
+  let protection = state.runnerProtection
+    ? dormantTail&&!tailReacceleratedNow?state.runnerProtection.cycleProtectionPriceUsd:
+      tailReacceleratedNow?Math.max(state.hardStopPriceUsd,observation.priceUsd*(1-drawdown/100)):
+        Math.max(state.runnerProtection.cycleProtectionPriceUsd,state.hardStopPriceUsd,
+          active?runnerCyclePeak!*(1-drawdown/100):0)
     : Math.max(state.protectionPriceUsd, state.hardStopPriceUsd, active ? peak * (1 - drawdown / 100) : 0);
   const drawdownWithoutWallet = clamp(policy.baseDrawdownPct + Math.min(policy.maxVolatilityWideningPct,
     volatility * policy.volatilityDrawdownMultiplier) - gainTightening, policy.minDrawdownPct, policy.maxDrawdownPct);
   const protectionWithoutWallet = state.runnerProtection
-    ? Math.max(state.runnerProtection.cycleProtectionPriceUsd,state.hardStopPriceUsd,
-      active?runnerCyclePeak!*(1-drawdownWithoutWallet/100):0)
+    ? dormantTail&&!tailReacceleratedNow?state.runnerProtection.cycleProtectionPriceUsd:
+      tailReacceleratedNow?Math.max(state.hardStopPriceUsd,observation.priceUsd*(1-drawdownWithoutWallet/100)):
+        Math.max(state.runnerProtection.cycleProtectionPriceUsd,state.hardStopPriceUsd,
+          active?runnerCyclePeak!*(1-drawdownWithoutWallet/100):0)
     : Math.max(state.protectionPriceUsd, state.hardStopPriceUsd,
       active ? peak * (1 - drawdownWithoutWallet / 100) : 0);
   if (!positive(protection)) return ignore('ARITHMETIC_INVALID');
@@ -509,8 +622,11 @@ export function stepAdaptiveExit(
     suggestedStages: [...state.suggestedStages], walletPressure: wallet.summary};
   if(state.runnerProtection){
     next.runnerProtection={...state.runnerProtection,cyclePeakPriceUsd:runnerCyclePeak!,
-      cyclePeakAt:observation.priceUsd>state.runnerProtection.cyclePeakPriceUsd?observation.observedAt:state.runnerProtection.cyclePeakAt,
-      cycleProtectionPriceUsd:protection};
+      cyclePeakAt:tailReacceleratedNow||!dormantTail&&observation.priceUsd>state.runnerProtection.cyclePeakPriceUsd
+        ?observation.observedAt:state.runnerProtection.cyclePeakAt,
+      cycleProtectionPriceUsd:protection,
+      ...(tailReacceleratedNow?{reacceleratedAt:observation.observedAt,consecutiveBreaches:0,
+        confirmingSince:undefined,confirmationSource:undefined,confirmationPool:undefined,lastBreachAt:undefined}:{})};
   }
   let momentumStalled=false;
   if(momentumPolicy(policy)){
@@ -528,38 +644,99 @@ export function stepAdaptiveExit(
       Math.abs(windowChangePct)<=policy.momentumMaxChangePct!&&
       // V3 lets a recovery keep running, even when it remains below an earlier peak.
       (policy.version===ADAPTIVE_SHADOW_V2.version||windowChangePct<=0);
-    // Once V4 has banked the +100% stage, its independent runner is governed
+    // Once V4/V5 has banked the +100% stage, its independent runner is governed
     // by observed price protection rather than the older momentum close.
     if(runnerPolicy(policy)&&state.runnerProtection)momentumStalled=false;
   }
   const deadline=adaptiveExitDeadline(next),deadlineReached=!!deadline&&observed>=time(deadline.dueAt);
   const hardStop = observation.priceUsd <= state.hardStopPriceUsd;
   const protectionHit = active && observation.priceUsd <= protection;
-  const stages = policy.partialExits.filter(stage => gain >= stage.gainPct && !state.suggestedStages.includes(stage.gainPct));
+  // A V5 high-multiple tail is a fixed 10% of initial principal. Profit tiers
+  // already served their purpose before the tail was created; applying a later
+  // tier would silently shrink the tail and make its persisted state invalid.
+  const stages = reliableRunnerPolicy(policy)&&state.runnerProtection?.phase==='tail'?[]:
+    policy.partialExits.filter(stage => gain >= stage.gainPct && !state.suggestedStages.includes(stage.gainPct));
+  let confirmedPreRunnerExit=false,preRunnerAwaitingConfirmation=false;
+  if(reliableRunnerPolicy(policy)&&!state.runnerProtection){
+    const prior=state.preRunnerProtection,reliable=evaluated-observed<=policy.protectionMaxPriceAgeMs!&&!!observedPool;
+    if(!reliable){if(prior)next.preRunnerProtection={...prior};else delete next.preRunnerProtection;}
+    else if(protectionHit){
+      if(prior&&prior.confirmationSource===observation.source&&prior.confirmationPool===observedPool){
+        const interval=observed-time(prior.lastBreachAt);
+        if(interval<policy.protectionConfirmationMinGapMs!)next.preRunnerProtection={...prior};
+        else if(interval<=policy.protectionConfirmationMaxGapMs!)next.preRunnerProtection={...prior,
+          consecutiveBreaches:prior.consecutiveBreaches+1,lastBreachAt:observation.observedAt};
+        else next.preRunnerProtection={consecutiveBreaches:1,confirmingSince:observation.observedAt,
+          confirmationSource:observation.source,confirmationPool:observedPool,lastBreachAt:observation.observedAt};
+      }else next.preRunnerProtection={consecutiveBreaches:1,confirmingSince:observation.observedAt,
+        confirmationSource:observation.source,confirmationPool:observedPool,lastBreachAt:observation.observedAt};
+      confirmedPreRunnerExit=(next.preRunnerProtection?.consecutiveBreaches??0)>=policy.protectionExitConfirmations!;
+      preRunnerAwaitingConfirmation=!!next.preRunnerProtection&&!confirmedPreRunnerExit;
+    }else delete next.preRunnerProtection;
+  }
   let confirmedRunnerExit=false,runnerAwaitingConfirmation=false;
   if(runnerPolicy(policy)&&state.runnerProtection){
-    if(protectionHit){
+    const canProtect=!reliableRunnerPolicy(policy)||state.runnerProtection.phase==='runner'||!!next.runnerProtection?.reacceleratedAt;
+    const reliable=!reliableRunnerPolicy(policy)||evaluated-observed<=policy.protectionMaxPriceAgeMs!&&!!observedPool;
+    if(!reliable){
+      next.runnerProtection={...next.runnerProtection!,consecutiveBreaches:state.runnerProtection.consecutiveBreaches,
+        confirmingSince:state.runnerProtection.confirmingSince,confirmationSource:state.runnerProtection.confirmationSource,
+        confirmationPool:state.runnerProtection.confirmationPool,lastBreachAt:state.runnerProtection.lastBreachAt};
+      runnerAwaitingConfirmation=state.runnerProtection.consecutiveBreaches>0;
+    }else if(protectionHit&&canProtect){
+      if(reliableRunnerPolicy(policy)){
+        const prior=state.runnerProtection;
+        if(prior.consecutiveBreaches>0&&prior.confirmationSource===observation.source&&prior.confirmationPool===observedPool){
+          const interval=observed-time(prior.lastBreachAt);
+          if(interval<policy.protectionConfirmationMinGapMs!){
+            next.runnerProtection={...next.runnerProtection!,consecutiveBreaches:prior.consecutiveBreaches,
+              confirmingSince:prior.confirmingSince,confirmationSource:prior.confirmationSource,
+              confirmationPool:prior.confirmationPool,lastBreachAt:prior.lastBreachAt};
+          }else if(interval<=policy.protectionConfirmationMaxGapMs!){
+            const consecutiveBreaches=prior.consecutiveBreaches+1;
+            next.runnerProtection={...next.runnerProtection!,consecutiveBreaches,confirmingSince:prior.confirmingSince,
+              confirmationSource:observation.source,confirmationPool:observedPool,lastBreachAt:observation.observedAt};
+          }else next.runnerProtection={...next.runnerProtection!,consecutiveBreaches:1,confirmingSince:observation.observedAt,
+            confirmationSource:observation.source,confirmationPool:observedPool,lastBreachAt:observation.observedAt};
+        }else next.runnerProtection={...next.runnerProtection!,consecutiveBreaches:1,confirmingSince:observation.observedAt,
+          confirmationSource:observation.source,confirmationPool:observedPool,lastBreachAt:observation.observedAt};
+        confirmedRunnerExit=next.runnerProtection!.consecutiveBreaches>=policy.protectionExitConfirmations!;
+        runnerAwaitingConfirmation=next.runnerProtection!.consecutiveBreaches>0&&!confirmedRunnerExit;
+      }else{
       const continuing=!longGap&&state.runnerProtection.consecutiveBreaches>0;
       const consecutiveBreaches=continuing?state.runnerProtection.consecutiveBreaches+1:1;
       next.runnerProtection={...next.runnerProtection!,consecutiveBreaches,
         confirmingSince:continuing?state.runnerProtection.confirmingSince:observation.observedAt};
       confirmedRunnerExit=consecutiveBreaches>=policy.protectionExitConfirmations!;
       runnerAwaitingConfirmation=!confirmedRunnerExit;
+      }
     }else{
-      const {confirmingSince:_cleared,...runner}=next.runnerProtection!;
+      const {confirmingSince:_cleared,confirmationSource:_source,confirmationPool:_pool,lastBreachAt:_breach,...runner}=next.runnerProtection!;
       next.runnerProtection={...runner,consecutiveBreaches:0};
     }
   }
   // Once the +100% stage has started a runner, an isolated breach advances
   // persisted confirmation state without selling it.
   // A profit stage on that sample still executes; a hard stop still exits immediately.
-  if(runnerAwaitingConfirmation&&!hardStop&&!stages.length)return {status:'observed',state:next,...common};
-  const protectionAction=runnerPolicy(policy)&&state.runnerProtection?confirmedRunnerExit:protectionHit;
+  if((preRunnerAwaitingConfirmation||runnerAwaitingConfirmation)&&!hardStop&&!deadlineReached&&!momentumStalled&&!stages.length)
+    return {status:'observed',state:next,...common};
+  const protectionAction=runnerPolicy(policy)&&state.runnerProtection?confirmedRunnerExit:
+    reliableRunnerPolicy(policy)?confirmedPreRunnerExit:protectionHit;
   if (!hardStop && !protectionAction && !deadlineReached && !momentumStalled && !stages.length) return {status: 'observed', state: next, ...common};
   const reasons: AdaptiveExitReason[] = [];
   let sellPctRemaining: number,stageGainsPct:number[]=[];
-  if (hardStop || protectionAction || deadlineReached || momentumStalled) {
-    reasons.push(hardStop ? 'HARD_STOP_OBSERVED' : protectionHit ? 'DYNAMIC_PROTECTION_OBSERVED' : deadlineReached ? deadline!.reason : 'MOMENTUM_STALLED_OBSERVED');
+  const retainHighMultipleTail=!hardStop&&protectionAction&&reliableRunnerPolicy(policy)&&
+    state.runnerProtection?.phase==='runner'&&peakGain>=policy.tailEligibilityPeakGainPct!;
+  if(retainHighMultipleTail){
+    reasons.push('DYNAMIC_PROTECTION_OBSERVED');
+    const target=policy.tailRetentionPctOfInitial!;
+    sellPctRemaining=Number(((1-target/next.remainingPctOfInitial)*100).toFixed(10));
+    next.remainingPctOfInitial=target;
+    next.runnerProtection={...next.runnerProtection!,phase:'tail',tailCreatedAt:observation.observedAt,
+      tailCreatedPeakPriceUsd:peak,consecutiveBreaches:0,confirmingSince:undefined,
+      confirmationSource:undefined,confirmationPool:undefined,lastBreachAt:undefined};
+  } else if (hardStop || protectionAction || deadlineReached || momentumStalled) {
+    reasons.push(hardStop ? 'HARD_STOP_OBSERVED' : protectionAction ? 'DYNAMIC_PROTECTION_OBSERVED' : deadlineReached ? deadline!.reason : 'MOMENTUM_STALLED_OBSERVED');
     sellPctRemaining = 100; next.remainingPctOfInitial = 0; next.shadowClosed = true;
   } else {
     reasons.push('PARTIAL_PROFIT_STAGE_OBSERVED');
@@ -573,7 +750,9 @@ export function stepAdaptiveExit(
       next.protectionPriceUsd=cycleProtection;
       next.runnerProtection={activatedAt:observation.observedAt,activationStageGainPct:policy.runnerActivationGainPct!,
         cyclePeakPriceUsd:observation.priceUsd,cyclePeakAt:observation.observedAt,
-        cycleProtectionPriceUsd:cycleProtection,consecutiveBreaches:0};
+        cycleProtectionPriceUsd:cycleProtection,consecutiveBreaches:0,
+        ...(reliableRunnerPolicy(policy)?{phase:'runner' as const}:{})};
+      delete next.preRunnerProtection;
     }
   }
   if (!hardStop && protection > protectionWithoutWallet) reasons.push('WALLET_NET_SELLING_TIGHTENED');

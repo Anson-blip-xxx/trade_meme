@@ -1960,17 +1960,23 @@
   function protectionPeakDisplay(item) {
     const closed=protectionReturns(item)?.status==='closed'&&numeric(item.remainingPct)===0;
     const strategy=protectionStrategyPeak(item),observed=numeric(item.peakGainPct);
-    const laterHigh=closed&&finite(observed)&&finite(strategy.gainPct)&&observed>strategy.gainPct+1e-8;
-    return {closed,strategy,observed,
-      observationLabel:closed?'退出后继续观察的档案峰值':'观察档案累计峰值',
-      observationHint:closed
-        ?`${laterHigh?'已记录退出后的更高报价；':'包含退出后的报价；'}跨池连续性未验证，不可直接视为可实现收益`
-        :'跨池连续性未验证，仅为报价档案最大值'};
+    return {closed,strategy,observed};
+  }
+  function protectionPostExitObservation(item) {
+    const peak=protectionPeakDisplay(item);
+    if(!peak.closed)return;
+    const node=el('section','protection-post-exit');
+    const heading=el('div','protection-post-exit-heading');
+    heading.append(el('h4','','退出后追踪'),badge('已无模拟仓位','neutral'));
+    const values=el('div','protection-post-exit-values');
+    values.append(protectionMetric('退出后追踪最高涨幅',percent(peak.observed),'全程行情档案最高值，不是策略持有收益',finite(peak.observed)?peak.observed<0?'negative':'positive':''),protectionMetric('最近市场样本涨幅',percent(numeric(item.gainPct)),'仅用于复盘退出后的市场走势',finite(numeric(item.gainPct))?numeric(item.gainPct)<0?'negative':'positive':''));
+    node.append(heading,values,el('p','','策略已清仓，这里的报价发生在无模拟仓位的追踪阶段。它不能回写权益最终收益，也不表示策略曾持有到该高点。'));
+    return node;
   }
   function protectionReturnCell(item) {
     const value=protectionReturns(item),cell=el('td','protection-return-cell');
     const closed=value?.status==='closed'&&value.remainingPctOfInitial===0&&finite(value.finalGainPct);
-    const label=closed?'最终收益（模拟）':value?.status==='open'?'合计收益（模拟）':'收益暂不可核算';
+    const label=closed?'权益最终收益（冻结）':value?.status==='open'?'当前权益收益（模拟）':'收益暂不可核算';
     const total=closed?value.finalGainPct:value?.status==='open'?value.totalGainPct:undefined;
     cell.append(el('strong','protection-return-label',label),gainNode(total));
     if(value?.status==='open'){
@@ -1979,7 +1985,7 @@
     }else if(closed){
       cell.append(el('small','protection-row-note',`全部模拟退出 ${date(value.closedAt,true)}`));
       const strategyPeak=protectionStrategyPeak(item).gainPct;
-      if(finite(strategyPeak))cell.append(el('small','protection-row-note',`策略退出前币价峰值 ${percent(strategyPeak)} · 与最终收益分开核算`));
+      if(finite(strategyPeak))cell.append(el('small','protection-row-note',`退出前策略峰值 ${percent(strategyPeak)} · 币价口径`));
     }
     else cell.append(el('small','protection-row-note','退出记录不足或校验未通过，未知不记为零'));
     cell.append(el('small','protection-row-note','按初始本金 · 未扣费用滑点'));return cell;
@@ -1992,10 +1998,10 @@
     }
     const closed=value.status==='closed'&&value.remainingPctOfInitial===0&&finite(value.finalGainPct),grid=el('div','protection-return-grid'),strategyPeak=protectionStrategyPeak(item).gainPct;
     const metric=(label,amount,hint)=>protectionMetric(label,percent(amount),hint,finite(amount)?amount<0?'negative':'positive':'');
-    if(finite(strategyPeak))grid.append(metric(closed?'策略退出前币价峰值':'策略当前币价峰值',strategyPeak,closed?'退出时冻结的模型峰值；不是最终收益':'策略仍在跟踪；不是已获得收益'));
-    grid.append(metric('已实现收益（模拟）',value.realizedGainPct,'逐次退出的收益贡献相加'),metric('剩余浮动收益（模拟）',value.unrealizedGainPct,closed?'模拟仓位已全部退出':finite(value.unrealizedGainPct)?`采用样本 ${date(value.valuationAt,true)}`:'等待新的有效报价'),metric(closed?'最终收益（模拟）':'合计收益（模拟）',closed?value.finalGainPct:value.totalGainPct,closed?`已冻结于 ${date(value.closedAt,true)}`:'已实现 + 剩余浮动，尚非最终收益'));
+    if(finite(strategyPeak))grid.append(metric(closed?'退出前策略峰值（币价）':'策略当前峰值（币价）',strategyPeak,closed?'清仓时冻结；与权益收益分开核算':'策略仍在跟踪；不是已获得收益'));
+    grid.append(metric('已实现收益（模拟）',value.realizedGainPct,'逐次退出的收益贡献相加'),metric('剩余浮动收益（模拟）',value.unrealizedGainPct,closed?'模拟仓位已全部退出':finite(value.unrealizedGainPct)?`采用样本 ${date(value.valuationAt,true)}`:'等待新的有效报价'),metric(closed?'权益最终收益（冻结）':'当前权益收益（模拟）',closed?value.finalGainPct:value.totalGainPct,closed?`清仓时冻结于 ${date(value.closedAt,true)}`:'已实现 + 剩余浮动，尚非最终收益'));
     node.append(grid,el('p','','均按模拟初始本金计算：每次退出的初始仓位比例 × 该次样本价格涨跌幅，再加剩余仓位的浮动收益。不含费用、滑点与税费，不是实盘成交利润。'));
-    if(closed)node.append(el('p','protection-result-boundary','最终模拟收益在全部退出时冻结。退出后继续采到的报价和新高属于观察对照，不能回写策略结果，也不能直接当作本应获得的收益。'));
+    if(closed)node.append(el('p','protection-result-boundary','权益最终收益在全部退出时冻结。退出后新高属于无仓位行情追踪，不能回写策略结果，也不表示策略曾持有到该高点。'));
     if(Array.isArray(value.exits)&&value.exits.length){
       const fold=el('details','protection-return-exits');fold.append(el('summary','',`分批退出明细 · ${value.exits.length} 次`));
       const list=el('ol','protection-event-list');
@@ -2061,13 +2067,15 @@
     const actions = el('div', 'protection-card-actions');
     actions.append(badge(...protectionPhase(item)), gmgnTokenLink(item.chain, item.address));
     header.append(identity, actions); card.append(header, addressNode(item.address, 'detail-address'));
-    const data = el('div', 'protection-value-grid'); const gain = numeric(item.gainPct), peakDisplay=protectionPeakDisplay(item);
-    data.append(protectionMetric('最近观察样本涨幅', percent(gain), peakDisplay.closed?'模拟退出后仍继续观察；不改写最终收益':'相对影子基准，非持仓收益', finite(gain) ? gain < 0 ? 'negative' : 'positive' : ''), protectionMetric(peakDisplay.observationLabel, percent(peakDisplay.observed), peakDisplay.observationHint, finite(peakDisplay.observed) ? peakDisplay.observed < 0 ? 'negative' : 'positive' : ''), protectionMetric(item.protectionActive === false ? '基础止损线（影子）' : '已锁定动态保护线', usd(item.protectionPriceUsd), finite(numeric(item.protectionGainPct)) ? `相对基准 ${percent(numeric(item.protectionGainPct))}` : '尚无有效保护线', 'protection-line-value'), protectionMetric('模拟剩余比例', plainPercent(numeric(item.remainingPct)), '相对模拟初始仓位，非真实持仓'));
+    const data = el('div', 'protection-value-grid'); const gain = numeric(item.gainPct), peakDisplay=protectionPeakDisplay(item),strategyPeak=peakDisplay.strategy.gainPct;
+    data.append(protectionMetric(peakDisplay.closed?'退出前策略峰值':'策略当前峰值',percent(strategyPeak),peakDisplay.closed?'清仓时冻结的币价峰值':'策略持有阶段的币价峰值',finite(strategyPeak)?strategyPeak<0?'negative':'positive':''),protectionMetric(item.protectionActive === false ? '基础止损线（影子）' : '已锁定动态保护线', usd(item.protectionPriceUsd), finite(numeric(item.protectionGainPct)) ? `相对基准 ${percent(numeric(item.protectionGainPct))}` : '尚无有效保护线', 'protection-line-value'), protectionMetric('模拟剩余比例', plainPercent(numeric(item.remainingPct)), peakDisplay.closed?'已清仓；后续报价不再属于持仓':'相对模拟初始仓位，非真实持仓'));
+    if(!peakDisplay.closed)data.prepend(protectionMetric('最近策略样本涨幅',percent(gain),'相对影子基准，非实盘收益',finite(gain)?gain<0?'negative':'positive':''));
     card.append(protectionReturnDetail(item),data);
+    const postExit=protectionPostExitObservation(item);if(postExit)card.append(postExit);
     const prices = el('div', 'protection-price-grid'),effectiveDrawdown=protectionEffectiveDrawdown(item);
-    prices.append(kv('模拟基准价', usd(item.baselinePriceUsd)), kv('最新观察样本价', usd(item.latestPriceUsd)), kv('观察档案累计峰值价', usd(item.peakPriceUsd)), kv('跟踪启动涨幅', percent(numeric(item.activationGainPct))), kv('策略本轮计算回撤', plainPercent(numeric(item.trailPct))),kv('已锁定保护线有效回撤',finite(effectiveDrawdown)?plainPercent(effectiveDrawdown):'—'));
+    prices.append(kv('模拟基准价', usd(item.baselinePriceUsd)), kv(peakDisplay.closed?'退出后最近市场样本价':'最新策略样本价', usd(item.latestPriceUsd)), kv(peakDisplay.closed?'退出后追踪最高报价':'策略当前峰值价', usd(item.peakPriceUsd)), kv('跟踪启动涨幅', percent(numeric(item.activationGainPct))), kv('策略本轮计算回撤', plainPercent(numeric(item.trailPct))),kv('已锁定保护线有效回撤',finite(effectiveDrawdown)?plainPercent(effectiveDrawdown):'—'));
     if (finite(peakDisplay.strategy.gainPct)) prices.append(kv(peakDisplay.closed ? '策略退出前币价峰值' : '策略当前币价峰值', percent(peakDisplay.strategy.gainPct)));
-    card.append(prices, el('p', 'protection-window-note', '“策略本轮计算回撤”是本轮规则允许的峰值回撤；“已锁定保护线有效回撤”按策略峰值到只升不降的保护线计算，可能更紧。观察档案峰值会继续吸收退出后的报价，且未验证跨池连续性，不能与冻结的最终模拟收益直接比较。'));
+    card.append(prices, el('p', 'protection-window-note', peakDisplay.closed?'“退出前策略峰值”和“权益最终收益”在清仓时冻结；“退出后追踪最高涨幅”只记录无仓位行情，三者不可混为实际持有结果。':'“策略本轮计算回撤”是规则允许的峰值回撤；“已锁定保护线有效回撤”按策略峰值到只升不降的保护线计算，可能更紧。'));
     card.append(protectionExitPlan(item),protectionPriceRoute(item));
     const health = el('div', `protection-health ${item.health === 'fresh' ? 'fresh' : 'attention'}`);
     const healthLabel = {fresh:'模型最近采用的样本正常',stale:'模型样本已延迟',unavailable:'模型等待新行情样本'}[item.health] || '模型样本状态未知';
@@ -2100,7 +2108,7 @@
     const container = $('protection-items'); const openEvents = new Set([...container.querySelectorAll('details[data-protection-id][open]')].map(item => item.dataset.protectionId)); container.replaceChildren();
     text('protection-total', count(status.positions)); text('protection-active', count(status.active)); text('protection-triggered', count(status.triggered)); text('protection-stale', count(status.stale)); text('protection-count', count(state.listPages.protection.total));
     const marker = $('protection-status-badge'); marker.className = `badge ${data?.enabled ? 'watch' : 'neutral'}`; marker.textContent = data ? data.enabled ? '仅影子验证' : '影子验证未启用' : '正在读取';
-    const policyHint=data?.policyVersion==='adaptive-shadow-v4'?' · 翻倍先减半 / 尾仓连续两次越线退出':data?.policyVersion==='adaptive-shadow-v3'?' · 无固定持有时限 / 按行情持续保护':'';
+    const policyHint=data?.policyVersion==='adaptive-shadow-v5'?' · -60%硬止损 / 翻倍减半 / 高倍尾仓二次启动保护':data?.policyVersion==='adaptive-shadow-v4'?' · 翻倍先减半 / 尾仓连续两次越线退出':data?.policyVersion==='adaptive-shadow-v3'?' · 无固定持有时限 / 按行情持续保护':'';
     text('protection-policy-note', `策略版本 ${scalar(data?.policyVersion)}${policyHint} · 影子研究，实盘规则另见订单`);
     $('protection-price-router').replaceChildren(priceRouterSummary(data?.priceRouter));
     text('protection-history-note', status.historyComplete === true ? '启用后成功获取的原始报价逐条保留；采样间隔内的行情仍未知。' : status.historyComplete === false ? '原始报价存档存在缺失，请结合记录异常复核。' : '原始采样保存状态尚未确认。');
@@ -2124,15 +2132,16 @@
   function renderProtectionRows(container, items) {
     if (!items.length) return;
     const scroll = el('div','table-scroll'), table = el('table','protection-table'), head = el('thead'), header = el('tr');
-    for (const label of ['代币 / 所属链','退出状态 / 剩余','策略退出结果（模拟毛收益）','最近观察样本涨幅','观察档案累计峰值','已锁定保护线','当前行情来源 / 时效','操作']) header.append(el('th','',label)); head.append(header); table.append(head); const body = el('tbody');
+    for (const label of ['代币 / 所属链','退出状态 / 剩余','策略权益收益（模拟毛收益）','退出前策略峰值','退出后追踪最高涨幅','最近行情样本','已锁定保护线','当前行情来源 / 时效','操作']) header.append(el('th','',label)); head.append(header); table.append(head); const body = el('tbody');
     for (const item of items) {
-      const row = el('tr'), token = el('td'); token.append(el('strong','',item.symbol || item.name || '未命名代币'), el('div','token-meta',chainName(item.chain)), addressNode(item.address)); row.append(token);
-      const status = el('td'); status.append(badge(...protectionPhase(item)),el('p','protection-row-remaining',`模拟剩余 ${plainPercent(numeric(item.remainingPct))}`),el('small','protection-row-note','初始仓位口径 · 未执行交易'));if(item.exitPlan?.intent?.reason&&!(protectionContinuous(item)&&protectionTimeExit(item.exitPlan.intent.reason)))status.append(el('small','protection-row-reason',protectionReason(item.exitPlan.intent.reason)));row.append(status);
-      row.append(protectionReturnCell(item));
-      const latest=el('td','numeric');latest.append(gainNode(numeric(item.gainPct)));if(protectionPeakDisplay(item).closed)latest.append(el('small','protection-row-note','退出后观察 · 不改写最终收益'));row.append(latest);
-      const observed=el('td','numeric'),peakDisplay=protectionPeakDisplay(item);observed.append(gainNode(peakDisplay.observed),el('small','protection-row-note',peakDisplay.closed?'含退出后报价 · 跨池连续性未验证':'跨池连续性未验证'));row.append(observed);
-      const line=el('td','numeric');line.append(el('span','',usd(item.protectionPriceUsd)));const effective=protectionEffectiveDrawdown(item);line.append(el('small','protection-row-note',`计算回撤 ${plainPercent(numeric(item.trailPct))} · 有效回撤 ${finite(effective)?plainPercent(effective):'—'}`));row.append(line);const quote=el('td','protection-quote-cell');quote.append(protectionPriceRoute(item,true),el('small','protection-row-note',`模型样本 ${date(item.lastPriceAt,true)}`));row.append(quote);
-      const actions = el('td'), detail = el('button','text-button','保护详情 ↗'); detail.type='button'; detail.addEventListener('click',()=>openDetail(item.id,detail,{protection:true})); actions.append(gmgnTokenLink(item.chain,item.address),detail); row.append(actions); body.append(row);
+      const row = el('tr','protection-row'), token = el('td');token.dataset.label='代币 / 所属链';token.append(el('strong','',item.symbol || item.name || '未命名代币'), el('div','token-meta',chainName(item.chain)), addressNode(item.address)); row.append(token);
+      const status = el('td');status.dataset.label='退出状态 / 剩余';status.append(badge(...protectionPhase(item)),el('p','protection-row-remaining',`模拟剩余 ${plainPercent(numeric(item.remainingPct))}`),el('small','protection-row-note','初始仓位口径 · 未执行交易'));if(item.exitPlan?.intent?.reason&&!(protectionContinuous(item)&&protectionTimeExit(item.exitPlan.intent.reason)))status.append(el('small','protection-row-reason',protectionReason(item.exitPlan.intent.reason)));row.append(status);
+      const returns=protectionReturnCell(item);returns.dataset.label='策略权益收益';row.append(returns);
+      const peakDisplay=protectionPeakDisplay(item),strategy=el('td','numeric');strategy.dataset.label='退出前策略峰值';strategy.append(gainNode(peakDisplay.strategy.gainPct),el('small','protection-row-note',peakDisplay.closed?'清仓时冻结 · 币价口径':'当前策略持有阶段'));row.append(strategy);
+      const observed=el('td','numeric');observed.dataset.label='退出后追踪最高涨幅';if(peakDisplay.closed)observed.append(gainNode(peakDisplay.observed),el('small','protection-row-note','已无模拟仓位 · 非策略收益'));else observed.append(el('span','','—'),el('small','protection-row-note','尚未退出，不适用'));row.append(observed);
+      const latest=el('td','numeric');latest.dataset.label='最近行情样本';latest.append(gainNode(numeric(item.gainPct)),el('small','protection-row-note',peakDisplay.closed?'退出后市场观察':'策略仍在持有阶段'));row.append(latest);
+      const line=el('td','numeric');line.dataset.label='已锁定保护线';line.append(el('span','',usd(item.protectionPriceUsd)));const effective=protectionEffectiveDrawdown(item);line.append(el('small','protection-row-note',`计算回撤 ${plainPercent(numeric(item.trailPct))} · 有效回撤 ${finite(effective)?plainPercent(effective):'—'}`));row.append(line);const quote=el('td','protection-quote-cell');quote.dataset.label='行情来源 / 时效';quote.append(protectionPriceRoute(item,true),el('small','protection-row-note',`模型样本 ${date(item.lastPriceAt,true)}`));row.append(quote);
+      const actions = el('td');actions.dataset.label='操作';const detail = el('button','text-button','保护详情 ↗'); detail.type='button'; detail.addEventListener('click',()=>openDetail(item.id,detail,{protection:true})); actions.append(gmgnTokenLink(item.chain,item.address),detail); row.append(actions); body.append(row);
     }
     table.append(body); scroll.append(table); container.append(scroll);
   }
@@ -2431,8 +2440,9 @@
     if(data.meme?.marketSampleCallbackError)runtime.append(el('p','detail-message detail-error','行情已采集，但复盘复用写入失败；新样本覆盖可能缺失。'));
     const protection = data.exitProtection || {};
     policy.append(kv('动态止盈保护', protection.enabled ? '影子研究 · 不发送卖单' : '影子研究未启用'), kv('GMGN 条件保护', '按订单回读状态核验'), kv('影子策略版本', protection.policyVersion), kv('影子观察对象 / 触发建议', `${count(protection.status?.positions)} / ${count(protection.status?.triggered)}`));
-    if(['adaptive-shadow-v3','adaptive-shadow-v4'].includes(protection.policyVersion))policy.append(kv('持有时限','无固定持有时限 / 按行情持续保护'));
+    if(['adaptive-shadow-v3','adaptive-shadow-v4','adaptive-shadow-v5'].includes(protection.policyVersion))policy.append(kv('持有时限','无固定持有时限 / 按行情持续保护'));
     if(protection.policyVersion==='adaptive-shadow-v4')policy.append(kv('V4 runner treatment','翻倍模拟卖出 50%并重置保护；连续两个新鲜样本越线才清尾仓'));
+    if(protection.policyVersion==='adaptive-shadow-v5')policy.append(kv('V5 runner treatment','翻倍模拟卖出 50%；同池同源新鲜报价两次越线；峰值达到 +500% 才保留初始 10% 尾仓，旧峰再涨 50% 后重启保护；隔离单点极端报价'));
     if (protection.captureError) policy.append(el('p', 'detail-message detail-error', `影子保护记录异常：${protectionReason(protection.captureError)}`));
     const caps = Array.isArray(settings.caps) ? settings.caps : [];
     if (caps.length) for (const cap of caps) { const fraction=cap.sizing==='balance_fraction'&&finite(cap.balanceBps);policy.append(kv(`${chainName(cap.chain)} · 单笔上限`, fraction?`原生币总余额 × ${count(cap.balanceBps/100)}%`:`${scalar(cap.maxPerOrder)} ${scalar(cap.symbol, chainSymbols[cap.chain] || '')}`), kv(`${chainName(cap.chain)} · 费用预留`, `${scalar(cap.feeReserve)} ${scalar(cap.symbol, chainSymbols[cap.chain] || '')}`));if(fraction)policy.append(el('p','policy-caption','按该链交易钱包原生币总余额计算比例，并受手续费预留及未结算订单占用后的可用金额限制；提交前再次核验。')); }

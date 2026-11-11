@@ -4,7 +4,7 @@ import {mkdirSync,chmodSync,statSync} from 'node:fs';
 import {dirname} from 'node:path';
 import {randomUUID} from 'node:crypto';
 import bs58 from 'bs58';
-import {ADAPTIVE_SHADOW_V1,ADAPTIVE_SHADOW_V2,ADAPTIVE_SHADOW_V3,ADAPTIVE_SHADOW_V4,adaptiveExitPolicy,adaptiveExitDeadline,migrateAdaptiveExitToV3,stepAdaptiveExit,type AdaptiveExitState,type WalletPressure} from './adaptive-exit.js';
+import {ADAPTIVE_SHADOW_V1,ADAPTIVE_SHADOW_V2,ADAPTIVE_SHADOW_V3,ADAPTIVE_SHADOW_V4,ADAPTIVE_SHADOW_V5,adaptiveExitPolicy,adaptiveExitDeadline,migrateAdaptiveExitToV3,stepAdaptiveExit,type AdaptiveExitState,type WalletPressure} from './adaptive-exit.js';
 import type {Chain} from './types.js';
 import type {ScanPrice,ScanToken} from './scan-archive.js';
 import {shadowReturn} from './exit-shadow-return.js';
@@ -22,12 +22,18 @@ export interface ShadowEvent {
   priceUsd?:number;protectionPriceUsd?:number;remainingPct?:number;peakPriceUsd?:number;
   policyVersion?:string;previousPolicyVersion?:string;effectiveAt?:string;dueAt?:string;
   reasons?:string[];stageGainsPct?:number[];
+  source?:string;poolAddress?:string;
 }
+interface ShadowPriceQuarantine {
+  basePriceUsd:number;candidatePriceUsd:number;direction:'up'|'down';observedAt:string;source:string;poolAddress?:string;
+}
+type ShadowQuarantineDecision='accept'|'accept_and_clear'|'quarantined';
 export interface ShadowExitIntent {
   requestedAt:string;dueAt:string;reason:string;sellPctRemaining:100;remainingPctOfInitial:number;
   peakPriceUsd:number;policyVersion:string;observedAt?:string;observedPriceUsd?:number;cancelledAt?:string;cancelReason?:string;
 }
-const continuousPolicy=(version:string)=>version===ADAPTIVE_SHADOW_V2.version||version===ADAPTIVE_SHADOW_V3.version||version===ADAPTIVE_SHADOW_V4.version;
+const continuousPolicy=(version:string)=>version===ADAPTIVE_SHADOW_V2.version||version===ADAPTIVE_SHADOW_V3.version||
+  version===ADAPTIVE_SHADOW_V4.version||version===ADAPTIVE_SHADOW_V5.version;
 const timeExitReason=(reason:string)=>reason==='MAX_HOLDING_TIME_OBSERVED'||reason==='OBSERVATION_WINDOW_END_OBSERVED';
 const stamp=(value:unknown):value is string=>typeof value==='string'&&/^\d{4}-\d\d-\d\dT/.test(value)&&Number.isFinite(Date.parse(value));
 const clean=(value:unknown,max=80)=>typeof value==='string'?value.replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g,' ').trim().slice(0,max):undefined;
@@ -81,6 +87,7 @@ export class ExitShadow {
       CREATE TABLE IF NOT EXISTS exit_shadow_exit_intents(position_id TEXT PRIMARY KEY,data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS exit_shadow_policy_history(position_id TEXT NOT NULL,effective_at TEXT NOT NULL,
         previous_policy TEXT NOT NULL,policy TEXT NOT NULL,previous_state TEXT NOT NULL,PRIMARY KEY(position_id,effective_at));
+      CREATE TABLE IF NOT EXISTS exit_shadow_price_quarantine(position_id TEXT PRIMARY KEY,data TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS exit_shadow_open ON exit_shadow_positions(phase,last_price_at,id);`);
     this.db.exec(`CREATE INDEX IF NOT EXISTS exit_shadow_quality_closed_at
       ON exit_shadow_positions(json_extract(state,'$.lastObservedAt') DESC,id) WHERE phase='triggered';`);
@@ -115,24 +122,30 @@ export class ExitShadow {
     const at=new Date(price.observedAt).toISOString();
     let previous=this.current(target);
     if(previous&&at<=previous.last_price_at)return;
-    if(previous&&(JSON.parse(previous.state).shadowClosed||!continuousPolicy(JSON.parse(previous.state).policyVersion))&&Date.parse(previous.ends_at)<=now.getTime()&&seed&&seed.candidateId!==previous.candidate_id&&
-      stamp(seed.eligibleAt)&&Date.parse(seed.eligibleAt)>Date.parse(previous.eligible_at))previous=undefined;
+    let state:AdaptiveExitState|undefined;
+    if(previous)try{state=JSON.parse(previous.state) as AdaptiveExitState;}catch{this.fail('EXIT_SHADOW_STATE_INVALID');}
+    if(previous&&(state!.shadowClosed||!continuousPolicy(state!.policyVersion))&&Date.parse(previous.ends_at)<=now.getTime()&&seed&&seed.candidateId!==previous.candidate_id&&
+      stamp(seed.eligibleAt)&&Date.parse(seed.eligibleAt)>Date.parse(previous.eligible_at)){previous=undefined;state=undefined;}
     if(!previous&&(!seed||!stamp(seed.eligibleAt)||!stamp(seed.endsAt)||Date.parse(seed.eligibleAt)>Date.parse(at)||
       Date.parse(seed.endsAt)<=now.getTime()||typeof seed.candidateId!=='string'||! /^[A-Za-z0-9_-]{1,200}$/.test(seed.candidateId)))return;
     // A finished observation is not silently reopened for the same old candidate.
-    const state=previous?JSON.parse(previous.state) as AdaptiveExitState:undefined;
     if(previous&&state&&!continuousPolicy(state.policyVersion)&&
       (previous.phase==='ended'||Date.parse(previous.ends_at)<=now.getTime()))return;
     // Preserve all previous samples; only future comparison ticks after simulated closure are capped.
     if(previous&&state?.shadowClosed&&Date.parse(at)-Date.parse(previous.last_price_at)<60_000)return;
     // A failed deployment migration must never resume a retired time-exit policy.
-    if(state&&!state.shadowClosed&&state.policyVersion!==ADAPTIVE_SHADOW_V3.version&&state.policyVersion!==ADAPTIVE_SHADOW_V4.version)
+    if(state&&!state.shadowClosed&&state.policyVersion!==ADAPTIVE_SHADOW_V3.version&&state.policyVersion!==ADAPTIVE_SHADOW_V4.version&&
+      state.policyVersion!==ADAPTIVE_SHADOW_V5.version)
       this.fail('EXIT_SHADOW_POLICY_MIGRATION_REQUIRED');
-    // Version selection is forward-only: existing v3 episodes retain their
-    // original rules, while only newly admitted episodes start on v4.
-    const policy=state?adaptiveExitPolicy(state.policyVersion):ADAPTIVE_SHADOW_V4;
+    // Version selection is forward-only: existing episodes retain their exact
+    // rules, while only newly admitted episodes start on V5.
+    const policy=state?adaptiveExitPolicy(state.policyVersion):ADAPTIVE_SHADOW_V5;
     if(!policy)this.fail('EXIT_SHADOW_STATE_INVALID');
-    const observation={...target,priceUsd:price.priceUsd,observedAt:at,evaluatedAt:now.toISOString(),source:price.source,metadata:evidence,...(!previous?{observationEndsAt:seed!.endsAt}:{})};
+    const pool=poolAddress(price);
+    const quarantine=previous?this.quarantineExtreme(previous,state!,price.source,pool,evidence,price.priceUsd,at):'accept';
+    if(quarantine==='quarantined')return;
+    const observation={...target,priceUsd:price.priceUsd,observedAt:at,evaluatedAt:now.toISOString(),source:price.source,
+      metadata:evidence,...(pool?{poolAddress:pool}:{}),...(!previous?{observationEndsAt:seed!.endsAt}:{})};
     const result=stepAdaptiveExit(state,observation,pressure,policy);
     if(result.status==='ignored'&&result.ignoredReason!=='SHADOW_CLOSED') {
       if(!['DUPLICATE_SAMPLE','TIME_REGRESSED','PRICE_STALE','PRICE_FROM_FUTURE'].includes(result.ignoredReason??''))
@@ -162,6 +175,8 @@ export class ExitShadow {
         const inserted=this.db.prepare('INSERT OR IGNORE INTO exit_shadow_samples VALUES (?,?,?,?,?)')
           .run(id,at,price.priceUsd,price.source,JSON.stringify(context));
         if(!Number(inserted.changes)){this.db.exec('COMMIT');return;}
+        if(quarantine==='accept_and_clear')
+          this.db.prepare('DELETE FROM exit_shadow_price_quarantine WHERE position_id=?').run(id);
         this.db.prepare(`INSERT INTO exit_shadow_metrics(position_id,peak_price,max_gap_sec,last_source) VALUES (?,?,?,?)
           ON CONFLICT(position_id) DO UPDATE SET peak_price=MAX(peak_price,excluded.peak_price),
           max_gap_sec=MAX(max_gap_sec,excluded.max_gap_sec),last_source=excluded.last_source`)
@@ -228,12 +243,13 @@ export class ExitShadow {
     for(const row of rows){
       const old=JSON.parse(row.state) as AdaptiveExitState;
       if(old.shadowClosed||old.policyVersion===ADAPTIVE_SHADOW_V1.version&&Date.parse(row.ends_at)<=now.getTime())continue;
-      // V4 is a later forward-only policy. This legacy migration must never
+      // Later policies are forward-only. This legacy migration must never
       // downgrade it when the process restarts.
-      if(old.policyVersion===ADAPTIVE_SHADOW_V4.version)continue;
+      if(old.policyVersion===ADAPTIVE_SHADOW_V4.version||old.policyVersion===ADAPTIVE_SHADOW_V5.version)continue;
       const next=migrateAdaptiveExitToV3(old,now.toISOString()),intent=this.activeIntent(row.id);
       const cancel=!!(intent&&!intent.observedAt&&timeExitReason(intent.reason));
-      if(!next&&old.policyVersion!==ADAPTIVE_SHADOW_V3.version&&old.policyVersion!==ADAPTIVE_SHADOW_V4.version)
+      if(!next&&old.policyVersion!==ADAPTIVE_SHADOW_V3.version&&old.policyVersion!==ADAPTIVE_SHADOW_V4.version&&
+        old.policyVersion!==ADAPTIVE_SHADOW_V5.version)
         this.fail('EXIT_SHADOW_STATE_INVALID');
       if(!next&&!cancel)continue;
       const state=next??old;
@@ -271,10 +287,10 @@ export class ExitShadow {
     const rows=this.db.prepare(`SELECT chain,address,
         MIN(CASE WHEN error_at>last_price_at THEN error_at ELSE last_price_at END) AS oldest
       FROM exit_shadow_positions
-      WHERE (phase IN ('tracking','exit_pending') AND json_extract(state,'$.policyVersion') IN (?,?,?) AND json_extract(state,'$.shadowClosed')=0)
+      WHERE (phase IN ('tracking','exit_pending') AND json_extract(state,'$.policyVersion') IN (?,?,?,?) AND json_extract(state,'$.shadowClosed')=0)
         OR (phase='tracking' AND ends_at>? AND json_extract(state,'$.policyVersion')=?)
       GROUP BY chain,address ORDER BY oldest,chain,address LIMIT ?`).all(ADAPTIVE_SHADOW_V2.version,ADAPTIVE_SHADOW_V3.version,
-        ADAPTIVE_SHADOW_V4.version,now.toISOString(),ADAPTIVE_SHADOW_V1.version,take);
+        ADAPTIVE_SHADOW_V4.version,ADAPTIVE_SHADOW_V5.version,now.toISOString(),ADAPTIVE_SHADOW_V1.version,take);
     return rows.map(row=>({chain:row.chain as Chain,address:String(row.address)}));
   }
 
@@ -296,11 +312,11 @@ export class ExitShadow {
 
   summary(now=this.now()) {
     const at=now.toISOString(),cutoff=new Date(now.getTime()-this.staleMs).toISOString();
-    const counts=this.db.prepare(`SELECT count(*) AS positions,SUM(phase IN ('tracking','exit_pending') AND (ends_at>? OR json_extract(state,'$.policyVersion') IN ('adaptive-shadow-v2','adaptive-shadow-v3','adaptive-shadow-v4'))) AS active,
+    const counts=this.db.prepare(`SELECT count(*) AS positions,SUM(phase IN ('tracking','exit_pending') AND (ends_at>? OR json_extract(state,'$.policyVersion') IN ('adaptive-shadow-v2','adaptive-shadow-v3','adaptive-shadow-v4','adaptive-shadow-v5'))) AS active,
       SUM(phase='triggered') AS triggered,SUM(phase='exit_pending') AS pending,
-      SUM(phase IN ('tracking','exit_pending') AND (ends_at>? OR json_extract(state,'$.policyVersion') IN ('adaptive-shadow-v2','adaptive-shadow-v3','adaptive-shadow-v4')) AND (error IS NOT NULL OR last_price_at<?)) AS stale
+      SUM(phase IN ('tracking','exit_pending') AND (ends_at>? OR json_extract(state,'$.policyVersion') IN ('adaptive-shadow-v2','adaptive-shadow-v3','adaptive-shadow-v4','adaptive-shadow-v5')) AND (error IS NOT NULL OR last_price_at<?)) AS stale
       FROM exit_shadow_positions`).get(at,at,cutoff)!;
-    return {enabled:true,mode:'shadow' as const,liveReady:false,policyVersion:ADAPTIVE_SHADOW_V4.version,
+    return {enabled:true,mode:'shadow' as const,liveReady:false,policyVersion:ADAPTIVE_SHADOW_V5.version,
       status:{positions:Number(counts.positions),active:Number(counts.active??0),triggered:Number(counts.triggered??0),
         stale:Number(counts.stale??0),pending:Number(counts.pending??0),
         samples:this.sampleCount,events:this.eventCount,
@@ -376,6 +392,59 @@ export class ExitShadow {
   private current(value:ScanToken):ShadowRow|undefined {
     return this.db.prepare('SELECT * FROM exit_shadow_positions WHERE chain=? AND address=? ORDER BY started_at DESC,id LIMIT 1')
       .get(value.chain,value.address) as unknown as ShadowRow|undefined;
+  }
+  /** Keep isolated V5 quotes and post-exit archive spikes out of retained state and comparison metrics. */
+  private quarantineExtreme(row:ShadowRow,state:AdaptiveExitState,source:string,pool:string|undefined,evidence:ReturnType<typeof priceEvidence>,
+    candidatePriceUsd:number,observedAt:string):ShadowQuarantineDecision {
+    // V1-V4 active episodes retain their original input semantics. Closed
+    // episodes use bidirectional quarantine because both MAX peaks and the
+    // first 5/15/60-minute comparison quote feed the archived exit analysis.
+    const v5=state.policyVersion===ADAPTIVE_SHADOW_V5.version;
+    if(!v5&&!state.shadowClosed)return 'accept';
+    const threshold=ADAPTIVE_SHADOW_V5.outlierJumpRatio!,ratio=Math.max(candidatePriceUsd/row.last_price,row.last_price/candidatePriceUsd);
+    const stored=this.db.prepare('SELECT data FROM exit_shadow_price_quarantine WHERE position_id=?').get(row.id);
+    let pending:ShadowPriceQuarantine|undefined;
+    try {pending=stored?JSON.parse(String(stored.data)) as ShadowPriceQuarantine:undefined;}catch{this.fail('EXIT_SHADOW_STATE_INVALID');}
+    let clearOnAccept=false;
+    if(pending?.basePriceUsd!==row.last_price){pending=undefined;clearOnAccept=true;}
+    // A chain-observed pool quote is strong enough to authorize an immediate
+    // hard-stop path. Vendor crashes still require persistence so one corrupt
+    // point cannot manufacture a simulated rug; a pool-less vendor cannot
+    // confirm one by itself.
+    if(candidatePriceUsd<=row.last_price/threshold&&source==='chain_pool_sample'&&evidence){
+      return pending||clearOnAccept?'accept_and_clear':'accept';
+    }
+    const extreme=Number.isFinite(ratio)&&ratio>=threshold;
+    if(pending){
+      const persistent=pending.direction==='up'?candidatePriceUsd>=pending.basePriceUsd*threshold/2:
+        candidatePriceUsd<=pending.basePriceUsd*2/threshold;
+      const sameSourcePool=!!pool&&!!pending.poolAddress&&source===pending.source&&pool===pending.poolAddress;
+      const independentlyVerified=source==='chain_pool_sample'&&!!evidence;
+      const confirmationGapMs=Date.parse(observedAt)-Date.parse(pending.observedAt);
+      const confirmationInWindow=confirmationGapMs>=ADAPTIVE_SHADOW_V5.protectionConfirmationMinGapMs!&&
+        confirmationGapMs<=ADAPTIVE_SHADOW_V5.protectionConfirmationMaxGapMs!;
+      if(persistent&&confirmationInWindow&&(sameSourcePool||independentlyVerified)){
+        return 'accept_and_clear';
+      }
+      // Duplicated or out-of-order observations cannot advance evidence. Keep
+      // the original candidate so rapid retries cannot slide the time window.
+      if(persistent&&confirmationGapMs<ADAPTIVE_SHADOW_V5.protectionConfirmationMinGapMs!)return 'quarantined';
+      if(!persistent&&!extreme)return 'accept_and_clear';
+    }else if(!extreme)return clearOnAccept?'accept_and_clear':'accept';
+    const next:ShadowPriceQuarantine={basePriceUsd:row.last_price,candidatePriceUsd,
+      direction:candidatePriceUsd>row.last_price?'up':'down',observedAt,source,...(pool?{poolAddress:pool}:{})};
+    try {
+      if(this.bytes()+JSON.stringify(next).length*4+16384>this.maxBytes)this.fail('EXIT_SHADOW_CAPACITY_REACHED');
+      this.db.exec('BEGIN IMMEDIATE');try{
+        this.db.prepare('INSERT OR REPLACE INTO exit_shadow_price_quarantine VALUES (?,?)').run(row.id,JSON.stringify(next));
+        const event:ShadowEvent={at:observedAt,kind:'price_quarantined',reason:'EXTREME_PRICE_AWAITING_CONFIRMATION',
+          observationOnly:true,priceUsd:candidatePriceUsd,policyVersion:state.policyVersion,
+          source,...(pool?{poolAddress:pool}:{})};
+        const added=Number(this.db.prepare('INSERT INTO exit_shadow_events(position_id,at,data) VALUES (?,?,?)')
+          .run(row.id,observedAt,JSON.stringify(event)).changes);
+        this.db.exec('COMMIT');this.eventCount+=added;this.lastError=undefined;return 'quarantined';
+      }catch(error){this.db.exec('ROLLBACK');throw error;}
+    }catch(error){this.fail(error instanceof Error&&/^EXIT_SHADOW_[A-Z_]+$/.test(error.message)?error.message:'EXIT_SHADOW_WRITE_FAILED');}
   }
   private meta(key:string):string|undefined {const row=this.db.prepare('SELECT value FROM exit_shadow_meta WHERE key=?').get(key);return row?String(row.value):undefined;}
   private bytes():number {

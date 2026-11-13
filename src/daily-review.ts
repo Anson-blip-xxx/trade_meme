@@ -17,7 +17,11 @@ export interface ReviewNotification {chain:Chain;address:string;id:string;source
   marketCapTiming?:'event_snapshot'|'unverified';reportedWalletCount?:number;identifiedWalletCount?:number;}
 export interface ReviewPrice {chain:Chain;address:string;at:string;price:number;source:string;pool?:string;stage?:string;score?:number;assessedAt?:string;}
 export interface ReviewVendorPerformance {source:'ave'|'debot';reportedAt:string;firstSignalAt?:string;maxGainPct?:number;maxGainValue?:number;maxGainUnit?:'fractional_return'|'provider_display_ratio';display?:string;scope:'vendor_reported_retrospective';}
-export interface ReviewExecution {chain:Chain;address:string;at:string;mode:string;status:string;reason?:string;scanId?:string;decisionAt?:string;}
+export interface ReviewExecution {chain:Chain;address:string;at:string;mode:string;status:string;reason?:string;scanId?:string;decisionAt?:string;
+  /** Frozen at evaluation time. Future reviews must not rebuild this from a newer report. */
+  decisionSnapshot?:ReviewDecision;
+  /** Durable local denominator for evaluated signals after scan-table retention. */
+  notificationSnapshot?:ReviewNotification;}
 export interface ReviewInput {
   date:string;asOf:string;entryMode:string;notifications:ReviewNotification[];
   decisions:Array<ReviewDecision&{chain:Chain;address:string}>;prices:ReviewPrice[];
@@ -275,7 +279,7 @@ export function readDailyReviewInput(config:Config,date:string,asOf:string,revie
       json_extract(payload,'$.alertMarketCapUsd') alert_market_cap,json_extract(payload,'$.marketSnapshotAt') market_snapshot_at,
       json_extract(payload,'$.marketCapTiming') market_cap_timing,json_extract(payload,'$.walletCount') wallet_count,
       json_extract(payload,'$.addressCount') address_count,json_extract(payload,'$.vendorWalletCount') vendor_wallet_count
-      FROM ${name} WHERE observed_at<=? ORDER BY observed_at DESC LIMIT 50001`).all(asOf);
+      FROM ${name} WHERE observed_at>=? AND observed_at<=? ORDER BY observed_at DESC LIMIT 50001`).all(notificationHistoryFrom,asOf);
     if(rows.length>50000){out.datasetComplete=false;out.limitations.push(`${provider}通知读取达到上限，报告覆盖不完整。`);}
     for(const r of rows.slice(0,50000))out.notifications.push({chain:r.chain as Chain,address:String(r.address),source:provider,id:String(r.id),receivedAt:String(r.observed_at),occurredAt:String(r.occurred_at),state:String(r.state),reason:safe(r.reason),name:safe(r.name),symbol:safe(r.symbol),
       ...(positive(r.alert_price)!==undefined?{alertPriceUsd:positive(r.alert_price)}:{}),
@@ -293,20 +297,27 @@ export function readDailyReviewInput(config:Config,date:string,asOf:string,revie
   });
   withDb(config.dashboard.archivePath,'扫描和后续表现库',db=>{
     if(table(db,'scan_summaries'))retained(db,'scan_summaries','received_at','scans',10000);
+    if(table(db,'signal_followups'))retained(db,'signal_followups','registered_at','followups',20000,notificationHistoryFrom);
     const known=new Set(out.notifications.map(n=>`${n.source}:${key(n)}`));
-    for(const [name,limit] of [['scan_summaries',20000],['signal_followups',20000]] as const){
-      if(!table(db,name)||Number(db.prepare(`SELECT count(*) n FROM ${name}`).get()!.n)>limit){out.datasetComplete=false;out.limitations.push(`${name}覆盖缺失或达到读取上限，暂停更新采样计划。`);}
+    for(const name of ['scan_summaries','signal_followups'] as const)if(!table(db,name)){
+      out.datasetComplete=false;out.limitations.push(`${name}覆盖缺失，暂停更新采样计划。`);}
+    const evidenceEnd=new Date(Math.min(Date.parse(asOf),Date.parse(reportWindow.end)+DAY)).toISOString();
+    if(table(db,'scan_summaries')){const rows=db.prepare(`SELECT record FROM scan_summaries
+      WHERE received_at>=? AND received_at<=? ORDER BY received_at DESC LIMIT 20001`).all(notificationHistoryFrom,evidenceEnd);
+      if(rows.length>20000){out.datasetComplete=false;out.limitations.push('scan_summaries 在日报窗口内达到读取上限，覆盖不完整。');}
+      for(const row of rows.slice(0,20000)){const r=parse<ScanRecord>(row.record);if(!r||r.mode==='demo')continue;
+        if(!known.has(`${r.source}:${key(r)}`))out.notifications.push({chain:r.chain,address:r.address,source:r.source,id:r.id,receivedAt:r.receivedAt,occurredAt:r.occurredAt,name:r.name,symbol:r.symbol,state:r.status});
+        const d=decisionFromScan(r);if(d)out.decisions.push(d);
+      }
     }
-    if(table(db,'scan_summaries'))for(const row of db.prepare('SELECT record FROM scan_summaries WHERE received_at<=? ORDER BY received_at DESC LIMIT 20001').iterate(asOf)){
-      const r=parse<ScanRecord>(row.record);if(!r||r.mode==='demo')continue;
-      if(!known.has(`${r.source}:${key(r)}`))out.notifications.push({chain:r.chain,address:r.address,source:r.source,id:r.id,receivedAt:r.receivedAt,occurredAt:r.occurredAt,name:r.name,symbol:r.symbol,state:r.status});
-      const d=decisionFromScan(r);if(d)out.decisions.push(d);
-    }
-    if(table(db,'signal_followups'))for(const row of db.prepare('SELECT record FROM signal_followups WHERE registered_at<=? ORDER BY registered_at DESC LIMIT 20001').iterate(asOf)){
-      const r=parse<FollowupRecord>(row.record);if(!r)continue;
-      out.decisions.push({chain:r.chain,address:r.address,scanId:r.initial.scanId,decision:r.initial.decision,at:r.initial.evaluatedAt,policyVersion:r.initial.policyVersion,
-        reasons:codes(r.initial.reasons),checks:r.initial.checks,buyEligible:r.initial.buyEligible,frozen:true});
-      // Old followup chart points do not retain each point's pool; they cannot form a strict same-pool return series.
+    if(table(db,'signal_followups')){const rows=db.prepare(`SELECT record FROM signal_followups
+      WHERE registered_at>=? AND registered_at<=? ORDER BY registered_at DESC LIMIT 20001`).all(notificationHistoryFrom,evidenceEnd);
+      if(rows.length>20000){out.datasetComplete=false;out.limitations.push('signal_followups 在日报窗口内达到读取上限，覆盖不完整。');}
+      for(const row of rows.slice(0,20000)){const r=parse<FollowupRecord>(row.record);if(!r)continue;
+        out.decisions.push({chain:r.chain,address:r.address,scanId:r.initial.scanId,decision:r.initial.decision,at:r.initial.evaluatedAt,policyVersion:r.initial.policyVersion,
+          reasons:codes(r.initial.reasons),checks:r.initial.checks,buyEligible:r.initial.buyEligible,frozen:true});
+        // Old followup chart points do not retain each point's pool; they cannot form a strict same-pool return series.
+      }
     }
   });
   withDb(config.meme?.database,'独立行情观察库',db=>{
@@ -353,8 +364,9 @@ export function readDailyReviewInput(config:Config,date:string,asOf:string,revie
     }
     if(capped){out.datasetComplete=false;out.limitations.push('独立价格样本达到读取上限，保留覆盖不足标记。');}
   });
+  const evidenceEnd=new Date(Math.min(Date.parse(asOf),Date.parse(reportWindow.end)+DAY)).toISOString();
   withDb(config.ordersDatabase,'订单库',db=>{if(!table(db,'opening_orders')){out.limitations.push('订单表不可用，不能排除已有订单。');return;}
-    const rows=db.prepare('SELECT chain,token_address,created_at,status,mode FROM opening_orders WHERE created_at<=? ORDER BY created_at DESC LIMIT 100001').all(asOf);
+    const rows=db.prepare('SELECT chain,token_address,created_at,status,mode FROM opening_orders WHERE created_at>=? AND created_at<=? ORDER BY created_at DESC LIMIT 100001').all(notificationHistoryFrom,evidenceEnd);
     if(rows.length>100000){out.datasetComplete=false;out.limitations.push('订单记录读取达到上限，历史开单覆盖不完整。');}
     for(const r of rows.slice(0,100000))out.orders.push({chain:r.chain as Chain,address:String(r.token_address),at:String(r.created_at),status:String(r.status),mode:String(r.mode)});});
   withDb(reviewPath,'执行审计',db=>{
@@ -362,9 +374,11 @@ export function readDailyReviewInput(config:Config,date:string,asOf:string,revie
       const v=parse<Record<string,any>>(r.data);if(!v)continue;
       out.vendor.push({chain:r.chain as Chain,address:String(r.address),source:r.provider as 'ave'|'debot',reportedAt:String(r.reported_at),scope:'vendor_reported_retrospective',firstSignalAt:v.firstSignalAt,maxGainPct:typeof v.maxGainPct==='number'?v.maxGainPct:undefined,maxGainValue:typeof v.maxGainValue==='number'?v.maxGainValue:undefined,maxGainUnit:v.maxGainUnit,display:safe(v.maxGainDisplay)});
     }
-    if(table(db,'review_entry_attempts')){const rows=db.prepare('SELECT data FROM review_entry_attempts WHERE at<=? ORDER BY at DESC LIMIT 100001').all(asOf);
+    if(table(db,'review_entry_attempts')){const rows=db.prepare('SELECT data FROM review_entry_attempts WHERE at>=? AND at<=? ORDER BY at DESC LIMIT 100001').all(notificationHistoryFrom,evidenceEnd);
       if(rows.length>100000){out.datasetComplete=false;out.limitations.push('执行审计读取达到上限，历史跳过原因覆盖不完整。');}
-      for(const r of rows.slice(0,100000)){const v=parse<ReviewExecution>(r.data);if(v)out.executions.push(v);}
+      for(const r of rows.slice(0,100000)){const v=parse<ReviewExecution>(r.data);if(!v)continue;out.executions.push(v);
+        if(v.decisionSnapshot)out.decisions.push({...v.decisionSnapshot,chain:v.chain,address:v.address,frozen:true});
+        if(v.notificationSnapshot)out.notifications.push({...v.notificationSnapshot,chain:v.chain,address:v.address});}
     }});
   return out;
 }

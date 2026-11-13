@@ -10,12 +10,13 @@ export interface GmgnSourceResearchObservation {
 }
 export type SourceResearchObservation=AveSignalObservation|DebotSignalObservation|GmgnSourceResearchObservation;
 export interface SourceObservationResult {
-  sourceError?:string;memeError?:string;nominationError?:string;
+  sourceError?:string;memeError?:string;nominationError?:string;evolutionError?:string;
 }
 export interface SourceObservationRunnerOptions {
   source?:{database:string;maxBytes:number;maxEvents?:number};
   meme?:{database:string;activeWindowSec:number;chains:Chain[]};
   wallet?:{database:string;maxBytes:number};
+  evolution?:{database:string};
   capacity?:number;
   requestTimeoutMs?:number;
   /** Test-only worker delay; production leaves this unset. */

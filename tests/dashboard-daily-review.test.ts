@@ -79,3 +79,18 @@ test('unconfigured daily review returns a bounded empty page and still validates
     assert.equal((await fetch(`${f.base}/daily-review?date=2026-02-30`,{headers})).status,400);
   }finally{await f.close();}
 });
+
+test('strategy evolution endpoints are authenticated, read-only and strictly paginated',async()=>{
+  const calls:unknown[]=[],f=await fixture({strategyEvolution:{status:()=>({enabled:true,execution:'observation_only'}),
+    candidates:options=>{calls.push(options);return {...options,total:0,items:[],hasMore:false};}}});
+  try {
+    assert.equal((await fetch(`${f.base}/evolution/status`)).status,401);
+    assert.equal((await fetch(`${f.base}/evolution`,{method:'POST',headers})).status,405);
+    assert.deepEqual(await(await fetch(`${f.base}/evolution/status`,{headers})).json(),{enabled:true,execution:'observation_only'});
+    const page=await(await fetch(`${f.base}/evolution?limit=7&offset=14&chain=solana`,{headers})).json();
+    assert.deepEqual(calls,[{limit:7,offset:14,chain:'solana'}]);assert.equal(page.total,0);
+    for(const query of ['foo=1','limit=1&limit=2','chain=bsc&chain=solana','chain=ethereum'])
+      assert.equal((await fetch(`${f.base}/evolution?${query}`,{headers})).status,400,query);
+    assert.equal((await fetch(`${f.base}/evolution/status?x=1`,{headers})).status,400);
+  }finally{await f.close();}
+});

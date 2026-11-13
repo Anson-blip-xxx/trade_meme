@@ -113,7 +113,12 @@ test('entry-off result is audited without network or raw report secrets; sink fa
   assert.deepEqual(await entry.consider(report),{status:'skipped',reason:'ENTRY_DISABLED'});assert.equal(fetchMock.mock.callCount(),0);
   const db=new DatabaseSync(path,{readOnly:true});const rows=db.prepare('SELECT data FROM review_entry_attempts').all();db.close();
   assert.equal(rows.length,1);const serialized=String(rows[0].data);assert.equal(serialized.includes('SHOULD_NOT_PERSIST'),false);
-  assert.deepEqual(JSON.parse(serialized),{chain:'bsc',address,at,mode:'off',status:'skipped',reason:'ENTRY_DISABLED',scanId:'report-1',decisionAt:at});
+  const saved=JSON.parse(serialized);
+  assert.deepEqual({...saved,decisionSnapshot:undefined,notificationSnapshot:undefined},
+    {chain:'bsc',address,at,mode:'off',status:'skipped',reason:'ENTRY_DISABLED',scanId:'report-1',decisionAt:at,
+      decisionSnapshot:undefined,notificationSnapshot:undefined});
+  assert.deepEqual(saved.decisionSnapshot,{at,reasons:[],checks:{},frozen:true,scanId:'report-1'});
+  assert.deepEqual(saved.notificationSnapshot,{chain:'bsc',address});
   const broken=new EntryController(readConfig({ENTRY_MODE:'off'}),orders,client,{onDecision:()=>{throw new Error('AUDIT_FAILURE');}});
   assert.deepEqual(await broken.consider(report),{status:'skipped',reason:'ENTRY_DISABLED'});
 });

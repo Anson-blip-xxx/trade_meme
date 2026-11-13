@@ -6,6 +6,7 @@ import {WalletHistory} from './wallet-history.js';
 import type {SourceObservationResult,SourceObservationRunnerOptions,SourceResearchObservation} from './source-observation-runner.js';
 import type {AveSignalObservation} from './providers/ave-signals.js';
 import {createHash} from 'node:crypto';
+import {StrategyEvolutionSignalLedger} from './strategy-evolution-signals.js';
 
 const options=workerData as SourceObservationRunnerOptions;
 const source=options.source?new SourceCorroboration(options.source.database,
@@ -13,6 +14,8 @@ const source=options.source?new SourceCorroboration(options.source.database,
 const memeDb=options.meme?new DatabaseSync(options.meme.database):undefined;
 if(memeDb)memeDb.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;');
 const wallet=options.wallet?new WalletHistory(options.wallet.database,{maxBytes:options.wallet.maxBytes}):undefined;
+const evolution=options.evolution?new StrategyEvolutionSignalLedger(options.evolution.database):undefined;
+evolution?.prune();
 let stopping=false,tail=Promise.resolve();
 
 async function observe(observation:SourceResearchObservation):Promise<SourceObservationResult>{
@@ -38,12 +41,14 @@ async function observe(observation:SourceResearchObservation):Promise<SourceObse
       occurredAt:signal.occurredAt,observedAt:observation.observedAt,wallets:ave.vendorWallets??[]});
     result.nominationError=captured.reason;
   }catch{result.nominationError='WALLET_NOMINATION_CAPTURE_FAILED';}
+  if(evolution&&(signal.source==='debot'||signal.source==='ave'))try {evolution.record(observation);}
+  catch{result.evolutionError='STRATEGY_EVOLUTION_SIGNAL_CAPTURE_FAILED';}
   return result;
 }
 
 parentPort!.on('message',(message:{type?:string;id?:number;observation?:SourceResearchObservation})=>{
   if(message?.type==='stop'){
-    stopping=true;tail.finally(()=>{source?.close();memeDb?.close();wallet?.close();parentPort!.close();});return;
+    stopping=true;tail.finally(()=>{source?.close();memeDb?.close();wallet?.close();evolution?.close();parentPort!.close();});return;
   }
   if(stopping||message?.type!=='observe'||!Number.isSafeInteger(message.id)||!message.observation)return;
   const {id,observation}=message;

@@ -17,6 +17,8 @@ import {createRuntime} from './runtime.js';
 import {buildDashboard} from './dashboard.js';
 import {WalletHistoryDetailRunner} from './wallet-history-detail.js';
 import {reviewSamplingPath} from './daily-review.js';
+import {strategyEvolutionDatabasePath} from './strategy-evolution-signals.js';
+import {readStrategyEvolutionCandidates,readStrategyEvolutionStatus} from './strategy-evolution-reader.js';
 
 function send(res:ServerResponse,status:number,data:unknown) {res.writeHead(status,{'content-type':'application/json; charset=utf-8','cache-control':'no-store'});res.end(JSON.stringify(data,null,2));}
 function authorized(req:IncomingMessage,token:string):boolean {
@@ -150,6 +152,7 @@ if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href) {
     memeSamplingPlanPath:reviewSamplingPath(config.dashboard.archivePath),
     corroborationDatabase:runtime.sourceEvidence?config.corroboration?.database:undefined}):undefined;
   walletQueries?.start();
+  const evolutionPath=strategyEvolutionDatabasePath(config.dashboard.archivePath);
   const dashboard=config.dashboard.enabled&&runtime.archive?buildDashboard(config,{
     archive:runtime.archive,home:runtime.dashboardHome,overview:async()=>{
       const value=runtime.dashboardOverview();
@@ -158,7 +161,9 @@ if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href) {
       return {...current,meme:await walletQueries.getMemeStatus({now:new Date().toISOString(),status:current.meme})};
     },orders:runtime.dashboardOrders,
     signalCountingPage:runtime.signalCountingPage,signalCountingControl:runtime.signalCountingControl,
-    dailyReview:options=>runtime.dailyReview?.page(options),
+    dailyReview:options=>{const page=runtime.dailyReview?.page(options);return page?{...page,strategyEvolution:readStrategyEvolutionStatus(evolutionPath)}:page;},
+    strategyEvolution:{status:()=>readStrategyEvolutionStatus(evolutionPath),
+      candidates:options=>readStrategyEvolutionCandidates(evolutionPath,options)},
     jev:runtime.jevShadow?{status:runtime.jevStatus,list:options=>runtime.jevShadow!.list(options),detail:id=>runtime.jevShadow!.detail(id)}:undefined,
     debotAuth:runtime.debotAuth,
     debotSignals:options=>runtime.debotScanner?.list(options)??{now:new Date().toISOString(),items:[],total:0,

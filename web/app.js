@@ -1820,6 +1820,17 @@
         for(const item of notificationGroups){const line=el('div');line.append(el('strong','',`${dailySource(item.source)} · ${chainName(item.chain)} · 第 ${count(item.notificationNumber)} 次`),el('span','',`成熟 ${count(item.mature)} / 触发 ${count(item.triggers)} · 有效报价 ${count(item.covered)}（${percent(numeric(item.coveragePct))}）`),el('span','',`先翻倍 ${count(item.doubleFirst)} · 先到 -60% ${count(item.stopFirst)} · 两者均未到 ${count(item.neither)} · 未知 ${count(item.unknown)}`),badge(`连续覆盖 ${count(item.dense)}`,'neutral'));section.append(line);}
         section.append(el('p','daily-review-basis','DeBot 与 Ave 分开计数；同一 CA 的第 3 次和第 4 次只使用各自触发后的固定池前向报价。'));learning.append(section);
       }
+      const evolution=data?.strategyEvolution;
+      if(evolution){const section=el('section','daily-review-priorities'),run=evolution.lastDailyRun;
+        section.append(el('h3','','策略进化 · 前向影子实验'));
+        const stateLabel=run?.status==='succeeded'?'最近例行验证完成':run?.status==='failed'?'最近例行验证失败':'等待首次例行验证';
+        const headline=el('div');headline.append(el('strong','',`研究候选 ${count(evolution.candidates?.total)} · 前向实验 ${count(evolution.candidates?.forwardShadow)}`),
+          el('span','',`独立信号 ${count(evolution.signals?.events)} 条 / ${count(evolution.signals?.sessions)} 轮 · DeBot ${count(evolution.signals?.bySource?.debot)} · Ave ${count(evolution.signals?.bySource?.ave)}`),
+          el('span','',`成熟结果 ${count(evolution.episodes?.mature)} · 有效行情路径 ${count(evolution.episodes?.valid)} · ${stateLabel}${run?.at?` ${dailyTime(run.at)}`:''}`),
+          badge(evolution.candidates?.champions?`研究冠军 ${count(evolution.candidates.champions)}`:'只观察，不改实盘',evolution.candidates?.champions?'pass':'neutral'));section.append(headline);
+        if(evolution.latestDecision) section.append(el('p','daily-review-basis',`最近决策：${scalar(evolution.latestDecision.action)} · ${scalar(evolution.latestDecision.reason)} · ${dailyTime(evolution.latestDecision.at)}`));
+        section.append(el('p','daily-review-basis','候选只使用注册后的新样本做固定分组验证；采集不受计数开关影响，研究结果不会自行开启交易或改写实盘参数。'));learning.append(section);
+      }
       const candidates=Array.isArray(data?.shadowPolicies?.items)?data.shadowPolicies.items:[];
       if(candidates.length){const section=el('section','daily-review-priorities');section.append(el('h3','','当前全局影子策略候选'));
         for(const item of candidates){const trigger=typeof item.generatorVersion==='string'&&item.generatorVersion.startsWith('notification-trigger-shadow-'),scope=trigger?`${dailySource(item.scope?.source)} · ${chainName(item.scope?.chain)}`:`${dailySource(item.scope?.source)} · ${chainName(item.scope?.chain)} · ${scalar(item.scope?.basePolicyVersion,'策略版本未知')}`;

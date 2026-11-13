@@ -10,11 +10,12 @@ import {readExitQualityReview} from '../src/exit-quality.js';
 import {buildShadowPolicyCandidates,readMatureFollowupSamples} from '../src/shadow-policy-candidate.js';
 import {buildNotificationTriggerCandidates} from '../src/notification-trigger-candidate.js';
 import {ShadowPolicyCandidateStore} from '../src/shadow-policy-candidate-store.js';
+import {runStrategyEvolutionDaily} from '../src/strategy-evolution-daily.js';
 
 const args=process.argv.slice(2),dateIndex=args.indexOf('--date');
 for(let i=0;i<args.length;i++){if(args[i]==='--date'){if(i!==dateIndex||!args[i+1])throw new Error('DAILY_REVIEW_ARGUMENT_INVALID');reviewWindow(args[++i]);}
   else if(args[i]!=='--offline')throw new Error('DAILY_REVIEW_ARGUMENT_INVALID');}
-const config=readConfig(),path=reviewDatabasePath(config.dashboard.archivePath),store=new DailyReviewStore(path);
+const config=readConfig(),path=reviewDatabasePath(config.dashboard.archivePath),store=new DailyReviewStore(path),asOf=new Date().toISOString();
 try {
   const vendorRefresh:{source:string;status:string;snapshots:number}[]=[];
   // Bounded retrospective reads only. No notification dispatch, evaluation, wallet or order action.
@@ -34,7 +35,7 @@ try {
       }catch{vendorRefresh.push({source:'ave',status:'unavailable',snapshots:0});}
     }
   }
-  const now=new Date(),asOf=now.toISOString(),today=reviewWindow(shanghaiDate(now));
+  const now=new Date(asOf),today=reviewWindow(shanghaiDate(now));
   if(config.exitShadow.enabled&&!store.hasExitQuality(shanghaiDate(now))){
     try{
       const quality=readExitQualityReview(config.exitShadow.database,{asOf,sinceAt:new Date(now.getTime()-7*86400_000).toISOString()});
@@ -81,3 +82,12 @@ try {
   store.prune(now);store.markRunSucceeded(new Date().toISOString());console.log(JSON.stringify({vendorRefresh}));
 }catch{store.failure(new Date().toISOString());console.error('DAILY_REVIEW_FAILED');process.exitCode=1;}
 finally{store.close();}
+
+// Strategy evolution is an independent research routine. A report failure
+// cannot stop forward evidence collection/evaluation, and an evolution failure
+// cannot mark an otherwise valid daily report as failed.
+if(config.meme)try {
+  const evolution=runStrategyEvolutionDaily({archivePath:config.dashboard.archivePath,memeDatabase:config.meme.database,
+    asOf,chains:config.scannerChains});
+  console.log(JSON.stringify({strategyEvolution:evolution}));
+}catch {console.error('STRATEGY_EVOLUTION_DAILY_FAILED');}

@@ -174,7 +174,7 @@ test('read adapter retains first followup verdict independently of a later scan 
 test('missing expected source tables and exhausted scan read capacity mark the dataset incomplete',()=>{
   const f=databases();try{
     f.notifyDb();f.ave.exec('DROP TABLE ave_signals');let raw=f.read();assert.equal(raw.datasetComplete,false);assert.match(raw.limitations.join('\n'),/ave/);
-    f.scans.exec('BEGIN');const insert=f.scans.prepare('INSERT INTO scan_summaries VALUES(?,?)');for(let i=0;i<20002;i++)insert.run(at(-10000),'{}');f.scans.exec('COMMIT');
+    f.scans.exec('BEGIN');const insert=f.scans.prepare('INSERT INTO scan_summaries VALUES(?,?)');for(let i=0;i<20002;i++)insert.run(at(-1),'{}');f.scans.exec('COMMIT');
     // Recent rows must still be read even when historical evidence exceeds the bounded import.
     f.scans.prepare('INSERT INTO scan_summaries VALUES(?,?)').run(at(),JSON.stringify({...token(2),id:'latest',source:'manual',mode:'live',receivedAt:at(),occurredAt:at(),evaluatedAt:at(1),decision:'WATCH',buyEligible:false,policyVersion:'v9',reasons:[],checks:{}}));
     raw=f.read();assert.equal(raw.datasetComplete,false);assert.ok(raw.notifications.some(n=>n.id==='latest'));
@@ -190,6 +190,23 @@ test('a source prune watermark intersecting the report day prevents complete-den
     const raw=f.read();assert.equal(raw.datasetComplete,false);assert.ok(raw.limitations.some(s=>s.includes('debot源库已修剪')));
     f.debot.prepare('UPDATE review_retention_watermarks SET pruned_through=?').run('2026-10-13T00:00:00.000Z');
     assert.equal(f.read().datasetComplete,true);
+  }finally{f.close();}
+});
+test('execution audit capacity is applied to the review window instead of all retained history',()=>{
+  const f=databases();try{
+    f.notifyDb();
+    const review=new DatabaseSync(f.reviewPath);
+    try {
+      review.exec(`WITH RECURSIVE rows(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM rows WHERE n<100001)
+        INSERT INTO review_entry_attempts(at,data) SELECT '2026-10-01T00:00:00.000Z','{}' FROM rows`);
+      review.prepare('INSERT INTO review_entry_attempts VALUES(?,?)').run(at(1),JSON.stringify({chain:'bsc',address:address(1),at:at(1),mode:'off',status:'skipped',
+        decisionSnapshot:{decision:'WATCH',at:at(1),policyVersion:'entry-v9',buyEligible:false,reasons:['NARRATIVE_WEAK'],checks:{},frozen:true,scanId:'frozen-1'},
+        notificationSnapshot:{chain:'bsc',address:address(1),id:'frozen-event',source:'debot',receivedAt:at(),occurredAt:at()}}));
+    }finally{review.close();}
+    const raw=f.read();assert.equal(raw.datasetComplete,true);
+    assert.equal(raw.executions.length,1);assert.equal(raw.decisions[0]?.scanId,'frozen-1');
+    assert.ok(raw.notifications.some(value=>value.id==='frozen-event'));
+    assert.equal(raw.limitations.some(value=>value.includes('执行审计读取达到上限')),false);
   }finally{f.close();}
 });
 test('price reads are bounded to the report window and only that window can exhaust the read limit',()=>{

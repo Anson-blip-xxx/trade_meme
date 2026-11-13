@@ -228,7 +228,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
     intervalMs:config.walletResearch.intervalSec*1000,maxRequestsPerCycle:config.walletResearch.maxRequestsPerCycle}):undefined;
   let archiveCaptureError:string|undefined,walletCaptureError:string|undefined;
   let memeCaptureError:string|undefined;
-  let sourceCaptureError:string|undefined,nominationCaptureError:string|undefined;
+  let sourceCaptureError:string|undefined,nominationCaptureError:string|undefined,evolutionCaptureError:string|undefined;
   const sourceEvidence=config.corroboration&&(config.meme?.enabled||config.ave?.enabled||config.gmgnMarketSignals.enabled)
     ?new SourceCorroboration(config.corroboration.database,{maxBytes:config.corroboration.maxBytes,maxEvents:config.corroboration.maxEvents}):undefined;
   let backgroundGmgnAbort:AbortController|undefined;
@@ -264,12 +264,13 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
     return gmgnMarketDiscovery?.nominate({chain:'solana',address:signal.token.address},observedAt??new Date().toISOString(),reason)??false;
   };
   const sourceObservation=(config.ave?.enabled||config.debotScannerEnabled||config.gmgnMarketSignals.enabled)&&
-    (sourceEvidence||memeObserver||walletHistory&&config.ave?.enabled)
+    (sourceEvidence||memeObserver||walletHistory&&config.ave?.enabled||config.debotScannerEnabled||config.ave?.enabled)
     ?new SourceObservationRunner({
       ...(sourceEvidence&&config.corroboration?{source:{database:config.corroboration.database,maxBytes:config.corroboration.maxBytes,
         maxEvents:config.corroboration.maxEvents}}:{}),
       ...(memeObserver&&config.meme?{meme:{database:config.meme.database,activeWindowSec:config.meme.activeWindowSec,chains:config.scannerChains}}:{}),
       ...(walletHistory&&config.ave?.enabled?{wallet:{database:config.walletResearch.database,maxBytes:config.walletResearch.maxBytes}}:{}),
+      ...((config.debotScannerEnabled||config.ave?.enabled)?{evolution:{database:`${config.dashboard.archivePath}.strategy-evolution.sqlite`}}:{}),
       capacity:config.gmgnMarketSignals.enabled?16:8
     }):undefined;
   const observeSourceResearch=async(observation:SourceResearchObservation)=>{
@@ -280,11 +281,18 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       sourceCaptureError=result.sourceError?'SOURCE_EVIDENCE_CAPTURE_FAILED':undefined;
       memeCaptureError=result.memeError?'MEME_SIGNAL_CAPTURE_FAILED':undefined;
       if(observation.signal.source==='ave')nominationCaptureError=result.nominationError?'WALLET_NOMINATION_CAPTURE_FAILED':undefined;
+      if(observation.signal.source==='debot'||observation.signal.source==='ave'){
+        evolutionCaptureError=result.evolutionError?'STRATEGY_EVOLUTION_SIGNAL_CAPTURE_FAILED':undefined;
+        // DeBot/Ave inboxes are the durable retry queue. A failed evolution
+        // write must keep that inbox row instead of silently creating a hole.
+        if(result.evolutionError)throw new Error('STRATEGY_EVOLUTION_SIGNAL_CAPTURE_FAILED');
+      }
       return result;
     }catch(error){
       sourceCaptureError='SOURCE_OBSERVATION_WORKER_UNAVAILABLE';
       memeCaptureError='SOURCE_OBSERVATION_WORKER_UNAVAILABLE';
       if(observation.signal.source==='ave')nominationCaptureError='SOURCE_OBSERVATION_WORKER_UNAVAILABLE';
+      if(observation.signal.source==='debot'||observation.signal.source==='ave')evolutionCaptureError='SOURCE_OBSERVATION_WORKER_UNAVAILABLE';
       throw error;
     }
   };
@@ -1305,7 +1313,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       debotStream:debotStream?.getStatus(),
       debotPublicFallback:debotPublicFallback?.status(),
       meme:memeObserver?{...memeObserver.runtimeStatus(),captureError:memeCaptureError}:{enabled:false},
-      sourceObservation:sourceObservation?.status()??{enabled:false},
+      sourceObservation:{...(sourceObservation?.status()??{enabled:false}),evolutionCaptureError},
       ave:aveScanner?{...aveScanner.getStatus(),nominationCaptureError,session:aveSession?.getStatus()??{status:'required',authenticated:false,reason:'AVE_LOGIN_EMAIL_NOT_CONFIGURED'}}:{enabled:false},
       tokenRankResearch:tokenRankResearch?.status()??{enabled:false},
       corroboration:sourceEvidence?{...sourceEvidence.status(),captureError:sourceCaptureError}:{enabled:false,captureError:sourceCaptureError},

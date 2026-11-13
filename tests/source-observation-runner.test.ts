@@ -8,6 +8,7 @@ import {DatabaseSync} from 'node:sqlite';
 import {SourceObservationRunner} from '../src/source-observation-runner.js';
 import {SourceCorroboration} from '../src/source-corroboration.js';
 import {MemeObserver} from '../src/meme-observer.js';
+import {StrategyEvolutionSignalLedger} from '../src/strategy-evolution-signals.js';
 import type {AveSignalObservation} from '../src/providers/ave-signals.js';
 
 const address='0x610a36f996650be0561f5d74d36b7e73520a7777';
@@ -65,5 +66,15 @@ test('GMGN restart replay uses a stable delivery key and does not create a new n
     const db=new DatabaseSync(sourcePath,{readOnly:true});
     try{const row=db.prepare('SELECT delivery_count FROM source_notifications WHERE source=? AND event_id=?')
       .get('gmgn',signal.sourceEventId);assert.equal(Number(row?.delivery_count),1);}finally{db.close();}
+  }finally{await runner.stop();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('DeBot and Ave evolution capture runs without a counting or trading service',async()=>{
+  const dir=mkdtempSync(join(tmpdir(),'source-observation-evolution-')),path=join(dir,'evolution.sqlite');
+  const runner=new SourceObservationRunner({evolution:{database:path}});
+  try {
+    runner.start();await waitFor(()=>runner.status().ready);assert.deepEqual(await runner.submit(observation()),{});await runner.stop();
+    const ledger=new StrategyEvolutionSignalLedger(path);try{assert.equal(ledger.status().events,1);assert.equal(ledger.status().bySource.ave,1);}
+    finally{ledger.close();}
   }finally{await runner.stop();rmSync(dir,{recursive:true,force:true});}
 });

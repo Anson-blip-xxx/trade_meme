@@ -120,7 +120,12 @@ export class SignalFollowup {
       CREATE INDEX IF NOT EXISTS signal_followups_active ON signal_followups(selected,ends_at,decision);
       CREATE INDEX IF NOT EXISTS signal_followups_registered ON signal_followups(registered_at,chain,address);
       CREATE INDEX IF NOT EXISTS signal_followups_retention ON signal_followups(selected,registered_at,chain,address);
-      CREATE TABLE IF NOT EXISTS signal_followup_meta (key TEXT PRIMARY KEY,value TEXT NOT NULL);`);
+      CREATE TABLE IF NOT EXISTS signal_followup_meta (key TEXT PRIMARY KEY,value TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS review_retention_watermarks(source TEXT PRIMARY KEY,pruned_through TEXT NOT NULL);
+      CREATE TRIGGER IF NOT EXISTS followups_review_retention AFTER DELETE ON signal_followups BEGIN
+        INSERT INTO review_retention_watermarks(source,pruned_through) VALUES('followups',OLD.registered_at)
+        ON CONFLICT(source) DO UPDATE SET pruned_through=MAX(pruned_through,excluded.pruned_through);
+      END;`);
     const columns=db.prepare('PRAGMA table_info(signal_followups)').all();
     if(!columns.some(c=>c.name==='summary_record'))db.exec("ALTER TABLE signal_followups ADD COLUMN summary_record TEXT NOT NULL DEFAULT '{}'");
     db.exec('CREATE INDEX IF NOT EXISTS signal_followups_summary ON signal_followups(registered_at,chain,address,summary_record)');

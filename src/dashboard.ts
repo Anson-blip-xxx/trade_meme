@@ -48,6 +48,7 @@ export interface DashboardServices {
   signalCountingControl?:(action:'start'|'stop',actor:'web')=>unknown;
   protection?:(options?:DashboardPageOptions)=>unknown;
   dailyReview?:(options:ReviewPageOptions)=>unknown;
+  strategyEvolution?:{status:()=>unknown;candidates:(options:DashboardPageOptions)=>unknown};
   chainStream?:()=>unknown;
   jev?:{status:()=>unknown;list:(options:DashboardPageOptions)=>unknown;detail:(id:string)=>unknown};
   debotAuth?:Pick<DebotAuthManager,'getStatus'|'sendCode'|'login'>;
@@ -241,6 +242,15 @@ export function buildDashboard(config:Config,services:DashboardServices,assetDir
         try{if(options.date)reviewWindow(options.date);send(res,200,services.dailyReview?.(options)??{enabled:false,dates:[],items:[],total:0,limit:options.limit,offset:options.offset,hasMore:false});}
         catch(error){if(error instanceof Error&&error.message==='REVIEW_DATE_INVALID')throw new Error('INVALID_FILTER');throw error;}
         return;
+      }
+      if(url.pathname==='/dashboard/api/evolution/status'){
+        if([...url.searchParams.keys()].length)throw new Error('INVALID_FILTER');
+        send(res,200,services.strategyEvolution?.status()??{enabled:false,mode:'research_only'});return;
+      }
+      if(url.pathname==='/dashboard/api/evolution'){
+        if([...url.searchParams.keys()].some(key=>!['limit','offset','chain'].includes(key))||
+          ['limit','offset','chain'].some(key=>url.searchParams.getAll(key).length>1))throw new Error('INVALID_FILTER');
+        const options=pageOptions(url);send(res,200,services.strategyEvolution?.candidates(options)??{enabled:false,total:0,items:[],...options,hasMore:false});return;
       }
       if(url.pathname==='/dashboard/api/followup') {send(res,200,services.archive.followupDashboardSummary());return;}
       if(url.pathname==='/dashboard/api/followup/records') {send(res,200,services.archive.followupList(followupOptions(url)));return;}

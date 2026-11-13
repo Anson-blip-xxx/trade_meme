@@ -42,8 +42,23 @@ export class DailyReviewStore {
       !['skipped','created','existing','blocked'].includes(result.status)||!Number.isFinite(Date.parse(at)))return;
     const scanId=typeof report.id==='string'&&/^[\w-]{1,200}$/.test(report.id)?report.id:undefined;if(!scanId)return;
     const reason=result.reason&&/^[A-Z][A-Z0-9_]{0,99}$/.test(result.reason)?result.reason:undefined;
-    const data:ReviewExecution={chain,address,at,mode,status:result.status,reason,scanId,decisionAt:report.evaluatedAt};
+    const reasons=(value:unknown)=>Array.isArray(value)?[...new Set(value.filter((item):item is string=>
+      typeof item==='string'&&/^[A-Z][A-Z0-9_]{0,99}$/.test(item)))].slice(0,48):[];
+    const check=(value:unknown)=>{
+      if(!value||typeof value!=='object'||Array.isArray(value))return;
+      const item=value as {status?:unknown;reasons?:unknown};
+      return typeof item.status==='string'?{status:item.status,reasons:reasons(item.reasons)}:undefined;
+    };
+    const checks=Object.fromEntries(Object.entries({provenance:report.provenance,safety:report.safety,marketRisk:report.marketRisk,
+      narrative:report.narrative,flow:report.flow}).flatMap(([key,value])=>{const compact=check(value);return compact?[[key,compact]]:[];}));
+    const decisionSnapshot={decision:report.decision,at:report.evaluatedAt,policyVersion:report.policyVersion,
+      buyEligible:report.buyEligible,reasons:reasons(report.reasons),checks,frozen:true,scanId};
+    const notificationSnapshot={chain,address,id:report.signal.sourceEventId,source:report.signal.source,
+      receivedAt:report.receivedAt,occurredAt:report.signal.occurredAt};
+    const data:ReviewExecution={chain,address,at,mode,status:result.status,reason,scanId,decisionAt:report.evaluatedAt,
+      decisionSnapshot,notificationSnapshot};
     this.db.prepare('INSERT INTO review_entry_attempts VALUES(?,?,?,?,?,?)').run(randomUUID(),scanId,chain,address,at,JSON.stringify(data));
+    this.db.prepare("INSERT OR IGNORE INTO review_meta VALUES('decision_snapshot_started_at',?)").run(at);
   }
   save(report:DailyReview,beforeCommit?:()=>void):boolean {
     const {items,...summary}=report;

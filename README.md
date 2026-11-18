@@ -213,6 +213,16 @@ GMGN 标签不证明真人身份；共同资金来源仅是关联线索，不证
 
 有向比较随原画像后台批处理执行，没有新 GMGN 请求。旧画像通过索引逐批补算，状态含 `roleProfiles/rolePending/roleLastRunAt`。同一输入至多复用 10 分钟的比较结果，再由画像更新或到期轮转重算；缓存时间不会延长旧角色的有效期。新增筛选为 `follower_pattern/precursor_pattern/mixed_pattern`，变化同样保留入组、退组记录。画像中的前向观察数只表示已有验证记录；新机会另存持续账本，两者均不报告预测命中率。
 
+### 实时启动器候选池
+
+完整画像库另行压缩为最多 500 个启动器调查对象，保存在独立的 `data/launcher-candidates.sqlite`。路线 A 要求钱包已经进入 `market_pre_candidate`，并且启动器分析仍为当前有效；路线 B 同时要求 `precursor_pattern`、后续 `forward_validated` 和仍可重新验证的逐笔角色证据。两条路线均只用于缩小调查范围，候选记录固定为 `sampleOnly=true`、`tradingEnabled=false`，不会凭标签授权交易。
+
+新鲜度只接受候选钱包自身的交易证据。画像计算时间、普通转账、对手方买入、市场首次发现和订阅名单刷新都不能续期。状态分别记录历史命中、近期自身证据、节点看到的新交易签名、已分类的真实买卖，以及节点已经确认的 WebSocket 订阅；互斥状态之外另给出这些维度的独立计数，避免“已加入名单”冒充“正在实时监控”。
+
+Solana 候选每 5 分钟使用 `finalized` RPC 重新读取最新签名，并复核最新交易；WebSocket 每链最多 30 个地址，其中近期已确认买卖最多占一半固定槽，其余候选按 5 分钟页面轮换。只有节点身份核验成功且订阅 ACK 后，候选才显示“已监控”；断线或订阅失效会清空覆盖。公共节点的 30 地址限制意味着几百个候选采用“全量周期复核 + 小批实时轮换”，不声称几百个地址同时保持长连接。
+
+配置项为 `LAUNCHER_CANDIDATES_ENABLED`、`LAUNCHER_CANDIDATES_CAP=500`、`LAUNCHER_CANDIDATES_MAX_MB=64`、`LAUNCHER_CANDIDATES_REFRESH_INTERVAL_SEC=300`、`LAUNCHER_CANDIDATES_FRESH_SEC=21600`、`LAUNCHER_CANDIDATES_LIVE_SEC=86400`、`LAUNCHER_REVALIDATE_INTERVAL_SEC=300`。鉴权只读接口为 `/dashboard/api/launcher-candidates/status`、`/dashboard/api/launcher-candidates?chain=solana&route=A&state=live_seen&limit=100` 和 `/dashboard/api/launcher-candidates/:chain/:address`；候选库尚未打开时列表返回 503，不用空数组伪装成零候选。
+
 ### 钱包画像接入 Meme 筛选
 
 信号研究同时检查两条钱包路径，满足其一可提供钱包支持依据，并参与复评优先级排序。原有明确失败的资金检查仍会阻断，发行来源、合约安全及信号时效要求继续生效；画像标签或盈利榜名次不能单独使代币通过筛选。该研究入口在 `ENTRY_MODE=off` 时不提交交易，独立第三次通知策略另行控制。

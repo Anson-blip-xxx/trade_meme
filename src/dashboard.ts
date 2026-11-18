@@ -14,6 +14,7 @@ import {DebotAuthError,type DebotAuthManager} from './providers/debot-auth.js';
 import type {Chain} from './types.js';
 import type {DebotSignalListOptions} from './debot-scanner.js';
 import type {FollowupListOptions} from './signal-followup.js';
+import type {LauncherCandidates,LauncherCandidateProfileRoute,LauncherCandidateState} from './launcher-candidates.js';
 
 export interface DashboardPageOptions {limit:number;offset:number;chain?:Chain;}
 type Awaitable<T>=T|Promise<T>;
@@ -82,6 +83,8 @@ export interface DashboardServices {
     get:(...input:Parameters<WalletProfileReader['get']>)=>Awaitable<ReturnType<WalletProfileReader['get']>>;
   };
   walletProfilesStatus?:()=>unknown;
+  launcherCandidates?:Pick<LauncherCandidates,'list'|'get'>;
+  launcherCandidatesStatus?:()=>unknown;
   walletScreening?:Pick<WalletSetupLedger,'list'|'status'>;
 }
 function same(a:string,b:string):boolean {
@@ -344,6 +347,28 @@ export function buildDashboard(config:Config,services:DashboardServices,assetDir
       }
       if(url.pathname==='/dashboard/api/wallet-profiles/status') {
         send(res,200,services.walletProfilesStatus?.()??{enabled:false,running:false,ready:false});return;
+      }
+      if(url.pathname==='/dashboard/api/launcher-candidates/status') {
+        send(res,200,services.launcherCandidatesStatus?.()??{enabled:false,ready:false,records:0});return;
+      }
+      if(url.pathname==='/dashboard/api/launcher-candidates') {
+        const status=services.launcherCandidatesStatus?.() as {enabled?:boolean;storeReady?:boolean;runtimeError?:string}|undefined;
+        if(status?.enabled&&status.storeReady!==true){send(res,503,{error:status.runtimeError??'LAUNCHER_CANDIDATE_STORE_NOT_READY'});return;}
+        const options=pageOptions(url,200),route=url.searchParams.get('route')||undefined,state=url.searchParams.get('state')||undefined;
+        if(route&&!['A','B'].includes(route)||state&&!['historical_seed','fresh_verified','live_seen','monitored'].includes(state))throw new Error('INVALID_FILTER');
+        send(res,200,services.launcherCandidates?.list({...options,route:route as LauncherCandidateProfileRoute|undefined,
+          state:state as LauncherCandidateState|undefined})??{items:[],total:0,...options});return;
+      }
+      const launcherMatch=url.pathname.match(/^\/dashboard\/api\/launcher-candidates\/([^/]+)\/([^/]+)$/);
+      if(launcherMatch) {
+        const status=services.launcherCandidatesStatus?.() as {enabled?:boolean;storeReady?:boolean;runtimeError?:string}|undefined;
+        if(status?.enabled&&status.storeReady!==true){send(res,503,{error:status.runtimeError??'LAUNCHER_CANDIDATE_STORE_NOT_READY'});return;}
+        const network=launcherMatch[1] as Chain;let address:string;
+        try {address=decodeURIComponent(launcherMatch[2]);if(!['bsc','solana','robinhood'].includes(network))throw new Error();
+          if(network==='solana'){if(address.length>44||bs58.decode(address).length!==32)throw new Error();}
+          else {if(!/^0x[0-9a-fA-F]{40}$/.test(address))throw new Error();address=address.toLowerCase();}}
+        catch {throw new Error('INVALID_FILTER');}
+        const item=services.launcherCandidates?.get(network,address);send(res,item?200:404,item??{error:'NOT_FOUND'});return;
       }
       if(url.pathname==='/dashboard/api/wallet-screening/status') {send(res,200,services.walletScreening?.status()??{enabled:false});return;}
       if(url.pathname==='/dashboard/api/wallet-screening') {

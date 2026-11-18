@@ -3,10 +3,12 @@ import {createRequire} from 'node:module';
 import {pathToFileURL} from 'node:url';
 import type {Config} from './config.js';
 import {LatencyWindow,type FastWalletEvent,type FastWalletSnapshot} from './wallet-fast.js';
+import type {Chain} from './types.js';
 
 export interface WalletFastOptions {
   endpoints:Config['chainStream']['endpoints'];maxWallets:number;
   snapshot:()=>FastWalletSnapshot;onEvent:(event:FastWalletEvent)=>void;
+  onCoverage?:(chain:Chain,wallets:string[],at:string)=>void;
 }
 /** Socket processing lives in its own thread, isolated from main-thread SQLite and HTTP work. */
 export class WalletFastRunner {
@@ -24,7 +26,16 @@ export class WalletFastRunner {
       const worker=new Worker(url,{workerData:{endpoints:this.options.endpoints,maxWallets:this.options.maxWallets},env:{},execArgv:[]});this.worker=worker;this.lastStatusAt=Date.now();
       worker.on('message',message=>{
         if(this.worker!==worker)return;
-        if(message?.type==='status'){this.cached=message.status;this.lastStatusAt=Date.now();worker.postMessage({type:'status_ack'});}
+        if(message?.type==='status'){this.cached=message.status;this.lastStatusAt=Date.now();
+          try {const at=message.status?.asOf;
+            if(typeof at==='string'&&Number.isFinite(Date.parse(at))&&Array.isArray(message.status?.chains))
+              for(const row of message.status.chains){
+                const chain=row?.chain;if(!['bsc','solana','robinhood'].includes(chain)||!Array.isArray(row.activeWallets)||
+                  row.activeWallets.some((wallet:unknown)=>typeof wallet!=='string'))continue;
+                this.options.onCoverage?.(chain as Chain,[...row.activeWallets],at);
+              }
+          }catch{this.error='FAST_WALLET_COVERAGE_CALLBACK_FAILED';}
+          worker.postMessage({type:'status_ack'});}
         else if(message?.type==='events'){
           try {for(const event of message.events as FastWalletEvent[]){this.handoff.add(Date.now()-Date.parse(event.judgedAt));
             this.recent.unshift(event);if(this.recent.length>100)this.recent.pop();

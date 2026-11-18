@@ -57,6 +57,8 @@ export interface Config extends z.infer<typeof schema> {
   dashboard:{enabled:boolean;host:string;port:number;token?:string;origin?:string;archivePath:string;retentionDays:number;trackingHours:number;sampleIntervalSec:number};
   walletResearch:{enabled:boolean;database:string;maxBytes:number;intervalSec:number;maxRequestsPerCycle:number};
   walletProfiles:{enabled:boolean;database:string;maxBytes:number;intervalSec:number;batchSize:number;refreshAfterSec:number};
+  launcherCandidates:{enabled:boolean;database:string;maxBytes:number;cap:number;refreshIntervalSec:number;
+    freshAfterSec:number;liveAfterSec:number;coverageAfterSec:number;revalidateIntervalSec:number;revalidateRequestIntervalMs:number};
   walletScreening:{enabled:boolean;database:string;maxBytes:number};
   meme?:{enabled:boolean;database:string;maxBytes:number;maxActive:number;activeWindowSec:number};
   jev?:{enabled:boolean;database:string;maxBytes:number;timeoutMs:number;minIntervalMs:number;perTokenIntervalMs:number;
@@ -266,6 +268,16 @@ export function readConfig(env:NodeJS.ProcessEnv=process.env): Config {
       intervalSec:z.coerce.number().int().min(1).max(300).parse(env.WALLET_PROFILES_INTERVAL_SEC??2),
       batchSize:z.coerce.number().int().min(1).max(500).parse(env.WALLET_PROFILES_BATCH_SIZE??20),
       refreshAfterSec:z.coerce.number().int().min(300).max(604800).parse(env.WALLET_PROFILES_REFRESH_AFTER_SEC??21600)},
+    launcherCandidates:{enabled:z.enum(['true','false']).parse(env.LAUNCHER_CANDIDATES_ENABLED??env.WALLET_PROFILES_ENABLED??env.WALLET_RESEARCH_ENABLED??'false')==='true',
+      database:z.string().trim().refine(isPersistentOrderPath).parse(env.LAUNCHER_CANDIDATES_DATABASE_PATH??'data/launcher-candidates.sqlite'),
+      maxBytes:z.coerce.number().int().min(8).max(512).parse(env.LAUNCHER_CANDIDATES_MAX_MB??64)*1024*1024,
+      cap:z.coerce.number().int().min(100).max(1000).parse(env.LAUNCHER_CANDIDATES_CAP??500),
+      refreshIntervalSec:z.coerce.number().int().min(30).max(3600).parse(env.LAUNCHER_CANDIDATES_REFRESH_INTERVAL_SEC??300),
+      freshAfterSec:z.coerce.number().int().min(60).max(86400).parse(env.LAUNCHER_CANDIDATES_FRESH_SEC??21600),
+      liveAfterSec:z.coerce.number().int().min(10).max(86400).parse(env.LAUNCHER_CANDIDATES_LIVE_SEC??86400),
+      coverageAfterSec:z.coerce.number().int().min(10).max(300).parse(env.LAUNCHER_CANDIDATES_COVERAGE_SEC??90),
+      revalidateIntervalSec:z.coerce.number().int().min(60).max(3600).parse(env.LAUNCHER_REVALIDATE_INTERVAL_SEC??300),
+      revalidateRequestIntervalMs:z.coerce.number().int().min(20).max(5000).parse(env.LAUNCHER_REVALIDATE_REQUEST_INTERVAL_MS??100)},
     exitShadow:{enabled:z.enum(['true','false']).default('false').parse(env.EXIT_SHADOW_ENABLED)==='true',
       database:z.string().trim().refine(isPersistentOrderPath).parse(env.EXIT_SHADOW_DATABASE_PATH??'data/exit-shadow.sqlite'),
       maxBytes:z.coerce.number().int().min(16).max(4096).parse(env.EXIT_SHADOW_MAX_MB??128)*1024*1024,

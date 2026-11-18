@@ -47,7 +47,7 @@ export class WalletActivityVerifier {
       if(!data){
         let work=this.pending.get(key);
         if(!work){work=(async()=>{
-          if(event.chain==='solana')return rpc.request('getTransaction',[event.txHash,{encoding:'jsonParsed',commitment:'confirmed',maxSupportedTransactionVersion:0}]);
+          if(event.chain==='solana')return rpc.request('getTransaction',[event.txHash,{encoding:'jsonParsed',commitment:'confirmed',maxSupportedTransactionVersion:1}]);
           const receipt=await rpc.request('eth_getTransactionReceipt',[event.txHash]);if(!receipt)return null;
           const transaction=await rpc.request('eth_getTransactionByHash',[event.txHash]);
           const block=typeof receipt.blockNumber==='string'?await rpc.request('eth_getBlockByNumber',[receipt.blockNumber,false]):null;

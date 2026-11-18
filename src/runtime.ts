@@ -1,7 +1,7 @@
 import {DailyReviewStore} from './daily-review-store.js';
 import {reviewDatabasePath,reviewSamplingPath} from './daily-review.js';
 import {isPersistentOrderPath,type Config} from './config.js';
-import type {Signal,Report} from './types.js';
+import type {Signal,Report,Chain} from './types.js';
 import {Store} from './store.js';
 import {OrderStore} from './orders.js';
 import {EntryController} from './entry.js';
@@ -85,6 +85,9 @@ import {SourceObservationRunner,type SourceResearchObservation} from './source-o
 import {GmgnPlusArchive,GmgnPlusArchiveRunner} from './gmgn-plus-archive.js';
 import {GmgnMarketArchiveError,GmgnMarketSignalScanner} from './gmgn-market-signal-scanner.js';
 import {GmgnMarketDiscoveryScanner,GmgnMarketDiscoveryStore} from './gmgn-market-discovery.js';
+import {LauncherCandidates} from './launcher-candidates.js';
+import {LauncherCandidateRefreshRunner} from './launcher-candidate-refresh-runner.js';
+import {LauncherRevalidator} from './launcher-revalidator.js';
 
 export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;jevInvoke?:JevShadowOptions['invoke'];telegramFetcher?:typeof fetch;
   heldFetcher?:typeof fetch;entryFetcher?:typeof fetch;gmgnFetcher?:typeof fetch;
@@ -116,9 +119,12 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
     config.walletProfiles.database,config.walletScreening.database,config.chainStream.database,config.exitShadow.database,
     config.debotSignalsDatabase,config.debotSessionPath].some(path=>sameDatabase(path,config.meme!.database)))
     throw new Error('MEME_DATABASE_CONFLICT');
-  const protectedPaths=[config.ordersDatabase,config.dashboard.archivePath,config.walletResearch.database,config.walletProfiles.database,
+  const coreProtectedPaths=[config.ordersDatabase,config.dashboard.archivePath,config.walletResearch.database,config.walletProfiles.database,
     config.walletScreening.database,config.chainStream.database,config.exitShadow.database,config.debotSignalsDatabase,config.debotSessionPath,
     ...(config.meme?.enabled?[config.meme.database]:[])];
+  if(config.launcherCandidates.enabled&&coreProtectedPaths.some(path=>sameDatabase(path,config.launcherCandidates.database)))
+    throw new Error('LAUNCHER_CANDIDATE_DATABASE_MUST_BE_SEPARATE');
+  const protectedPaths=[...coreProtectedPaths,...(config.launcherCandidates.enabled?[config.launcherCandidates.database]:[])];
   if(config.gmgnMarketDiscovery?.enabled&&protectedPaths.some(path=>sameDatabase(path,config.gmgnMarketDiscovery!.database)))
     throw new Error('GMGN_MARKET_DISCOVERY_DATABASE_MUST_BE_SEPARATE');
   const gmgnMarketDiscoveryStore=config.gmgnMarketDiscovery?.enabled?new GmgnMarketDiscoveryStore({
@@ -213,6 +219,32 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
     ...config.walletProfiles,historyDatabase:config.walletResearch.database,
     ...(config.chainStream.enabled?{chainDatabase:config.chainStream.database}:{})}):undefined;
   const walletProfilesStatus=()=>walletProfiles?.status()??{enabled:false,running:false,ready:false};
+  let launcherCandidates:LauncherCandidates|undefined,launcherRefresh:LauncherCandidateRefreshRunner|undefined,launcherRevalidator:LauncherRevalidator|undefined;
+  let launcherRefreshTimer:ReturnType<typeof setInterval>|undefined,launcherError:string|undefined;
+  const openLauncherCandidates=()=>{
+    if(!config.launcherCandidates.enabled)return;
+    if(!launcherCandidates){
+      if(!existsSync(config.walletProfiles.database)){launcherError='LAUNCHER_PROFILE_DATABASE_UNAVAILABLE';return;}
+      try {launcherCandidates=new LauncherCandidates({...config.launcherCandidates,profileDatabase:config.walletProfiles.database});}
+      catch {launcherError='LAUNCHER_CANDIDATE_STORE_OPEN_FAILED';return;}
+    }
+    if(!launcherRefresh)try {launcherRefresh=new LauncherCandidateRefreshRunner({...config.launcherCandidates,
+      profileDatabase:config.walletProfiles.database,intervalMs:config.launcherCandidates.refreshIntervalSec*1000});}
+    catch {launcherError='LAUNCHER_CANDIDATE_REFRESH_RUNNER_FAILED';}
+    const endpoint=config.chainStream.endpoints.solana?.http;
+    if(endpoint&&!launcherRevalidator)try {launcherRevalidator=new LauncherRevalidator({endpoint,
+        maxCandidates:config.launcherCandidates.cap,requestIntervalMs:config.launcherCandidates.revalidateRequestIntervalMs,
+        pollIntervalMs:config.launcherCandidates.revalidateIntervalSec*1000,source:{
+          listCandidates:limit=>launcherCandidates?.listRevalidation('solana',limit)??[],
+          recordResult:result=>launcherCandidates?.recordRevalidation(result)??false,
+          onActivity:activity=>{if(activity.eventAt)launcherCandidates?.observeActivity(activity);},
+        }});}catch {launcherError='LAUNCHER_REVALIDATOR_START_FAILED';}
+    if(launcherRefresh&&(!endpoint||launcherRevalidator))launcherError=undefined;
+  };
+  const launcherCandidatesStatus=()=>({...(launcherCandidates?.status()??{ready:false,records:0,cap:config.launcherCandidates.cap}),
+    enabled:config.launcherCandidates.enabled,storeReady:!!launcherCandidates,refreshScheduled:!!launcherRefreshTimer,
+    running:!!launcherCandidates&&launcherRefresh?.status().running===true,refresh:launcherRefresh?.status(),revalidator:launcherRevalidator?.status(),
+    ...(launcherError?{runtimeError:launcherError}:{})});
   const walletScreening=walletHistory&&walletProfiles&&config.walletScreening.enabled?new WalletScreeningService(walletHistory,walletProfiles.reader,
     {...config.walletScreening,historyDatabase:config.walletResearch.database,sourcePaths:[config.walletResearch.database,config.walletProfiles.database,config.ordersDatabase,config.dashboard.archivePath,
       config.chainStream.database,config.exitShadow.database]}):undefined;
@@ -912,7 +944,8 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
   const monitoredChains=new Set([...config.scannerChains,...positionPriceTokens().map(t=>t.chain)]);
   const monitorEndpoints=Object.fromEntries(Object.entries(config.chainStream.endpoints).filter(([chain])=>monitoredChains.has(chain as Signal['token']['chain'])));
   const chainMonitor=config.chainStream.enabled?new ChainMonitor({config:{...config.chainStream,endpoints:monitorEndpoints,maxWallets:streamWalletCapacity},
-    tokens:streamPriceTokens,wallets:chain=>acceptsChain(chain)?mergePinnedWallets(chain,walletHistory?.streamWalletTargets(chain,config.chainStream.maxWallets)??[],config.chainStream.pinnedWallets?.[chain]):[],onPrice:price=>{
+    tokens:streamPriceTokens,wallets:chain=>acceptsChain(chain)?mergePinnedWallets(chain,
+      walletHistory?.streamWalletTargets(chain,config.chainStream.maxWallets)??[],config.chainStream.pinnedWallets?.[chain]):[],onPrice:price=>{
       if(priceRouter.observeChainSample(price)){
         const route=priceRouter.latest(price);
         if(route.status==='available'&&route.sample)recordPrice(route.sample);
@@ -1047,22 +1080,29 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       // independently. A confirmed buy is an explicit on-demand trigger even
       // when broad GMGN discovery is paused by focused mode.
       ready:walletTriggeredResearchReady,
-      verify:dependencies.walletActivityVerify??(event=>walletVerifier!.verify(event)),onClassification:result=>walletActivity!.record(result),
+      verify:dependencies.walletActivityVerify??(event=>walletVerifier!.verify(event)),onClassification:result=>{
+        const archived=walletActivity!.record(result),launcher=!!result.eventAt&&launcherCandidates?.observeActivity(result)===true;
+        return archived||launcher;
+      },
       onTrades:trades=>walletHistory.recordTrades(trades),onSignal});
-    walletFast=new WalletFastRunner({endpoints:Object.fromEntries(Object.entries(config.chainStream.endpoints).filter(([chain])=>acceptsChain(chain as Signal['token']['chain']))),maxWallets:streamWalletCapacity,
-      onEvent:event=>walletFastResearch?.enqueue(event),snapshot:()=>{
+    // Candidate liveness is chain-wide research. scannerChains still gates signal
+    // analysis and trading, but must not hide configured chains from RPC ACKs.
+    walletFast=new WalletFastRunner({endpoints:config.chainStream.endpoints,maxWallets:streamWalletCapacity,
+      onEvent:event=>{launcherCandidates?.observeRealtime({chain:event.chain,wallet:event.wallet,observedAt:event.receivedAt,source:'wallet_fast'});
+        walletFastResearch?.enqueue(event);},onCoverage:(chain,wallets,at)=>{launcherCandidates?.replaceCoverage(chain,wallets,at);},snapshot:()=>{
         const now=Date.now(),targets:FastWalletTarget[]=[],tokens:FastTokenCheck[]=[];
-        for(const chain of config.scannerChains){
-          if(!config.chainStream.endpoints[chain])continue;
+        for(const chain of Object.keys(config.chainStream.endpoints) as Chain[]){
           const addresses=new Set<string>();
+          for(const address of launcherCandidates?.streamTargets(chain,config.chainStream.maxWallets)??[])addresses.add(address);
           // Reserve room for multiple research cohorts rather than only the largest reported profits.
           for(const p of walletProfiles?.reader.streamTargets(chain,config.chainStream.maxWallets)??[])addresses.add(p.address);
           for(const address of walletHistory.streamWalletTargets(chain,config.chainStream.maxWallets))addresses.add(address);
           const selected=mergePinnedWallets(chain,fastTargets.select(chain,[...addresses],config.chainStream.maxWallets,now),config.chainStream.pinnedWallets?.[chain]),
             profiles=new Map((walletProfiles?.reader.getMany(selected.map(address=>({chain,address})))??[]).map(p=>[p.address,p]));
           for(const wallet of selected){
-            const p=profiles.get(wallet);
-            targets.push({chain,wallet,groups:p?.groups.map(g=>g.id)??[],profileUntil:p?.freshUntil});
+            const p=profiles.get(wallet),launcher=launcherCandidates?.get(chain,wallet),groups:string[]=p?.groups.map(g=>g.id)??[];
+            if(launcher&&!groups.includes('launcher_candidate'))groups.push('launcher_candidate');
+            targets.push({chain,wallet,groups,profileUntil:p?.freshUntil});
           }
         }
         const cachedTokens=new Set<string>();
@@ -1254,7 +1294,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
     }catch{priceTargetError='PRICE_STREAM_TARGET_REFRESH_FAILED';}
   };
   sourceObservation?.start();
-  return {client,providers,store,orders,entry,dailyReview,scanner,debotScanner,debotStream,debotPublicFallback,debotAuth,archive,followupReview,tracking,priceRouter,walletHistory,walletIndexRunner,walletObserver,walletResearchStatus,walletAssociationsStatus,walletProfiles,walletProfilesStatus,walletScreening,watchRechecker,exitShadow,chainMonitor,chainStreamStatus,walletFastResearch,memeObserver,sourceEvidence,sourceObservation,aveScanner,aveSession,tokenRankResearch,jevShadow,telegram,tradeNotifications,telegramStatus,heldMonitor,heldTracking,
+  return {client,providers,store,orders,entry,dailyReview,scanner,debotScanner,debotStream,debotPublicFallback,debotAuth,archive,followupReview,tracking,priceRouter,walletHistory,walletIndexRunner,walletObserver,walletResearchStatus,walletAssociationsStatus,walletProfiles,walletProfilesStatus,launcherCandidates:()=>launcherCandidates,launcherCandidatesStatus,walletScreening,watchRechecker,exitShadow,chainMonitor,chainStreamStatus,walletFastResearch,memeObserver,sourceEvidence,sourceObservation,aveScanner,aveSession,tokenRankResearch,jevShadow,telegram,tradeNotifications,telegramStatus,heldMonitor,heldTracking,
     signalCounting,telegramControls,telegramPositions,manualClose,directSell,manualNativeBuy,telegramTokenCard,gmgnMarketScanner,
     gmgnMarketDiscovery,gmgnMarketDiscoveryStore,
     executionStatus:()=>{const counting=signalCounting.executionState();return {
@@ -1318,12 +1358,16 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       tokenRankResearch:tokenRankResearch?.status()??{enabled:false},
       corroboration:sourceEvidence?{...sourceEvidence.status(),captureError:sourceCaptureError}:{enabled:false,captureError:sourceCaptureError},
       tracking:tracking?.getStatus(),priceRouter:{...priceRouter.getStatus(),captureError:priceTargetError},stats:archive?.stats(),archiveError:archiveCaptureError??store.observationError??archiveMaintenanceError,
-      settings:dashboardSettings(config),balances:balances?.get()??[],system:system?.get(),walletResearch:walletResearchStatus(),exitProtection:protectionSummary(),chainStream:chainStreamStatus(),
+      settings:dashboardSettings(config),balances:balances?.get()??[],system:system?.get(),walletResearch:walletResearchStatus(),launcherCandidates:launcherCandidatesStatus(),exitProtection:protectionSummary(),chainStream:chainStreamStatus(),
       watchRecheck:watchRechecker?{enabled:backgroundGmgnEnabled,...watchRechecker.getStatus(),pausedReason:backgroundGmgnPausedReason}:{enabled:false}}),
     dashboardOrders:(options:DashboardPageOptions={limit:20,offset:0})=>dashboardOrders(orders,options),
     start(){
       if(closed) return;
       syncLiveLatencyPriority();
+      openLauncherCandidates();launcherRefresh?.start();launcherRevalidator?.start();
+      if(config.launcherCandidates.enabled&&!launcherRefreshTimer){launcherRefreshTimer=setInterval(()=>{
+        openLauncherCandidates();launcherRefresh?.start();launcherRevalidator?.start();
+      },config.launcherCandidates.refreshIntervalSec*1000);launcherRefreshTimer.unref();}
       walletStatsRunner?.start();
       gmgnPlusRunner?.start();
       if(backgroundGmgnEnabled)gmgnMarketScanner?.start();
@@ -1394,6 +1438,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       const gmgnMarketStop=gmgnMarketScanner?.stop();
       gmgnMarketDiscovery?.stop();const gmgnMarketDiscoveryDrain=gmgnMarketDiscovery?.drain();
       scanner.stop();clearInterval(sweep);clearInterval(reconcileTimer);clearInterval(debotSyncTimer);clearInterval(exitMaintenanceTimer);clearInterval(telegramTimer);
+      clearInterval(launcherRefreshTimer);launcherRefreshTimer=undefined;
       await telegramControls?.close();
       // Fence both sources before draining third-signal callbacks. Otherwise a
       // final socket/page event can be admitted after waitForDispatches returns.
@@ -1414,6 +1459,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       await jevShadow?.stop();
       await heldTracking?.stop();await heldMonitor?.stop();
       priceRouter.close();
+      await launcherRevalidator?.stop();await launcherRefresh?.stop();
       await walletFast?.stop();walletVerifier?.stop();await walletFastResearch?.stop();walletActivity?.close();
       await Promise.all([chainMonitor?.stop(),tracking?.stop(),balances?.stop(),walletObserver?.stop(),system?.stop(),watchRechecker?.stop()]);
       await walletExitPressure?.stop();
@@ -1429,6 +1475,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       await sourceObservation?.stop();sourceEvidence?.close();
       await walletScreening?.close();
       await walletProfiles?.stop();
+      launcherCandidates?.close();launcherCandidates=undefined;
       await walletStatsRunner?.stop();
       heldMonitor?.close();
       unsubscribeOrderNotifications();positionPriceHealth?.close();tradeNotifications?.close();await telegram?.close();

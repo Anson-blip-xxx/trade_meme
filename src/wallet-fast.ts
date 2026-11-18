@@ -13,7 +13,7 @@ export interface FastWalletEvent {
   verdict:FastVerdict;groups:string[];profileFresh:boolean;cachedSafety:'pass'|'fail'|'unknown'|'expired';
   commitment:'processed'|'included';removed:boolean;buyVerified:false;tradingEnabled:false;
 }
-const priority=new Set(['forward_validated','repeated_early','precursor_pattern','public_kol']);
+const priority=new Set(['launcher_candidate','forward_validated','repeated_early','precursor_pattern','public_kol']);
 const validTime=(v:unknown)=>typeof v==='string'&&Number.isFinite(Date.parse(v));
 /** Pins add observation targets after automatic selection; they grant no profile or trading qualification. */
 export function mergePinnedWallets(chain:Chain,automatic:readonly string[],pinned:readonly string[]=[]):string[]{

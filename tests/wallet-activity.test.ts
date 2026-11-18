@@ -7,6 +7,7 @@ import {classifySolanaActivity} from '../src/wallet-activity-solana.js';
 import {WalletActivityVerifier,activityResult} from '../src/wallet-activity.js';
 import {WalletActivityStore} from '../src/wallet-activity-store.js';
 import {CHAIN_PRICE_DEPLOYMENTS as D} from '../src/chain-prices.js';
+import {JUPITER_SWAP_PROGRAM} from '../src/native-solana/jupiter.js';
 import registry from '../config/platforms.json' with {type:'json'};
 import type {FastWalletEvent} from '../src/wallet-fast.js';
 const at=Date.parse('2026-10-21T01:00:00Z'),a=(n:number)=>'0x'+n.toString(16).padStart(40,'0'),h=(n:number)=>'0x'+n.toString(16).padStart(64,'0');
@@ -146,6 +147,20 @@ function solFixture(){
     meta:{err:null,fee:5000,preBalances,postBalances,preTokenBalances:[bal(2,user,'0'),bal(3,curve,'100000')],postTokenBalances:[bal(2,user,'1000'),bal(3,curve,'99000')],innerInstructions:[{index:0,instructions:[transferIx]}]}};
   return {event,raw,user,mint,userAta,vault,curve,ix,transferIx};
 }
+function jupiterFixture(side:'buy'|'sell'='buy'){
+  const f=solFixture(),wsolAta=pk(28);
+  f.raw.transaction.message.accountKeys[9].pubkey=JUPITER_SWAP_PROGRAM;
+  f.ix.programId=JUPITER_SWAP_PROGRAM as any;
+  f.ix.accounts=side==='buy'?[f.user,wsolAta,f.userAta,D.wsol,f.mint,D.token,D.token,JUPITER_SWAP_PROGRAM,pk(29),JUPITER_SWAP_PROGRAM]:
+    [f.user,f.userAta,wsolAta,f.mint,D.wsol,D.token,D.token,JUPITER_SWAP_PROGRAM,pk(29),JUPITER_SWAP_PROGRAM];
+  f.ix.data=bs58.encode(Buffer.from('bb64facc31c4af14'+'00'.repeat(36),'hex'));
+  if(side==='sell'){
+    [f.raw.meta.preTokenBalances,f.raw.meta.postTokenBalances]=[f.raw.meta.postTokenBalances,f.raw.meta.preTokenBalances];
+    f.raw.meta.postBalances[0]=f.raw.meta.preBalances[0]+99995000;f.raw.meta.postBalances[4]=f.raw.meta.preBalances[4]-100000000;
+    [f.transferIx.parsed.info.source,f.transferIx.parsed.info.destination]=[f.userAta,f.vault];
+  }
+  return f;
+}
 const system='11111111111111111111111111111111';
 test('Pump swap requires the real instruction, signer, token balance and program-scoped asset movement',()=>{
   const f=solFixture(),r=classifySolanaActivity(f.event,f.raw,at+1000);assert.equal(r.classification,'buy');assert.equal(r.trades[0].amountAtomic,'1000');assert.equal(r.trades[0].quoteAmountAtomic,'100000000');
@@ -157,6 +172,33 @@ test('nested supported swap is recognized through instruction scope, not the agg
   assert.equal(classifySolanaActivity(f.event,f.raw,at+1000).classification,'buy');
   f.raw.meta.innerInstructions[0].instructions[1].stackHeight=2;
   assert.equal(classifySolanaActivity(f.event,f.raw,at+1000).classification,'unknown');
+});
+test('Jupiter v2 buys and sells require one exact non-WSOL wallet flow against native value',()=>{
+  for(const side of ['buy','sell'] as const){const f=jupiterFixture(side),r=classifySolanaActivity(f.event,f.raw,at+1000);
+    assert.equal(r.classification,side);assert.equal(r.trades.length,1);assert.equal(r.trades[0].protocol,'jupiter_v2');
+    assert.equal(r.trades[0].tokenAddress,f.mint);assert.equal(r.trades[0].amountAtomic,'1000');assert.equal(r.trades[0].quoteAddress,D.wsol);
+    assert.equal(r.trades[0].quoteAmountAtomic,'100000000');assert.equal(r.tradingEnabled,false);
+  }
+});
+test('Jupiter presence cannot promote unsigned, same-direction, multi-token or plain transfer flows',()=>{
+  const extraFlow=(f:any)=>{const index=f.raw.transaction.message.accountKeys.length,mint=pk(70);
+    f.raw.transaction.message.accountKeys.push({pubkey:pk(71),signer:false,writable:true});f.raw.meta.preBalances.push(1000);f.raw.meta.postBalances.push(1000);
+    f.raw.meta.preTokenBalances.push({accountIndex:index,owner:f.user,mint,uiTokenAmount:{amount:'2',decimals:6}});
+    f.raw.meta.postTokenBalances.push({accountIndex:index,owner:f.user,mint,uiTokenAmount:{amount:'1',decimals:6}});};
+  for(const change of [
+    (f:any)=>f.raw.transaction.message.accountKeys[0].signer=false,
+    (f:any)=>f.ix.programId=pk(99),
+    (f:any)=>f.raw.meta.postBalances[0]=f.raw.meta.preBalances[0]+99995000,
+    (f:any)=>f.raw.meta.postTokenBalances[0].uiTokenAmount.amount='0',
+    extraFlow
+  ]){const f=jupiterFixture();change(f);assert.equal(classifySolanaActivity(f.event,f.raw,at+1000).classification,'unknown');}
+  const routed=jupiterFixture(),keys=routed.raw.transaction.message.accountKeys;extraFlow(routed);
+  routed.raw.transaction.message.instructions.push({programId:D.pump,accounts:[keys[5].pubkey,keys[6].pubkey,routed.mint,routed.curve,routed.vault,routed.userAta,routed.user,system,D.token,keys[10].pubkey,keys[11].pubkey,D.pump],
+    data:bs58.encode(Buffer.from('66063d1201daebea'+'00'.repeat(16),'hex'))});
+  routed.raw.meta.innerInstructions.push({index:1,instructions:[routed.transferIx]});
+  assert.equal(classifySolanaActivity(routed.event,routed.raw,at+1000).classification,'unknown');
+  const transfer=jupiterFixture();transfer.raw.transaction.message.instructions=[transfer.transferIx];transfer.raw.meta.innerInstructions=[];
+  assert.equal(classifySolanaActivity(transfer.event,transfer.raw,at+1000).classification,'transfer');
 });
 test('Solana transfer, fee/rent and ATA creation cannot masquerade as payment for a purchase',()=>{
   const f=solFixture();f.raw.transaction.message.instructions=[f.transferIx as any];f.raw.meta.innerInstructions=[];
@@ -229,6 +271,7 @@ test('RPC verifier checks chain identity, requests confirmed parsed Solana and c
     calls.push({method,params});return method==='getGenesisHash'?'5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d':f.raw;}}));
   try{assert.equal((await verifier.verify(f.event)).classification,'buy');await verifier.verify(f.event);
     assert.equal(calls.filter(c=>c.method==='getTransaction').length,1);assert.equal(calls[1].params[1].commitment,'confirmed');assert.equal(calls[1].params[1].encoding,'jsonParsed');
+    assert.equal(calls[1].params[1].maxSupportedTransactionVersion,1);
   }finally{verifier.stop();}
   const wrong=new WalletActivityVerifier({bsc:{http:'http://test.invalid'}},()=>at+1000,()=>({request:async()=> '0x1'}));
   assert.equal((await wrong.verify(preview())).reasons[0],'TRANSACTION_CHAIN_MISMATCH');wrong.stop();

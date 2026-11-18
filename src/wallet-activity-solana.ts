@@ -1,6 +1,7 @@
 import bs58 from 'bs58';
 import {CHAIN_PRICE_DEPLOYMENTS as D} from './chain-prices.js';
 import {chainAddress,object} from './chain-stream-store.js';
+import {JUPITER_SWAP_PROGRAM} from './native-solana/jupiter.js';
 import {activityResult,type WalletActivity,type ActivityTrade,type ActivityTransfer} from './wallet-activity.js';
 import type {FastWalletEvent} from './wallet-fast.js';
 
@@ -109,6 +110,16 @@ export function classifySolanaActivity(e:FastWalletEvent,raw:any,now:number):Wal
       if(spec.side==='buy'?q>=0n:q<=0n)continue;
     }
     trades.push({tokenAddress:base,side:spec.side,amountAtomic:(baseNet<0n?-baseNet:baseNet).toString(),protocol:spec.protocol,quoteAddress,quoteAmountAtomic:quoteAmount.toString()});
+  }
+  // Jupiter is the only aggregate fallback; native already includes owned WSOL account lamports.
+  if(all.some(ix=>ix.programId===JUPITER_SWAP_PROGRAM)){
+    const base=[...net].filter(([mint,n])=>mint!==D.wsol&&n!==0n);
+    if(!keys[walletIndex].signer||base.length!==1||liquidity)return result('unknown',[liquidity?'MULTI_ACTION_TRANSACTION':'SWAP_BALANCE_OR_TRANSFER_MISMATCH'],details);
+    const [tokenAddress,tokenNet]=base[0],side=tokenNet>0n&&native<0n?'buy':tokenNet<0n&&native>0n?'sell':undefined;
+    if(!side)return result('unknown',['SWAP_BALANCE_OR_TRANSFER_MISMATCH'],details);
+    const trade={tokenAddress,side,amountAtomic:(tokenNet<0n?-tokenNet:tokenNet).toString(),protocol:'jupiter_v2',
+      quoteAddress:D.wsol,quoteAmountAtomic:(native<0n?-native:native).toString()} satisfies ActivityTrade;
+    return result(side,['SUPPORTED_SWAP_AND_WALLET_FLOW_CONFIRMED'],{...details,trades:[trade]});
   }
   const unique=new Map(trades.map(t=>[t.tokenAddress+':'+t.side,t]));
   if(unique.size===1&&!liquidity){const trade=[...unique.values()][0];return result(trade.side,['SUPPORTED_SWAP_AND_WALLET_FLOW_CONFIRMED'],{...details,trades:[trade]});}

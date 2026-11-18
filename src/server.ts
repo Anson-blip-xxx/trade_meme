@@ -193,7 +193,12 @@ if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href) {
     walletAssociationsStatus:runtime.walletAssociationsStatus,
     walletProfiles:walletQueries&&runtime.walletProfiles?{list:options=>walletQueries.listProfiles(options),
       get:(chain,address)=>walletQueries.getProfile(chain,address)}:undefined,
-    walletProfilesStatus:runtime.walletProfilesStatus,walletScreening:runtime.walletScreening?.ledger}):undefined;
+    walletProfilesStatus:runtime.walletProfilesStatus,
+    launcherCandidates:config.launcherCandidates.enabled?{
+      list:options=>runtime.launcherCandidates()?.list(options)??{items:[],total:0,limit:options?.limit??100,offset:options?.offset??0},
+      get:(chain,address)=>runtime.launcherCandidates()?.get(chain,address),
+    }:undefined,
+    launcherCandidatesStatus:runtime.launcherCandidatesStatus,walletScreening:runtime.walletScreening?.ledger}):undefined;
   const fatal=()=>{console.error('SERVICE_LISTEN_FAILED');process.exit(1);};
   server.on('error',fatal);dashboard?.on('error',fatal);
   dashboard?.listen(config.dashboard.port,config.dashboard.host,()=>console.log(`Dashboard listening at http://${config.dashboard.host}:${config.dashboard.port}/dashboard/`));

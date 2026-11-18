@@ -124,6 +124,27 @@ test('disabled JEV supplies empty pages and the homepage never loads its records
   try{assert.deepEqual(await(await fetch(`${isolated.base}/dashboard/api/home`,{headers})).json(),{compact:true});}finally{await isolated.close();}
 });
 
+test('launcher candidate pages are authenticated, bounded and distinguish an unopened store from zero candidates',async()=>{
+  const headers={'x-dashboard-access':password},address='0x'+'1'.repeat(40),calls:unknown[]=[];
+  const item={chain:'bsc',address,route:'A',state:'historical_seed'};
+  const f=await fixture({launcherCandidatesStatus:()=>({enabled:true,storeReady:true,records:1}),launcherCandidates:{
+    list:(options:any)=>{calls.push(options);return {items:[item],total:1,limit:options.limit??100,offset:options.offset??0};},
+    get:(chain:any,wallet:string)=>chain==='bsc'&&wallet===address?item:undefined} as any});
+  try {
+    assert.equal((await fetch(`${f.base}/dashboard/api/launcher-candidates`)).status,401);
+    const response=await fetch(`${f.base}/dashboard/api/launcher-candidates?limit=7&offset=14&chain=bsc&route=A&state=historical_seed`,{headers});
+    assert.equal(response.status,200);assert.equal((await response.json()).total,1);
+    assert.deepEqual(calls,[{limit:7,offset:14,chain:'bsc',route:'A',state:'historical_seed'}]);
+    assert.equal((await fetch(`${f.base}/dashboard/api/launcher-candidates/bsc/${address}`,{headers})).status,200);
+    for(const query of ['limit=0','limit=201','offset=-1','chain=eth','route=C','state=ready'])
+      assert.equal((await fetch(`${f.base}/dashboard/api/launcher-candidates?${query}`,{headers})).status,400,query);
+  } finally {await f.close();}
+  const unavailable=await fixture({launcherCandidatesStatus:()=>({enabled:true,storeReady:false,runtimeError:'LAUNCHER_PROFILE_DATABASE_UNAVAILABLE'})});
+  try {const response=await fetch(`${unavailable.base}/dashboard/api/launcher-candidates`,{headers});assert.equal(response.status,503);
+    assert.deepEqual(await response.json(),{error:'LAUNCHER_PROFILE_DATABASE_UNAVAILABLE'});}
+  finally {await unavailable.close();}
+});
+
 test('ranking research is authenticated and read-only with chain scoped stable pagination for tokens and wallets',async()=>{
   const calls:unknown[]=[],headers={'x-dashboard-access':password},stamp='2026-10-15T08:00:00.000Z',address='0x'+'A'.repeat(40);
   const page=(kind:string)=>async(options:unknown)=>{calls.push({kind,options});return {items:[],total:0};};

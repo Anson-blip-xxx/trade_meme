@@ -2378,11 +2378,21 @@
     runtime.append(kv('钱包历史采集', research.enabled ? '已启用 · 长期保留' : '未启用'), kv('钱包历史 / 容量上限', `${bytes(research.store?.bytes)} / ${bytes(research.store?.maxBytes)}`), kv('最近钱包观测', date(research.store?.lastObservedAt, true)), kv('最近钱包增强采集', date(research.observer?.lastCycle?.completedAt, true)));
     const researchError = research.store?.error || research.captureError || research.observer?.feedError;
     if (researchError) runtime.append(el('p', 'detail-message detail-error', reasonNames[researchError] || scalar(researchError)));
-    const evidence = data.corroboration, rank = data.tokenRankResearch, profiles = research.profiles || {};
+    const evidence = data.corroboration, rank = data.tokenRankResearch, profiles = research.profiles || {}, launchers = data.launcherCandidates || {};
     const priorityState = worker => worker?.livePriority === true
       ? worker.workerLivePriority === true ? '实盘计数优先 · 批处理已暂停' : '正在切换到实盘计数优先'
       : worker?.workerLivePriority === false ? '正常处理积压' : worker?.enabled === false ? '未启用' : '等待工作线程状态';
     runtime.append(kv('钱包画像批处理', priorityState(profiles)));
+    const launcherDimensions=launchers.dimensionCounts||{},launcherChains=launchers.chainCounts||{},launcherRoutes=launchers.routeCounts||{};
+    runtime.append(kv('启动器候选池', !launchers.enabled?'未启用':!launchers.storeReady?'等待候选库':launchers.running?'持续更新中':'候选库已打开'),
+      kv('画像压缩结果 / 上限', `${count(launchers.records)} / ${count(launchers.cap)}`),
+      kv('候选链分布', `Sol ${count(launcherChains.solana)} · BSC ${count(launcherChains.bsc)} · Robinhood ${count(launcherChains.robinhood)}`),
+      kv('候选证据路线', `启动器 ${count(launcherRoutes.A)} · 前置兑现 ${count(launcherRoutes.B)}`),
+      kv('近期证据 / 链上活跃 / 已确认订阅', `${count(launcherDimensions.evidenceFresh)} / ${count(launcherDimensions.liveSeen)} / ${count(launcherDimensions.monitored)}`),
+      kv('实时可核验 / 已确认交易且监听中', `${count(launcherDimensions.realtimeReady)} / ${count(launcherDimensions.verifiedTradeMonitored)}`),
+      kv('Solana 链上复核', launchers.revalidator?.running?`运行中 · 累计检查 ${count(launchers.revalidator.counts?.checked)} 个`:'未运行'));
+    if(launchers.runtimeError||launchers.error||launchers.revalidator?.error)
+      runtime.append(el('p','detail-message detail-error',scalar(launchers.runtimeError||launchers.error||launchers.revalidator?.error)));
     renderPersistentStore(runtime, '来源账本', evidence, {records:evidence?.events,maxRecords:evidence?.maxEvents,recordLabel:'通知数 / 条数上限',errors:[evidence?.error,evidence?.captureError]});
     renderPersistentStore(runtime, '涨幅榜研究', rank, {records:rank?.tokens,recordLabel:'已登记币数',errors:[rank?.error]});
     runtime.append(kv('涨幅榜研究批处理', priorityState(rank)), kv('涨幅榜研究已登记钱包 / 待更新币数', `${count(rank?.wallets)} / ${count(rank?.pending)}`), kv('涨幅榜研究最近更新', date(rank?.lastRunAt, true)));

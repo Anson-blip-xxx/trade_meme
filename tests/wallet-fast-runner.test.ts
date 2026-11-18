@@ -16,13 +16,16 @@ test('independent worker subscribes processed, verifies the endpoint and judges 
   const sockets=new WebSocketServer({server}),requests:any[]=[];let socket:any,sub:number|undefined;
   sockets.on('connection',(s:any)=>{socket=s;s.on('message',(raw:Buffer)=>{const req=JSON.parse(raw.toString());requests.push(req);
     const id=requests.length;if(req.method==='logsSubscribe')sub=id;s.send(JSON.stringify({jsonrpc:'2.0',id:req.id,result:req.method.endsWith('Unsubscribe')?true:id}));});});
-  server.listen(0,'127.0.0.1');await once(server,'listening');const port=(server.address() as {port:number}).port,events:FastWalletEvent[]=[];
+  server.listen(0,'127.0.0.1');await once(server,'listening');const port=(server.address() as {port:number}).port,events:FastWalletEvent[]=[],
+    coverage:{wallets:string[];at:string}[]=[];
   const runner=new WalletFastRunner({endpoints:{solana:{http:`http://127.0.0.1:${port}`,ws:`ws://127.0.0.1:${port}`}},maxWallets:10,
     snapshot:()=>{const now=Date.now();return {at:new Date(now).toISOString(),validUntil:new Date(now+120000).toISOString(),targets:[{chain:'solana',wallet,groups:['forward_validated'],profileUntil:new Date(now+120000).toISOString()}],tokens:[]};},
-    onEvent:e=>events.push(e)});
+    onEvent:e=>events.push(e),onCoverage:(_chain,wallets,at)=>coverage.push({wallets,at})});
   t.after(async()=>{await runner.stop();for(const client of sockets.clients)client.terminate();await new Promise<void>(r=>sockets.close(()=>r()));server.closeAllConnections();await new Promise<void>(r=>server.close(()=>r()));});
   runner.start();await until(()=>sub!==undefined&&runner.status().chains?.[0]?.identityVerified).catch(()=>{throw new Error(JSON.stringify({status:runner.status(),requests}));});
   assert.equal(requests.find(r=>r.method==='logsSubscribe').params[1].commitment,'processed');
+  await until(()=>coverage.some(row=>row.wallets.includes(wallet)));
+  assert.ok(runner.status().chains[0].activeWallets.includes(wallet));
   socket.send(JSON.stringify({jsonrpc:'2.0',method:'logsNotification',params:{subscription:sub,result:{context:{slot:123},value:{signature,err:null,logs:[]}}}}));
   const end=Date.now()+350;while(Date.now()<end){Math.sqrt(913);}
   await until(()=>events.length===1);

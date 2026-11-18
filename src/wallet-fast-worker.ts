@@ -65,11 +65,15 @@ const status=()=>{
   if(stopped||statusPending)return;statusPending=true;
   port.postMessage({type:'status',status:{enabled:true,running:true,asOf:new Date().toISOString(),mode:'preview_only',...judge.status(),
     droppedEvents:dropped,pendingDelivery:pending.size,eventLoopP99Ms:lag.percentile(99)/1e6,
-    chains:[...contexts].map(([chain,c])=>{const s=c.stream.getStatus();return {chain,state:s.state,identityVerified:c.verified===s.generation&&s.state==='open',
+    chains:[...contexts].map(([chain,c])=>{const s=c.stream.getStatus(),wallets=judge.wallets(chain),activeKeys=new Set(s.activeKeys),
+      identityVerified=c.verified===s.generation&&s.state==='open',activeWallets=!identityVerified?[]:chain==='solana'?
+        wallets.filter(wallet=>activeKeys.has('wallet:'+wallet)):
+        activeKeys.has('wallet:out')&&activeKeys.has('wallet:in')?wallets:[];return {chain,state:s.state,identityVerified,
       identityScope:chain==='solana'?'paired_http_rpc':'http_and_ws',watchedWallets:judge.wallets(chain).length,
+      activeWallets,
       activeSubscriptions:s.activeSubscriptions,desiredSubscriptions:s.desiredSubscriptions,reconnects:s.reconnects,
       lastMessageAt:s.lastMessageAt?new Date(s.lastMessageAt).toISOString():undefined,lastDisconnect:c.lastDisconnect,error:c.error??s.lastError};}),
-    coverage:'selected_wallets_live_only',replay:'historical_observer_separate',buyVerified:false,tradingEnabled:false}});
+    coverage:'rpc_subscription_acknowledged_wallets',replay:'historical_observer_separate',buyVerified:false,tradingEnabled:false}});
 };
 const timer=setInterval(status,1000);
 port.on('message',message=>{

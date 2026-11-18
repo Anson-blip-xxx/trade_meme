@@ -7,19 +7,26 @@ import {DatabaseSync} from 'node:sqlite';
 import {WalletHistory,type WalletTradeObservation} from '../src/wallet-history.js';
 import {WalletProfiles,WalletProfileReader} from '../src/wallet-profiles.js';
 import {ChainStreamStore,evmTransfers,TRANSFER_TOPIC} from '../src/chain-stream-store.js';
+import {WALLET_FAST_PROFILE_PRIORITY_GROUPS} from '../src/wallet-fast-groups.js';
 
 const base=Date.parse('2026-10-10T00:00:00Z'),iso=(s=0)=>new Date(base+s*1000).toISOString();
 const address=(n:number)=>'0x'+n.toString(16).padStart(40,'0'),hash=(n:number)=>'0x'+n.toString(16).padStart(64,'0');
-function fixture(options:{maxBytes?:number;refreshAfterSec?:number}={}){
+function fixture(options:{maxBytes?:number;refreshAfterSec?:number;coldRefreshAfterSec?:number}={}){
   const root=mkdtempSync(join(tmpdir(),'wallet-profiles-'));let seconds=100;
   const historyPath=join(root,'history.sqlite'),chainPath=join(root,'chain.sqlite'),database=join(root,'profiles.sqlite');
   const now=()=>new Date(base+seconds*1000),history=new WalletHistory(historyPath,{now}),chain=new ChainStreamStore(chainPath);
-  const raw=new DatabaseSync(historyPath);let engine=new WalletProfiles({database,historyDatabase:historyPath,chainDatabase:chainPath,now,refreshAfterSec:1,...options});
+  const raw=new DatabaseSync(historyPath),coldRefreshAfterSec=options.coldRefreshAfterSec??options.refreshAfterSec??1;
+  let engine=new WalletProfiles({database,historyDatabase:historyPath,chainDatabase:chainPath,now,refreshAfterSec:1,...options,coldRefreshAfterSec});
   const reader=new WalletProfileReader(database,now);
   const trade=(wallet=1,patch:Partial<WalletTradeObservation>={})=>history.recordTrade({chain:'bsc',wallet:address(wallet),tokenAddress:address(100),txHash:hash(wallet),side:'buy',eventAt:iso(10),observedAt:iso(20),source:'gmgn_wallet_activity',...patch});
   const batch=(n=100)=>engine.runBatch(n),groups=(wallet=1)=>reader.get('bsc',address(wallet))?.groups.map(g=>g.id)??[];
   return {root,historyPath,chainPath,database,history,chain,raw,reader,trade,batch,groups,setNow:(s:number)=>{seconds=s;},now,
-    restart:(maxBytes?:number)=>{engine.close();engine=new WalletProfiles({database,historyDatabase:historyPath,chainDatabase:chainPath,now,refreshAfterSec:1,...(maxBytes?{maxBytes}:{})});},
+    pragmas:()=>({synchronous:Number((engine as any).db.prepare('PRAGMA synchronous').get()!.synchronous),
+      busyTimeout:Number((engine as any).db.prepare('PRAGMA busy_timeout').get()!.timeout),
+      autoCheckpoint:Number((engine as any).db.prepare('PRAGMA wal_autocheckpoint').get()!.wal_autocheckpoint),
+      journalMode:String((engine as any).db.prepare('PRAGMA journal_mode').get()!.journal_mode)}),
+    restart:(maxBytes?:number)=>{engine.close();engine=new WalletProfiles({database,historyDatabase:historyPath,chainDatabase:chainPath,now,
+      refreshAfterSec:options.refreshAfterSec??1,coldRefreshAfterSec,...(maxBytes?{maxBytes}:{})});},
     close:()=>{reader.close();engine.close();raw.close();chain.close();history.close();rmSync(root,{recursive:true,force:true});}};
 }
 function relation(f:ReturnType<typeof fixture>,tokens=[100],forward=false){
@@ -153,7 +160,7 @@ test('initial rowid ingestion, changed wallets and expiry progress across bounde
     const status=f.reader.status();assert.equal(status.profiles,30);assert.equal(status.sourceWallets,30);assert.equal(status.profiledSourceWallets,30);assert.equal(status.initialComplete,true);
     f.setNow(102);f.trade(31,{observedAt:iso(102),eventAt:iso(101)});f.batch(5);assert.ok(f.reader.get('bsc',address(31)));
     assert.equal(f.reader.list({search:address(31)}).total,1);assert.equal(f.reader.list({group:'insufficient_evidence',chain:'bsc',limit:2}).items.length,2);
-    f.setNow(200);assert.equal(f.reader.get('bsc',address(1))!.status,'stale');assert.ok(f.reader.status().staleProfiles>0);
+    f.setNow(200);assert.equal(f.reader.get('bsc',address(1))!.status,'stale');assert.equal(f.reader.status().staleProfilesBasis,'legacy_all_profiles_short_window');
   }finally{f.close();}
 });
 
@@ -163,9 +170,128 @@ test('periodic reconciliation uses the configured window while source changes re
     assert.equal(f.reader.get('bsc',address(1))!.status,'current');
     assert.equal(f.reader.status().staleProfiles,0);
     f.setNow(3700);assert.equal(f.reader.get('bsc',address(1))!.status,'stale');
-    assert.equal(f.reader.status().staleProfiles,1);
+    assert.equal(f.reader.status().staleProfiles,0,'legacy aggregate remains a periodic compatibility snapshot');
     f.history.captureLeaders('bsc',[{address:address(1),period:'7d',realizedProfitUsd:'5'}],{source:'gmgn_stats',observedAt:iso(3700)});
     f.batch();assert.equal(f.reader.get('bsc',address(1))!.status,'current');
+  }finally{f.close();}
+});
+
+test('launcher profiles use the hot cadence while unchanged historical profiles wait for the cold backstop',()=>{
+  const root=mkdtempSync(join(tmpdir(),'wallet-profile-schedule-')),historyPath=join(root,'history.sqlite'),database=join(root,'profiles.sqlite'),
+    launcherPath=join(root,'launchers.sqlite');let seconds=100;const now=()=>new Date(base+seconds*1000),history=new WalletHistory(historyPath,{now}),
+    launcher=new DatabaseSync(launcherPath);
+  launcher.exec('CREATE TABLE lc_candidates(chain TEXT,address TEXT,monitored INTEGER NOT NULL DEFAULT 0)');
+  launcher.prepare('INSERT INTO lc_candidates VALUES (?,?,?)').run('bsc',address(1),1);
+  const engine=new WalletProfiles({database,historyDatabase:historyPath,launcherDatabase:launcherPath,now,refreshAfterSec:3600,coldRefreshAfterSec:604800}),
+    reader=new WalletProfileReader(database,now,3600);
+  const trade=(wallet:number)=>history.recordTrade({chain:'bsc',wallet:address(wallet),tokenAddress:address(100),txHash:hash(wallet),side:'buy',
+    eventAt:iso(10),observedAt:iso(20),source:'gmgn_wallet_activity'});
+  try {
+    trade(1);trade(2);engine.runBatch(100);assert.equal(reader.get('bsc',address(1))!.computedAt,iso(100));assert.equal(reader.get('bsc',address(2))!.computedAt,iso(100));
+    seconds=3701;let status=engine.runBatch(100);assert.equal(reader.get('bsc',address(1))!.computedAt,iso(3701));
+    assert.equal(reader.get('bsc',address(2))!.computedAt,iso(100));assert.equal(status.schedule?.hotCandidatePoolLowerBound,1);
+    assert.equal(status.schedule?.monitoredCandidatePool,1);assert.equal(status.schedule?.hotServed,1);
+    assert.equal(status.schedule?.hotCandidateDueLowerBound,1);assert.equal(status.schedule?.hotCandidateFreshLowerBound,0);
+    assert.equal(status.schedule?.coldDueProfilesLowerBound,0);assert.equal(status.staleProfilesBasis,'legacy_all_profiles_short_window');
+    assert.equal(status.schedule?.coldServed,0);assert.equal(status.schedule?.counts,'bounded_lower_bounds_at_batch_start');assert.equal(status.schedule?.computedAtIsTradeEvidence,false);
+    seconds=604902;status=engine.runBatch(100);assert.equal(reader.get('bsc',address(2))!.computedAt,iso(604902));
+    assert.equal(status.schedule?.coldRefreshAfterSec,604800);assert.ok((status.schedule?.coldServed??0)>=1);
+    status=engine.runBatch(100);assert.equal(status.schedule?.hotCandidateDueLowerBound,0);assert.equal(status.schedule?.hotCandidateFreshLowerBound,1);
+    assert.equal(status.schedule?.coldDueProfilesLowerBound,0);
+  }finally{reader.close();engine.close();launcher.close();history.close();rmSync(root,{recursive:true,force:true});}
+});
+
+test('launcher refresh keeps a bounded slice during initial profile backfill',()=>{
+  const root=mkdtempSync(join(tmpdir(),'wallet-profile-hot-reserve-')),historyPath=join(root,'history.sqlite'),database=join(root,'profiles.sqlite'),
+    launcherPath=join(root,'launchers.sqlite'),now=()=>new Date(base+100_000),history=new WalletHistory(historyPath,{now}),launcher=new DatabaseSync(launcherPath);
+  launcher.exec('CREATE TABLE lc_candidates(chain TEXT,address TEXT,monitored INTEGER NOT NULL DEFAULT 0)');
+  launcher.prepare('INSERT INTO lc_candidates VALUES (?,?,?)').run('bsc',address(42),1);
+  for(let wallet=1;wallet<=42;wallet++)history.recordTrade({chain:'bsc',wallet:address(wallet),tokenAddress:address(100),txHash:hash(wallet),side:'buy',
+    eventAt:iso(10),observedAt:iso(20),source:'gmgn_wallet_activity'});
+  const engine=new WalletProfiles({database,historyDatabase:historyPath,launcherDatabase:launcherPath,now,refreshAfterSec:3600,coldRefreshAfterSec:604800}),
+    reader=new WalletProfileReader(database,now,3600);
+  try {const status=engine.runBatch(20);assert.ok(reader.get('bsc',address(42)),'hot launcher is profiled before the historical cursor reaches it');
+    assert.equal(status.schedule?.hotServed,1);assert.ok(status.processed<=20);assert.ok(status.profiles<=20);
+  }finally{reader.close();engine.close();launcher.close();history.close();rmSync(root,{recursive:true,force:true});}
+});
+
+test('every realtime fast-target profile group receives the hot refresh cadence',()=>{
+  const f=fixture({refreshAfterSec:3600,coldRefreshAfterSec:604800});try {
+    WALLET_FAST_PROFILE_PRIORITY_GROUPS.forEach((_,index)=>f.trade(index+1));f.trade(99);f.batch(100);
+    const output=new DatabaseSync(f.database);
+    try {WALLET_FAST_PROFILE_PRIORITY_GROUPS.forEach((group,index)=>output.prepare('INSERT INTO wp_groups(chain,address,group_id,first_at,computed_at) VALUES (?,?,?,?,?)')
+      .run('bsc',address(index+1),group,iso(100),iso(100)));}finally{output.close();}
+    f.setNow(3701);const status=f.batch(100);
+    WALLET_FAST_PROFILE_PRIORITY_GROUPS.forEach((group,index)=>assert.equal(f.reader.get('bsc',address(index+1))!.computedAt,iso(3701),group));
+    assert.equal(f.reader.get('bsc',address(99))!.computedAt,iso(100));
+    assert.equal(status.schedule?.launcherCandidatePool,0);assert.equal(status.schedule?.realtimePriorityPoolLowerBound,WALLET_FAST_PROFILE_PRIORITY_GROUPS.length);
+    assert.equal(status.schedule?.hotServed,WALLET_FAST_PROFILE_PRIORITY_GROUPS.length);
+  }finally{f.close();}
+});
+
+test('hot refresh stays within forty percent while dirty and cold queues both progress',()=>{
+  const f=fixture({refreshAfterSec:3600,coldRefreshAfterSec:604800});try {
+    for(let wallet=1;wallet<=25;wallet++)f.trade(wallet);f.batch(100);
+    const output=new DatabaseSync(f.database);
+    try {for(let wallet=6;wallet<=25;wallet++)output.prepare('INSERT INTO wp_groups(chain,address,group_id,first_at,computed_at) VALUES (?,?,?,?,?)')
+      .run('bsc',address(wallet),'public_kol',iso(100),iso(100));}finally{output.close();}
+    f.setNow(604902);for(let wallet=100;wallet<110;wallet++)f.trade(wallet,{eventAt:iso(604900),observedAt:iso(604901)});
+    const processedBefore=f.reader.status().processed,status=f.batch(10);
+    assert.equal(status.schedule?.hotServed,4);assert.ok((status.schedule?.dirtySelected??0)>0);
+    assert.ok((status.schedule?.coldServed??0)>0);assert.equal(f.reader.get('bsc',address(1))!.computedAt,iso(604902));
+    assert.ok((status.schedule?.hotServed??0)<=Math.ceil(10*0.4));assert.ok(status.processed-processedBefore<=10);
+  }finally{f.close();}
+});
+
+test('batch one rotates dirty cursors so chain evidence progresses during historical backfill',()=>{
+  const f=fixture({refreshAfterSec:3600,coldRefreshAfterSec:604800});try {
+    for(let wallet=1;wallet<=20;wallet++)f.trade(wallet);
+    const watched=address(99),log={address:address(100),topics:[TRANSFER_TOPIC,'0x'+watched.slice(2).padStart(64,'0'),'0x'+address(2).slice(2).padStart(64,'0')],
+      data:'0x'+'1'.padStart(64,'0'),transactionHash:hash(999),blockHash:hash(1999),blockNumber:'0x1',logIndex:'0x0'};
+    f.chain.record(evmTransfers('bsc',log,new Set([watched]),'live',f.now())[0]);
+    f.batch(1);assert.equal(f.reader.get('bsc',watched),undefined);
+    for(let batch=0;batch<10&&!f.reader.get('bsc',watched);batch++)f.batch(1);
+    assert.equal(f.reader.get('bsc',watched)?.metrics.chain.transfers,1);
+    assert.equal(f.reader.status().initialComplete,false);
+  }finally{f.close();}
+});
+
+test('hot and cold scheduler limits are satisfied by covering indexes without temp sorting',()=>{
+  const f=fixture();try {f.trade();f.batch();const output=new DatabaseSync(f.database,{readOnly:true});try {
+    const hot=output.prepare(`EXPLAIN QUERY PLAN SELECT chain,address,computed_at FROM wp_groups INDEXED BY wp_groups_hot
+      WHERE group_id=? ORDER BY computed_at,chain,address LIMIT ?`).all('public_kol',4).map(row=>String(row.detail));
+    const cold=output.prepare(`EXPLAIN QUERY PLAN SELECT chain,address FROM wp_profiles INDEXED BY wp_profiles_recent WHERE computed_at<=?
+      ORDER BY computed_at DESC,chain,address LIMIT ?`).all(iso(100),4).map(row=>String(row.detail));
+    const fast=output.prepare(`EXPLAIN QUERY PLAN SELECT address FROM wp_groups INDEXED BY wp_groups_hot WHERE group_id=? AND chain=? AND computed_at>?
+      ORDER BY computed_at DESC LIMIT ?`).all('public_kol','bsc',iso(1),4).map(row=>String(row.detail));
+    assert.ok(hot.some(detail=>detail.includes('COVERING INDEX wp_groups_hot')));assert.ok(cold.some(detail=>detail.includes('COVERING INDEX wp_profiles_recent')));
+    assert.ok(fast.some(detail=>detail.includes('COVERING INDEX wp_groups_hot')));assert.ok([...hot,...cold,...fast].every(detail=>!detail.includes('TEMP B-TREE')));
+    assert.deepEqual(f.pragmas(),{synchronous:1,busyTimeout:1000,autoCheckpoint:64,journalMode:'wal'});
+  }finally{output.close();}}finally{f.close();}
+});
+
+test('hot backlog status is explicitly a bounded lower bound',()=>{
+  const f=fixture({refreshAfterSec:3600,coldRefreshAfterSec:604800});try {
+    for(let wallet=1;wallet<=25;wallet++)f.trade(wallet);f.batch(100);
+    const output=new DatabaseSync(f.database);try {for(let wallet=1;wallet<=25;wallet++)
+      output.prepare('INSERT INTO wp_groups(chain,address,group_id,first_at,computed_at) VALUES (?,?,?,?,?)').run('bsc',address(wallet),'public_kol',iso(100),iso(100));
+    }finally{output.close();}
+    f.setNow(3701);const schedule=f.batch(10).schedule!;
+    assert.equal(schedule.counts,'bounded_lower_bounds_at_batch_start');assert.equal(schedule.hotCandidateDueLowerBound,4);
+    assert.equal(schedule.hotCandidatePoolLowerBound,4);assert.equal(schedule.hotServed,4);
+  }finally{f.close();}
+});
+
+test('batch one enforces hot and cold shares across the persisted ten-slot cycle',()=>{
+  const f=fixture({refreshAfterSec:3600,coldRefreshAfterSec:604800});try {
+    for(let wallet=1;wallet<=20;wallet++)f.trade(wallet);f.batch(100);
+    const output=new DatabaseSync(f.database);try {for(let wallet=1;wallet<=10;wallet++)
+      output.prepare('INSERT INTO wp_groups(chain,address,group_id,first_at,computed_at) VALUES (?,?,?,?,?)').run('bsc',address(wallet),'public_kol',iso(100),iso(100));
+    }finally{output.close();}
+    f.setNow(604902);let hot=0,cold=0,processed=f.reader.status().processed;
+    for(let batch=0;batch<10;batch++){const status=f.batch(1);hot+=status.schedule!.hotServed;cold+=status.schedule!.coldServed;
+      assert.ok(status.processed-processed<=1);processed=status.processed;}
+    assert.ok(hot<=4);assert.ok(cold>=1);
   }finally{f.close();}
 });
 
@@ -394,12 +520,12 @@ test('global event cursor retains an older post-market buy after a busy wallet p
     f.batch(1000);let profile=f.reader.get('bsc',address(1))!,analysis=profile.initiatorAnalysis!;
     assert.equal(profile.metrics.observedEvents,500,'the ordinary profile frame has dropped the older relevant buy');
     assert.equal(analysis.directionalTokens.post,1,'the independent event cursor still nominates the dropped buy');
-    assert.equal(analysis.status,'partial','qualification stays conservative until the durable event cursor catches up');
+    assert.equal(analysis.status,'current','the rotated event slice can catch up in the same large batch');
     const output=new DatabaseSync(f.database,{readOnly:true});try{
       assert.equal(output.prepare('SELECT count(*) AS n FROM wp_initiator_tokens WHERE chain=? AND address=? AND token_address=?')
         .get('bsc',address(1),address(100))!.n,1);
     }finally{output.close();}
-    f.batch(1000);f.batch(1000);assert.equal(Number(profileMeta(f.database,'initiator_event_cursor')),501);
+    assert.equal(Number(profileMeta(f.database,'initiator_event_cursor')),501);
     f.setNow(5601);f.batch(1000);profile=f.reader.get('bsc',address(1))!;analysis=profile.initiatorAnalysis!;
     assert.equal(analysis.status,'current');assert.equal(analysis.directionalTokens.post,1);
   }finally{f.close();}

@@ -53,6 +53,27 @@ test('跨feed重复交易只计一次，独立来源及冲突证据保留，无�
   } finally {history.close();}
 });
 
+test('removed-log retracts only the matching verified transaction and dirties derived research idempotently',()=>{
+  const {history}=fixture(),db=(history as unknown as {db:DatabaseSync}).db,peer=address(2),otherToken=address(9001);
+  try {
+    history.recordTrade(trade());
+    history.recordTrade(trade({wallet:peer,txHash:hash(2),observedAt:iso(11)}));
+    history.recordTrade(trade({txHash:hash(3),tokenAddress:otherToken,side:'sell',eventAt:iso(2),observedAt:iso(12)}));
+    history.recordPrice(token,1,iso(20),'test_price');history.recordPrice(token,2,iso(30),'test_price');
+    db.prepare('UPDATE wh_metrics SET coordination_dirty=0 WHERE chain=? AND address IN (?,?)').run('bsc',address(1),peer);
+    assert.equal(history.retractVerifiedTrade({chain:'bsc',wallet:address(1),txHash:hash(1),checkedAt:iso(40)}),true);
+    const detail=history.getWallet('bsc',address(1))!;
+    assert.equal(detail.wallet.observedEventCount,1);assert.equal(detail.wallet.buyEvents,0);assert.equal(detail.wallet.sellEvents,1);
+    assert.equal(detail.timeline[0].txHash,hash(3));assert.equal(detail.wallet.gain,undefined);
+    assert.equal(detail.wallet.tokenCount,1);assert.equal(history.stats().events,2);assert.equal(history.stats().observations,2);
+    assert.equal(Number(db.prepare('SELECT coordination_dirty FROM wh_metrics WHERE chain=? AND address=?').get('bsc',address(1))!.coordination_dirty),1);
+    assert.equal(Number(db.prepare('SELECT coordination_dirty FROM wh_metrics WHERE chain=? AND address=?').get('bsc',peer)!.coordination_dirty),1);
+    assert.equal(history.retractVerifiedTrade({chain:'bsc',wallet:address(1),txHash:hash(1),checkedAt:iso(41)}),false);
+    assert.equal(history.getWallet('bsc',address(1))!.wallet.observedEventCount,1);
+    assert.equal(history.getWallet('bsc',peer)!.wallet.buyEvents,1);
+  } finally {history.close();}
+});
+
 test('live WATCH/REJECT同样入库，重复报告跨时间幂等；旧snapshot与本地导入时间分开',()=>{
   const {history,setNow}=fixture();
   try {

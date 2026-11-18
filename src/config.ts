@@ -56,7 +56,7 @@ export interface Config extends z.infer<typeof schema> {
   exitPolicy?:ExitPolicy;
   dashboard:{enabled:boolean;host:string;port:number;token?:string;origin?:string;archivePath:string;retentionDays:number;trackingHours:number;sampleIntervalSec:number};
   walletResearch:{enabled:boolean;database:string;maxBytes:number;intervalSec:number;maxRequestsPerCycle:number};
-  walletProfiles:{enabled:boolean;database:string;maxBytes:number;intervalSec:number;batchSize:number;refreshAfterSec:number};
+  walletProfiles:{enabled:boolean;database:string;maxBytes:number;intervalSec:number;batchSize:number;refreshAfterSec:number;coldRefreshAfterSec:number};
   launcherCandidates:{enabled:boolean;database:string;maxBytes:number;cap:number;refreshIntervalSec:number;
     freshAfterSec:number;liveAfterSec:number;coverageAfterSec:number;revalidateIntervalSec:number;revalidateRequestIntervalMs:number};
   walletScreening:{enabled:boolean;database:string;maxBytes:number};
@@ -70,7 +70,7 @@ export interface Config extends z.infer<typeof schema> {
   exitShadow:{enabled:boolean;database:string;maxBytes:number;staleAfterSec:number;maxPositions:number};
   chainStream:{enabled:boolean;database:string;maxBytes:number;maxWallets:number;maxPools:number;
     endpoints:Partial<Record<Chain,{http:string;ws:string}>>;pinnedWallets?:Partial<Record<Chain,string[]>>};
-  walletFast?:{enabled:boolean;database?:string;maxBytes?:number};
+  walletFast?:{enabled:boolean;database?:string;maxBytes?:number;evmMaxWallets:number};
   telegram?:{enabled:boolean;token?:string;chatId?:string;database:string;summaryIntervalMs:number};
   nativeSolana?:{keypairFile?:string;rpcUrl?:string;wsUrl?:string;inventoryRpcUrl?:string;jupiterApiKey?:string;
     jupiterMainBucketTier:'keyless'|'free'|'developer'|'launch'|'pro';jupiterMainBucketRps:number;
@@ -144,6 +144,12 @@ export function readConfig(env:NodeJS.ProcessEnv=process.env): Config {
   if(!Number.isFinite(jupiterMainBucketRps)||jupiterMainBucketRps<=0||jupiterMainBucketRps>jupiterTierRps[jupiterTier]||
     Math.round(jupiterMainBucketRps*2)!==jupiterMainBucketRps*2)
     throw new Error('JUPITER_MAIN_BUCKET_CONFIG_INVALID');
+  const walletProfilesRefreshAfterSec=z.coerce.number().int().min(300).max(604800)
+    .parse(env.WALLET_PROFILES_REFRESH_AFTER_SEC??21600);
+  const walletProfilesColdRefreshAfterSec=z.coerce.number().int().min(86400).max(2592000)
+    .parse(env.WALLET_PROFILES_COLD_REFRESH_AFTER_SEC??604800);
+  if(walletProfilesColdRefreshAfterSec<walletProfilesRefreshAfterSec)
+    throw new Error('WALLET_PROFILES_REFRESH_ORDER_INVALID');
   return {
     ...schema.parse({maxSignalAgeSec:env.MAX_SIGNAL_AGE_SEC, maxEvidenceAgeSec:env.MAX_EVIDENCE_AGE_SEC,
       decisionTtlSec:env.DECISION_TTL_SEC,maxTaxRate:env.MAX_TAX_RATE,xDataProvider:env.X_DATA_PROVIDER,narrativeProvider:env.NARRATIVE_PROVIDER,
@@ -170,7 +176,8 @@ export function readConfig(env:NodeJS.ProcessEnv=process.env): Config {
       priorityFeeLamports:reserve(env.SOLANA_NATIVE_PRIORITY_FEE_LAMPORTS,'10000',10_000_000n)},
     walletFast:{enabled:z.enum(['true','false']).default('false').parse(env.WALLET_FAST_ENABLED)==='true',
       database:z.string().trim().refine(isPersistentOrderPath).parse(env.WALLET_ACTIVITY_DATABASE_PATH??'data/wallet-activity.sqlite'),
-      maxBytes:z.coerce.number().int().min(16).max(1024).parse(env.WALLET_ACTIVITY_MAX_MB??128)*1024*1024},
+      maxBytes:z.coerce.number().int().min(16).max(1024).parse(env.WALLET_ACTIVITY_MAX_MB??128)*1024*1024,
+      evmMaxWallets:z.coerce.number().int().min(1).max(200).parse(env.WALLET_FAST_EVM_MAX_WALLETS??200)},
     chainStream:{enabled:z.enum(['true','false']).default('false').parse(env.CHAIN_STREAM_ENABLED)==='true',
       database:z.string().trim().refine(isPersistentOrderPath).parse(env.CHAIN_STREAM_DATABASE_PATH??'data/chain-stream.sqlite'),
       maxBytes:z.coerce.number().int().min(16).max(4096).parse(env.CHAIN_STREAM_MAX_MB??256)*1024*1024,
@@ -254,7 +261,7 @@ export function readConfig(env:NodeJS.ProcessEnv=process.env): Config {
       maxBytes:z.coerce.number().int().min(1048576).max(1073741824).default(67108864).parse(env.WALLET_SCREENING_MAX_BYTES)},
     walletResearch:{enabled:z.enum(['true','false']).default('false').parse(env.WALLET_RESEARCH_ENABLED)==='true',
       database:z.string().trim().refine(isPersistentOrderPath).parse(env.WALLET_HISTORY_DATABASE_PATH??'data/wallet-history.sqlite'),
-      maxBytes:z.coerce.number().int().min(16).max(16384).parse(env.WALLET_HISTORY_MAX_MB??512)*1024*1024,
+      maxBytes:z.coerce.number().int().min(16).max(32768).parse(env.WALLET_HISTORY_MAX_MB??512)*1024*1024,
       intervalSec:z.coerce.number().int().min(60).max(3600).parse(env.WALLET_OBSERVER_INTERVAL_SEC??300),
       maxRequestsPerCycle:z.coerce.number().int().min(1).max(10).parse(env.WALLET_OBSERVER_MAX_REQUESTS??9)},
     tokenRankResearch:{enabled:z.enum(['true','false']).parse(env.TOKEN_RANK_RESEARCH_ENABLED??env.WALLET_RESEARCH_ENABLED??'false')==='true',
@@ -267,7 +274,7 @@ export function readConfig(env:NodeJS.ProcessEnv=process.env): Config {
       maxBytes:z.coerce.number().int().min(16).max(4096).parse(env.WALLET_PROFILES_MAX_MB??512)*1024*1024,
       intervalSec:z.coerce.number().int().min(1).max(300).parse(env.WALLET_PROFILES_INTERVAL_SEC??2),
       batchSize:z.coerce.number().int().min(1).max(500).parse(env.WALLET_PROFILES_BATCH_SIZE??20),
-      refreshAfterSec:z.coerce.number().int().min(300).max(604800).parse(env.WALLET_PROFILES_REFRESH_AFTER_SEC??21600)},
+      refreshAfterSec:walletProfilesRefreshAfterSec,coldRefreshAfterSec:walletProfilesColdRefreshAfterSec},
     launcherCandidates:{enabled:z.enum(['true','false']).parse(env.LAUNCHER_CANDIDATES_ENABLED??env.WALLET_PROFILES_ENABLED??env.WALLET_RESEARCH_ENABLED??'false')==='true',
       database:z.string().trim().refine(isPersistentOrderPath).parse(env.LAUNCHER_CANDIDATES_DATABASE_PATH??'data/launcher-candidates.sqlite'),
       maxBytes:z.coerce.number().int().min(8).max(512).parse(env.LAUNCHER_CANDIDATES_MAX_MB??64)*1024*1024,

@@ -9,6 +9,7 @@ import type {Chain} from './types.js';
 import type {ScanPrice,ScanToken} from './scan-archive.js';
 import {shadowReturn} from './exit-shadow-return.js';
 import {readPositionExitQuality} from './exit-quality.js';
+import {configureResearchWal} from './research-sqlite.js';
 
 export interface ExitObservationSeed {candidateId:string;eligibleAt:string;endsAt:string;symbol?:string;}
 export interface ExitShadowOptions {maxBytes?:number;staleAfterSec?:number;maxPositions?:number;now?:()=>Date;}
@@ -24,6 +25,11 @@ export interface ShadowEvent {
   reasons?:string[];stageGainsPct?:number[];
   source?:string;poolAddress?:string;
 }
+interface ShadowSampleSnapshot {at:string;priceUsd:number;source:string;poolAddress?:string;}
+interface ShadowSampleStatsRow {
+  evaluated_samples:number;stored_samples:number;samples_thinned:number;
+  retention_started_at:string;last_pruned_at:string;
+}
 interface ShadowPriceQuarantine {
   basePriceUsd:number;candidatePriceUsd:number;direction:'up'|'down';observedAt:string;source:string;poolAddress?:string;
 }
@@ -34,6 +40,37 @@ export interface ShadowExitIntent {
 }
 const continuousPolicy=(version:string)=>version===ADAPTIVE_SHADOW_V2.version||version===ADAPTIVE_SHADOW_V3.version||
   version===ADAPTIVE_SHADOW_V4.version||version===ADAPTIVE_SHADOW_V5.version;
+// Exit quality reads the 5/15/60-minute marks and accepts a quote for up to
+// 120 seconds after each mark. Quotes after the final window add no evidence.
+const CLOSED_COMPARISON_HORIZON_MS=(60*60+120)*1000;
+// Raw observations are an audit aid, never policy state. Keep a short exact
+// window, then progressively coarsen it. The hard unpinned cap also bounds a
+// burst whose quote rate is much higher than the usual stream cadence.
+const SAMPLE_RETENTION_VERSION='tiered-v1';
+const SAMPLE_PRUNE_INTERVAL_MS=15*60_000;
+const SAMPLE_RECENT_WINDOW_MS=15*60_000;
+const SAMPLE_MID_WINDOW_MS=6*60*60_000;
+const SAMPLE_LONG_WINDOW_MS=24*60*60_000;
+const SAMPLE_MID_BUCKET_SEC=5*60;
+const SAMPLE_LONG_BUCKET_SEC=30*60;
+const SAMPLE_RECENT_MAX=1024;
+const SAMPLE_UNPINNED_MAX=2048;
+const SAMPLE_PROTECTED_SQL=`(
+  s.at=(SELECT p.started_at FROM exit_shadow_positions p WHERE p.id=s.position_id)
+  OR EXISTS (SELECT 1 FROM exit_shadow_sample_pins pin WHERE pin.position_id=s.position_id AND pin.at=s.at)
+  OR EXISTS (SELECT 1 FROM exit_shadow_events e WHERE e.position_id=s.position_id AND e.at=s.at
+    AND json_extract(e.data,'$.kind') IN ('partial_exit','full_exit'))
+  OR EXISTS (SELECT 1 FROM exit_shadow_positions p WHERE p.id=s.position_id
+    AND json_extract(p.state,'$.shadowClosed')=1 AND (
+      CAST(strftime('%s',s.at) AS INTEGER) BETWEEN CAST(strftime('%s',json_extract(p.state,'$.lastObservedAt')) AS INTEGER)+300 AND CAST(strftime('%s',json_extract(p.state,'$.lastObservedAt')) AS INTEGER)+420
+      OR CAST(strftime('%s',s.at) AS INTEGER) BETWEEN CAST(strftime('%s',json_extract(p.state,'$.lastObservedAt')) AS INTEGER)+900 AND CAST(strftime('%s',json_extract(p.state,'$.lastObservedAt')) AS INTEGER)+1020
+      OR CAST(strftime('%s',s.at) AS INTEGER) BETWEEN CAST(strftime('%s',json_extract(p.state,'$.lastObservedAt')) AS INTEGER)+3600 AND CAST(strftime('%s',json_extract(p.state,'$.lastObservedAt')) AS INTEGER)+3720
+    ))
+)`;
+export const EXIT_SHADOW_SAMPLE_RETENTION=Object.freeze({version:SAMPLE_RETENTION_VERSION,
+  pruneIntervalMs:SAMPLE_PRUNE_INTERVAL_MS,recentWindowMs:SAMPLE_RECENT_WINDOW_MS,midWindowMs:SAMPLE_MID_WINDOW_MS,
+  longWindowMs:SAMPLE_LONG_WINDOW_MS,midBucketSec:SAMPLE_MID_BUCKET_SEC,longBucketSec:SAMPLE_LONG_BUCKET_SEC,
+  recentMax:SAMPLE_RECENT_MAX,unpinnedMax:SAMPLE_UNPINNED_MAX,protectedSql:SAMPLE_PROTECTED_SQL});
 const timeExitReason=(reason:string)=>reason==='MAX_HOLDING_TIME_OBSERVED'||reason==='OBSERVATION_WINDOW_END_OBSERVED';
 const stamp=(value:unknown):value is string=>typeof value==='string'&&/^\d{4}-\d\d-\d\dT/.test(value)&&Number.isFinite(Date.parse(value));
 const clean=(value:unknown,max=80)=>typeof value==='string'?value.replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g,' ').trim().slice(0,max):undefined;
@@ -55,10 +92,14 @@ export class ExitShadow {
   private readonly db:DatabaseSync;
   private readonly now:()=>Date;
   private readonly maxBytes:number;
+  private readonly maxPages:number;
   private readonly staleMs:number;
   private readonly maxPositions:number;
   private lastError?:string;
+  private persistedFailure?:string;
   private sampleCount=0;
+  private evaluatedSampleCount=0;
+  private thinnedPositions=0;
   private eventCount=0;
   constructor(private readonly path:string,options:ExitShadowOptions={}) {
     this.now=options.now??(()=>new Date());this.maxBytes=options.maxBytes??128*1024*1024;
@@ -67,7 +108,8 @@ export class ExitShadow {
       !Number.isSafeInteger(this.maxPositions)||this.maxPositions<1||this.maxPositions>10000)throw new Error('EXIT_SHADOW_CONFIG_INVALID');
     if(path!==':memory:')mkdirSync(dirname(path),{recursive:true,mode:0o700});
     this.db=new DatabaseSync(path);if(path!==':memory:')chmodSync(path,0o600);
-    this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA wal_autocheckpoint=128;
+    configureResearchWal(this.db,{busyTimeoutMs:5000,autoCheckpointPages:128});
+    this.db.exec(`
       CREATE TABLE IF NOT EXISTS exit_shadow_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS exit_shadow_positions(id TEXT PRIMARY KEY,chain TEXT NOT NULL,address TEXT NOT NULL,
         candidate_id TEXT NOT NULL,eligible_at TEXT NOT NULL,ends_at TEXT NOT NULL,symbol TEXT,started_at TEXT NOT NULL,
@@ -78,10 +120,21 @@ export class ExitShadow {
       CREATE INDEX IF NOT EXISTS exit_shadow_chain_page ON exit_shadow_positions(chain,started_at DESC,id);
       CREATE TABLE IF NOT EXISTS exit_shadow_samples(position_id TEXT NOT NULL,at TEXT NOT NULL,price REAL NOT NULL,
         source TEXT NOT NULL,context TEXT NOT NULL,PRIMARY KEY(position_id,at));
+      CREATE TABLE IF NOT EXISTS exit_shadow_sample_stats(position_id TEXT PRIMARY KEY,evaluated_samples INTEGER NOT NULL,
+        stored_samples INTEGER NOT NULL,samples_thinned INTEGER NOT NULL,retention_started_at TEXT NOT NULL,last_pruned_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS exit_shadow_sample_pins(position_id TEXT NOT NULL,reason TEXT NOT NULL,at TEXT NOT NULL,
+        PRIMARY KEY(position_id,reason));
+      CREATE INDEX IF NOT EXISTS exit_shadow_sample_pin_time ON exit_shadow_sample_pins(position_id,at);
       CREATE TABLE IF NOT EXISTS exit_shadow_events(id INTEGER PRIMARY KEY,position_id TEXT NOT NULL,at TEXT NOT NULL,data TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS exit_shadow_event_position ON exit_shadow_events(position_id,id DESC);
       CREATE INDEX IF NOT EXISTS exit_shadow_event_return ON exit_shadow_events(position_id,id)
         WHERE json_extract(data,'$.kind') IN ('partial_exit','full_exit');
+      CREATE INDEX IF NOT EXISTS exit_shadow_event_return_time ON exit_shadow_events(position_id,at)
+        WHERE json_extract(data,'$.kind') IN ('partial_exit','full_exit');
+      CREATE TABLE IF NOT EXISTS exit_shadow_event_samples(event_id INTEGER NOT NULL,relation INTEGER NOT NULL,
+        position_id TEXT NOT NULL,at TEXT NOT NULL,price REAL NOT NULL,source TEXT NOT NULL,pool_address TEXT,
+        PRIMARY KEY(event_id,relation));
+      CREATE INDEX IF NOT EXISTS exit_shadow_event_sample_position ON exit_shadow_event_samples(position_id,event_id,relation);
       CREATE TABLE IF NOT EXISTS exit_shadow_metrics(position_id TEXT PRIMARY KEY,peak_price REAL NOT NULL,
         max_gap_sec REAL NOT NULL,last_source TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS exit_shadow_exit_intents(position_id TEXT PRIMARY KEY,data TEXT NOT NULL);
@@ -98,16 +151,37 @@ export class ExitShadow {
         COALESCE((SELECT source FROM exit_shadow_samples WHERE position_id=p.id ORDER BY at DESC LIMIT 1),'')
       FROM exit_shadow_positions p LEFT JOIN exit_shadow_samples s ON s.position_id=p.id
       WHERE NOT EXISTS (SELECT 1 FROM exit_shadow_metrics m WHERE m.position_id=p.id) GROUP BY p.id;`);
+    const retentionStartedAt=this.now().toISOString();
+    // Existing rows begin in an explicitly unthinned state. Online retention
+    // only touches observations accepted after this deployment boundary; the
+    // older archive is compacted separately while the service is offline.
+    this.db.prepare(`INSERT OR IGNORE INTO exit_shadow_sample_stats
+      SELECT p.id,count(s.at),count(s.at),0,?,? FROM exit_shadow_positions p
+      LEFT JOIN exit_shadow_samples s ON s.position_id=p.id
+      WHERE NOT EXISTS (SELECT 1 FROM exit_shadow_sample_stats x WHERE x.position_id=p.id)
+      GROUP BY p.id`).run(retentionStartedAt,retentionStartedAt);
     this.db.prepare('INSERT OR IGNORE INTO exit_shadow_meta VALUES (?,?)').run('started_at',this.now().toISOString());
     this.db.prepare('INSERT OR IGNORE INTO exit_shadow_meta VALUES (?,?)').run('history_complete','true');
-    const oldBudget=Number(this.meta('max_bytes')??0);
-    if(this.maxBytes>oldBudget&&this.bytes()+16384<this.maxBytes&&this.meta('last_error')==='EXIT_SHADOW_CAPACITY_REACHED')
+    this.db.prepare('INSERT OR REPLACE INTO exit_shadow_meta VALUES (?,?)').run('sample_retention_version',SAMPLE_RETENTION_VERSION);
+    const pageSize=Number(this.db.prepare('PRAGMA page_size').get()!.page_size);
+    const pageCount=Number(this.db.prepare('PRAGMA page_count').get()!.page_count);
+    this.maxPages=Math.max(pageCount,Math.floor(this.maxBytes/pageSize));
+    this.db.exec(`PRAGMA max_page_count=${this.maxPages}`);
+    // An offline VACUUM/compaction can restore physical headroom without a
+    // configuration change. Clear only the capacity alarm; the independent
+    // history_complete=false audit marker remains durable.
+    if(this.hasLogicalCapacity(16384)&&this.meta('last_error')==='EXIT_SHADOW_CAPACITY_REACHED')
       this.db.prepare("DELETE FROM exit_shadow_meta WHERE key='last_error'").run();
     this.db.prepare('INSERT OR REPLACE INTO exit_shadow_meta VALUES (?,?)').run('max_bytes',String(this.maxBytes));
+    const storedFailure=this.meta('last_error');
+    if(storedFailure&&this.meta('history_complete')==='false')this.lastError=this.persistedFailure=storedFailure;
     // Historical totals are initialized once. All later writes below update the
     // in-memory counters after COMMIT, so dashboard summary calls never scan the
     // growing sample table on the event-loop thread.
     this.sampleCount=Number(this.db.prepare('SELECT count(*) AS n FROM exit_shadow_samples').get()!.n);
+    const sampleStats=this.db.prepare(`SELECT COALESCE(sum(evaluated_samples),0) AS evaluated,
+      COALESCE(sum(samples_thinned<>0),0) AS thinned FROM exit_shadow_sample_stats`).get()!;
+    this.evaluatedSampleCount=Number(sampleStats.evaluated);this.thinnedPositions=Number(sampleStats.thinned);
     this.eventCount=Number(this.db.prepare('SELECT count(*) AS n FROM exit_shadow_events').get()!.n);
   }
 
@@ -124,10 +198,21 @@ export class ExitShadow {
     if(previous&&at<=previous.last_price_at)return;
     let state:AdaptiveExitState|undefined;
     if(previous)try{state=JSON.parse(previous.state) as AdaptiveExitState;}catch{this.fail('EXIT_SHADOW_STATE_INVALID');}
-    if(previous&&(state!.shadowClosed||!continuousPolicy(state!.policyVersion))&&Date.parse(previous.ends_at)<=now.getTime()&&seed&&seed.candidateId!==previous.candidate_id&&
+    // A closed episode owns this contract's quotes through the complete
+    // 5/15/60-minute quality window. Its original signal end may pass shortly
+    // after the exit, but rolling then would redirect the remaining comparison
+    // quotes to the new episode because current() selects only the latest row.
+    const canRollClosed=!!(previous&&state?.shadowClosed&&
+      Date.parse(at)>Date.parse(state.lastObservedAt)+CLOSED_COMPARISON_HORIZON_MS);
+    const canRollLegacy=!!(previous&&state&&!state.shadowClosed&&!continuousPolicy(state.policyVersion)&&
+      Date.parse(previous.ends_at)<=now.getTime());
+    if(previous&&(canRollClosed||canRollLegacy)&&seed&&seed.candidateId!==previous.candidate_id&&
       stamp(seed.eligibleAt)&&Date.parse(seed.eligibleAt)>Date.parse(previous.eligible_at)){previous=undefined;state=undefined;}
     if(!previous&&(!seed||!stamp(seed.eligibleAt)||!stamp(seed.endsAt)||Date.parse(seed.eligibleAt)>Date.parse(at)||
       Date.parse(seed.endsAt)<=now.getTime()||typeof seed.candidateId!=='string'||! /^[A-Za-z0-9_-]{1,200}$/.test(seed.candidateId)))return;
+    // A later candidate on the same CA is admitted before the old comparison
+    // horizon gate. Only another quote for the already-closed episode stops.
+    if(previous&&state?.shadowClosed&&Date.parse(at)>Date.parse(state.lastObservedAt)+CLOSED_COMPARISON_HORIZON_MS)return;
     // A finished observation is not silently reopened for the same old candidate.
     if(previous&&state&&!continuousPolicy(state.policyVersion)&&
       (previous.phase==='ended'||Date.parse(previous.ends_at)<=now.getTime()))return;
@@ -162,28 +247,41 @@ export class ExitShadow {
       gapSec:previous?(Date.parse(at)-Date.parse(previous.last_price_at))/1000:0,
       walletPressure:next.walletPressure,pressureIgnoredReason:result.ignoredPressureReason};
     try {
-      if(this.bytes()+JSON.stringify(context).length*3+JSON.stringify(next).length*3+16384>this.maxBytes)
+      const requiredBytes=JSON.stringify(context).length*3+JSON.stringify(next).length*3+16384;
+      if(!this.ensureCapacity(previous?.id,at,requiredBytes))
         throw new Error('EXIT_SHADOW_CAPACITY_REACHED');
       if(!previous&&Number(this.db.prepare('SELECT count(*) AS n FROM exit_shadow_positions').get()!.n)>=this.maxPositions)
         throw new Error('EXIT_SHADOW_POSITION_CAPACITY_REACHED');
       this.db.exec('BEGIN IMMEDIATE');
       try {
         const id=previous?.id??randomUUID();
-        if(!previous)this.db.prepare('INSERT INTO exit_shadow_positions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id,target.chain,target.address,
-          seed!.candidateId,new Date(seed!.eligibleAt).toISOString(),new Date(seed!.endsAt).toISOString(),clean(seed!.symbol)??null,
-          at,at,'tracking',JSON.stringify(next),at,price.priceUsd,null,null);
+        if(!previous){
+          this.db.prepare('INSERT INTO exit_shadow_positions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id,target.chain,target.address,
+            seed!.candidateId,new Date(seed!.eligibleAt).toISOString(),new Date(seed!.endsAt).toISOString(),clean(seed!.symbol)??null,
+            at,at,'tracking',JSON.stringify(next),at,price.priceUsd,null,null);
+          this.db.prepare('INSERT INTO exit_shadow_sample_stats VALUES (?,?,?,?,?,?)').run(id,0,0,0,at,at);
+        }
         const inserted=this.db.prepare('INSERT OR IGNORE INTO exit_shadow_samples VALUES (?,?,?,?,?)')
           .run(id,at,price.priceUsd,price.source,JSON.stringify(context));
         if(!Number(inserted.changes)){this.db.exec('COMMIT');return;}
+        this.db.prepare(`UPDATE exit_shadow_sample_stats SET evaluated_samples=evaluated_samples+1,
+          stored_samples=stored_samples+1 WHERE position_id=?`).run(id);
+        const currentSample:ShadowSampleSnapshot={at,priceUsd:price.priceUsd,source:price.source,...(pool?{poolAddress:pool}:{})};
+        this.completeEventNeighbors(id,currentSample);
         if(quarantine==='accept_and_clear')
           this.db.prepare('DELETE FROM exit_shadow_price_quarantine WHERE position_id=?').run(id);
+        const priorMetrics=this.db.prepare('SELECT peak_price,max_gap_sec FROM exit_shadow_metrics WHERE position_id=?').get(id);
+        const pin=this.db.prepare('INSERT OR REPLACE INTO exit_shadow_sample_pins VALUES (?,?,?)');
+        if(!priorMetrics||price.priceUsd>Number(priorMetrics.peak_price))pin.run(id,'peak',at);
+        if(!priorMetrics||context.gapSec>Number(priorMetrics.max_gap_sec))pin.run(id,'max_gap',at);
         this.db.prepare(`INSERT INTO exit_shadow_metrics(position_id,peak_price,max_gap_sec,last_source) VALUES (?,?,?,?)
           ON CONFLICT(position_id) DO UPDATE SET peak_price=MAX(peak_price,excluded.peak_price),
           max_gap_sec=MAX(max_gap_sec,excluded.max_gap_sec),last_source=excluded.last_source`)
           .run(id,price.priceUsd,context.gapSec,price.source);
         let eventsAdded=0;
-        const emit=(event:ShadowEvent)=>{eventsAdded+=Number(this.db.prepare('INSERT INTO exit_shadow_events(position_id,at,data) VALUES (?,?,?)')
-          .run(id,event.at,JSON.stringify(event)).changes);};
+        const emit=(event:ShadowEvent)=>{const insertedEvent=this.db.prepare('INSERT INTO exit_shadow_events(position_id,at,data) VALUES (?,?,?)')
+          .run(id,event.at,JSON.stringify(event));eventsAdded+=Number(insertedEvent.changes);
+          this.captureEventNeighbors(Number(insertedEvent.lastInsertRowid),id,currentSample);};
         if(!previous)emit({at,kind:'initialized',reason:'SHADOW_STARTED',observationOnly:true,priceUsd:price.priceUsd,gainPct:0,remainingPct:100,policyVersion:next.policyVersion,effectiveAt:next.policyEffectiveAt,dueAt:adaptiveExitDeadline(next)?.dueAt});
         else if(previous.error)emit({at,kind:'price_recovered',reason:'PRICE_SAMPLE_RECOVERED',observationOnly:true,priceUsd:price.priceUsd});
         if(state&&!state.shadowClosed&&next.protectionActive&&(!state.protectionActive||next.protectionPriceUsd>state.protectionPriceUsd))
@@ -205,7 +303,10 @@ export class ExitShadow {
         this.db.prepare('INSERT OR REPLACE INTO exit_shadow_meta VALUES (?,?)').run('last_sample_at',
           [this.meta('last_sample_at')??'',at].sort().at(-1)!);
         this.db.prepare("DELETE FROM exit_shadow_meta WHERE key='last_error'").run();
-        this.db.exec('COMMIT');this.sampleCount+=Number(inserted.changes);this.eventCount+=eventsAdded;this.lastError=undefined;
+        const pruned=this.pruneSamples(id,at);
+        this.db.exec('COMMIT');this.sampleCount+=Number(inserted.changes)-pruned.deleted;this.evaluatedSampleCount++;
+        this.thinnedPositions+=Number(pruned.becameThinned);this.eventCount+=eventsAdded;
+        this.lastError=undefined;this.persistedFailure=undefined;
       }catch(error){this.db.exec('ROLLBACK');throw error;}
     }catch(error){this.fail(error instanceof Error&&/^EXIT_SHADOW_[A-Z_]+$/.test(error.message)?error.message:'EXIT_SHADOW_WRITE_FAILED');}
   }
@@ -218,7 +319,7 @@ export class ExitShadow {
     if(state.shadowClosed||!continuousPolicy(state.policyVersion)&&Date.parse(row.ends_at)<=now.getTime())return;
     if(now.getTime()<Date.parse(row.last_price_at)||row.error_at&&now.getTime()<=Date.parse(row.error_at))return;
     try {
-      if(this.bytes()+16384>this.maxBytes)this.fail('EXIT_SHADOW_CAPACITY_REACHED');
+      if(!this.ensureCapacity(row.id,now.toISOString(),16384))this.fail('EXIT_SHADOW_CAPACITY_REACHED');
       this.db.exec('BEGIN IMMEDIATE');
       this.db.prepare('UPDATE exit_shadow_positions SET error=?,error_at=?,updated_at=? WHERE id=?')
         .run(code(reason),now.toISOString(),now.toISOString(),row.id);
@@ -320,9 +421,13 @@ export class ExitShadow {
       status:{positions:Number(counts.positions),active:Number(counts.active??0),triggered:Number(counts.triggered??0),
         stale:Number(counts.stale??0),pending:Number(counts.pending??0),
         samples:this.sampleCount,events:this.eventCount,
+        evaluatedSamples:this.evaluatedSampleCount,storedSamples:this.sampleCount,
+        storedSamplesThinned:this.thinnedPositions>0,thinnedPositions:this.thinnedPositions,
         startedAt:this.meta('started_at'),lastSampleAt:this.meta('last_sample_at'),lastError:this.lastError??this.meta('last_error'),
         maxBytes:this.maxBytes,bytes:this.bytes(),historyComplete:this.meta('history_complete')==='true',
-        staleAfterSec:this.staleMs/1000,closedComparisonIntervalSec:60,execution:'observation_only',liveBlockReason:'ENTRY_UNATTENDED_PROTECTION_UNVERIFIED'}};
+        staleAfterSec:this.staleMs/1000,closedComparisonIntervalSec:60,
+        closedComparisonHorizonSec:CLOSED_COMPARISON_HORIZON_MS/1000,
+        execution:'observation_only',liveBlockReason:'ENTRY_UNATTENDED_PROTECTION_UNVERIFIED'}};
   }
   list(limit=50,now=this.now()) {
     const take=Number.isSafeInteger(limit)?Math.max(1,Math.min(100,limit)):50;
@@ -342,10 +447,17 @@ export class ExitShadow {
     const row=this.db.prepare('SELECT * FROM exit_shadow_positions WHERE id=?').get(id) as unknown as ShadowRow|undefined;
     if(!row)return;
     const samples=this.db.prepare('SELECT at,price AS priceUsd,source,context FROM exit_shadow_samples WHERE position_id=? ORDER BY at LIMIT 2000').all(id);
-    const count=Number(this.db.prepare('SELECT count(*) AS n FROM exit_shadow_samples WHERE position_id=?').get(id)!.n);
+    const stats=this.sampleStats(id),count=Number(stats?.stored_samples??
+      this.db.prepare('SELECT count(*) AS n FROM exit_shadow_samples WHERE position_id=?').get(id)!.n);
+    const evaluated=Number(stats?.evaluated_samples??count),thinned=!!stats?.samples_thinned||evaluated>count;
+    const eventSampleCount=Number(this.db.prepare('SELECT count(*) AS n FROM exit_shadow_event_samples WHERE position_id=?').get(id)!.n);
+    const eventSamples=this.db.prepare(`SELECT event_id AS eventId,relation,at,price AS priceUsd,source,pool_address AS poolAddress
+      FROM exit_shadow_event_samples WHERE position_id=? ORDER BY event_id DESC,relation LIMIT 2000`).all(id);
     const item=this.project(row,now);
     return {item,quality:readPositionExitQuality(this.db,row,now.toISOString(),item.returns),samples:samples.map(r=>({...r,context:JSON.parse(String(r.context))})),sampleCount:count,
-      responseTruncated:count>samples.length,storedSamplesThinned:false,mode:'shadow',liveReady:false};
+      evaluatedSampleCount:evaluated,storedSampleCount:count,responseTruncated:count>samples.length,
+      storedSamplesThinned:thinned,sampleRetentionVersion:SAMPLE_RETENTION_VERSION,
+      eventSamples,eventSampleCount,eventSamplesTruncated:eventSampleCount>eventSamples.length,mode:'shadow',liveReady:false};
   }
   close():void {this.db.close();}
   private projectList(row:ShadowRow,now:Date) {
@@ -434,7 +546,7 @@ export class ExitShadow {
     const next:ShadowPriceQuarantine={basePriceUsd:row.last_price,candidatePriceUsd,
       direction:candidatePriceUsd>row.last_price?'up':'down',observedAt,source,...(pool?{poolAddress:pool}:{})};
     try {
-      if(this.bytes()+JSON.stringify(next).length*4+16384>this.maxBytes)this.fail('EXIT_SHADOW_CAPACITY_REACHED');
+      if(!this.ensureCapacity(row.id,observedAt,JSON.stringify(next).length*4+16384))this.fail('EXIT_SHADOW_CAPACITY_REACHED');
       this.db.exec('BEGIN IMMEDIATE');try{
         this.db.prepare('INSERT OR REPLACE INTO exit_shadow_price_quarantine VALUES (?,?)').run(row.id,JSON.stringify(next));
         const event:ShadowEvent={at:observedAt,kind:'price_quarantined',reason:'EXTREME_PRICE_AWAITING_CONFIRMATION',
@@ -446,6 +558,97 @@ export class ExitShadow {
       }catch(error){this.db.exec('ROLLBACK');throw error;}
     }catch(error){this.fail(error instanceof Error&&/^EXIT_SHADOW_[A-Z_]+$/.test(error.message)?error.message:'EXIT_SHADOW_WRITE_FAILED');}
   }
+  private sampleSnapshot(id:string,before:string):ShadowSampleSnapshot|undefined {
+    const row=this.db.prepare(`SELECT at,price AS priceUsd,source,
+      COALESCE(json_extract(context,'$.poolAddress'),json_extract(context,'$.priceEvidence.pool')) AS poolAddress
+      FROM exit_shadow_samples WHERE position_id=? AND at<? ORDER BY at DESC LIMIT 1`).get(id,before);
+    if(!row)return;
+    return {at:String(row.at),priceUsd:Number(row.priceUsd),source:String(row.source),
+      ...(typeof row.poolAddress==='string'?{poolAddress:String(row.poolAddress)}:{})};
+  }
+  private completeEventNeighbors(id:string,current:ShadowSampleSnapshot):void {
+    this.db.prepare(`INSERT OR IGNORE INTO exit_shadow_event_samples(event_id,relation,position_id,at,price,source,pool_address)
+      SELECT current.event_id,1,current.position_id,?,?,?,? FROM exit_shadow_event_samples current
+      JOIN exit_shadow_events event ON event.id=current.event_id
+      WHERE current.position_id=? AND current.relation=0 AND event.at<?
+        AND NOT EXISTS (SELECT 1 FROM exit_shadow_event_samples following
+          WHERE following.event_id=current.event_id AND following.relation=1)`)
+      .run(current.at,current.priceUsd,current.source,current.poolAddress??null,id,current.at);
+  }
+  private captureEventNeighbors(eventId:number,id:string,current:ShadowSampleSnapshot):void {
+    const previous=this.sampleSnapshot(id,current.at),insert=this.db.prepare(
+      'INSERT OR IGNORE INTO exit_shadow_event_samples VALUES (?,?,?,?,?,?,?)');
+    if(previous)insert.run(eventId,-1,id,previous.at,previous.priceUsd,previous.source,previous.poolAddress??null);
+    insert.run(eventId,0,id,current.at,current.priceUsd,current.source,current.poolAddress??null);
+  }
+  private sampleStats(id:string):ShadowSampleStatsRow|undefined {
+    return this.db.prepare('SELECT * FROM exit_shadow_sample_stats WHERE position_id=?').get(id) as unknown as ShadowSampleStatsRow|undefined;
+  }
+  private pruneSamples(id:string,at:string,force=false):{deleted:number;becameThinned:boolean} {
+    const stats=this.sampleStats(id);if(!stats)return {deleted:0,becameThinned:false};
+    const evaluated=Number(stats.evaluated_samples),due=Date.parse(at)-Date.parse(stats.last_pruned_at)>=SAMPLE_PRUNE_INTERVAL_MS||evaluated%256===0;
+    if(!force&&!due)return {deleted:0,becameThinned:false};
+    const recent=new Date(Date.parse(at)-SAMPLE_RECENT_WINDOW_MS).toISOString();
+    const mid=new Date(Date.parse(at)-SAMPLE_MID_WINDOW_MS).toISOString();
+    const long=new Date(Date.parse(at)-SAMPLE_LONG_WINDOW_MS).toISOString();
+    const start=stats.retention_started_at,pool="COALESCE(json_extract(s.context,'$.poolAddress'),json_extract(s.context,'$.priceEvidence.pool'),'')";
+    let deleted=0;
+    const remove=(sql:string,...args:(string|number)[])=>{deleted+=Number(this.db.prepare(sql).run(...args).changes);};
+    remove(`DELETE FROM exit_shadow_samples WHERE rowid IN (SELECT s.rowid FROM exit_shadow_samples s
+      WHERE s.position_id=? AND s.at>=? AND s.at<? AND NOT ${SAMPLE_PROTECTED_SQL})`,id,start,long);
+    for(const [from,to,bucket] of [[long,mid,SAMPLE_LONG_BUCKET_SEC],[mid,recent,SAMPLE_MID_BUCKET_SEC]] as const)
+      remove(`DELETE FROM exit_shadow_samples WHERE rowid IN (SELECT rowid FROM (
+        SELECT s.rowid,
+          row_number() OVER (PARTITION BY CAST(CAST(strftime('%s',s.at) AS INTEGER)/? AS INTEGER),s.source,${pool} ORDER BY s.at) AS first_rank,
+          row_number() OVER (PARTITION BY CAST(CAST(strftime('%s',s.at) AS INTEGER)/? AS INTEGER),s.source,${pool} ORDER BY s.at DESC) AS last_rank,
+          row_number() OVER (PARTITION BY CAST(CAST(strftime('%s',s.at) AS INTEGER)/? AS INTEGER),s.source,${pool} ORDER BY s.price,s.at) AS min_rank,
+          row_number() OVER (PARTITION BY CAST(CAST(strftime('%s',s.at) AS INTEGER)/? AS INTEGER),s.source,${pool} ORDER BY s.price DESC,s.at) AS max_rank
+        FROM exit_shadow_samples s WHERE s.position_id=? AND s.at>=? AND s.at<? AND NOT ${SAMPLE_PROTECTED_SQL}
+      ) WHERE first_rank>1 AND last_rank>1 AND min_rank>1 AND max_rank>1)`,bucket,bucket,bucket,bucket,id,from,to);
+    remove(`DELETE FROM exit_shadow_samples WHERE rowid IN (SELECT s.rowid FROM exit_shadow_samples s
+      WHERE s.position_id=? AND s.at>=? AND s.at>=? AND NOT ${SAMPLE_PROTECTED_SQL}
+      ORDER BY s.at DESC LIMIT -1 OFFSET ?)`,id,start,recent,SAMPLE_RECENT_MAX);
+    remove(`DELETE FROM exit_shadow_samples WHERE rowid IN (SELECT s.rowid FROM exit_shadow_samples s
+      WHERE s.position_id=? AND s.at>=? AND NOT ${SAMPLE_PROTECTED_SQL}
+      ORDER BY s.at DESC LIMIT -1 OFFSET ?)`,id,start,SAMPLE_UNPINNED_MAX);
+    this.db.prepare(`UPDATE exit_shadow_sample_stats SET stored_samples=(SELECT count(*) FROM exit_shadow_samples WHERE position_id=?),
+      samples_thinned=CASE WHEN ?>0 THEN 1 ELSE samples_thinned END,last_pruned_at=? WHERE position_id=?`)
+      .run(id,deleted,at,id);
+    return {deleted,becameThinned:deleted>0&&!Number(stats.samples_thinned)};
+  }
+  /**
+   * Capacity recovery is deliberately limited to one position and one prune
+   * pass. The short checkpoint timeout keeps a slow external reader from
+   * stalling the quote loop; a busy checkpoint simply leaves the normal
+   * durable capacity alarm to stop further writes.
+   */
+  private ensureCapacity(id:string|undefined,at:string,requiredBytes:number):boolean {
+    if(this.bytes()+requiredBytes<=this.maxBytes)return true;
+    // A failed attempt already proved that this exact on-disk state has no
+    // reclaimable headroom. Do not rewrite prune timestamps or the durable
+    // failure marker on every quote; a restart rechecks offline compaction.
+    if(this.lastError==='EXIT_SHADOW_CAPACITY_REACHED')return this.hasLogicalCapacity(requiredBytes);
+    if(!id)return false;
+    this.db.exec('BEGIN IMMEDIATE');let pruned:{deleted:number;becameThinned:boolean};
+    try{pruned=this.pruneSamples(id,at,true);this.db.exec('COMMIT');}
+    catch(error){this.db.exec('ROLLBACK');throw error;}
+    this.sampleCount-=pruned.deleted;this.thinnedPositions+=Number(pruned.becameThinned);
+    if(this.bytes()+requiredBytes<=this.maxBytes)return true;
+    try {
+      this.db.exec('PRAGMA busy_timeout=50');
+      this.db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get();
+    } finally {this.db.exec('PRAGMA busy_timeout=5000');}
+    return this.hasLogicalCapacity(requiredBytes);
+  }
+  private hasLogicalCapacity(requiredBytes:number):boolean {
+    const pageSize=Number(this.db.prepare('PRAGMA page_size').get()!.page_size);
+    const pages=Number(this.db.prepare('PRAGMA page_count').get()!.page_count);
+    const free=Number(this.db.prepare('PRAGMA freelist_count').get()!.freelist_count);
+    const requiredPages=Math.max(1,Math.ceil(requiredBytes/pageSize));
+    const growth=Math.max(0,requiredPages-free);
+    const walBytes=this.path===':memory:'?0:(()=>{try{return statSync(this.path+'-wal').size;}catch{return 0;}})();
+    return pages+growth<=this.maxPages&&(pages-free)*pageSize+walBytes+requiredBytes<=this.maxBytes;
+  }
   private meta(key:string):string|undefined {const row=this.db.prepare('SELECT value FROM exit_shadow_meta WHERE key=?').get(key);return row?String(row.value):undefined;}
   private bytes():number {
     if(this.path===':memory:')return Number(this.db.prepare('PRAGMA page_count').get()!.page_count)*Number(this.db.prepare('PRAGMA page_size').get()!.page_size);
@@ -453,8 +656,12 @@ export class ExitShadow {
   }
   private fail(reason:string):never {
     this.lastError=reason;
-    try {this.db.prepare('INSERT OR REPLACE INTO exit_shadow_meta VALUES (?,?)').run('last_error',reason);
-      this.db.prepare('INSERT OR REPLACE INTO exit_shadow_meta VALUES (?,?)').run('history_complete','false');}catch{}
+    if(this.persistedFailure!==reason)try {
+      this.db.exec('BEGIN IMMEDIATE');
+      this.db.prepare('INSERT OR REPLACE INTO exit_shadow_meta VALUES (?,?)').run('last_error',reason);
+      this.db.prepare('INSERT OR REPLACE INTO exit_shadow_meta VALUES (?,?)').run('history_complete','false');
+      this.db.exec('COMMIT');this.persistedFailure=reason;
+    }catch{try {this.db.exec('ROLLBACK');}catch{}}
     throw new Error(reason);
   }
 }

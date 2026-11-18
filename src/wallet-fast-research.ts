@@ -5,8 +5,14 @@ import type {Chain,Signal} from './types.js';
 import type {WalletTradeObservation} from './wallet-history.js';
 
 interface Work {event:FastWalletEvent;attempts:number;due:number;cancelled:boolean;}
+const QUEUE_CAPACITY=64;
+const CHAINS:Chain[]=['solana','bsc','robinhood'];
+const chainCounts=():Record<Chain,number>=>({solana:0,bsc:0,robinhood:0});
 export interface FastResearchOptions {
   allowedChains?:Chain[];
+  /** Chains allowed to enter the slower signal analysis path. Other allowed
+   * chains still receive receipt classification and durable trade capture. */
+  analysisChains?:Chain[];
   ready:()=>boolean;verify:(event:FastWalletEvent)=>Promise<WalletActivity>;
   onClassification:(result:WalletActivity)=>boolean;
   onTrades:(trades:WalletTradeObservation[])=>void;
@@ -16,12 +22,39 @@ export interface FastResearchOptions {
 export class WalletFastResearch {
   private queue=new Map<string,Work>();private seen=new Map<string,number>();private timer?:ReturnType<typeof setInterval>;
   private pendingAnalysis=new Map<string,{event:FastWalletEvent;result:WalletActivity}>();
-  private running=false;private work?:Promise<void>;private analysis?:Promise<void>;private nextRequest=0;private nextAnalysis=0;private now:()=>number;
+  private running=false;private work?:Promise<void>;private activeKey?:string;private analysis?:Promise<void>;private nextRequest=0;private nextAnalysis=0;private now:()=>number;
   private counts={queued:0,dropped:0,perWalletDropped:0,duplicates:0,expired:0,requests:0,matchedBuys:0,verifiedSells:0,filtered:0,unknown:0,
-    dispatched:0,retracted:0,errors:0,analysisDropped:0,persistenceErrors:0};
+    dispatched:0,retracted:0,errors:0,analysisDropped:0,persistenceErrors:0,evicted:0,priorityEvicted:0,fairShareEvicted:0};
+  private rejectedByChain=chainCounts();private evictedByChain=chainCounts();
   private recent:WalletActivity[]=[];
   constructor(private readonly options:FastResearchOptions){this.now=options.now??(()=>Date.now());}
   private key(event:FastWalletEvent){return `${event.chain}:${event.wallet}:${event.txHash}`;}
+  private configuredChains(){const configured=this.options.allowedChains?.length?this.options.allowedChains:CHAINS;
+    return [...new Set(configured)];}
+  private priority(event:FastWalletEvent){const analysis=this.options.analysisChains??['solana'];
+    return Number(analysis.includes(event.chain))*4+Number(event.verdict==='priority_review')*2;}
+  private queuedByChain(){const counts=chainCounts();for(const work of this.queue.values())counts[work.event.chain]++;return counts;}
+  /** Keep the global queue bounded while reserving room for the analysis chain
+   * and for high-confidence wallet profiles. Equal-priority chains share the
+   * queue; lower-priority work can never displace stronger evidence. */
+  private makeRoom(event:FastWalletEvent):'available'|'priority'|'fair'|undefined {
+    if(this.queue.size<QUEUE_CAPACITY)return 'available';
+    const incoming=this.priority(event),rows=[...this.queue].filter(([key])=>key!==this.activeKey);
+    let lower:typeof rows[number]|undefined,lowerPriority=Infinity;
+    for(const row of rows){const candidate=this.priority(row[1].event);
+      if(candidate<incoming&&candidate<lowerPriority){lower=row;lowerPriority=candidate;}}
+    if(lower){this.evict(lower[0],'priority');return 'priority';}
+    const chains=this.configuredChains(),quota=Math.floor(QUEUE_CAPACITY/chains.length),counts=this.queuedByChain();
+    if(counts[event.chain]>=quota)return;
+    const donor=rows.find(([,work])=>work.event.chain!==event.chain&&counts[work.event.chain]>quota&&this.priority(work.event)===incoming);
+    if(!donor)return;
+    this.evict(donor[0],'fair');return 'fair';
+  }
+  private evict(key:string,reason:'priority'|'fair'){
+    const work=this.queue.get(key);if(!work)return;
+    this.queue.delete(key);this.counts.evicted++;this.evictedByChain[work.event.chain]++;
+    if(reason==='priority')this.counts.priorityEvicted++;else this.counts.fairShareEvicted++;
+  }
   enqueue(event:FastWalletEvent){
     if(!this.running)return;const key=this.key(event);
     if(this.options.allowedChains&&!this.options.allowedChains.includes(event.chain))return;
@@ -30,7 +63,7 @@ export class WalletFastResearch {
     if(event.verdict==='blocked_cached_risk')return;
     if(this.queue.has(key)||this.seen.has(key)){this.counts.duplicates++;return;}
     if([...this.queue.values()].filter(w=>w.event.chain===event.chain&&w.event.wallet===event.wallet).length>=4){this.counts.perWalletDropped++;return;}
-    if(this.queue.size>=64){this.counts.dropped++;return;}
+    if(!this.makeRoom(event)){this.counts.dropped++;this.rejectedByChain[event.chain]++;return;}
     this.queue.set(key,{event,attempts:0,due:this.now(),cancelled:false});this.counts.queued++;
     setImmediate(()=>this.tick());
   }
@@ -42,8 +75,10 @@ export class WalletFastResearch {
     for(const [key,w]of this.queue)if(w.cancelled||now-Date.parse(w.event.receivedAt)>120000){this.queue.delete(key);this.counts.expired++;}
     for(const [key,at]of this.seen)if(now-at>600000)this.seen.delete(key);
     this.dispatch();if(this.work||now<this.nextRequest)return;
-    const row=[...this.queue].filter(([,w])=>w.due<=now).sort((a,b)=>Number(b[1].event.verdict==='priority_review')-Number(a[1].event.verdict==='priority_review'))[0];
-    if(!row)return;this.nextRequest=now+1000;this.work=this.process(...row).finally(()=>{this.work=undefined;});
+    const analysisChains=this.options.analysisChains??this.options.allowedChains;
+    const priority=(work:Work)=>this.priority(work.event)+Number(!analysisChains||analysisChains.includes(work.event.chain));
+    const row=[...this.queue].filter(([,w])=>w.due<=now).sort((a,b)=>priority(b[1])-priority(a[1]))[0];
+    if(!row)return;this.activeKey=row[0];this.nextRequest=now+1000;this.work=this.process(...row).finally(()=>{this.work=undefined;this.activeKey=undefined;});
   }
   private async process(key:string,w:Work){
     const e=w.event;let retry=false;
@@ -61,6 +96,7 @@ export class WalletFastResearch {
         amount:t.amountAtomic,amountUnit:'atomic',eventAt:result.eventAt!,observedAt:result.checkedAt,source:'chain_verified_swap'})));
       if(result.classification==='sell'){this.counts.verifiedSells+=trades.length;return;}
       this.counts.matchedBuys+=trades.length;
+      if(this.options.analysisChains&&!this.options.analysisChains.includes(e.chain))return;
       if(this.pendingAnalysis.size>=16){this.counts.analysisDropped++;return;}
       this.pendingAnalysis.set(key,{event:e,result});
     }catch{this.counts.errors++;}
@@ -83,6 +119,8 @@ export class WalletFastResearch {
   }
   status(){return {running:this.running,inFlight:!!this.work,analysisInFlight:!!this.analysis,queued:this.queue.size,analysisQueued:this.pendingAnalysis.size,
     counts:{...this.counts},recent:this.recent,requestLimitPerMinute:60,analysisLimitPerMinute:6,maxPendingPerWallet:4,
+    admission:{capacity:QUEUE_CAPACITY,queuedByChain:this.queuedByChain(),rejectedByChain:{...this.rejectedByChain},evictedByChain:{...this.evictedByChain},
+      protectedChains:[...(this.options.analysisChains??['solana'])],fairSharePerChain:Math.floor(QUEUE_CAPACITY/this.configuredChains().length)},
     scope:'chain_receipt_and_wallet_flow_then_full_research',tradingEnabled:false};}
   async stop(){this.running=false;clearInterval(this.timer);await Promise.all([this.work,this.analysis]);this.queue.clear();this.pendingAnalysis.clear();}
 }

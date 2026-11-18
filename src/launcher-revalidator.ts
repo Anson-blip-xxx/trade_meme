@@ -21,7 +21,8 @@ export type LauncherRevalidationError=
   'LAUNCHER_SOURCE_UNAVAILABLE'|'LAUNCHER_REVALIDATOR_STOPPED';
 export interface LauncherRevalidationSource {
   listCandidates(limit:number):MaybePromise<readonly LauncherRevalidationCandidate[]>;
-  recordResult(result:LauncherRevalidationResult):MaybePromise<boolean|void>;
+  /** `stale` means the candidate left the refreshed shortlist while this bounded batch was in flight. */
+  recordResult(result:LauncherRevalidationResult):MaybePromise<boolean|'stale'|void>;
   onActivity?(activity:WalletActivity):MaybePromise<void>;
 }
 interface ActivityVerifier {verify(event:FastWalletEvent):Promise<WalletActivity>;stop?():void;}
@@ -82,7 +83,7 @@ export class LauncherRevalidator {
       profileFresh:true,cachedSafety:'unknown',commitment:'included',removed:false,buyVerified:false,tradingEnabled:false};
   }
   private async persist(result:LauncherRevalidationResult,run:LauncherRevalidationRun){
-    try {if(await this.options.source.recordResult(result)===false)throw new Error();}
+    try {const outcome=await this.options.source.recordResult(result);if(outcome==='stale')return;if(outcome===false)throw new Error();}
     catch {run.errors++;this.counts.errors++;this.error='LAUNCHER_RESULT_PERSIST_FAILED';return;}
     this.recent.unshift(result);this.recent=this.recent.slice(0,20);
   }
@@ -112,6 +113,7 @@ export class LauncherRevalidator {
     // before the saved cursor (up to the bounded RPC page), so a trailing
     // transfer cannot hide a buy immediately behind it.
     const observations=candidate.latestSignature?(changed?rows.slice(0,previousIndex<0?rows.length:previousIndex).reverse():[]):[latest];
+    let replayError:LauncherRevalidationError|undefined;
     for(const row of observations){
       if(this.stopped)return;
       try {
@@ -121,9 +123,20 @@ export class LauncherRevalidator {
           ...(row.blockTime!==undefined?{blockTime:row.blockTime}:{}),...(activity.eventAt?{eventAt:activity.eventAt}:{})};
         (result.observations??=[]).push(observation);if(row.signature===latest.signature)result.classification=activity.classification;
         run.classified++;this.counts.classified++;
-        try {await this.options.source.onActivity?.(activity);}catch{result.error='LAUNCHER_ACTIVITY_CALLBACK_FAILED';run.errors++;this.counts.errors++;this.error=result.error;}
+        // A retryable verifier result has not established the transaction facts.
+        // Keep the prior cursor so the same signature is replayed next cycle.
+        if(activity.retryable){replayError='LAUNCHER_ACTIVITY_VERIFY_FAILED';run.errors++;this.counts.errors++;this.error=replayError;continue;}
+        try {await this.options.source.onActivity?.(activity);}
+        catch{replayError='LAUNCHER_ACTIVITY_CALLBACK_FAILED';run.errors++;this.counts.errors++;this.error=replayError;}
       }catch(error){if(this.stopped)return;result.error=error instanceof RevalidationFailure?error.code:'LAUNCHER_ACTIVITY_VERIFY_FAILED';
-        run.errors++;this.counts.errors++;this.error=result.error;}
+        replayError=result.error;run.errors++;this.counts.errors++;this.error=result.error;}
+    }
+    if(replayError){
+      // Do not persist latestSignature/blockTime/slot on a non-durable pass.
+      // LauncherCandidates preserves the previous cursor when these fields are
+      // absent, making the retry idempotent while retaining fixed diagnostics.
+      await this.persist({chain:'solana',wallet,checkedAt,state:'error',newSignature:false,error:replayError,
+        ...(result.observations?.length?{observations:result.observations}:{})},run);return;
     }
     await this.persist(result,run);
   }

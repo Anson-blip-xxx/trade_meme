@@ -2380,7 +2380,7 @@
     if (researchError) runtime.append(el('p', 'detail-message detail-error', reasonNames[researchError] || scalar(researchError)));
     const evidence = data.corroboration, rank = data.tokenRankResearch, profiles = research.profiles || {}, launchers = data.launcherCandidates || {};
     const priorityState = worker => worker?.livePriority === true
-      ? worker.workerLivePriority === true ? '实盘计数优先 · 批处理已暂停' : '正在切换到实盘计数优先'
+      ? worker.workerLivePriority === true ? '实盘计数优先 · 单条低频维护' : '正在切换到实盘计数优先'
       : worker?.workerLivePriority === false ? '正常处理积压' : worker?.enabled === false ? '未启用' : '等待工作线程状态';
     runtime.append(kv('钱包画像批处理', priorityState(profiles)));
     const launcherDimensions=launchers.dimensionCounts||{},launcherChains=launchers.chainCounts||{},launcherRoutes=launchers.routeCounts||{};
@@ -3613,18 +3613,23 @@
     const enabled = data?.enabled !== false;
     const limited = data?.capacityReached === true || Boolean(data?.error);
     const running = enabled && data?.running === true;
-    const priorityRequested=data?.livePriority===true,priorityPaused=priorityRequested&&data?.workerLivePriority===true;
-    const lastRun = validDate(data?.lastRunAt); const delayed = running && !priorityRequested && lastRun && Date.now() - lastRun.getTime() > Math.max(600000, (numeric(data.intervalSec) || 2) * 10000);
-    const label = failed ? '状态读取失败' : !enabled ? '画像未启用' : limited ? '更新需关注' : priorityPaused ? '实盘计数优先 · 已暂停' : priorityRequested ? '正在切换实盘优先' : delayed ? '处理进度过旧' : running ? data?.inFlight ? '正在分析' : '持续更新中' : data?.running === false ? '后台任务已暂停' : '等待后台任务';
+    const priorityRequested=data?.livePriority===true,priorityMaintenance=priorityRequested&&data?.workerLivePriority===true;
+    const lastRun = validDate(data?.lastRunAt), expectedInterval=priorityRequested?data?.liveMaintenanceIntervalSec:data?.intervalSec;
+    const delayed = running && lastRun && Date.now() - lastRun.getTime() > Math.max(600000, (numeric(expectedInterval) || 2) * 10000);
+    const label = failed ? '状态读取失败' : !enabled ? '画像未启用' : limited ? '更新需关注' : delayed ? '处理进度过旧' : priorityMaintenance ? '实盘计数优先 · 低频维护' : priorityRequested ? '正在切换实盘优先' : running ? data?.inFlight ? '正在分析' : '持续更新中' : data?.running === false ? '后台任务已暂停' : '等待后台任务';
     text('profile-status-badge', label); $('profile-status-badge').className = `badge ${failed || limited || delayed ? 'watch' : running ? 'pass' : 'neutral'}`;
-    text('profile-status-title', !enabled ? '钱包画像任务未启用' : priorityRequested ? '实盘计数优先，已有画像继续可用' : failed || limited || delayed || data?.running === false ? '已有画像保留，更新状态需确认' : data?.initialComplete ? '已有画像持续重新评估' : '正在为已积累钱包建立画像');
+    text('profile-status-title', !enabled ? '钱包画像任务未启用' : failed || limited || delayed || data?.running === false ? '已有画像保留，更新状态需确认' : priorityRequested ? '实盘计数优先，画像保持低频维护' : data?.initialComplete ? '已有画像持续重新评估' : '正在为已积累钱包建立画像');
     text('profile-built-count', count(data?.profiles)); text('profile-source-count', count(data?.sourceWallets));
     const sourceProfiles = finite(data?.profiledSourceWallets) ? data.profiledSourceWallets : data?.profiles;
     text('profile-pending-count', finite(sourceProfiles) && finite(data?.sourceWallets) ? count(Math.max(0, data.sourceWallets - sourceProfiles)) : '—');
     const coverage = finite(sourceProfiles) && finite(data?.sourceWallets) && data.sourceWallets > 0 ? Math.min(100, sourceProfiles / data.sourceWallets * 100) : 0;
     $('profile-build-progress').value = coverage;
     $('profile-build-progress').setAttribute('aria-valuetext', `${Math.floor(coverage)}% 的已积累钱包已有画像`);
-    text('profile-status-note', `${data?.lastRunAt ? `最近处理 ${date(data.lastRunAt, true)}。` : '等待首次后台处理。'}${finite(data?.staleProfiles) ? `${count(data.staleProfiles)} 个画像已到期等待重评。` : ''}${priorityPaused ? '实盘计数期间暂停批处理，停止计数后自动继续处理积压。' : priorityRequested ? '正在等待当前批次结束，随后暂停到停止计数。' : running && !failed && !limited && !delayed ? `${finite(data?.intervalSec) ? `后台每 ${data.intervalSec} 秒调度一批，` : ''}新增证据和到期画像会分批重新评估；页面关闭后仍继续。` : '当前不能确认画像正在正常更新。'}覆盖率只表示已建档，不代表全部交易历史已覆盖。`);
+    const schedule = data?.schedule;
+    const due = schedule && schedule.counts === 'bounded_lower_bounds_at_batch_start' && finite(schedule.hotCandidateDueLowerBound) && finite(schedule.coldDueProfilesLowerBound)
+      ? `最近一批开始时，有界采样至少发现实时优先画像到期 ${count(schedule.hotCandidateDueLowerBound)} 个、长期回看到期 ${count(schedule.coldDueProfilesLowerBound)} 个；本批已分别处理 ${count(schedule.hotServed)} / ${count(schedule.coldServed)} 个。这些是批前下界，不代表当前完整积压。`
+      : finite(data?.staleProfiles) ? `${count(data.staleProfiles)} 个画像已到期等待重评。` : '';
+    text('profile-status-note', `${data?.lastRunAt ? `最近处理 ${date(data.lastRunAt, true)}。` : '等待首次后台处理。'}${due}${priorityMaintenance ? `实盘计数期间每 ${count(data.liveMaintenanceIntervalSec??data.intervalSec)} 秒维护 1 个画像，停止计数后恢复每批 ${count(data.batchSize)} 个。` : priorityRequested ? '正在等待当前批次结束，随后切换为单条低频维护。' : running && !failed && !limited && !delayed ? `${finite(data?.intervalSec) ? `后台每 ${data.intervalSec} 秒调度一批，` : ''}新增证据和到期画像会分批重新评估；页面关闭后仍继续。` : '当前不能确认画像正在正常更新。'}覆盖率只表示已建档，不代表全部交易历史已覆盖。`);
     const warning = failed ? '状态暂时无法更新，以下保留最近成功读取的数据。' : data?.capacityReached ? '画像库已达容量上限，更新暂停；已有画像保留，请检查服务端存储。' : data?.error ? '后台画像处理异常，已有画像可能未更新。' : delayed ? '较长时间未完成画像处理，已有结果可能过时，请查看后台任务状态。' : '';
     $('profile-status-warning').hidden = !warning; text('profile-status-warning', warning);
     text('profile-role-progress', finite(data?.roleProfiles) ? `有向行为比较：已处理 ${count(data.roleProfiles)} 个画像${finite(data.rolePending) ? ` · 尚待 ${count(data.rolePending)} 个` : ''}${data.roleLastRunAt ? ` · 最近 ${date(data.roleLastRunAt, true)}` : ''}。按每一对钱包分别比较先后方向。` : '有向行为比较尚未取得处理状态；已有历史分组不等于已完成角色辨别。');

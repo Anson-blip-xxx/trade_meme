@@ -11,6 +11,7 @@ import {compactWalletScreening} from './wallet-screening-summary.js';
 import {StrategyObservation} from './strategy-observation.js';
 import {SignalFollowup,type FollowupListOptions} from './signal-followup.js';
 import type {FollowupWalletEvidence} from './wallet-history.js';
+import {configureResearchWal} from './research-sqlite.js';
 
 export interface ScanToken {chain:Chain;address:string;}
 export interface ScanCheck {status:Status;reasons:string[];}
@@ -240,7 +241,8 @@ export class ScanArchive {
     this.trackingMs=hours*3_600_000;this.now=options.now??(()=>new Date());
     if(path!==':memory:') mkdirSync(dirname(path),{recursive:true,mode:0o700});
     this.db=new DatabaseSync(path);if(path!==':memory:') chmodSync(path,0o600);
-    this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;
+    configureResearchWal(this.db,{busyTimeoutMs:5000,autoCheckpointPages:128});
+    this.db.exec(`
       CREATE TABLE IF NOT EXISTS scan_summaries (
         id TEXT PRIMARY KEY,chain TEXT NOT NULL,address TEXT NOT NULL,status TEXT NOT NULL,
         received_at TEXT NOT NULL,decision TEXT,eligible_at TEXT,last_price_attempt_at TEXT,lease_expires_at TEXT,

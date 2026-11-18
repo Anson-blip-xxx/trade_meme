@@ -65,14 +65,14 @@ export class Store {
       return {created:Number(write.changes)>0,conflict,entry};
     } catch(e) {this.db.exec('ROLLBACK');throw e;}
   }
-  finish(id:string,report:Report,claimId:string):boolean {
+  finish(id:string,report:Report,claimId:string,options:{notify?:boolean}={}):boolean {
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const write=this.db.prepare(`UPDATE signals SET status='completed', report=?, claim_id=NULL, lease_expires_at=NULL
         WHERE id=? AND status='processing' AND claim_id=?`).run(JSON.stringify(report),id,claimId);
       if(Number(write.changes)) this.db.prepare('INSERT INTO evaluations(signal_id,evaluated_at,report) VALUES (?,?,?)').run(id,report.evaluatedAt,JSON.stringify(report));
       this.db.exec('COMMIT');
-      if(Number(write.changes)>0) this.notify(this.get(id)!);
+      if(Number(write.changes)>0&&options.notify!==false) this.notify(this.get(id)!);
       return Number(write.changes)>0;
     } catch(e) {this.db.exec('ROLLBACK');throw e;}
   }

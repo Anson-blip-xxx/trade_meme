@@ -3,10 +3,12 @@ import {chmodSync,existsSync,mkdirSync,realpathSync,statSync} from 'node:fs';
 import {dirname,resolve} from 'node:path';
 import {createHash} from 'node:crypto';
 import {chainAddress} from './chain-stream-store.js';
+import {configureResearchWal} from './research-sqlite.js';
 import type {Chain} from './types.js';
 import {analyzeWalletRoles,type WalletRoleAnalysis,type WalletRoleEvent,type WalletRoleEventReference,type WalletRolePeerInput} from './wallet-role-analysis.js';
 import {analyzeWalletInitiator,type GmgnMarketFirstSeen,type WalletInitiatorAnalysis} from './wallet-initiator-analysis.js';
 import {analyzeWalletVisibleStart,type WalletVisibleStartAnalysis,type WalletVisibleStartFollowupInput} from './wallet-visible-start-analysis.js';
+import {WALLET_FAST_PROFILE_PRIORITY_GROUPS} from './wallet-fast-groups.js';
 
 export const WALLET_PROFILE_GROUPS=['public_kol','early_candidate','repeated_early','forward_validated','shared_funding','synchronized','follower_pattern','precursor_pattern','mixed_pattern','market_pre_candidate','market_precursor_pattern','market_visible_start','market_follower_pattern','market_mixed_pattern','market_repeated_exit','vendor_profit_positive','observed_runner','insufficient_evidence','inactive_observed'] as const;
 export type WalletProfileGroupId=typeof WALLET_PROFILE_GROUPS[number];
@@ -26,13 +28,22 @@ export interface WalletProfile {
 }
 export interface WalletProfileStatus {ready:boolean;profiles:number;sourceWallets:number;profiledSourceWallets:number;initialComplete:boolean;processed:number;lastRunAt?:string;
   roleProfiles:number;rolePending:number;roleLastRunAt?:string;
-  groupCounts:Partial<Record<WalletProfileGroupId,number>>;bytes:number;maxBytes:number;capacityReached:boolean;error?:string;sampleOnly:true;staleProfiles:number;aggregatedAt?:string;}
+  groupCounts:Partial<Record<WalletProfileGroupId,number>>;bytes:number;maxBytes:number;capacityReached:boolean;error?:string;sampleOnly:true;staleProfiles:number;
+  staleProfilesBasis?:'legacy_all_profiles_short_window';schedule?:WalletProfileScheduleStatus;aggregatedAt?:string;}
 export interface WalletProfileListOptions {chain?:Chain;group?:string;search?:string;limit?:number;offset?:number;}
+export interface WalletFastProfileMetadata {chain:Chain;address:string;groups:string[];freshUntil:string;}
 export interface WalletProfitCohortSnapshot {asOf:string;validUntil:string;values:number[];}
 export type WalletProfitCohorts=Partial<Record<Chain,WalletProfitCohortSnapshot>>;
-export interface WalletProfilesOptions {database:string;historyDatabase:string;chainDatabase?:string;maxBytes?:number;now?:()=>Date;refreshAfterSec?:number;cohortMaxAgeSec?:number;}
+export interface WalletProfileScheduleStatus {hotCandidatePoolLowerBound:number;launcherCandidatePool:number;realtimePriorityPoolLowerBound:number;monitoredCandidatePool:number;
+  hotCandidateDueLowerBound:number;hotCandidateFreshLowerBound:number;coldDueProfilesLowerBound:number;hotSampleLimitPerGroup:number;coldSampleLimit:number;
+  dirtySelected:number;hotServed:number;coldServed:number;uniqueSelected:number;hotRefreshAfterSec:number;coldRefreshAfterSec:number;
+  basis:'rotating_dirty_realtime_hot_cold_periodic';counts:'bounded_lower_bounds_at_batch_start';computedAtIsTradeEvidence:false;}
+export interface WalletProfilesOptions {database:string;historyDatabase:string;chainDatabase?:string;launcherDatabase?:string;maxBytes?:number;now?:()=>Date;
+  refreshAfterSec?:number;coldRefreshAfterSec?:number;cohortMaxAgeSec?:number;}
 type Row=Record<string,any>;
 const DAY=86_400_000,CAPACITY='WALLET_PROFILES_CAPACITY_REACHED',CHAINS:Chain[]=['bsc','solana','robinhood'];
+const SCHEDULE_SLOTS=['hot','dirty','dirty','hot','dirty','cold','hot','dirty','hot','dirty'] as const;
+const DIRTY_QUEUES=['initial','changed','coordination','relation','market','events','roles','chain'] as const;
 const SERVICES=new Set(['exchange_or_pool','exchange','pool','router','bridge','cex']);
 const parse=(value:unknown):any=>{try{return typeof value==='string'?JSON.parse(value):undefined;}catch{return undefined;}};
 const stamp=(value:unknown):value is string=>typeof value==='string'&&/^\d{4}-\d\d-\d\dT/.test(value)&&Number.isFinite(Date.parse(value));
@@ -46,8 +57,8 @@ const emptyStatus=():WalletProfileStatus=>({ready:false,profiles:0,sourceWallets
 
 /** Independently persisted research classifications. Every source database is opened read-only. */
 export class WalletProfiles {
-  private readonly history:DatabaseSync;private chain?:DatabaseSync;private readonly db:DatabaseSync;
-  private readonly now:()=>Date;private readonly maxBytes:number;private readonly refreshMs:number;
+  private readonly history:DatabaseSync;private chain?:DatabaseSync;private launcher?:DatabaseSync;private readonly db:DatabaseSync;
+  private readonly now:()=>Date;private readonly maxBytes:number;private readonly refreshMs:number;private readonly coldRefreshMs:number;
   private readonly sourceStatements=new Map<string,StatementSync>();private readonly outputStatements=new Map<string,StatementSync>();
   private sourceCount=0;private countedAt=0;
   private readonly roleKeys=new Map<string,string>();
@@ -58,17 +69,22 @@ export class WalletProfiles {
   private cachedProfitCohorts:WalletProfitCohorts={};private cohortsAt=0;
   constructor(private readonly options:WalletProfilesOptions) {
     this.now=options.now??(()=>new Date());this.maxBytes=options.maxBytes??256*1024*1024;this.refreshMs=(options.refreshAfterSec??21600)*1000;
+    this.coldRefreshMs=(options.coldRefreshAfterSec??604800)*1000;
     if(!Number.isSafeInteger(this.maxBytes)||this.maxBytes<16_384||!Number.isFinite(this.refreshMs)||this.refreshMs<1000||canonicalPath(options.database)===canonicalPath(options.historyDatabase)||
-      options.chainDatabase&&canonicalPath(options.database)===canonicalPath(options.chainDatabase))throw new Error('WALLET_PROFILES_CONFIG_INVALID');
+      !Number.isFinite(this.coldRefreshMs)||this.coldRefreshMs<this.refreshMs||
+      options.chainDatabase&&canonicalPath(options.database)===canonicalPath(options.chainDatabase)||
+      options.launcherDatabase&&[options.database,options.historyDatabase,options.chainDatabase].some(path=>path&&canonicalPath(path)===canonicalPath(options.launcherDatabase!)))
+      throw new Error('WALLET_PROFILES_CONFIG_INVALID');
     this.history=new DatabaseSync(options.historyDatabase,{readOnly:true});this.history.exec('PRAGMA busy_timeout=1000; PRAGMA query_only=ON');
     if(options.chainDatabase&&existsSync(options.chainDatabase)){this.chain=new DatabaseSync(options.chainDatabase,{readOnly:true});this.chain.exec('PRAGMA busy_timeout=1000; PRAGMA query_only=ON');}
+    this.openLauncher();
     if(options.database!==':memory:')mkdirSync(dirname(options.database),{recursive:true,mode:0o700});
     this.db=new DatabaseSync(options.database);if(options.database!==':memory:')chmodSync(options.database,0o600);
-    this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=1000; PRAGMA wal_autocheckpoint=64;
-      CREATE TABLE IF NOT EXISTS wp_profiles(chain TEXT,address TEXT,computed_at TEXT NOT NULL,fresh_until TEXT NOT NULL,data TEXT NOT NULL,source_wallet INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(chain,address));
+    configureResearchWal(this.db,{busyTimeoutMs:1000,autoCheckpointPages:64});
+    this.db.exec(`CREATE TABLE IF NOT EXISTS wp_profiles(chain TEXT,address TEXT,computed_at TEXT NOT NULL,fresh_until TEXT NOT NULL,data TEXT NOT NULL,source_wallet INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(chain,address));
       CREATE INDEX IF NOT EXISTS wp_profiles_due ON wp_profiles(fresh_until);
       CREATE INDEX IF NOT EXISTS wp_profiles_recent ON wp_profiles(computed_at DESC,chain,address);
-      CREATE TABLE IF NOT EXISTS wp_groups(chain TEXT,address TEXT,group_id TEXT,first_at TEXT NOT NULL,PRIMARY KEY(chain,address,group_id));
+      CREATE TABLE IF NOT EXISTS wp_groups(chain TEXT,address TEXT,group_id TEXT,first_at TEXT NOT NULL,computed_at TEXT,PRIMARY KEY(chain,address,group_id));
       CREATE INDEX IF NOT EXISTS wp_groups_filter ON wp_groups(group_id,chain,address);
       CREATE TABLE IF NOT EXISTS wp_group_first(chain TEXT,address TEXT,group_id TEXT,first_at TEXT NOT NULL,PRIMARY KEY(chain,address,group_id));
       CREATE TABLE IF NOT EXISTS wp_changes(id INTEGER PRIMARY KEY,chain TEXT,address TEXT,observed_at TEXT NOT NULL,data TEXT NOT NULL);
@@ -79,10 +95,15 @@ export class WalletProfiles {
       CREATE TABLE IF NOT EXISTS wp_snapshots(key TEXT PRIMARY KEY,updated_at TEXT NOT NULL,data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS wp_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);`);
     if(!this.db.prepare('PRAGMA table_info(wp_profiles)').all().some(column=>column.name==='source_wallet'))this.db.exec('ALTER TABLE wp_profiles ADD COLUMN source_wallet INTEGER NOT NULL DEFAULT 0');
+    if(!this.db.prepare('PRAGMA table_info(wp_groups)').all().some(column=>column.name==='computed_at'))this.db.exec('ALTER TABLE wp_groups ADD COLUMN computed_at TEXT');
+    this.db.exec(`UPDATE wp_groups SET computed_at=(SELECT p.computed_at FROM wp_profiles p WHERE p.chain=wp_groups.chain AND p.address=wp_groups.address)
+      WHERE computed_at IS NULL;
+      CREATE INDEX IF NOT EXISTS wp_groups_hot ON wp_groups(group_id,computed_at,chain,address);`);
     for(const column of ['role_computed_at','role_input_key'])if(!this.db.prepare('PRAGMA table_info(wp_profiles)').all().some(row=>row.name===column))this.db.exec(`ALTER TABLE wp_profiles ADD COLUMN ${column} TEXT`);
     this.db.exec('CREATE INDEX IF NOT EXISTS wp_profiles_source ON wp_profiles(source_wallet)');
     this.db.exec('CREATE INDEX IF NOT EXISTS wp_profiles_roles ON wp_profiles(role_computed_at)');
     this.setMeta('refresh_after_sec',String(this.refreshMs/1000));
+    this.setMeta('cold_refresh_after_sec',String(this.coldRefreshMs/1000));
     const oldLimit=Number(this.meta('max_bytes'));this.setMeta('max_bytes',String(this.maxBytes));
     if(this.meta('error')===CAPACITY&&this.maxBytes>oldLimit&&filesBytes(options.database,this.db)+32768<this.maxBytes)this.setMeta('error','');
     // Historical coverage belongs to the rowid pass. Start update watermarks at
@@ -107,12 +128,92 @@ export class WalletProfiles {
   }
   private hs(sql:string):StatementSync {let statement=this.sourceStatements.get(sql);if(!statement){statement=this.history.prepare(sql);this.sourceStatements.set(sql,statement);}return statement;}
   private os(sql:string):StatementSync {let statement=this.outputStatements.get(sql);if(!statement){statement=this.db.prepare(sql);this.outputStatements.set(sql,statement);}return statement;}
+  private openLauncher():DatabaseSync|undefined {
+    if(this.launcher)return this.launcher;const path=this.options.launcherDatabase;if(!path||!existsSync(path))return;
+    let db:DatabaseSync|undefined;try {db=new DatabaseSync(path,{readOnly:true});db.exec('PRAGMA busy_timeout=500; PRAGMA query_only=ON');
+      const columns=new Set(db.prepare('PRAGMA table_info(lc_candidates)').all().map(row=>String(row.name)));
+      if(!['chain','address','monitored'].every(column=>columns.has(column))){db.close();return;}
+      this.launcher=db;return db;
+    }catch {try{db?.close();}catch{}return;}
+  }
+  private hotPriorityProfiles(dueAt:string,limit:number):{poolLowerBound:number;launcherPool:number;realtimePoolLowerBound:number;monitored:number;dueLowerBound:number;freshLowerBound:number;rows:Row[]} {
+    type HotRow={rank:number;monitored:number;chain:Chain;address:string;computed_at?:string;launcher:boolean;realtime:boolean};
+    const order=new Map<string,HotRow>(),byChain=new Map<Chain,string[]>(),launcher=this.openLauncher();let candidates:Row[]=[];
+    try {candidates=launcher?.prepare(`SELECT chain,address,monitored FROM lc_candidates
+      ORDER BY monitored DESC,chain,address LIMIT 1000`).all()??[];}catch{}
+    for(const row of candidates){const network=row.chain as Chain,address=chainAddress(network,row.address);if(!address)continue;
+      const key=`${network}:${address}`;if(order.has(key))continue;order.set(key,{rank:order.size,monitored:Number(row.monitored)===1?1:0,chain:network,address,launcher:true,realtime:false});
+      const values=byChain.get(network)??[];values.push(address);byChain.set(network,values);}
+    const launcherPool=order.size,monitored=[...order.values()].filter(row=>row.monitored===1).length;
+    const profiled:Row[]=[];
+    for(const [network,addresses] of byChain)profiled.push(...this.os(`WITH selected(address) AS (SELECT value FROM json_each(?))
+      SELECT p.chain,p.address,p.computed_at FROM selected s CROSS JOIN wp_profiles p ON p.chain=? AND p.address=s.address
+      `).all(JSON.stringify(addresses),network));
+    const computed=new Map(profiled.map(row=>[`${row.chain}:${row.address}`,String(row.computed_at)]));
+    for(const [key,row] of order){const computedAt=computed.get(key);if(computedAt)row.computed_at=computedAt;}
+    // computed_at is copied into the membership row so this query walks the
+    // covering hot index and stops at LIMIT instead of sorting the whole group.
+    const groupLimit=Math.max(1,limit);
+    for(const [groupRank,group] of WALLET_FAST_PROFILE_PRIORITY_GROUPS.entries()){
+      const rows=this.os(`SELECT chain,address,computed_at FROM wp_groups INDEXED BY wp_groups_hot
+        WHERE group_id=? ORDER BY computed_at,chain,address LIMIT ?`).all(group,groupLimit);
+      for(const row of rows){const network=row.chain as Chain,address=chainAddress(network,row.address);if(!address)continue;const key=`${network}:${address}`,prior=order.get(key);
+        if(prior){prior.realtime=true;if(!prior.computed_at)prior.computed_at=String(row.computed_at);}
+        else order.set(key,{rank:launcherPool+groupRank*groupLimit+order.size,monitored:0,chain:network,address,
+          computed_at:String(row.computed_at),launcher:false,realtime:true});}
+    }
+    const values=[...order.values()],realtimePool=values.filter(row=>row.realtime).length,
+      eligible=values.filter(row=>!row.computed_at||row.computed_at<=dueAt);
+    eligible.sort((left,right)=>(left.computed_at??'').localeCompare(right.computed_at??'')||right.monitored-left.monitored||left.rank-right.rank);
+    return {poolLowerBound:values.length,launcherPool,realtimePoolLowerBound:realtimePool,monitored,dueLowerBound:eligible.length,
+      freshLowerBound:values.length-eligible.length,
+      rows:eligible.slice(0,Math.max(0,limit))};
+  }
   private meta(key:string):string{return String(this.os('SELECT value FROM wp_meta WHERE key=?').get(key)?.value??'');}
   private setMeta(key:string,value:string):void {this.os('INSERT INTO wp_meta VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key,value);}
   private snapshot(key:string):{updatedAt:string;data:unknown}|undefined {const row=this.os('SELECT updated_at,data FROM wp_snapshots WHERE key=?').get(key);if(!row)return;
     return {updatedAt:String(row.updated_at),data:parse(row.data)};}
   private saveSnapshot(key:string,updatedAt:string,data:unknown):void {this.os(`INSERT INTO wp_snapshots VALUES (?,?,?) ON CONFLICT(key)
     DO UPDATE SET updated_at=excluded.updated_at,data=excluded.data`).run(key,updatedAt,JSON.stringify(data));}
+  /**
+   * Build the small live-watcher cohort inside the profile worker. The output
+   * database can be several gigabytes, so these synchronous reads must never
+   * run in the HTTP/event-loop process.
+   */
+  fastWalletTargets(limits:number|Partial<Record<Chain,number>>=30):Partial<Record<Chain,string[]>> {
+    const cutoff=new Date(this.now().getTime()-this.refreshMs).toISOString(),result:Partial<Record<Chain,string[]>>={};
+    for(const network of CHAINS){const addresses=new Set<string>();
+      const requested=typeof limits==='number'?limits:limits[network]??30,cap=Math.max(1,Math.min(network==='solana'?30:200,Math.trunc(requested)));
+      for(const group of WALLET_FAST_PROFILE_PRIORITY_GROUPS){
+        const rows=this.os(`SELECT address FROM wp_groups INDEXED BY wp_groups_hot WHERE group_id=? AND chain=? AND computed_at>?
+          ORDER BY computed_at DESC LIMIT ?`).all(group,network,cutoff,cap);
+        for(const row of rows){const address=chainAddress(network,row.address);if(address)addresses.add(address);}
+        if(addresses.size>=cap)break;
+      }
+      result[network]=[...addresses].slice(0,cap);
+    }
+    return result;
+  }
+  /** Compact profile fields required by the socket judge; never copies or parses full profile JSON. */
+  fastWalletMetadata(targets:readonly {chain:Chain;address:string}[]):WalletFastProfileMetadata[] {
+    const unique=new Map<string,{chain:Chain;address:string}>();
+    for(const target of targets.slice(0,500)){const address=chainAddress(target.chain,target.address);
+      if(address)unique.set(`${target.chain}:${address}`,{chain:target.chain,address});}
+    const result:WalletFastProfileMetadata[]=[];
+    for(const network of CHAINS){const addresses=[...unique.values()].filter(row=>row.chain===network).map(row=>row.address);if(!addresses.length)continue;
+      const rows=this.os(`WITH selected(address) AS (SELECT value FROM json_each(?))
+        SELECT p.address,p.fresh_until,g.group_id FROM selected s CROSS JOIN wp_profiles p
+          ON p.chain=? AND p.address=s.address LEFT JOIN wp_groups g ON g.chain=p.chain AND g.address=p.address
+        ORDER BY p.address,g.group_id`).all(JSON.stringify(addresses),network);
+      const found=new Map<string,WalletFastProfileMetadata>();
+      for(const row of rows){const address=chainAddress(network,row.address),freshUntil=stamp(row.fresh_until)?row.fresh_until:undefined;if(!address||!freshUntil)continue;
+        let item=found.get(address);if(!item){item={chain:network,address,groups:[],freshUntil};found.set(address,item);}
+        if(typeof row.group_id==='string'&&WALLET_PROFILE_GROUPS.includes(row.group_id as WalletProfileGroupId))item.groups.push(row.group_id);
+      }
+      result.push(...found.values());
+    }
+    return result;
+  }
   /**
    * Read one prospective market observation at a time, then page only that
    * token's observed buyers. This keeps the source cursor durable without a
@@ -186,66 +287,72 @@ export class WalletProfiles {
   }
   private runSnapshot(limit:number):WalletProfileStatus {
     this.roleKeys.clear();this.funderCache.clear();this.initiatorNominations.clear();this.newQualifications.clear();
-    const now=this.now().toISOString(),n=bounded(limit,100,1000),targets=new Map<string,{chain:Chain;address:string;discover:boolean;nominations:Map<string,string>}>();
+    const now=this.now().toISOString(),n=bounded(limit,100,1000),hotDueAt=new Date(Date.parse(now)-this.refreshMs).toISOString(),
+      coldDueAt=new Date(Date.parse(now)-this.coldRefreshMs).toISOString(),slotStart=Number(this.meta('schedule_slot_cursor')||0)%SCHEDULE_SLOTS.length;
+    let hotBudget=0,coldBudget=0,dirtyBudget=0;
+    for(let offset=0;offset<n;offset++){const slot=SCHEDULE_SLOTS[(slotStart+offset)%SCHEDULE_SLOTS.length];
+      if(slot==='hot')hotBudget++;else if(slot==='cold')coldBudget++;else dirtyBudget++;}
+    const cold=this.os(`SELECT chain,address FROM wp_profiles INDEXED BY wp_profiles_recent WHERE computed_at<=?
+      ORDER BY computed_at DESC,chain,address LIMIT ?`).all(coldDueAt,Math.min(1001,n+1)),coldDue=cold.length>0;
+    if(!coldDue){dirtyBudget+=coldBudget;coldBudget=0;}
+    const hot=this.hotPriorityProfiles(hotDueAt,hotBudget);dirtyBudget+=Math.max(0,hotBudget-hot.rows.length);
+    const targets=new Map<string,{chain:Chain;address:string;discover:boolean;nominations:Map<string,string>}>(),dirtyRoom=()=>Math.max(0,dirtyBudget-targets.size);
     if(this.meta('error')===CAPACITY)return this.status();
     const add=(row:Row,discover=false,nominate=false)=>{const chain=row.chain as Chain,address=chainAddress(chain,row.address??row.wallet);if(!address)return;
       const key=chain+':'+address,old=targets.get(key),nominations=old?.nominations??new Map<string,string>();
       if(nominate){const token=chainAddress(chain,row.token_address),marketAt=stamp(row.market_at)?String(row.market_at):undefined,prior=token&&nominations.get(token);
         if(token&&marketAt&&(!prior||marketAt<prior))nominations.set(token,marketAt);}
       targets.set(key,{chain,address,discover:discover||old?.discover===true,nominations});};
-    const initialCursor=Number(this.meta('initial_cursor')||0),initialLimit=Math.max(1,Math.ceil(n*0.6));
-    const initial=this.hs('SELECT rowid AS cursor,chain,address FROM wh_wallets WHERE rowid>? ORDER BY rowid LIMIT ?').all(initialCursor,initialLimit);
-    initial.forEach(row=>add(row,true));
-    // Stable timestamp/rowid cursor consumes changed wallets fairly; new rows have an independent cursor.
-    const changedAt=this.meta('changed_at'),changedRow=Number(this.meta('changed_row')||0),changedLimit=Math.max(1,Math.ceil(n*0.1));
-    const changed=this.hs('SELECT rowid AS cursor,chain,address,last_at FROM wh_wallets WHERE last_at>=? AND last_at<=? AND (last_at>? OR (last_at=? AND rowid>?)) ORDER BY last_at,rowid LIMIT ?').all(changedAt,now,changedAt,changedAt,changedRow,changedLimit);
-    changed.forEach(row=>add(row,true));
-    const coordinationAt=this.meta('coordination_at'),coordinationRow=Number(this.meta('coordination_row')||0);
-    const coordination=this.hs(`SELECT rowid AS cursor,chain,address,coordination_checked_at FROM wh_metrics WHERE coordination_dirty=0
-      AND coordination_checked_at>=? AND coordination_checked_at<=? AND (coordination_checked_at>? OR (coordination_checked_at=? AND rowid>?))
-      ORDER BY coordination_checked_at,rowid LIMIT ?`).all(coordinationAt,now,coordinationAt,coordinationAt,coordinationRow,changedLimit);
-    coordination.forEach(row=>add(row));
-    // Association refreshes often follow a public-wallet buy, while only that
-    // public wallet receives a trade event. Recompute the candidate through a
-    // separate durable cursor instead of waiting for the periodic profile pass.
-    const relationAt=this.meta('relation_changed_at'),relationRow=Number(this.meta('relation_changed_row')||0);
-    const relationChanged=this.hs(`SELECT rowid AS cursor,chain,candidate AS address,updated_at FROM wh_assoc_relations INDEXED BY wh_assoc_relation_updated
-      WHERE updated_at>=? AND updated_at<=? AND (updated_at>? OR (updated_at=? AND rowid>?))
-      ORDER BY updated_at,rowid LIMIT ?`).all(relationAt,now,relationAt,relationAt,relationRow,changedLimit);
-    relationChanged.forEach(row=>add(row));
-    // A new local market first-seen can change an already profiled wallet even
-    // when that wallet has no new trade. Page one observation's buyers at a
-    // time so a popular token cannot force a global DISTINCT/sort.
-    const market=this.marketBatch(now,Math.max(1,Math.ceil(n*0.2)));market.rows.forEach(row=>add(row,false,true));
-    // The per-wallet frame below intentionally keeps only 500 recent events.
-    // Consume every newly archived event with a separate durable cursor so an
-    // older post-market buy from a busy wallet cannot fall out of that frame
-    // before it is copied into the compact initiator ledger.
-    const eventStart=Number(this.meta('initiator_event_cursor')||0),eventLimit=Math.max(1,Math.ceil(n*0.2));
-    const eventCeiling=Number(this.hs('SELECT COALESCE(MAX(rowid),0) AS n FROM wh_events').get()!.n),eventRows=this.hs(`SELECT rowid AS cursor,chain,wallet,token_address,side,event_at,observed_at
-      FROM wh_events WHERE rowid>? AND rowid<=? ORDER BY rowid LIMIT ?`).all(eventStart,eventCeiling,eventLimit);
-    const eventCandidates=new Map<Chain,Row[]>();
-    for(const row of eventRows){const chain=row.chain as Chain,wallet=chainAddress(chain,row.wallet),token=chainAddress(chain,row.token_address);
-      if(!wallet||!token||row.side!=='buy'||!validTime(row.event_at,now)||!validTime(row.observed_at,now)||row.event_at>row.observed_at)continue;
-      const values=eventCandidates.get(chain)??[];values.push({...row,wallet,token_address:token});eventCandidates.set(chain,values);}
-    for(const [chain,rows] of eventCandidates){const frames=this.marketFrames(chain,rows.map(row=>row.token_address),now);
-      for(const row of rows){const marketAt=frames.get(row.token_address);if(marketAt)add({...row,market_at:marketAt},false,true);}}
+    const initialCursor=Number(this.meta('initial_cursor')||0),changedAt=this.meta('changed_at'),changedRow=Number(this.meta('changed_row')||0),
+      coordinationAt=this.meta('coordination_at'),coordinationRow=Number(this.meta('coordination_row')||0),
+      relationAt=this.meta('relation_changed_at'),relationRow=Number(this.meta('relation_changed_row')||0),
+      eventStart=Number(this.meta('initiator_event_cursor')||0),eventCeiling=Number(this.hs('SELECT COALESCE(MAX(rowid),0) AS n FROM wh_events').get()!.n),
+      chainCursor=Number(this.meta('chain_cursor')||0);
+    let initialLimit=0,initial:Row[]=[],changed:Row[]=[],coordination:Row[]=[],relationChanged:Row[]=[],eventRows:Row[]=[],roleRows:Row[]=[],chainRows:Row[]=[],
+      market:{rows:Row[];cursor:number;wallet:string;changed:boolean}={rows:[],cursor:Number(this.meta('market_cursor')||0),wallet:this.meta('market_wallet'),changed:false},
+      dirtyNext=Number(this.meta('dirty_queue_cursor')||0)%DIRTY_QUEUES.length;
+    const consumeEventRows=(rows:Row[])=>{const candidates=new Map<Chain,Row[]>();
+      for(const row of rows){const chain=row.chain as Chain,wallet=chainAddress(chain,row.wallet),token=chainAddress(chain,row.token_address);
+        if(!wallet||!token||row.side!=='buy'||!validTime(row.event_at,now)||!validTime(row.observed_at,now)||row.event_at>row.observed_at)continue;
+        const values=candidates.get(chain)??[];values.push({...row,wallet,token_address:token});candidates.set(chain,values);}
+      for(const [chain,values] of candidates){const frames=this.marketFrames(chain,values.map(row=>row.token_address),now);
+        for(const row of values){const marketAt=frames.get(row.token_address);if(marketAt)add({...row,market_at:marketAt},false,true);}}};
+    // Give the available dirty slice to one queue at a time and persist the
+    // next starting queue. A permanently busy early queue therefore cannot
+    // prevent any later cursor from receiving a whole slice on a future batch.
+    const dirtyStart=dirtyNext;
+    for(let visited=0;visited<DIRTY_QUEUES.length&&dirtyRoom()>0;visited++){
+      const index=(dirtyStart+visited)%DIRTY_QUEUES.length,queue=DIRTY_QUEUES[index],quota=dirtyRoom();
+      if(queue==='initial'){initialLimit=quota;initial=this.hs('SELECT rowid AS cursor,chain,address FROM wh_wallets WHERE rowid>? ORDER BY rowid LIMIT ?').all(initialCursor,quota);initial.forEach(row=>add(row,true));}
+      else if(queue==='changed'){changed=this.hs('SELECT rowid AS cursor,chain,address,last_at FROM wh_wallets WHERE last_at>=? AND last_at<=? AND (last_at>? OR (last_at=? AND rowid>?)) ORDER BY last_at,rowid LIMIT ?').all(changedAt,now,changedAt,changedAt,changedRow,quota);changed.forEach(row=>add(row,true));}
+      else if(queue==='coordination'){coordination=this.hs(`SELECT rowid AS cursor,chain,address,coordination_checked_at FROM wh_metrics WHERE coordination_dirty=0
+        AND coordination_checked_at>=? AND coordination_checked_at<=? AND (coordination_checked_at>? OR (coordination_checked_at=? AND rowid>?))
+        ORDER BY coordination_checked_at,rowid LIMIT ?`).all(coordinationAt,now,coordinationAt,coordinationAt,coordinationRow,quota);coordination.forEach(row=>add(row));}
+      else if(queue==='relation'){relationChanged=this.hs(`SELECT rowid AS cursor,chain,candidate AS address,updated_at FROM wh_assoc_relations INDEXED BY wh_assoc_relation_updated
+        WHERE updated_at>=? AND updated_at<=? AND (updated_at>? OR (updated_at=? AND rowid>?))
+        ORDER BY updated_at,rowid LIMIT ?`).all(relationAt,now,relationAt,relationAt,relationRow,quota);relationChanged.forEach(row=>add(row));}
+      else if(queue==='market'){market=this.marketBatch(now,quota);market.rows.forEach(row=>add(row,false,true));}
+      else if(queue==='events'){eventRows=this.hs(`SELECT rowid AS cursor,chain,wallet,token_address,side,event_at,observed_at
+        FROM wh_events WHERE rowid>? AND rowid<=? ORDER BY rowid LIMIT ?`).all(eventStart,eventCeiling,quota);consumeEventRows(eventRows);}
+      else if(queue==='roles'){roleRows=this.os('SELECT chain,address FROM wp_profiles WHERE role_computed_at IS NULL LIMIT ?').all(quota);roleRows.forEach(row=>add(row));}
+      else {chainRows=this.chain?.prepare('SELECT rowid AS cursor,chain,wallet FROM chain_events WHERE rowid>? ORDER BY rowid LIMIT ?').all(chainCursor,quota)??[];chainRows.forEach(row=>add(row));}
+      dirtyNext=(index+1)%DIRTY_QUEUES.length;
+    }
     const eventCursor=eventRows.length?Number(eventRows.at(-1)!.cursor):eventStart;
     const eventCoverageComplete=eventCursor>=eventCeiling;
-    // Existing profiles also receive the new model, independent of new events
-    // or the original history cursor. The NULL index makes this bounded.
-    this.os('SELECT chain,address FROM wp_profiles WHERE role_computed_at IS NULL LIMIT ?').all(Math.max(1,Math.ceil(n*0.2))).forEach(row=>add(row));
-    // Source cursors refresh changed wallets immediately. The periodic pass is
-    // only reconciliation, so key it by computed_at and the configured window
-    // instead of perpetually rewriting the whole corpus every 30 minutes.
-    const dueAt=new Date(Date.parse(now)-this.refreshMs).toISOString();
-    const due=this.os('SELECT chain,address FROM wp_profiles INDEXED BY wp_profiles_recent WHERE computed_at<=? ORDER BY computed_at,chain,address LIMIT ?')
-      .all(dueAt,Math.max(1,n-targets.size));due.forEach(row=>add(row));
-    const chainCursor=Number(this.meta('chain_cursor')||0);
-    const chainRows=this.chain?.prepare('SELECT rowid AS cursor,chain,wallet FROM chain_events WHERE rowid>? ORDER BY rowid LIMIT ?').all(chainCursor,Math.max(1,Math.min(200,Math.floor(n*0.2))))??[];
-    chainRows.forEach(row=>add(row));
+    // Dirty source cursors keep their own bounded share. Launcher candidates
+    // and every group consumed by the realtime wallet path share a capped hot
+    // slice; computedAt schedules recomputation and is not trade freshness.
+    const dirtySelected=targets.size,hotKeys=new Set<string>();
+    for(const row of hot.rows){add(row);const chain=row.chain as Chain,address=chainAddress(chain,row.address);if(address)hotKeys.add(`${chain}:${address}`);}
+    // The large historical corpus changes only through the durable cursors
+    // above. A seven-day pass is a backstop for model/schema drift; when any
+    // rows are overdue, the reserved slice guarantees continued cold progress.
+    const coldServed=new Set<string>();
+    for(const row of cold){const chain=row.chain as Chain,address=chainAddress(chain,row.address);if(!address)continue;
+      const key=`${chain}:${address}`;if(targets.size>=n&&!targets.has(key))break;add(row);coldServed.add(key);}
     const statusBefore=this.cachedStatus&&structuredClone(this.cachedStatus);this.db.exec('BEGIN');
-    let processed=0,full=false;
+    let processed=0,full=false;const processedKeys=new Set<string>();
     try {
       for(const target of targets.values()){
         const profile=this.compute(target.chain,target.address,now,target.discover,[...target.nominations].map(([tokenAddress,marketAt])=>({tokenAddress,marketAt})),eventCoverageComplete);
@@ -253,17 +360,18 @@ export class WalletProfiles {
         const size=Buffer.byteLength(JSON.stringify(profile));
         const logical=Number(this.os('PRAGMA page_count').get()!.page_count)*Number(this.os('PRAGMA page_size').get()!.page_size);
         if(Math.max(logical,filesBytes(this.options.database,this.db))+size*4+32768>this.maxBytes){full=true;break;}
-        this.save(profile);processed++;
+        this.save(profile);processed++;processedKeys.add(`${profile.chain}:${profile.address}`);
       }
       // Never advance input cursors over a capacity-truncated batch.
       if(!full){if(initial.length)this.setMeta('initial_cursor',String(initial.at(-1)!.cursor));
-        this.setMeta('initial_complete',initial.length<initialLimit?'1':'0');
+        if(initialLimit)this.setMeta('initial_complete',initial.length<initialLimit?'1':'0');
         if(changed.length){this.setMeta('changed_at',String(changed.at(-1)!.last_at));this.setMeta('changed_row',String(changed.at(-1)!.cursor));}
         if(coordination.length){this.setMeta('coordination_at',String(coordination.at(-1)!.coordination_checked_at));this.setMeta('coordination_row',String(coordination.at(-1)!.cursor));}
         if(relationChanged.length){this.setMeta('relation_changed_at',String(relationChanged.at(-1)!.updated_at));this.setMeta('relation_changed_row',String(relationChanged.at(-1)!.cursor));}
         if(market.changed){this.setMeta('market_cursor',String(market.cursor));this.setMeta('market_wallet',market.wallet);}
         if(eventCursor!==eventStart)this.setMeta('initiator_event_cursor',String(eventCursor));
-        if(chainRows.length)this.setMeta('chain_cursor',String(chainRows.at(-1)!.cursor));}
+        if(chainRows.length)this.setMeta('chain_cursor',String(chainRows.at(-1)!.cursor));
+        this.setMeta('dirty_queue_cursor',String(dirtyNext));this.setMeta('schedule_slot_cursor',String((slotStart+n)%SCHEDULE_SLOTS.length));}
       // No reader can see any row until this transaction commits. Newly formed
       // peer qualifications therefore start at batch completion, never at the
       // earlier read-snapshot time or an intermediate per-wallet calculation.
@@ -281,10 +389,18 @@ export class WalletProfiles {
             profile.visibleStartAnalysis.qualification.prerequisiteKnownAt=registeredAt;}}
         this.os('UPDATE wp_profiles SET computed_at=?,role_computed_at=?,data=? WHERE chain=? AND address=?')
           .run(registeredAt,profile.roleAnalysis?.computedAt??null,JSON.stringify(profile),profile.chain,profile.address);
+        this.os('UPDATE wp_groups SET computed_at=? WHERE chain=? AND address=?').run(registeredAt,profile.chain,profile.address);
       }
       if([...this.newQualifications.values()].some(value=>value.peers.size)&&this.cachedStatus&&(!this.cachedStatus.roleLastRunAt||registeredAt>this.cachedStatus.roleLastRunAt))
         this.cachedStatus.roleLastRunAt=registeredAt;
       this.setMeta('processed',String(Number(this.meta('processed')||0)+processed));this.setMeta('last_run_at',registeredAt);
+      this.setMeta('schedule_hot_candidate_pool_lower_bound',String(hot.poolLowerBound));this.setMeta('schedule_launcher_candidate_pool',String(hot.launcherPool));
+      this.setMeta('schedule_realtime_priority_pool_lower_bound',String(hot.realtimePoolLowerBound));this.setMeta('schedule_monitored_candidate_pool',String(hot.monitored));
+      this.setMeta('schedule_hot_candidate_due_lower_bound',String(hot.dueLowerBound));this.setMeta('schedule_hot_candidate_fresh_lower_bound',String(hot.freshLowerBound));
+      this.setMeta('schedule_cold_due_profiles_lower_bound',String(cold.length));this.setMeta('schedule_hot_sample_limit_per_group',String(Math.max(1,hotBudget)));
+      this.setMeta('schedule_cold_sample_limit',String(Math.min(1001,n+1)));
+      this.setMeta('schedule_dirty_selected',String(dirtySelected));this.setMeta('schedule_hot_served',String([...hotKeys].filter(key=>processedKeys.has(key)).length));
+      this.setMeta('schedule_cold_served',String([...coldServed].filter(key=>processedKeys.has(key)).length));this.setMeta('schedule_unique_selected',String(targets.size));
       if(full)this.setMeta('error',CAPACITY);this.db.exec('COMMIT');
     }catch(error){this.db.exec('ROLLBACK');this.cachedStatus=statusBefore;throw error;}
     if(!this.countedAt||this.now().getTime()-this.countedAt>=60_000){this.sourceCount=Number(this.hs('SELECT count(*) AS n FROM wh_wallets').get()!.n);this.countedAt=this.now().getTime();this.setMeta('source_wallets',String(this.sourceCount));}
@@ -619,7 +735,8 @@ export class WalletProfiles {
         DO UPDATE SET market_at=MIN(wp_initiator_tokens.market_at,excluded.market_at)`)
         .run(profile.chain,profile.address,nomination.tokenAddress,nomination.marketAt);
     this.os('DELETE FROM wp_groups WHERE chain=? AND address=?').run(profile.chain,profile.address);
-    for(const group of profile.groups)this.os('INSERT INTO wp_groups VALUES (?,?,?,?)').run(profile.chain,profile.address,group.id,group.firstObservedAt);
+    for(const group of profile.groups)this.os('INSERT INTO wp_groups(chain,address,group_id,first_at,computed_at) VALUES (?,?,?,?,?)')
+      .run(profile.chain,profile.address,group.id,group.firstObservedAt,profile.computedAt);
     const status=this.cachedStatus;if(!status)return;
     const wasSource=Number(oldRow?.source_wallet)===1,isSource=profile.source==='wallet_history',hadRole=!!oldRow?.role_computed_at,hasRole=!!profile.roleAnalysis?.computedAt;
     if(!oldRow){status.profiles++;if(hasRole)status.roleProfiles++;else status.rolePending++;}
@@ -660,7 +777,7 @@ export class WalletProfiles {
     }else this.cachedStatus=updateStatus(this.cachedStatus,this.db,this.options.database,now,this.refreshMs/1000);
     this.saveSnapshot('profile_status',now,this.cachedStatus);return structuredClone(this.cachedStatus);
   }
-  close():void {this.chain?.close();this.history.close();this.db.close();}
+  close():void {this.launcher?.close();this.chain?.close();this.history.close();this.db.close();}
 }
 function aggregateStatus(db:DatabaseSync,path:string,now:string,refreshAfterSec?:number):WalletProfileStatus {
   const meta=Object.fromEntries(db.prepare('SELECT key,value FROM wp_meta').all().map(r=>[String(r.key),String(r.value)]));
@@ -670,15 +787,28 @@ function aggregateStatus(db:DatabaseSync,path:string,now:string,refreshAfterSec?
     roleProfiles:Number(roles.n),rolePending:Number(roles.pending),roleLastRunAt:roles.latest?String(roles.latest):undefined,
     profiledSourceWallets:Number(db.prepare('SELECT count(*) AS n FROM wp_profiles WHERE source_wallet=1').get()!.n),initialComplete:meta.initial_complete==='1',processed:Number(meta.processed||0),
     lastRunAt:meta.last_run_at||undefined,groupCounts,bytes:filesBytes(path,db),maxBytes:Number(meta.max_bytes||0),capacityReached:meta.error===CAPACITY,error:meta.error||undefined,sampleOnly:true,aggregatedAt:now,
+    schedule:profileSchedule(meta),staleProfilesBasis:'legacy_all_profiles_short_window',
     staleProfiles:Number(db.prepare('SELECT count(*) AS n FROM wp_profiles WHERE computed_at<=?').get(
       new Date(Date.parse(now)-Math.max(1,refreshAfterSec??Number(meta.refresh_after_sec||21600))*1000).toISOString())!.n)};
+}
+function profileSchedule(meta:Record<string,string>):WalletProfileScheduleStatus {
+  const count=(key:string)=>{const value=Number(meta[key]||0);return Number.isSafeInteger(value)&&value>=0?value:0;};
+  return {hotCandidatePoolLowerBound:count('schedule_hot_candidate_pool_lower_bound'),launcherCandidatePool:count('schedule_launcher_candidate_pool'),
+    realtimePriorityPoolLowerBound:count('schedule_realtime_priority_pool_lower_bound'),monitoredCandidatePool:count('schedule_monitored_candidate_pool'),
+    hotCandidateDueLowerBound:count('schedule_hot_candidate_due_lower_bound'),hotCandidateFreshLowerBound:count('schedule_hot_candidate_fresh_lower_bound'),
+    coldDueProfilesLowerBound:count('schedule_cold_due_profiles_lower_bound'),hotSampleLimitPerGroup:count('schedule_hot_sample_limit_per_group'),
+    coldSampleLimit:count('schedule_cold_sample_limit'),
+    dirtySelected:count('schedule_dirty_selected'),hotServed:count('schedule_hot_served'),coldServed:count('schedule_cold_served'),
+    uniqueSelected:count('schedule_unique_selected'),
+    hotRefreshAfterSec:Math.max(1,count('refresh_after_sec')),coldRefreshAfterSec:Math.max(1,count('cold_refresh_after_sec')||604800),
+    basis:'rotating_dirty_realtime_hot_cold_periodic',counts:'bounded_lower_bounds_at_batch_start',computedAtIsTradeEvidence:false};
 }
 function updateStatus(base:WalletProfileStatus,db:DatabaseSync,path:string,now:string,refreshAfterSec?:number):WalletProfileStatus {
   const meta=Object.fromEntries(db.prepare('SELECT key,value FROM wp_meta').all().map(r=>[String(r.key),String(r.value)]));
   return {...base,sourceWallets:Number(meta.source_wallets||0),initialComplete:meta.initial_complete==='1',processed:Number(meta.processed||0),
     lastRunAt:meta.last_run_at||undefined,bytes:filesBytes(path,db),maxBytes:Number(meta.max_bytes||0),capacityReached:meta.error===CAPACITY,
-    error:meta.error||undefined,staleProfiles:Number(db.prepare('SELECT count(*) AS n FROM wp_profiles WHERE computed_at<=?').get(
-      new Date(Date.parse(now)-Math.max(1,refreshAfterSec??Number(meta.refresh_after_sec||21600))*1000).toISOString())!.n)};
+    schedule:profileSchedule(meta),staleProfilesBasis:'legacy_all_profiles_short_window',
+    error:meta.error||undefined};
 }
 function validStatus(value:unknown):value is WalletProfileStatus {if(!value||typeof value!=='object')return false;const status=value as Partial<WalletProfileStatus>;
   return status.ready===true&&Number.isSafeInteger(status.profiles)&&status.profiles!>=0&&Number.isSafeInteger(status.profiledSourceWallets)&&status.profiledSourceWallets!>=0&&

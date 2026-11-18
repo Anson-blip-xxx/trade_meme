@@ -25,7 +25,7 @@ export interface ExitQuality {
 }
 export interface ExitQualityInput {
   asOf:string;policyVersion:string;baselineAt:string;baselinePriceUsd:number;returns:ShadowReturn;
-  preExitSamples:readonly ExitQualitySample[];preExitTruncated:boolean;
+  preExitSamples:readonly ExitQualitySample[];preExitTruncated:boolean;preExitThinned?:boolean;
   exitSample?:ExitQualitySample;
   comparisonSamples:Readonly<Record<number,{samples:readonly ExitQualitySample[];truncated:boolean}>>;
 }
@@ -52,7 +52,8 @@ export function exitQuality(input:ExitQualityInput):ExitQuality {
   const exit=input.exitSample,exitValid=!!exit&&valid(exit)&&time(exit.at)===closedAt&&exit.priceUsd===final.priceUsd;
   const samples=input.preExitSamples;
   let peakError:string|undefined;
-  if(input.preExitTruncated||samples.length>EXIT_QUALITY_SAMPLE_LIMIT)peakError='PRE_EXIT_SAMPLE_LIMIT';
+  if(input.preExitThinned)peakError='PRE_EXIT_HISTORY_THINNED';
+  else if(input.preExitTruncated||samples.length>EXIT_QUALITY_SAMPLE_LIMIT)peakError='PRE_EXIT_SAMPLE_LIMIT';
   else if(!exitValid)peakError='EXIT_SAMPLE_UNAVAILABLE';
   else if(!exit.pool||samples.some(sample=>!sample.pool))peakError='POOL_PROVENANCE_UNKNOWN';
   else if(samples.some(sample=>sample.pool!==exit.pool))peakError='POOL_PROVENANCE_MISMATCH';
@@ -146,6 +147,7 @@ export function readPositionExitQuality(db:DatabaseSync,row:QualityPositionRow,a
   // COUNT over a long-lived position. No unbounded wide-row materialization.
   const rows=db.prepare(`SELECT ${sampleColumns} FROM exit_shadow_samples WHERE position_id=? AND at<=? ORDER BY at LIMIT ?`)
     .all(row.id,returns.closedAt,EXIT_QUALITY_SAMPLE_LIMIT+1);
+  try {input.preExitThinned=Number(db.prepare('SELECT samples_thinned FROM exit_shadow_sample_stats WHERE position_id=?').get(row.id)?.samples_thinned)>0;}catch{}
   input.preExitTruncated=rows.length>EXIT_QUALITY_SAMPLE_LIMIT;
   input.preExitSamples=rows.slice(0,EXIT_QUALITY_SAMPLE_LIMIT).map(readSample);
   const exit=db.prepare(`SELECT ${sampleColumns} FROM exit_shadow_samples WHERE position_id=? AND at=?`).get(row.id,returns.closedAt);

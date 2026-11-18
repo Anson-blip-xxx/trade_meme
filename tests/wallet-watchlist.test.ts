@@ -10,6 +10,7 @@ import {WalletFastRunner,type WalletFastOptions} from '../src/wallet-fast-runner
 import {ChainMonitor,type ChainMonitorOptions} from '../src/chain-monitor.js';
 import {PriceTracker} from '../src/price-tracker.js';
 import {createRuntime} from '../src/runtime.js';
+import {WalletProfileRunner} from '../src/wallet-profile-runner.js';
 
 const pin='BNnN2MqfWLvgThYBsv6v8JQaYZXYKYahC5YCy27Ct1cX';
 const pub=(n:number)=>bs58.encode(new Uint8Array(32).fill(n));
@@ -19,7 +20,7 @@ test('Solana watchlist is optional, trims and deduplicates full public keys with
   assert.equal(readConfig({SOLANA_WALLET_WATCHLIST:'  '}).chainStream.pinnedWallets,undefined);
   const config=readConfig({SOLANA_WALLET_WATCHLIST:` ${pin}, ${pub(2)},${pin} `});
   assert.deepEqual(config.chainStream.pinnedWallets,{solana:[pin,pub(2)]});
-  assert.equal(config.chainStream.maxWallets,10);assert.equal(config.entryMode,'off');
+  assert.equal(config.chainStream.maxWallets,10);assert.equal(config.walletFast?.evmMaxWallets,200);assert.equal(config.entryMode,'off');
 });
 
 test('watchlist rejects invalid keys, empty members and excessive unique pins without echoing input',()=>{
@@ -36,6 +37,8 @@ test('reserved pin capacity is bounded by thirty wallets, counting duplicate pin
   assert.equal(readConfig({CHAIN_STREAM_MAX_WALLETS:'30'}).chainStream.maxWallets,30);
   assert.equal(readConfig({CHAIN_STREAM_MAX_WALLETS:'29',SOLANA_WALLET_WATCHLIST:`${pin},${pin}`}).chainStream.pinnedWallets?.solana?.length,1);
   assert.throws(()=>readConfig({CHAIN_STREAM_MAX_WALLETS:'30',SOLANA_WALLET_WATCHLIST:pin}),{message:'SOLANA_WALLET_WATCHLIST_CAPACITY'});
+  assert.equal(readConfig({WALLET_FAST_EVM_MAX_WALLETS:'135'}).walletFast?.evmMaxWallets,135);
+  assert.throws(()=>readConfig({WALLET_FAST_EVM_MAX_WALLETS:'201'}));
 });
 
 test('pin survives automatic refresh and rotation without displacing or qualifying any target',()=>{
@@ -58,34 +61,41 @@ test('runtime reserves the extra slot in both watchers while keeping automatic s
   const config=readConfig({CHAIN_STREAM_ENABLED:'true',WALLET_FAST_ENABLED:'true',SOLANA_WALLET_WATCHLIST:pin,
     SOLANA_STREAM_HTTP_URL:'https://rpc.invalid',SOLANA_STREAM_WS_URL:'wss://rpc.invalid',
     BSC_STREAM_HTTP_URL:'https://evm.invalid',BSC_STREAM_WS_URL:'wss://evm.invalid',
-    WALLET_RESEARCH_ENABLED:'true',WALLET_PROFILES_ENABLED:'false',WALLET_SCREENING_ENABLED:'false',TOKEN_RANK_RESEARCH_ENABLED:'false',
+    WALLET_RESEARCH_ENABLED:'true',WALLET_PROFILES_ENABLED:'true',LAUNCHER_CANDIDATES_ENABLED:'false',WALLET_SCREENING_ENABLED:'false',TOKEN_RANK_RESEARCH_ENABLED:'false',
     WALLET_HISTORY_DATABASE_PATH:join(dir,'wallets.sqlite'),WALLET_ACTIVITY_DATABASE_PATH:join(dir,'activity.sqlite'),
+    WALLET_PROFILES_DATABASE_PATH:join(dir,'profiles.sqlite'),
     CHAIN_STREAM_DATABASE_PATH:join(dir,'stream.sqlite'),SCAN_DATABASE_PATH:join(dir,'scans.sqlite'),ORDERS_DATABASE_PATH:join(dir,'orders.sqlite')});
   let fast:WalletFastOptions|undefined,monitor:ChainMonitorOptions|undefined,requests=0,now=Date.now();
   t.mock.method(Date,'now',()=>now);
   t.mock.method(globalThis,'fetch',async()=>{requests++;throw new Error('NETWORK_NOT_ALLOWED');});
   t.mock.method(WalletFastRunner.prototype,'start',function(this:WalletFastRunner){fast=(this as unknown as {options:WalletFastOptions}).options;});
   t.mock.method(ChainMonitor.prototype,'start',function(this:ChainMonitor){monitor=(this as unknown as {options:ChainMonitorOptions}).options;});
+  t.mock.method(WalletProfileRunner.prototype,'start',()=>{});
   t.mock.method(PriceTracker.prototype,'start',()=>{});
   const runtime=createRuntime(config);
   let automatic=Array.from({length:10},(_,i)=>pub(i+1));
-  const evm=Array.from({length:10},(_,i)=>'0x'+(i+1).toString(16).padStart(40,'0'));
-  const limits:number[]=[];
-  runtime.walletHistory!.streamWalletTargets=(chain,limit=10)=>{limits.push(limit);return chain==='solana'?automatic:evm;};
+  const profileEvm=Array.from({length:135},(_,i)=>'0x'+(i+1).toString(16).padStart(40,'0')),evm=profileEvm.slice(0,10);
+  const limits:{chain:string;limit:number}[]=[],profileLimits:{chain:string;limit:number}[]=[];
+  runtime.walletHistory!.streamWalletTargets=(chain,limit=10)=>{limits.push({chain,limit});return chain==='solana'?automatic:evm;};
+  runtime.walletProfiles!.fastTargetAddresses=(chain,limit=30)=>{profileLimits.push({chain,limit});return chain==='bsc'?profileEvm.slice(0,limit):[];};
   try {
     runtime.start();assert.ok(fast);assert.ok(monitor);
-    assert.equal(fast.maxWallets,11);assert.equal(monitor.config.maxWallets,11);assert.equal(config.chainStream.maxWallets,10);
+    assert.equal(fast.maxWallets,11);assert.deepEqual(fast.maxWalletsByChain,{solana:11,bsc:200,robinhood:200});
+    assert.equal(monitor.config.maxWallets,11);assert.equal(config.chainStream.maxWallets,10);
     assert.deepEqual(monitor.wallets('solana',11),[...automatic,pin]);
     assert.deepEqual(monitor.wallets('bsc',11),evm);
     const snapshot=fast.snapshot();
     assert.deepEqual(snapshot.targets.filter(t=>t.chain==='solana').map(t=>t.wallet),[...automatic,pin]);
-    assert.equal(snapshot.targets.filter(t=>t.chain==='bsc').length,10);
+    assert.equal(snapshot.targets.filter(t=>t.chain==='bsc').length,135);
     const pinned=snapshot.targets.find(t=>t.wallet===pin)!;
     assert.deepEqual(pinned.groups,[]);assert.equal(pinned.profileUntil,undefined);
     automatic=Array.from({length:10},(_,i)=>pub(i+20));now+=300000;
     assert.deepEqual(fast.snapshot().targets.filter(t=>t.chain==='solana').map(t=>t.wallet),[...automatic,pin]);
     assert.deepEqual(monitor.wallets('solana',11),[...automatic,pin]);
-    assert.ok(limits.length>0&&limits.every(limit=>limit===10));
+    assert.ok(limits.some(row=>row.chain==='solana'&&row.limit===10));
+    assert.ok(limits.some(row=>row.chain==='bsc'&&row.limit===200));
+    assert.ok(profileLimits.some(row=>row.chain==='solana'&&row.limit===10));
+    assert.ok(profileLimits.some(row=>row.chain==='bsc'&&row.limit===200));
     assert.equal(runtime.dashboardOverview().entryMode,'off');assert.equal(runtime.dashboardOrders().items.length,0);
     assert.equal(requests,0);
   }finally{await runtime.close();rmSync(dir,{recursive:true,force:true});}

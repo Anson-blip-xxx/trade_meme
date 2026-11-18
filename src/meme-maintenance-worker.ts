@@ -4,12 +4,13 @@ import {performance} from 'node:perf_hooks';
 import {maintainMemePriceArchive,MEME_FULL_SNAPSHOT_MAX_ROWS,memePriceArchiveDeletionCeiling,
   type MemePriceArchiveMaintenance} from './meme-price-archive.js';
 
-const options=workerData as {database:string;maxBytes:number;reclaimedSnapshots:number};
+const options=workerData as {database:string;maxBytes:number;reclaimedSnapshots:number;nowMs?:number};
 const db=new DatabaseSync(options.database);db.exec('PRAGMA journal_mode=WAL; PRAGMA busy_timeout=0; PRAGMA wal_autocheckpoint=0; PRAGMA synchronous=NORMAL');
 const pageSize=Number(db.prepare('PRAGMA page_size').get()!.page_size);
 const DELETE_BATCH=10,FULL_SNAPSHOT_DELETE_BATCH=250,PRICE_ARCHIVE_BATCH=100;
 let stopping=false,timer:ReturnType<typeof setTimeout>|undefined,reclaimed=options.reclaimedSnapshots;
 let maxWriteLockMs=0;
+const now=()=>options.nowMs??Date.now();
 const measure=()=>Math.max(0,Number(db.prepare('PRAGMA page_count').get()!.page_count)-Number(db.prepare('PRAGMA freelist_count').get()!.freelist_count))*pageSize;
 const safeArchiveError=(error:unknown)=>{
   const message=error instanceof Error?error.message:'';
@@ -32,14 +33,14 @@ const boundedRowidDelete=(table:'meme_signals'|'meme_tokens'|'meme_sampling_sele
   catch(error){try{db.exec('ROLLBACK');}catch{}throw error;}
   finally{maxWriteLockMs=Math.max(maxWriteLockMs,performance.now()-started);}};
 const run=()=>{
-  if(stopping)return;const started=performance.now(),checkedAt=new Date().toISOString(),cutoff=new Date(Date.now()-30*86400000).toISOString();
+  if(stopping)return;const started=performance.now(),current=now(),checkedAt=new Date(current).toISOString(),cutoff=new Date(current-30*86400000).toISOString();
   let backlog=false;maxWriteLockMs=0;
   try {
     // Copy legacy JSON rows faster than they are retired. Current observations
     // are already dual-written by MemeObserver in the sample savepoint.
     const archiveStarted=performance.now();let archiveError:string|undefined;
     let prices:MemePriceArchiveMaintenance={deleted:0,backfilled:0,backfillPending:true,retentionBacklog:false};
-    try {prices=maintainMemePriceArchive(db,Date.now(),PRICE_ARCHIVE_BATCH,PRICE_ARCHIVE_BATCH);}
+    try {prices=maintainMemePriceArchive(db,current,PRICE_ARCHIVE_BATCH,PRICE_ARCHIVE_BATCH);}
     catch(error){archiveError=safeArchiveError(error);backlog=true;}
     const archiveDurationMs=performance.now()-archiveStarted;
     backlog=prices.backfillPending||prices.retentionBacklog||backlog;
@@ -63,7 +64,7 @@ const run=()=>{
     backlog=boundedRowidDelete('meme_tokens','last_signal_at<?','last_signal_at,rowid',[cutoff])===DELETE_BATCH||backlog;
     backlog=boundedRowidDelete('meme_sampling_selections','last_selected_at<?','last_selected_at,rowid',[cutoff])===DELETE_BATCH||backlog;
     backlog=boundedRowidDelete('meme_sampling_plans','first_applied_at<? AND plan_id NOT IN (SELECT plan_id FROM meme_sampling_selections)','first_applied_at,rowid',[cutoff])===DELETE_BATCH||backlog;
-    const forwardCutoff=new Date(Date.now()-7*86400000).toISOString();
+    const forwardCutoff=new Date(current-7*86400000).toISOString();
     backlog=boundedRowidDelete('meme_forward_targets','until_at<?','until_at,rowid',[forwardCutoff])===DELETE_BATCH||backlog;
     backlog=boundedRowidDelete('meme_notification_windows','last_at<?','last_at,rowid',[cutoff])===DELETE_BATCH||backlog;
     let usedBytes=measure(),pressure=usedBytes>=options.maxBytes*0.8;

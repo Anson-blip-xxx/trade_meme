@@ -24,7 +24,8 @@ function createProfiles(path:string):DatabaseSync {
 }
 function addProfile(db:DatabaseSync,id:number):void {
   const address=wallet(id),at=now(),profile={version:1,chain:'bsc',address,computedAt:at,groups:[],metrics:{lastEventAt:at},
-    initiatorAnalysis:{status:'current',chain:'bsc',wallet:address,evidence:[],screeningEvidence:[]}};
+    initiatorAnalysis:{status:'current',classification:'candidate',chain:'bsc',wallet:address,prospectivePreTokens:1,selectedTokens:1,
+      evidence:[],screeningEvidence:[]}};
   db.prepare('INSERT INTO wp_profiles VALUES (?,?,?,?,?,1)').run('bsc',address,at,at,JSON.stringify(profile));
   db.prepare('INSERT INTO wp_groups VALUES (?,?,?,?)').run('bsc',address,'market_pre_candidate',at);
 }

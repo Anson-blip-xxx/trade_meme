@@ -9,11 +9,17 @@ export interface MemeMaintenanceSnapshot {
     stage:'maintain';durationMs:number;error?:string};
 }
 
+interface MemeMaintenanceOptions {
+  database:string;maxBytes:number;reclaimedSnapshots:number;
+  /** Serializable logical clock for deterministic observers. Production omits it. */
+  nowMs?:number;
+}
+
 /** Runs retention deletes and WAL checkpoints away from the signal event loop. */
 export class MemeMaintenanceRunner {
   private worker?:Worker;private running=false;private retry?:ReturnType<typeof setTimeout>;private restarts=0;
   private value?:MemeMaintenanceSnapshot;private error?:string;
-  constructor(private readonly options:{database:string;maxBytes:number;reclaimedSnapshots:number}){}
+  constructor(private readonly options:MemeMaintenanceOptions){}
   start():void {if(this.running)return;this.running=true;this.launch();}
   wake():void {if(this.running)try{this.worker?.postMessage('run');}catch{}}
   snapshot(){return {value:this.value,error:this.error,running:this.running&&!!this.worker,restarts:this.restarts};}

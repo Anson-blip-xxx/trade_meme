@@ -188,9 +188,13 @@ export class WalletAssociations {
       }
       tokens.set(`${value.chain}\0${value.tokenAddress}`,{chain:value.chain,tokenAddress:value.tokenAddress});
     }
+    this.invalidateTradeEvidence(tokens.values());
+  }
+  /** A trade insert or retraction invalidates the same bounded derived graph. */
+  invalidateTradeEvidence(values:Iterable<{chain:Chain;tokenAddress:string}>):void {
     const anchors=this.db.prepare(WALLET_ASSOCIATION_TRADE_INVALIDATION_SQL.anchors),
       relations=this.db.prepare(WALLET_ASSOCIATION_TRADE_INVALIDATION_SQL.relations);
-    for(const {chain,tokenAddress} of tokens.values()) {
+    for(const {chain,tokenAddress} of values) {
       anchors.run(chain,tokenAddress);
       relations.run(chain,chain,tokenAddress);
     }

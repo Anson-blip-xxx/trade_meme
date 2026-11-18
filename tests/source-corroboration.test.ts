@@ -5,7 +5,8 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
 import bs58 from 'bs58';
-import {SourceCorroboration,SOURCE_ASSESSMENT_ROWS_SQL,assessSourceCorroboration,type SourceNotificationEvidence,type CorroborationSource} from '../src/source-corroboration.js';
+import {SourceCorroboration,SOURCE_ASSESSMENT_ROWS_SQL,SOURCE_ASSESSMENT_LATEST_ROWS_SQL,SOURCE_NOTIFICATION_COUNT_SQL,assessSourceCorroboration,
+  type SourceNotificationEvidence,type CorroborationSource} from '../src/source-corroboration.js';
 import type {Signal} from '../src/types.js';
 
 const origin=Date.parse('2026-10-16T10:00:00.000Z'),at=(seconds=0)=>new Date(origin+seconds*1000).toISOString();
@@ -35,14 +36,22 @@ test('pure comparison requires fresh same-chain full CA notifications from disti
   assert.equal(repeated.classification,'single_source');assert.equal(repeated.sources[0].notificationCount,1);
 });
 
-test('assessment rows pin the token and provider index before applying the bounded freshness sort',()=>{
+test('assessment rows use bounded token-index ranges without a full-history temporary sort',()=>{
   const f=fixture();try {
     const ledger=f.create();ledger.record(signal());
     const db=new DatabaseSync(f.database,{readOnly:true});try {
-      const plan=db.prepare(`EXPLAIN QUERY PLAN ${SOURCE_ASSESSMENT_ROWS_SQL}`).all(
-        token.chain,token.address,'ave',at(1),at(-100),at(-300),at(1),at(-300),at(1),65);
-      assert.ok(plan.some(row=>String(row.detail).includes('source_notifications_token (chain=? AND address=? AND source=?')));
-      assert.ok(!plan.some(row=>String(row.detail).includes('source_notifications_history')));
+      const fresh=db.prepare(`EXPLAIN QUERY PLAN ${SOURCE_ASSESSMENT_ROWS_SQL}`).all(
+        token.chain,token.address,'ave',at(-300),at(1),at(-300),at(1),at(1),at(-100),at(1),65);
+      const latest=db.prepare(`EXPLAIN QUERY PLAN ${SOURCE_ASSESSMENT_LATEST_ROWS_SQL}`).all(
+        token.chain,token.address,'ave',at(1),at(-100),65);
+      const count=db.prepare(`EXPLAIN QUERY PLAN ${SOURCE_NOTIFICATION_COUNT_SQL}`).all(
+        token.chain,token.address,'ave',at(-300),at(1),at(1),at(-100));
+      for(const plan of [fresh,latest,count]){
+        assert.ok(plan.some(row=>String(row.detail).includes('source_notifications_token (chain=? AND address=? AND source=?')));
+        assert.ok(!plan.some(row=>/USE TEMP B-TREE|source_notifications_history/.test(String(row.detail))));
+      }
+      assert.ok(fresh.some(row=>String(row.detail).includes('first_observed_at>? AND first_observed_at<?')));
+      assert.ok(count.some(row=>String(row.detail).includes('first_observed_at>? AND first_observed_at<?')));
     }finally{db.close();}
     assert.equal(ledger.assess(token).classification,'single_source');
   }finally{f.close();}

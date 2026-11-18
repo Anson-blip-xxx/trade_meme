@@ -80,3 +80,45 @@ test('malformed signature pages are persisted as a safe response error without i
   try {assert.equal((await runner.runOnce()).errors,1);assert.equal(saved[0].error,'LAUNCHER_RPC_RESPONSE_INVALID');assert.equal(verifiedCount,0);}
   finally {await runner.stop();}
 });
+
+test('a candidate removed by a concurrent shortlist refresh is skipped without a false persistence error',async()=>{
+  const address=wallet(19),runner=new LauncherRevalidator({endpoint:'http://rpc.invalid',requestIntervalMs:1,
+    source:{listCandidates:()=>[{wallet:address}],recordResult:()=> 'stale'},rpcFactory:()=>({request:async()=>[]}),
+    verifier:{verify:async event=>verified(event)}});
+  try {
+    assert.deepEqual(await runner.runOnce(),{accepted:1,checked:1,changed:0,classified:0,errors:0});
+    const status=runner.status();assert.equal(status.error,undefined);assert.deepEqual(status.recent,[]);
+  } finally {await runner.stop();}
+});
+
+test('retryable verification keeps the prior cursor and replays the same signature next run',async()=>{
+  const address=wallet(20),next=signature(20),saved:LauncherRevalidationResult[]=[];let latest:string|undefined,attempts=0;
+  const runner=new LauncherRevalidator({endpoint:'http://rpc.invalid',requestIntervalMs:1,
+    source:{listCandidates:()=>[{wallet:address,...(latest?{latestSignature:latest}:{})}],recordResult:result=>{
+      saved.push(result);if(result.latestSignature)latest=result.latestSignature;
+    }},rpcFactory:()=>({request:async()=>[{signature:next,slot:20,blockTime:1_795_000_000}]}),verifier:{verify:async event=>{
+      attempts++;return attempts===1?activityResult(event,Date.parse('2026-11-18T12:00:01.000Z'),'unknown',['TRANSACTION_RPC_UNAVAILABLE'],{retryable:true}):verified(event);
+    }}});
+  try {
+    assert.deepEqual(await runner.runOnce(),{accepted:1,checked:1,changed:0,classified:1,errors:1});
+    assert.equal(saved[0].state,'error');assert.equal(saved[0].error,'LAUNCHER_ACTIVITY_VERIFY_FAILED');
+    assert.equal(saved[0].latestSignature,undefined);assert.equal(latest,undefined);
+    assert.deepEqual(await runner.runOnce(),{accepted:1,checked:1,changed:0,classified:1,errors:0});
+    assert.equal(saved[1].latestSignature,next);assert.equal(attempts,2);
+  } finally {await runner.stop();}
+});
+
+test('activity callback failure does not advance the cursor and is retried durably',async()=>{
+  const address=wallet(21),next=signature(21),saved:LauncherRevalidationResult[]=[];let latest:string|undefined,calls=0;
+  const runner=new LauncherRevalidator({endpoint:'http://rpc.invalid',requestIntervalMs:1,
+    source:{listCandidates:()=>[{wallet:address,...(latest?{latestSignature:latest}:{})}],recordResult:result=>{
+      saved.push(result);if(result.latestSignature)latest=result.latestSignature;
+    },onActivity:()=>{if(++calls===1)throw new Error('private storage detail');}},
+    rpcFactory:()=>({request:async()=>[{signature:next,slot:21,blockTime:1_795_000_000}]}),verifier:{verify:async event=>verified(event)}});
+  try {
+    assert.equal((await runner.runOnce()).errors,1);assert.equal(saved[0].error,'LAUNCHER_ACTIVITY_CALLBACK_FAILED');
+    assert.equal(saved[0].latestSignature,undefined);assert.equal(latest,undefined);
+    assert.equal((await runner.runOnce()).errors,0);assert.equal(saved[1].latestSignature,next);assert.equal(calls,2);
+    assert.doesNotMatch(JSON.stringify(runner.status()),/private storage detail/);
+  } finally {await runner.stop();}
+});

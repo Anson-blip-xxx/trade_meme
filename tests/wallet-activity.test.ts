@@ -4,7 +4,7 @@ import bs58 from 'bs58';
 import {decodeFunctionData,encodeAbiParameters,encodeEventTopics,encodeFunctionResult,parseAbi} from 'viem';
 import {classifyEvmActivity,WALLET_ACTIVITY_ABI,loadSwapPools,type ActivityPool} from '../src/wallet-activity-evm.js';
 import {classifySolanaActivity} from '../src/wallet-activity-solana.js';
-import {WalletActivityVerifier,activityResult} from '../src/wallet-activity.js';
+import {WalletActivityVerifier,activityResult,type ActivityKind,type WalletActivity} from '../src/wallet-activity.js';
 import {WalletActivityStore} from '../src/wallet-activity-store.js';
 import {CHAIN_PRICE_DEPLOYMENTS as D} from '../src/chain-prices.js';
 import {JUPITER_SWAP_PROGRAM} from '../src/native-solana/jupiter.js';
@@ -14,6 +14,9 @@ const at=Date.parse('2026-10-21T01:00:00Z'),a=(n:number)=>'0x'+n.toString(16).pa
 const wallet=a(10),token=a(20),other=a(30),txHash=h(1),blockHash=h(2),pk=(n:number)=>bs58.encode(new Uint8Array(32).fill(n));
 function preview(chain:'bsc'|'robinhood'|'solana'='bsc'):FastWalletEvent{return {id:'id',chain,wallet,txHash,receivedAt:new Date(at).toISOString(),judgedAt:new Date(at).toISOString(),processingMs:1,
   kind:'token_inflow',verdict:'priority_review',groups:[],profileFresh:true,cachedSafety:'unknown',commitment:'included',removed:false,buyVerified:false,tradingEnabled:false};}
+function archived(id:number,classification:ActivityKind,checkedAt=at):WalletActivity {
+  return activityResult({...preview(),txHash:h(id)},checkedAt,classification,['TEST_EVIDENCE'],{confirmation:'included'});
+}
 const transfers=parseAbi(['event Transfer(address indexed from,address indexed to,uint256 value)']);
 function log(name:string,args:Record<string,any>,emitter=token){const event=(name==='Transfer'?transfers:WALLET_ACTIVITY_ABI).find(x=>x.name===name&&x.inputs.every(i=>i.name in args))!;
   return {address:emitter,topics:encodeEventTopics({abi:[event],eventName:name,args} as any),data:encodeAbiParameters(event.inputs.filter(i=>!('indexed' in i&&i.indexed)) as any,event.inputs.filter(i=>!('indexed' in i&&i.indexed)).map(i=>args[i.name]) as any),
@@ -259,12 +262,48 @@ test('classifier archive strips arbitrary payloads, keeps transfer evidence, and
     assert.equal(store.record({...r,Authorization:'secret',rawResponse:'secret'} as any),true);assert.equal(store.status().counts.buy,1);
     assert.equal(JSON.stringify(store.status()).includes('secret'),false);assert.equal(store.status().recent[0].transfers?.length,2);
     assert.equal(store.record({...r,classification:'retracted',trades:[],reasons:['CHAIN_EVENT_RETRACTED']}),true);
+    assert.equal(store.record({...r,classification:'retracted',trades:[],reasons:['CHAIN_EVENT_RETRACTED']}),true);
     assert.equal(store.record(r),false);assert.equal(store.status().counts.retracted,1);assert.equal(store.status().counts.buy,undefined);
     const db=(store as any).db,prepare=db.prepare.bind(db);db.prepare=(sql:string)=>{
       assert.equal(/GROUP BY kind/i.test(sql),false,'status must use the write-through count cache');return prepare(sql);
     };
     assert.equal(store.status().counts.retracted,1);
   }finally{store.close();}
+});
+test('classifier archive evicts its oldest diagnostic row at the bound without blocking a buy',()=>{
+  const now=at+10_000,store=new WalletActivityStore(':memory:',1024*1024,{now:()=>now,lowValueTtlMs:60_000,
+    lowValueMaxRows:3,maintenanceBatchSize:10,maintenanceIntervalMs:60_000});
+  try {
+    assert.equal(store.record(archived(101,'unknown',at+1000)),true);
+    assert.equal(store.record(archived(102,'transfer',at+2000)),true);
+    assert.equal(store.record(archived(103,'no_change',at+3000)),true);
+    assert.equal(store.record(archived(104,'unknown',at+4000)),true);
+    const hashes=store.status().recent.map(row=>row.txHash);
+    assert.equal(hashes.includes(h(101)),false);assert.equal(hashes.includes(h(102)),true);
+    assert.equal(store.status().retention.lowValueRows,3);
+    assert.equal(store.record(archived(105,'buy',at+5000)),true);
+    assert.equal(store.status().counts.buy,1);
+  } finally {store.close();}
+});
+test('classifier archive cannot downgrade verified evidence to unknown',()=>{
+  const store=new WalletActivityStore(':memory:');try {
+    assert.equal(store.record(archived(111,'buy')),true);
+    assert.equal(store.record(archived(111,'unknown',at+1000)),true);
+    const status=store.status();assert.equal(status.counts.buy,1);assert.equal(status.counts.unknown,undefined);
+    assert.equal(status.recent.find(row=>row.txHash===h(111))?.classification,'buy');
+  } finally {store.close();}
+});
+test('classifier archive TTL maintenance deletes only low-value diagnostics',()=>{
+  let now=at;const store=new WalletActivityStore(':memory:',1024*1024,{now:()=>now,lowValueTtlMs:1000,
+    lowValueMaxRows:10,maintenanceBatchSize:10,maintenanceIntervalMs:1000});
+  try {
+    for(const [id,kind] of [[121,'unknown'],[122,'transfer'],[123,'no_change'],[124,'buy'],[125,'sell'],[126,'received_purchase'],[127,'retracted']] as const)
+      assert.equal(store.record(archived(id,kind)),true);
+    now+=2000;const result=store.maintain(10),status=store.status();
+    assert.equal(result.deleted,3);assert.equal(status.retention.lowValueRows,0);
+    assert.equal(status.counts.buy,1);assert.equal(status.counts.sell,1);
+    assert.equal(status.counts.received_purchase,1);assert.equal(status.counts.retracted,1);
+  } finally {store.close();}
 });
 test('RPC verifier checks chain identity, requests confirmed parsed Solana and coalesces transaction fetches',async()=>{
   const f=solFixture(),calls:any[]=[];const verifier=new WalletActivityVerifier({solana:{http:'http://test.invalid'}},()=>at+1000,()=>({request:async(method,params)=>{

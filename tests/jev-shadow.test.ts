@@ -53,6 +53,9 @@ test('enqueue snapshots inputs without awaiting model, and cannot change the bas
   assert.equal(row.result?.dimensions.celebrity,null);assert.equal(row.comparison.selected,true);
   assert.equal(ctx.runner.status().budget.knownTokens,120);assert.equal(ctx.runner.status().budget.reservedTokens,0);
   assert.equal(ctx.runner.status().budget.accountBalanceKnown,false);assert.equal(statSync(ctx.database).mode&0o777,0o600);
+  const physical=[ctx.database,ctx.database+'-wal',ctx.database+'-shm']
+    .reduce((sum,path)=>{try{return sum+statSync(path).size;}catch{return sum;}},0);
+  assert.equal(ctx.runner.status().storage.usedBytes,physical);
   assert.equal(ctx.runner.detail(row.id)?.input.state.sample,'one');assert.equal(ctx.runner.detail('../secrets'),undefined);
 });
 

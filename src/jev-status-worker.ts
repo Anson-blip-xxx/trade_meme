@@ -1,5 +1,6 @@
 import {parentPort,workerData} from 'node:worker_threads';
 import {DatabaseSync} from 'node:sqlite';
+import {statSync} from 'node:fs';
 import type {JevComparison,JevStatusAggregate} from './jev-shadow.js';
 
 const options=workerData as {database:string;intervalMs:number};
@@ -14,9 +15,8 @@ const scan=db.prepare(`SELECT rowid AS cursor,status,completed_at,comparison FRO
   WHERE rowid>? AND rowid<=? ORDER BY rowid LIMIT ?`);
 
 /**
- * DELETE-journal readers hold a shared lock for the duration of one statement.
- * Keyset batches deliberately keep each statement tiny, then yield so the
- * writer's 50 ms busy timeout is never exposed to a multi-second table scan.
+ * Keyset batches keep each WAL read statement tiny, then yield so the status
+ * scan cannot monopolize storage bandwidth while realtime evidence is written.
  */
 async function read():Promise<JevStatusAggregate|undefined> {
   const now=Date.now(),counts={total:0,available:0,unavailable:0,pending:0};
@@ -51,7 +51,8 @@ async function read():Promise<JevStatusAggregate|undefined> {
       jevSelectedMeanGrossPct:value.selectedCount?value.selectedSum/value.selectedCount:null,
       selectedCount:value.selectedCount,rejectedCount:value.rejectedCount});
   }
-  const usedBytes=Number(db.prepare('PRAGMA page_count').get()!.page_count)*Number(db.prepare('PRAGMA page_size').get()!.page_size);
+  const usedBytes=[options.database,options.database+'-wal',options.database+'-shm']
+    .reduce((sum,path)=>{try{return sum+statSync(path).size;}catch{return sum;}},0);
   return {counts,comparison,usedBytes,computedAt:new Date(now).toISOString()};
 }
 

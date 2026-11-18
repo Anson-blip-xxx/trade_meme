@@ -2,10 +2,11 @@ import {parentPort,workerData} from 'node:worker_threads';
 import {performance} from 'node:perf_hooks';
 import {DatabaseSync} from 'node:sqlite';
 import {SignalFollowup} from './signal-followup.js';
+import {configureResearchWal} from './research-sqlite.js';
 
 interface Options {database:string;intervalMs:number;}
 const options=workerData as Options,db=new DatabaseSync(options.database);
-db.exec('PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000');
+configureResearchWal(db,{busyTimeoutMs:5000,autoCheckpointPages:128});
 const followup=new SignalFollowup(db);
 let stopping=false,timer:ReturnType<typeof setTimeout>|undefined;
 

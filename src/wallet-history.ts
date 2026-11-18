@@ -11,6 +11,7 @@ import type {WalletAnalysis,WalletRecord} from './research/wallet-types.js';
 import type {WalletPressure} from './adaptive-exit.js';
 import {readRecentExitPressure} from './wallet-exit-pressure.js';
 import {WalletResearchSeeds,type WalletResearchSeedSnapshot,type WalletResearchSeedHint,type WalletResearchSeedCheck,type WalletResearchSeedStatus} from './wallet-research-seeds.js';
+import {configureResearchWal} from './research-sqlite.js';
 
 export interface WalletHistoryToken {chain:Chain;address:string;}
 export interface WalletHistoryOptions {maxBytes?:number;now?:()=>Date;}
@@ -46,6 +47,7 @@ export interface WalletTradeObservation {
   amount?:string|null;amountUnit?:'human'|'atomic'|'unknown'|'vendor_quantity';usd?:string|null;
   priceUsd?:string|null;source:string;eventIndex?:number;
 }
+export interface WalletTradeRetraction {chain:Chain;wallet:string;txHash:string;checkedAt:string;}
 /** Observed vendor trades within one forward review window; never whole-market flow or ownership proof. */
 export interface FollowupWalletEvidence {
   chain?:Chain;address?:string;
@@ -317,7 +319,8 @@ export class WalletHistory {
     if(!Number.isSafeInteger(this.maxBytes)||this.maxBytes<16_384) throw new Error('WALLET_HISTORY_CONFIG_INVALID');
     if(path!==':memory:') mkdirSync(dirname(path),{recursive:true,mode:0o700});
     this.db=new DatabaseSync(path);if(path!==':memory:') chmodSync(path,0o600);
-    this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA wal_autocheckpoint=128;
+    configureResearchWal(this.db,{busyTimeoutMs:5000,autoCheckpointPages:128});
+    this.db.exec(`
       CREATE TABLE IF NOT EXISTS wh_wallets(chain TEXT,address TEXT,first_at TEXT,last_at TEXT,profile TEXT NOT NULL,PRIMARY KEY(chain,address));
       CREATE TABLE IF NOT EXISTS wh_tokens(chain TEXT,address TEXT,first_at TEXT,last_at TEXT,last_checked_at TEXT,PRIMARY KEY(chain,address));
       CREATE TABLE IF NOT EXISTS wh_events(id TEXT PRIMARY KEY,chain TEXT,wallet TEXT,token_address TEXT,tx_hash TEXT,side TEXT,event_at TEXT,observed_at TEXT,data TEXT NOT NULL);
@@ -455,6 +458,57 @@ export class WalletHistory {
       for(const value of normalized)if(this.putTrade(value,changes))associationTrades.push(value);
       this.associations.recordTrades(associationTrades);
       this.flushAssociationChanges(changes);});
+  }
+
+  /** Remove evidence invalidated by an EVM removed-log notification. The
+   * classifier archive keeps the retraction itself; this store only retracts
+   * the exact chain/wallet/transaction facts and dirties derived research. */
+  retractVerifiedTrade(input:WalletTradeRetraction):boolean {
+    if(!input||!chainValid(input.chain))return false;
+    const wallet=addr(input.wallet,input.chain),txHash=addr(input.txHash,input.chain,true),checkedAt=this.observed(input.checkedAt);
+    if(!wallet||!txHash||!checkedAt)return false;
+    const rows=this.db.prepare(`SELECT id,token_address,side,event_at FROM wh_events
+      WHERE chain=? AND wallet=? AND tx_hash=?`).all(input.chain,wallet,txHash) as
+      {id:string;token_address:string;side:string;event_at:string}[];
+    if(!rows.length)return false;
+    const tokens=new Set(rows.map(row=>row.token_address)),buyCount=rows.filter(row=>row.side==='buy').length,
+      sellCount=rows.filter(row=>row.side==='sell').length;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const dirtyPeer=this.db.prepare(`UPDATE wh_metrics SET coordination_dirty=1 WHERE chain=? AND address IN (
+        SELECT wallet FROM wh_events WHERE chain=? AND token_address=? AND side=? AND event_at BETWEEN ? AND ?)`),
+        deleteObservation=this.db.prepare('DELETE FROM wh_observations WHERE event_id=?'),
+        hasTokenEvidence=this.db.prepare(`SELECT 1 FROM wh_events WHERE chain=? AND wallet=? AND token_address=? LIMIT 1`),
+        hasTokenObservation=this.db.prepare(`SELECT 1 FROM wh_observations
+          WHERE chain=? AND wallet=? AND token_address=? LIMIT 1`),
+        deleteWalletToken=this.db.prepare('DELETE FROM wh_wallet_tokens WHERE chain=? AND wallet=? AND token_address=?');
+      for(const row of rows) {
+        const event=Date.parse(row.event_at);
+        dirtyPeer.run(input.chain,input.chain,row.token_address,row.side,
+          new Date(event-120_000).toISOString(),new Date(event+120_000).toISOString());
+        deleteObservation.run(row.id);
+      }
+      this.db.prepare('DELETE FROM wh_events WHERE chain=? AND wallet=? AND tx_hash=?').run(input.chain,wallet,txHash);
+      this.db.prepare(`UPDATE wh_metrics SET event_count=MAX(0,event_count-?),buy_count=MAX(0,buy_count-?),
+        sell_count=MAX(0,sell_count-?),coordination_dirty=1,last_at=MAX(COALESCE(last_at,?),?)
+        WHERE chain=? AND address=?`).run(rows.length,buyCount,sellCount,checkedAt,checkedAt,input.chain,wallet);
+      this.db.prepare(`UPDATE wh_wallets SET last_at=MAX(last_at,?) WHERE chain=? AND address=?`).run(checkedAt,input.chain,wallet);
+      for(const tokenAddress of tokens) {
+        this.db.prepare('DELETE FROM wh_gains WHERE chain=? AND wallet=? AND token_address=?').run(input.chain,wallet,tokenAddress);
+        if(!hasTokenEvidence.get(input.chain,wallet,tokenAddress)&&!hasTokenObservation.get(input.chain,wallet,tokenAddress)) {
+          const deleted=Number(deleteWalletToken.run(input.chain,wallet,tokenAddress).changes);
+          if(deleted)this.db.prepare('UPDATE wh_metrics SET token_count=MAX(0,token_count-1) WHERE chain=? AND address=?')
+            .run(input.chain,wallet);
+        }
+      }
+      const bestGain=this.db.prepare(`SELECT data FROM wh_gains WHERE chain=? AND wallet=?
+        ORDER BY CAST(json_extract(data,'$.maxGainPct') AS REAL) DESC LIMIT 1`).get(input.chain,wallet);
+      if(bestGain){const data=String(bestGain.data),gain=Number(JSON.parse(data).maxGainPct);
+        this.db.prepare('UPDATE wh_metrics SET gain_pct=?,gain_data=? WHERE chain=? AND address=?').run(gain,data,input.chain,wallet);
+      }else this.db.prepare('UPDATE wh_metrics SET gain_pct=NULL,gain_data=NULL WHERE chain=? AND address=?').run(input.chain,wallet);
+      this.associations.invalidateTradeEvidence([...tokens].map(tokenAddress=>({chain:input.chain,tokenAddress})));
+      this.db.exec('COMMIT');return true;
+    }catch(error){this.db.exec('ROLLBACK');throw error;}
   }
 
   /** Save all bounded full-address nominees before optional/early-vetoed research.

@@ -89,6 +89,7 @@ test('wallet history config is independent of dashboard and bounded',()=>{
   assert.equal(c.walletResearch.enabled,true);assert.equal(c.dashboard.enabled,false);
   assert.equal(c.walletResearch.intervalSec,300);assert.equal(c.walletResearch.maxRequestsPerCycle,9);
   assert.equal(c.walletResearch.maxBytes,512*1024*1024);
+  assert.equal(readConfig({WALLET_HISTORY_MAX_MB:'24576'}).walletResearch.maxBytes,24576*1024*1024);
   for(const value of ['0','99999','NaN'])assert.throws(()=>readConfig({WALLET_HISTORY_MAX_MB:value}));
   assert.throws(()=>readConfig({WALLET_HISTORY_DATABASE_PATH:':memory:'}));
   assert.throws(()=>readConfig({WALLET_RESEARCH_ENABLED:'maybe'}));

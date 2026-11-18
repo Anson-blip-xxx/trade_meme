@@ -7,6 +7,7 @@ import {qualifiedRoleEvidence,type WalletRolePeerAnalysis} from './wallet-role-a
 import type {ActivityKind} from './wallet-activity.js';
 import type {WalletProfile} from './wallet-profiles.js';
 import type {Chain} from './types.js';
+import {configureResearchWal} from './research-sqlite.js';
 
 export type LauncherCandidateProfileRoute='A'|'B';
 export type LauncherCandidateState='historical_seed'|'fresh_verified'|'live_seen'|'monitored';
@@ -27,8 +28,10 @@ export interface LauncherRevalidationObservation {
 
 export interface LauncherActivityObservation {
   chain:Chain;wallet:string;checkedAt:string;eventAt?:string;classification:ActivityKind;
-  confirmation:'confirmed'|'included'|'unknown';txHash:string;
+  confirmation:'confirmed'|'included'|'unknown';txHash:string;tokenAddress?:string;
+  trades?:readonly {tokenAddress:string;side:'buy'|'sell'}[];
 }
+export interface LauncherActivityRetraction {chain:Chain;wallet:string;checkedAt:string;txHash:string;}
 
 export interface LauncherRevalidationEvidence {
   checkedAt:string;latestSignature?:string;blockTime?:number;eventAt?:string;slot?:number;
@@ -39,6 +42,8 @@ export interface LauncherCandidate {
   version:1;chain:Chain;address:string;route:LauncherCandidateProfileRoute;state:LauncherCandidateState;
   qualifiedAt:string;profileComputedAt:string;lastEvidenceAt?:string;
   verifiedAt?:string;verifiedActivityAt?:string;liveSeenAt?:string;
+  lastVerifiedBuyAt?:string;lastVerifiedBuyTx?:string;lastVerifiedBuyToken?:string;
+  lastVerifiedSellAt?:string;lastVerifiedSellTx?:string;lastVerifiedSellToken?:string;
   monitored:boolean;coverageAt?:string;revalidation?:LauncherRevalidationEvidence;
   dimensions:{evidenceFresh:boolean;verifiedTradeFresh:boolean;liveSeen:boolean;monitored:boolean;
     realtimeReady:boolean;verifiedTradeMonitored:boolean};
@@ -63,9 +68,13 @@ export interface LauncherCandidateList {
   items:LauncherCandidate[];total:number;limit:number;offset:number;
 }
 
+export interface LauncherCoverageUpdate {chain:Chain;wallets:readonly string[];at:string}
+
 export interface LauncherCandidatesOptions {
   database:string;profileDatabase:string;cap?:number;maxBytes?:number;
-  freshAfterSec?:number;liveAfterSec?:number;coverageAfterSec?:number;now?:()=>Date;
+  freshAfterSec?:number;liveAfterSec?:number;coverageAfterSec?:number;
+  /** Bounds synchronous SQLite writer-lock waits on this connection. */
+  busyTimeoutMs?:number;now?:()=>Date;
 }
 
 type Row=Record<string,unknown>;
@@ -80,6 +89,7 @@ const DEFAULT_MAX_BYTES=16*1024*1024;
 const MIN_DATABASE_BYTES=64*1024;
 const RECORD_RESERVE_BYTES=4096;
 const REFRESH_RESERVE_BYTES=64*1024;
+const QUALIFICATION_MAX_AGE_MS=30*86_400_000;
 
 const parse=(value:unknown):unknown=>{try{return typeof value==='string'?JSON.parse(value):undefined;}catch{return undefined;}};
 const object=(value:unknown):value is Record<string,unknown>=>!!value&&typeof value==='object'&&!Array.isArray(value);
@@ -123,7 +133,6 @@ function profileEvidence(profile:WalletProfile,route:LauncherCandidateProfileRou
   const add=(value:unknown)=>{const valid=evidenceTime(value,now);if(valid)values.push(valid);};
   // Freshness is candidate-wallet trade evidence. Coverage timestamps, market
   // observations, counterparties and unrelated chain transfers never renew it.
-  add(profile.metrics?.lastEventAt);
   if(route==='A'){
     const analysis=profile.initiatorAnalysis;
     for(const row of [...(analysis?.evidence??[]),...(analysis?.screeningEvidence??[]),...(analysis?.qualification?.evidence??[])]){
@@ -173,16 +182,24 @@ export class LauncherCandidates {
         !schema.some(row=>row.name==='wp_groups_filter'&&row.type==='index'))throw new Error('LAUNCHER_PROFILE_DATABASE_INVALID');
       if(options.database!==':memory:')mkdirSync(dirname(options.database),{recursive:true,mode:0o700});
       this.db=new DatabaseSync(options.database);if(options.database!==':memory:')chmodSync(options.database,0o600);
-      this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=1000; PRAGMA wal_autocheckpoint=32;
-        CREATE TABLE IF NOT EXISTS lc_candidates(
+      const busyTimeoutMs=boundedInteger(options.busyTimeoutMs,1000,0,5000);
+      configureResearchWal(this.db,{busyTimeoutMs,autoCheckpointPages:32});
+      this.db.exec(`CREATE TABLE IF NOT EXISTS lc_candidates(
           chain TEXT NOT NULL,address TEXT NOT NULL,route TEXT NOT NULL,qualified_at TEXT NOT NULL,profile_computed_at TEXT NOT NULL,
           last_evidence_at TEXT,verified_at TEXT,activity_at TEXT,live_seen_at TEXT,live_source TEXT,
           monitored INTEGER NOT NULL DEFAULT 0,coverage_at TEXT,revalidation_checked_at TEXT,latest_signature TEXT,
           block_time INTEGER,slot INTEGER,revalidation_state TEXT,revalidation_classification TEXT,revalidation_error TEXT,
+          last_verified_buy_at TEXT,last_verified_buy_tx TEXT,last_verified_buy_token TEXT,
+          last_verified_sell_at TEXT,last_verified_sell_tx TEXT,last_verified_sell_token TEXT,
           updated_at TEXT NOT NULL,data TEXT NOT NULL,PRIMARY KEY(chain,address));
         CREATE INDEX IF NOT EXISTS lc_candidates_route ON lc_candidates(route,chain,address);
         CREATE INDEX IF NOT EXISTS lc_candidates_activity ON lc_candidates(activity_at DESC,chain,address);
         CREATE TABLE IF NOT EXISTS lc_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);`);
+      const candidateColumns=new Set((this.db.prepare('PRAGMA table_info(lc_candidates)').all() as Row[]).map(row=>String(row.name)));
+      for(const column of ['last_verified_buy_at','last_verified_buy_tx','last_verified_buy_token',
+        'last_verified_sell_at','last_verified_sell_tx','last_verified_sell_token'])
+        if(!candidateColumns.has(column))this.db.exec(`ALTER TABLE lc_candidates ADD COLUMN ${column} TEXT`);
+      this.db.exec('CREATE INDEX IF NOT EXISTS lc_candidates_buy ON lc_candidates(last_verified_buy_at DESC,chain,address)');
       const pageSize=Number((this.db.prepare('PRAGMA page_size').get() as Row).page_size);
       if(options.database!==':memory:'&&Number.isSafeInteger(pageSize)&&pageSize>0)this.db.exec(`PRAGMA max_page_count=${Math.max(1,Math.floor(this.maxBytes/pageSize))}`);
       this.setMeta('max_bytes',String(this.maxBytes));this.setMeta('cap',String(this.cap));
@@ -218,19 +235,23 @@ export class LauncherCandidates {
     if(!profile||!network||!address||!computed||!qualified)return;
     let peers:WalletRolePeerAnalysis[]=[];
     if(route==='A'){
-      if(profile.initiatorAnalysis?.status!=='current'||profile.initiatorAnalysis.chain!==network||
-        chainAddress(network,profile.initiatorAnalysis.wallet)!==address)return;
+      const analysis=profile.initiatorAnalysis,prospective=analysis?.prospectivePreTokens,selected=analysis?.selectedTokens;
+      if(analysis?.status!=='current'||analysis.chain!==network||analysis.classification!=='candidate'||
+        !natural(prospective)||prospective<1||!natural(selected)||selected<1||prospective/selected<.1||
+        chainAddress(network,analysis.wallet)!==address)return;
     }else{
       const analysis=profile.roleAnalysis;if(!analysis||!Array.isArray(analysis.peers))return;
       peers=analysis.peers.filter(peer=>peer?.classification==='precursor_pattern'&&
+        peer.forwardObservedTokens>=1&&
+        time(peer.qualification?.knownAt)!==undefined&&now-time(peer.qualification!.knownAt)!<=QUALIFICATION_MAX_AGE_MS&&
         !!chainAddress(network,peer.address)&&qualifiedRoleEvidence(peer.qualification,network,address,peer.address,iso(now)));
       if(!peers.length)return;
     }
     const lastEvidenceAt=profileEvidence(profile,route,peers,now),qualificationAt=route==='B'?
       later(qualified,...peers.map(peer=>evidenceTime(peer.qualification?.knownAt,now)))??qualified:qualified;
     return {chain:network,address,route,qualifiedAt:qualificationAt,profileComputedAt:computed,...(lastEvidenceAt?{lastEvidenceAt}:{}),
-      base:{version:1,reasons:route==='A'?['PROFILE_MARKET_PRE_CANDIDATE','INITIATOR_ANALYSIS_CURRENT']:
-        ['PROFILE_PRECURSOR_PATTERN','PROFILE_FORWARD_VALIDATED','QUALIFIED_ROLE_EVIDENCE_VALID'],sampleOnly:true,tradingEnabled:false}};
+      base:{version:1,reasons:route==='A'?['PROFILE_MARKET_PRE_CANDIDATE','INITIATOR_ANALYSIS_CURRENT','PROSPECTIVE_PRE_SHARE_10PCT']:
+        ['PROFILE_PRECURSOR_PATTERN','PEER_FORWARD_OBSERVED','QUALIFICATION_WITHIN_30D','QUALIFIED_ROLE_EVIDENCE_VALID'],sampleOnly:true,tradingEnabled:false}};
   }
 
   refresh():LauncherCandidateStatus {
@@ -268,8 +289,8 @@ export class LauncherCandidates {
   }
 
   private dimensions(row:Row,now:number):LauncherCandidate['dimensions'] {
-    const coverage=time(row.coverage_at),live=time(row.live_seen_at),verified=time(row.activity_at),
-      evidence=time(later(row.last_evidence_at as string|undefined,row.activity_at as string|undefined));
+    const coverage=time(row.coverage_at),live=time(row.live_seen_at),verified=time(row.last_verified_buy_at),
+      evidence=time(later(row.last_evidence_at as string|undefined,row.last_verified_buy_at as string|undefined));
     const monitored=Number(row.monitored)===1&&coverage!==undefined&&coverage<=now&&now-coverage<=this.coverageMs,
       liveSeen=live!==undefined&&live<=now&&now-live<=this.liveMs,
       verifiedTradeFresh=verified!==undefined&&verified<=now&&now-verified<=this.freshMs,
@@ -300,6 +321,12 @@ export class LauncherCandidates {
       ...(typeof row.last_evidence_at==='string'?{lastEvidenceAt:row.last_evidence_at}:{}),
       ...(typeof row.verified_at==='string'?{verifiedAt:row.verified_at}:{}),
       ...(typeof row.activity_at==='string'?{verifiedActivityAt:row.activity_at}:{}),
+      ...(typeof row.last_verified_buy_at==='string'?{lastVerifiedBuyAt:row.last_verified_buy_at}:{}),
+      ...(typeof row.last_verified_buy_tx==='string'?{lastVerifiedBuyTx:row.last_verified_buy_tx}:{}),
+      ...(typeof row.last_verified_buy_token==='string'?{lastVerifiedBuyToken:row.last_verified_buy_token}:{}),
+      ...(typeof row.last_verified_sell_at==='string'?{lastVerifiedSellAt:row.last_verified_sell_at}:{}),
+      ...(typeof row.last_verified_sell_tx==='string'?{lastVerifiedSellTx:row.last_verified_sell_tx}:{}),
+      ...(typeof row.last_verified_sell_token==='string'?{lastVerifiedSellToken:row.last_verified_sell_token}:{}),
       ...(typeof row.live_seen_at==='string'?{liveSeenAt:row.live_seen_at}:{}),monitored:dimensions.monitored,dimensions,
       ...(typeof row.coverage_at==='string'?{coverageAt:row.coverage_at}:{}),...(revalidation?{revalidation}:{})};
   }
@@ -323,7 +350,8 @@ export class LauncherCandidates {
       revalidation_state=?,revalidation_classification=?,revalidation_error=?,updated_at=? WHERE chain=? AND address=?`).run(
         sqlValue(liveAt),live?(input.source??(isRevalidation?'launcher_revalidator':'realtime')):sqlValue(row.live_source),
         replace?iso(at):sqlValue(row.revalidation_checked_at),replace?(input.latestSignature??sqlValue(row.latest_signature)):sqlValue(row.latest_signature),
-        replace?(input.blockTime??null):sqlValue(row.block_time),replace?(input.slot??null):sqlValue(row.slot),
+        replace?(input.blockTime??sqlValue(row.block_time)):sqlValue(row.block_time),
+        replace?(input.slot??sqlValue(row.slot)):sqlValue(row.slot),
         replace?(input.state??null):sqlValue(row.revalidation_state),replace?(input.classification??null):sqlValue(row.revalidation_classification),
         replace?(input.error??null):sqlValue(row.revalidation_error),
         iso(now),network,wallet);return true;
@@ -331,35 +359,99 @@ export class LauncherCandidates {
   }
 
   observeActivity(input:LauncherActivityObservation):boolean {
-    const now=this.currentTime(),network=chain(input?.chain),wallet=network&&chainAddress(network,input.wallet),checked=time(input?.checkedAt),event=time(input?.eventAt);
+    const now=this.currentTime(),network=chain(input?.chain),wallet=network&&chainAddress(network,input.wallet),hash=network&&transaction(network,input.txHash),
+      checked=time(input?.checkedAt),event=time(input?.eventAt);
     if(!network||!wallet||checked===undefined||event===undefined||event>checked||checked>now||!['confirmed','included'].includes(input.confirmation)||
-      !['buy','sell'].includes(input.classification)||!transaction(network,input.txHash))return false;
-    const row=this.statement('SELECT verified_at,activity_at FROM lc_candidates WHERE chain=? AND address=?').get(network,wallet) as Row|undefined;if(!row)return false;
+      !['buy','sell'].includes(input.classification)||!hash)return false;
+    if(input.tokenAddress!==undefined&&!chainAddress(network,input.tokenAddress)||input.trades!==undefined&&
+      (!Array.isArray(input.trades)||input.trades.length>32||input.trades.some(trade=>!trade||!['buy','sell'].includes(trade.side)||!chainAddress(network,trade.tokenAddress))))return false;
+    const tokens=[...new Set([...(input.tokenAddress?[chainAddress(network,input.tokenAddress)!]:[]),
+      ...(input.trades??[]).filter(trade=>trade.side===input.classification).map(trade=>chainAddress(network,trade.tokenAddress)!)] )];
+    const token=tokens.length===1?tokens[0]:undefined;
+    const row=this.statement(`SELECT verified_at,activity_at,last_verified_buy_at,last_verified_buy_tx,last_verified_buy_token,
+      last_verified_sell_at,last_verified_sell_tx,last_verified_sell_token FROM lc_candidates WHERE chain=? AND address=?`).get(network,wallet) as Row|undefined;if(!row)return false;
     const oldActivity=time(row.activity_at),oldVerified=time(row.verified_at);
     const activityAt=oldActivity===undefined||event>oldActivity?iso(event):row.activity_at;
     const verifiedAt=oldVerified===undefined||checked>oldVerified?iso(checked):row.verified_at;
-    try {this.statement('UPDATE lc_candidates SET verified_at=?,activity_at=?,updated_at=? WHERE chain=? AND address=?')
-      .run(sqlValue(verifiedAt),sqlValue(activityAt),iso(now),network,wallet);return true;
+    const side=input.classification,sideAtKey=side==='buy'?'last_verified_buy_at':'last_verified_sell_at',oldSide=time(row[sideAtKey]),replace=oldSide===undefined||event>oldSide;
+    const buy=side==='buy'&&replace,sell=side==='sell'&&replace;
+    try {this.statement(`UPDATE lc_candidates SET verified_at=?,activity_at=?,
+      last_verified_buy_at=?,last_verified_buy_tx=?,last_verified_buy_token=?,
+      last_verified_sell_at=?,last_verified_sell_tx=?,last_verified_sell_token=?,updated_at=? WHERE chain=? AND address=?`).run(
+        sqlValue(verifiedAt),sqlValue(activityAt),buy?iso(event):sqlValue(row.last_verified_buy_at),
+        buy?hash:sqlValue(row.last_verified_buy_tx),buy?(token??null):sqlValue(row.last_verified_buy_token),
+        sell?iso(event):sqlValue(row.last_verified_sell_at),sell?hash:sqlValue(row.last_verified_sell_tx),
+        sell?(token??null):sqlValue(row.last_verified_sell_token),iso(now),network,wallet);return true;
     }catch(error){if(sqliteCapacity(error)){this.markCapacity();return false;}throw error;}
   }
 
-  replaceCoverage(network:Chain,wallets:readonly string[],at:string):number {
-    const now=this.currentTime(),validChain=chain(network),checked=time(at);
-    if(!validChain||checked===undefined||checked>now||!Array.isArray(wallets)||wallets.length>this.cap)throw new Error('LAUNCHER_COVERAGE_INVALID');
-    const selected=[...new Set(wallets.map(wallet=>chainAddress(validChain,wallet)))];
-    if(selected.some(wallet=>!wallet))throw new Error('LAUNCHER_COVERAGE_INVALID');
+  /** Clear only the latest side whose exact transaction was retracted. No
+   * older activity is fabricated because this compact store does not retain a
+   * transaction ledger. */
+  retractActivity(input:LauncherActivityRetraction):boolean {
+    const now=this.currentTime(),network=chain(input?.chain),wallet=network&&chainAddress(network,input.wallet),
+      hash=network&&transaction(network,input.txHash),checked=time(input?.checkedAt);
+    if(!network||!wallet||!hash||checked===undefined||checked>now)return false;
+    const row=this.statement(`SELECT verified_at,activity_at,last_verified_buy_at,last_verified_buy_tx,last_verified_buy_token,
+      last_verified_sell_at,last_verified_sell_tx,last_verified_sell_token FROM lc_candidates
+      WHERE chain=? AND address=?`).get(network,wallet) as Row|undefined;
+    if(!row)return false;
+    const buy=row.last_verified_buy_tx===hash,sell=row.last_verified_sell_tx===hash;if(!buy&&!sell)return false;
+    const buyAt=buy?undefined:typeof row.last_verified_buy_at==='string'?row.last_verified_buy_at:undefined,
+      sellAt=sell?undefined:typeof row.last_verified_sell_at==='string'?row.last_verified_sell_at:undefined,
+      activityAt=later(buyAt,sellAt)??null;
+    try {this.statement(`UPDATE lc_candidates SET verified_at=NULL,activity_at=?,
+      last_verified_buy_at=?,last_verified_buy_tx=?,last_verified_buy_token=?,
+      last_verified_sell_at=?,last_verified_sell_tx=?,last_verified_sell_token=?,updated_at=?
+      WHERE chain=? AND address=?`).run(activityAt,buyAt??null,buy?null:sqlValue(row.last_verified_buy_tx),buy?null:sqlValue(row.last_verified_buy_token),
+        sellAt??null,sell?null:sqlValue(row.last_verified_sell_tx),sell?null:sqlValue(row.last_verified_sell_token),iso(now),network,wallet);
+      return true;
+    }catch(error){if(sqliteCapacity(error)){this.markCapacity();return false;}throw error;}
+  }
+
+  replaceCoverageBatch(updates:readonly LauncherCoverageUpdate[]):Partial<Record<Chain,number>> {
+    const now=this.currentTime();
+    if(!Array.isArray(updates)||updates.length>CHAINS.length)throw new Error('LAUNCHER_COVERAGE_INVALID');
+    const seen=new Set<Chain>(),prepared:{chain:Chain;at:string;wallets:string}[]=[];
+    for(const update of updates){
+      const validChain=chain(update?.chain),checked=time(update?.at),wallets=update?.wallets;
+      if(!validChain||seen.has(validChain)||checked===undefined||checked>now||!Array.isArray(wallets)||wallets.length>this.cap)
+        throw new Error('LAUNCHER_COVERAGE_INVALID');
+      const selected=[...new Set(wallets.map(wallet=>chainAddress(validChain,wallet)))];
+      if(selected.some(wallet=>!wallet))throw new Error('LAUNCHER_COVERAGE_INVALID');
+      seen.add(validChain);prepared.push({chain:validChain,at:iso(checked),wallets:JSON.stringify(selected)});
+    }
+    const counts:Partial<Record<Chain,number>>={};if(!prepared.length)return counts;
+    const updatedAt=iso(now),clear=this.statement(`UPDATE lc_candidates SET monitored=0,coverage_at=NULL,updated_at=?
+      WHERE chain=? AND monitored=1 AND NOT EXISTS(
+        SELECT 1 FROM json_each(?) AS selected WHERE selected.type='text' AND selected.value=lc_candidates.address)`),
+      update=this.statement(`UPDATE lc_candidates SET monitored=1,coverage_at=?,updated_at=?
+        WHERE chain=? AND address IN (SELECT value FROM json_each(?) WHERE type='text')`);
     this.db.exec('BEGIN IMMEDIATE');try {
-      this.statement('UPDATE lc_candidates SET monitored=0,coverage_at=NULL WHERE chain=?').run(validChain);
-      const update=this.statement('UPDATE lc_candidates SET monitored=1,coverage_at=?,updated_at=? WHERE chain=? AND address=?');let count=0;
-      for(const wallet of selected as string[])count+=Number(update.run(iso(checked),iso(now),validChain,wallet).changes);
-      this.db.exec('COMMIT');return count;
-    }catch(error){this.db.exec('ROLLBACK');if(sqliteCapacity(error)){this.markCapacity();return 0;}throw error;}
+      for(const value of prepared){
+        clear.run(updatedAt,value.chain,value.wallets);
+        counts[value.chain]=Number(update.run(value.at,updatedAt,value.chain,value.wallets).changes);
+      }
+      this.db.exec('COMMIT');return counts;
+    }catch(error){this.db.exec('ROLLBACK');if(sqliteCapacity(error)){
+      this.markCapacity();for(const value of prepared)counts[value.chain]=0;return counts;
+    }throw error;}
+  }
+
+  replaceCoverage(network:Chain,wallets:readonly string[],at:string):number {
+    const counts=this.replaceCoverageBatch([{chain:network,wallets,at}]);return counts[network]??0;
   }
 
   get(network:Chain,address:string):LauncherCandidate|undefined {
     const validChain=chain(network),wallet=validChain&&chainAddress(validChain,address);if(!validChain||!wallet)return;
     const row=this.statement('SELECT * FROM lc_candidates WHERE chain=? AND address=?').get(validChain,wallet) as Row|undefined;
     return row?this.candidate(row):undefined;
+  }
+
+  /** Compact membership snapshot for live target labelling; avoids one SQLite lookup per watched wallet. */
+  addresses(network:Chain):string[] {
+    if(!chain(network))throw new Error('LAUNCHER_CANDIDATE_QUERY_INVALID');
+    return (this.statement('SELECT address FROM lc_candidates WHERE chain=? ORDER BY address').all(network) as Row[]).map(row=>String(row.address));
   }
 
   list(options:LauncherCandidateListOptions={}):LauncherCandidateList {
@@ -372,7 +464,7 @@ export class LauncherCandidates {
     if(options.route)items=items.filter(item=>item.route===options.route);
     if(options.state)items=items.filter(item=>item.state===options.state);
     items.sort((a,b)=>stateRank[a.state]-stateRank[b.state]||(a.route==='A'?0:1)-(b.route==='A'?0:1)||
-      (b.liveSeenAt??b.verifiedActivityAt??b.lastEvidenceAt??'').localeCompare(a.liveSeenAt??a.verifiedActivityAt??a.lastEvidenceAt??'')||
+      (b.lastVerifiedBuyAt??b.liveSeenAt??b.lastEvidenceAt??'').localeCompare(a.lastVerifiedBuyAt??a.liveSeenAt??a.lastEvidenceAt??'')||
       a.chain.localeCompare(b.chain)||a.address.localeCompare(b.address));
     return {items:items.slice(offset,offset+limit),total:items.length,limit,offset};
   }
@@ -381,19 +473,21 @@ export class LauncherCandidates {
     if(!chain(network))throw new Error('LAUNCHER_CANDIDATE_QUERY_INVALID');
     const size=boundedInteger(limit,this.cap,1,5000),now=this.currentTime(),rows=(this.statement('SELECT * FROM lc_candidates WHERE chain=?').all(network) as Row[]);
     const freshness=(row:Row):{rank:number;at:string}=>{
-      const live=time(row.live_seen_at),fresh=later(row.last_evidence_at as string|undefined,row.activity_at as string|undefined),freshAt=time(fresh);
+      const live=time(row.live_seen_at),fresh=later(row.last_evidence_at as string|undefined,row.last_verified_buy_at as string|undefined),freshAt=time(fresh);
       if(live!==undefined&&live<=now&&now-live<=this.liveMs)return {rank:0,at:iso(live)};
       if(freshAt!==undefined&&freshAt<=now&&now-freshAt<=this.freshMs)return {rank:1,at:iso(freshAt)};
       return {rank:2,at:''};
     };
     const ordered=(a:Row,b:Row)=>{const left=freshness(a),right=freshness(b);return left.rank-right.rank||right.at.localeCompare(left.at)||
       (a.route==='A'?0:1)-(b.route==='A'?0:1)||String(a.address).localeCompare(String(b.address));};
-    const orderedRows=rows.sort(ordered),strict=orderedRows.filter(row=>{
-      const activity=time(row.activity_at);return activity!==undefined&&activity<=now&&now-activity<=this.freshMs;
-    });
-    // A small directly-classified core stays hot. Every other candidate,
+    const orderedRows=rows.sort(ordered),strict=rows.filter(row=>{
+      const activity=time(row.last_verified_buy_at);return activity!==undefined&&activity<=now&&now-activity<=this.freshMs;
+    }).sort((a,b)=>String(b.last_verified_buy_at).localeCompare(String(a.last_verified_buy_at))||ordered(a,b));
+    // A small directly-classified BUY core stays hot. Every other candidate,
     // including generic-live overflow, advances through five-minute pages.
-    const reserved=Math.min(strict.length,Math.floor(size/2)),selected=strict.slice(0,reserved),selectedKeys=new Set(selected.map(row=>String(row.address))),
+    // RPC polling already explores the whole Solana shortlist. Keep most live
+    // socket slots on recently verified buys while retaining a 20% discovery lane.
+    const reserved=Math.min(strict.length,Math.max(1,Math.floor(size*0.8))),selected=strict.slice(0,reserved),selectedKeys=new Set(selected.map(row=>String(row.address))),
       rotating=orderedRows.filter(row=>!selectedKeys.has(String(row.address))),remaining=size-selected.length;
     if(remaining>0&&rotating.length){
       const rotationStarted=time(this.meta('rotation_started_at'))??now,page=Math.max(0,Math.floor((now-rotationStarted)/(5*60_000))),
@@ -406,14 +500,17 @@ export class LauncherCandidates {
   /** Adapter shape consumed by LauncherRevalidator.listCandidates. */
   listRevalidation(network:Chain,limit=this.cap):{wallet:string;latestSignature?:string}[]{
     if(!chain(network))throw new Error('LAUNCHER_CANDIDATE_QUERY_INVALID');
-    const size=boundedInteger(limit,this.cap,1,5000);return this.streamTargets(network,size).map(wallet=>{
-      const item=this.get(network,wallet)!;return {wallet,...(item.revalidation?.latestSignature?{latestSignature:item.revalidation.latestSignature}:{})};
-    });
+    const size=boundedInteger(limit,this.cap,1,5000),wallets=this.streamTargets(network,size),signatures=new Map(
+      (this.statement('SELECT address,latest_signature FROM lc_candidates WHERE chain=?').all(network) as Row[])
+        .map(row=>[String(row.address),typeof row.latest_signature==='string'?row.latest_signature:undefined]));
+    return wallets.map(wallet=>{const latestSignature=signatures.get(wallet);return {wallet,...(latestSignature?{latestSignature}:{})};});
   }
 
   /** A signature change is liveness evidence only. Classification is promoted solely by observeActivity. */
-  recordRevalidation(input:LauncherRevalidationObservation):boolean {
-    return this.observeRealtime({...input,source:'launcher_revalidator'});
+  recordRevalidation(input:LauncherRevalidationObservation):boolean|'stale' {
+    if(this.observeRealtime({...input,source:'launcher_revalidator'}))return true;
+    const network=chain(input?.chain),wallet=network&&chainAddress(network,input.wallet);
+    return network&&wallet&&!this.statement('SELECT 1 FROM lc_candidates WHERE chain=? AND address=?').get(network,wallet)?'stale':false;
   }
 
   status():LauncherCandidateStatus {

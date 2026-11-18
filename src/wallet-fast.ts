@@ -2,6 +2,7 @@ import bs58 from 'bs58';
 import {chainAddress,evmTransfers,object} from './chain-stream-store.js';
 import type {Chain} from './types.js';
 import type {RpcNotificationMeta} from './rpc-stream.js';
+import {WALLET_FAST_PRIORITY_GROUPS} from './wallet-fast-groups.js';
 
 export interface FastWalletTarget {chain:Chain;wallet:string;groups:string[];profileUntil?:string;}
 export interface FastTokenCheck {chain:Chain;address:string;state:'pass'|'fail'|'unknown';validUntil:string;}
@@ -13,7 +14,8 @@ export interface FastWalletEvent {
   verdict:FastVerdict;groups:string[];profileFresh:boolean;cachedSafety:'pass'|'fail'|'unknown'|'expired';
   commitment:'processed'|'included';removed:boolean;buyVerified:false;tradingEnabled:false;
 }
-const priority=new Set(['launcher_candidate','forward_validated','repeated_early','precursor_pattern','public_kol']);
+const priority=new Set<string>(WALLET_FAST_PRIORITY_GROUPS);
+const noWallets=new Set<string>();
 const validTime=(v:unknown)=>typeof v==='string'&&Number.isFinite(Date.parse(v));
 /** Pins add observation targets after automatic selection; they grant no profile or trading qualification. */
 export function mergePinnedWallets(chain:Chain,automatic:readonly string[],pinned:readonly string[]=[]):string[]{
@@ -25,7 +27,7 @@ export function mergePinnedWallets(chain:Chain,automatic:readonly string[],pinne
 export class WalletFastTargets {
   private selected=new Map<Chain,{wallets:string[];rotateAt:number}>();
   select(chain:Chain,candidates:readonly string[],limit:number,now:number):string[]{
-    const cap=Math.max(1,Math.min(30,Math.trunc(limit)));
+    const cap=Math.max(1,Math.min(200,Math.trunc(limit)));
     const previous=this.selected.get(chain);
     const wallets=previous&&now<previous.rotateAt?previous.wallets.slice(0,cap):[];
     for(const value of candidates){const wallet=chainAddress(chain,value);if(wallet&&!wallets.includes(wallet)&&wallets.length<cap)wallets.push(wallet);}
@@ -44,21 +46,25 @@ export class LatencyWindow {
 /** Bounded in-memory preview only. No database, network, signing or trade verdict. */
 export class WalletFastJudge {
   private targets=new Map<string,FastWalletTarget>();private tokens=new Map<string,FastTokenCheck>();
+  private walletSets=new Map<Chain,Set<string>>();
   private expires=0;private dedup=new Map<string,number>();private snapshotAt?:string;
   readonly latency=new LatencyWindow();counts={notifications:0,accepted:0,duplicates:0,invalid:0,staleSnapshot:0,failedTransactions:0};
   constructor(private readonly now=()=>Date.now(),private readonly mono=()=>performance.now()){}
   update(snapshot:FastWalletSnapshot){
     const now=this.now(),expires=Date.parse(snapshot?.validUntil),at=Date.parse(snapshot?.at);
     if(!Number.isFinite(at)||at>now||now-at>120000||!Number.isFinite(expires)||expires<=now||expires-at>120000||
-      !Array.isArray(snapshot.targets)||snapshot.targets.length>90||!Array.isArray(snapshot.tokens)||snapshot.tokens.length>500)throw new Error('FAST_WALLET_SNAPSHOT_INVALID');
+      !Array.isArray(snapshot.targets)||snapshot.targets.length>500||!Array.isArray(snapshot.tokens)||snapshot.tokens.length>500)throw new Error('FAST_WALLET_SNAPSHOT_INVALID');
     const targets=new Map<string,FastWalletTarget>(),tokens=new Map<string,FastTokenCheck>();
     for(const row of snapshot.targets){const wallet=chainAddress(row.chain,row.wallet);if(!wallet||!Array.isArray(row.groups))continue;
       targets.set(`${row.chain}:${wallet}`,{chain:row.chain,wallet,groups:row.groups.filter(g=>typeof g==='string'&&/^[a-z_]{1,40}$/.test(g)).slice(0,16),
         ...(validTime(row.profileUntil)?{profileUntil:row.profileUntil}:{})});}
     for(const row of snapshot.tokens){const address=chainAddress(row.chain,row.address);if(address&&['pass','fail','unknown'].includes(row.state)&&validTime(row.validUntil))tokens.set(`${row.chain}:${address}`,{...row,address});}
-    this.targets=targets;this.tokens=tokens;this.expires=expires;this.snapshotAt=snapshot.at;
+    const walletSets=new Map<Chain,Set<string>>();for(const target of targets.values()){
+      let wallets=walletSets.get(target.chain);if(!wallets){wallets=new Set();walletSets.set(target.chain,wallets);}wallets.add(target.wallet);
+    }
+    this.targets=targets;this.tokens=tokens;this.walletSets=walletSets;this.expires=expires;this.snapshotAt=snapshot.at;
   }
-  wallets(chain:Chain){return [...this.targets.values()].filter(t=>t.chain===chain).map(t=>t.wallet);}
+  wallets(chain:Chain){return [...(this.walletSets.get(chain)??[])];}
   status(){return {snapshotAt:this.snapshotAt,snapshotFresh:this.now()<this.expires,targets:this.targets.size,
     watchedTargets:[...this.targets.values()].map(t=>({...t,profileFresh:!!t.profileUntil&&Date.parse(t.profileUntil)>this.now()})),
     counts:{...this.counts},latency:this.latency.summary()};}
@@ -78,7 +84,7 @@ export class WalletFastJudge {
           kind:'wallet_mention',receivedAt:new Date(meta.receivedAt).toISOString(),commitment:'processed',removed:false,buyVerified:false,tradingEnabled:false});
       }else{
         if(!['bsc','robinhood'].includes(chain)||!key.startsWith('wallet:')){this.counts.invalid++;return [];}
-        const events=evmTransfers(chain,data,new Set(this.wallets(chain)),'live',new Date(meta.receivedAt));
+        const events=evmTransfers(chain,data,this.walletSets.get(chain)??noWallets,'live',new Date(meta.receivedAt));
         for(const e of events)if(e.from!==e.to&&e.amountAtomic!=='0')previews.push({id:e.id,chain,wallet:e.wallet,txHash:e.txHash,
           tokenAddress:e.tokenAddress,blockHash:e.blockHash,kind:e.to===e.wallet?'token_inflow':'token_outflow',receivedAt:e.observedAt,
           commitment:'included',removed:!!e.removed,buyVerified:false,tradingEnabled:false});

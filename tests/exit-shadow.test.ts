@@ -156,15 +156,22 @@ test('observation expiry never closes an open position or resets it to a new can
   assert.equal(store.detail(oldId)?.sampleCount,2);assert.equal(store.detail(oldId)?.item.phase,'tracking');
   assert.equal(store.detail(oldId)?.item.remainingPct,100);assert.equal(store.detail(oldId)?.item.exitPlan.scheduledExitAt,undefined);
   ctx.clock.time+=1000;
-  const later=seed({candidateId:'candidate-2',eligibleAt:iso(ctx.clock.time),endsAt:iso(start+600_000)});
+  const later=seed({candidateId:'candidate-2',eligibleAt:iso(ctx.clock.time),endsAt:iso(start+7_200_000)});
   store.recordPrice(price(ctx.clock.time,210),later);
   assert.equal(store.summary().status.positions,1);assert.equal(store.detail(oldId)?.item.baselinePriceUsd,100);
   ctx.clock.time+=1000;store.recordPrice(price(ctx.clock.time,30),later);
   assert.equal(store.detail(oldId)?.item.phase,'triggered');assert.equal(store.detail(oldId)?.item.lastEvent?.reason,'HARD_STOP_OBSERVED');
+  const closedAt=ctx.clock.time;
   ctx.clock.time+=1000;store.recordPrice(price(ctx.clock.time,60),later);
+  assert.equal(store.summary().status.positions,1,'a new signal cannot steal quotes from the closed quality window');
+  assert.equal(store.detail(oldId)?.sampleCount,4,'sub-minute closed quotes remain rate limited');
+  ctx.clock.time=closedAt+3_720_000;store.recordPrice(price(ctx.clock.time,55),later);
+  assert.equal(store.summary().status.positions,1,'the final 60-minute comparison grace boundary still belongs to the old episode');
+  assert.equal(store.detail(oldId)?.sampleCount,5);
+  ctx.clock.time+=1;store.recordPrice(price(ctx.clock.time,60),later);
   const newItem=store.list().items.find(item=>item.id!==oldId)!;
   assert.equal(store.summary().status.positions,2);assert.equal(newItem.baselinePriceUsd,60);
-  assert.equal(newItem.gainPct,0);assert.equal(newItem.candidateId,'candidate-2');assert.equal(store.detail(oldId)?.sampleCount,4);
+  assert.equal(newItem.gainPct,0);assert.equal(newItem.candidateId,'candidate-2');assert.equal(store.detail(oldId)?.sampleCount,5);
 });
 
 test('a triggered shadow episode keeps comparison samples after restart but never emits a second full exit',t=>{
@@ -196,6 +203,21 @@ test('capacity failures retain existing observations and persist incomplete-hist
   assert.equal(store.summary().status.lastError,undefined);
   ctx.clock.time+=60_000;store.recordPrice(price(ctx.clock.time,110),undefined);
   assert.equal(store.detail(id)?.sampleCount,2);assert.equal(store.summary().status.lastError,undefined);
+  assert.equal(store.summary().status.historyComplete,false);
+});
+
+test('repeated capacity failures do not rewrite the same durable failure marker',t=>{
+  const ctx=setup(t);ctx.store.recordPrice(price(start),seed());ctx.store.close();
+  const store=ctx.open({maxBytes:16384}),watcher=new DatabaseSync(ctx.path,{readOnly:true});
+  t.after(()=>watcher.close());
+  const version=()=>Number(watcher.prepare('PRAGMA data_version').get()!.data_version);
+  const before=version();ctx.clock.time+=1000;
+  assert.throws(()=>store.recordPrice(price(ctx.clock.time,101),undefined),/EXIT_SHADOW_CAPACITY_REACHED/);
+  const persisted=version();assert.notEqual(persisted,before);
+  ctx.clock.time+=1000;
+  assert.throws(()=>store.recordPrice(price(ctx.clock.time,102),undefined),/EXIT_SHADOW_CAPACITY_REACHED/);
+  assert.equal(version(),persisted);
+  assert.equal(store.summary().status.lastError,'EXIT_SHADOW_CAPACITY_REACHED');
   assert.equal(store.summary().status.historyComplete,false);
 });
 
@@ -374,6 +396,29 @@ test('closed comparison capture is sampled at most once per minute without delet
   assert.equal(store.detail(id)?.sampleCount,2);ctx.clock.time=start+61_000;store.recordPrice(price(ctx.clock.time,200),undefined);
   assert.equal(store.detail(id)?.sampleCount,3);assert.equal(Reflect.get(store.detail(id)!.samples[0],'priceUsd'),100);
   assert.equal(store.summary().status.closedComparisonIntervalSec,60);
+});
+
+test('closed comparison capture includes the final 62-minute boundary then stops while open episodes continue',t=>{
+  const ctx=setup(t),store=ctx.store;
+  store.recordPrice(price(start),seed());
+  store.recordPrice(price(start,100,other),seed({candidateId:'open-candidate'}));
+  ctx.clock.time=start+1000;store.recordPrice(price(ctx.clock.time,30),undefined);
+  const closedAt=ctx.clock.time,items=store.list().items;
+  const closedId=items.find(item=>item.address===token.address)!.id;
+  const openId=items.find(item=>item.address===other.address)!.id;
+  assert.equal(store.detail(closedId)?.sampleCount,2);
+
+  ctx.clock.time=closedAt+62*60_000;
+  store.recordPrice(price(ctx.clock.time,31),undefined);
+  assert.equal(store.detail(closedId)?.sampleCount,3,'the final 60-minute window includes its 120-second grace boundary');
+
+  ctx.clock.time+=1;
+  store.recordPrice(price(ctx.clock.time,32),undefined);
+  store.recordPrice(price(ctx.clock.time,101,other),undefined);
+  assert.equal(store.detail(closedId)?.sampleCount,3,'closed samples stop immediately after the final evidence window');
+  assert.equal(store.detail(openId)?.sampleCount,2,'an unclosed episode still accepts a fresh quote at the same time');
+  assert.deepEqual(store.trackingTokens().map(item=>item.address),[other.address]);
+  assert.equal(store.summary().status.closedComparisonHorizonSec,3720);
 });
 
 

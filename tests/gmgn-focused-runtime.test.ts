@@ -333,6 +333,29 @@ test('focused runtime sends an RPC-verified wallet buy through on-demand researc
   }finally{await runtime.close();rmSync(dir,{recursive:true,force:true});}
 });
 
+test('runtime propagates an EVM removed-log into durable activity and retracts prior wallet trade evidence',async()=>{
+  const evmWallet='0x'+'1'.repeat(40),evmToken='0x'+'2'.repeat(40),txHash='0x'+'3'.repeat(64);
+  const {dir,config}=fixture({SCANNER_CHAINS:'solana',CHAIN_STREAM_ENABLED:'true',WALLET_FAST_ENABLED:'true',
+    BSC_STREAM_HTTP_URL:'https://bsc.example.test',BSC_STREAM_WS_URL:'wss://bsc.example.test'});
+  const runtime=createRuntime(config,{walletActivityVerify:async event=>({version:1,chain:'bsc',wallet:event.wallet,txHash:event.txHash,
+    receivedAt:event.receivedAt,checkedAt:new Date().toISOString(),eventAt:event.receivedAt,classification:'buy',
+    reasons:['SUPPORTED_SWAP_AND_WALLET_FLOW_CONFIRMED'],trades:[{tokenAddress:evmToken,side:'buy',amountAtomic:'1000',protocol:'pancake_v2'}],
+    retryable:false,confirmation:'confirmed',transferCount:2,tradingEnabled:false})});
+  try {
+    const research=runtime.walletFastResearch!;research.start();const receivedAt=new Date().toISOString();
+    const event={id:`bsc:${evmWallet}:${txHash}`,chain:'bsc' as const,wallet:evmWallet,txHash,receivedAt,judgedAt:receivedAt,
+      processingMs:0,kind:'token_inflow' as const,verdict:'priority_review' as const,groups:['forward_validated'],profileFresh:true,
+      cachedSafety:'unknown' as const,commitment:'included' as const,removed:false,buyVerified:false as const,tradingEnabled:false as const};
+    research.enqueue(event);await research.runOnce();assert.equal(runtime.walletHistory!.stats().events,1);
+    research.enqueue({...event,removed:true,verdict:'retracted'});await research.runOnce();
+    assert.equal(runtime.walletHistory!.stats().events,0);assert.equal(runtime.walletHistory!.getWallet('bsc',evmWallet)!.wallet.buyEvents,0);
+    const activity=new DatabaseSync(config.walletFast!.database!,{readOnly:true});
+    try {assert.equal(activity.prepare('SELECT kind FROM wallet_activity WHERE chain=? AND wallet=? AND tx_hash=?')
+      .get('bsc',evmWallet,txHash)!.kind,'retracted');}finally{activity.close();}
+    research.enqueue({...event,removed:true,verdict:'retracted'});assert.equal(research.status().counts.persistenceErrors,0);
+  } finally {await runtime.close();rmSync(dir,{recursive:true,force:true});}
+});
+
 for(const failure of ['GMGN_API_KEY_MISSING','GMGN_RATE_LIMITED'] as const)
 test(`focused DeBot/Ave still analyze signals during ${failure}, preserving unknown safety and no orders`,async()=>{
   const {dir,config}=fixture(failure==='GMGN_API_KEY_MISSING'?{GMGN_API_KEY:''}:{}),runtime=createRuntime(config);

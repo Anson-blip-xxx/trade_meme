@@ -53,6 +53,16 @@ export interface RpcStreamStatus {
   activeSubscriptions: number;
   activeKeys: string[];
   pendingRequests: number;
+  /** Subscription requests sent but not yet acknowledged. */
+  subscribingSubscriptions?: number;
+  /** Desired revisions waiting for an acknowledgement-window slot. */
+  queuedSubscriptions?: number;
+  maxConcurrentSubscriptions?: number;
+  peakConcurrentSubscriptions?: number;
+  /** Explicit server rejections waiting for an isolated retry. */
+  retryingSubscriptions?: number;
+  /** Cumulative isolated retries; ambiguous failures still reconnect the socket. */
+  subscriptionRetries?: number;
   reconnectAttempt: number;
   reconnects: number;
   requestsSent: number;
@@ -74,6 +84,10 @@ export interface RpcStreamOptions {
   connectTimeoutMs?: number;
   maxMessageBytes?: number;
   maxSubscriptions?: number;
+  /** Bound only subscription requests; ordinary RPC and unsubscribe requests remain independent. */
+  maxConcurrentSubscriptions?: number;
+  /** Retry explicit JSON-RPC subscription rejections without discarding healthy subscriptions. */
+  retryRejectedSubscriptions?: boolean;
   maxPendingRequests?: number;
   reconnectBaseMs?: number;
   reconnectMaxMs?: number;
@@ -84,6 +98,8 @@ export interface RpcStreamOptions {
 
 interface Desired extends RpcSubscription {revision: number; fingerprint: string;}
 interface Active {desired: Desired; id: string | number; generation: number;}
+interface Subscribing {desired: Desired; generation: number;}
+interface SubscriptionRetry {desired: Desired; generation: number; attempt: number; timer?: unknown;}
 interface Pending {
   generation: number;
   timer: unknown;
@@ -133,6 +149,8 @@ export class RpcStream {
   private readonly connectTimeout: number;
   private readonly maxBytes: number;
   private readonly maxSubscriptions: number;
+  private readonly maxConcurrentSubscriptions: number;
+  private readonly retryRejectedSubscriptions: boolean;
   private readonly maxPending: number;
   private readonly reconnectBase: number;
   private readonly reconnectMax: number;
@@ -143,7 +161,8 @@ export class RpcStream {
   private readonly active = new Map<string, Active>();
   private readonly activeIds = new Map<string, Active>();
   private readonly retiredIds = new Set<string>();
-  private readonly subscribing = new Map<string, {revision: number; generation: number}>();
+  private readonly subscribing = new Set<Subscribing>();
+  private readonly subscriptionRetryState = new Map<string,SubscriptionRetry>();
   private readonly pending = new Map<number, Pending>();
   private connection?: Connection;
   private connectTimer?: unknown;
@@ -159,6 +178,8 @@ export class RpcStream {
   private requestsSent = 0;
   private messagesReceived = 0;
   private notificationsReceived = 0;
+  private peakConcurrentSubscriptions = 0;
+  private subscriptionRetries = 0;
   private connectedAt?: number;
   private lastMessageAt?: number;
   private lastHeartbeatAt?: number;
@@ -179,11 +200,15 @@ export class RpcStream {
     this.connectTimeout = options.connectTimeoutMs ?? 15_000;
     this.maxBytes = options.maxMessageBytes ?? 1_048_576;
     this.maxSubscriptions = options.maxSubscriptions ?? 200;
+    this.maxConcurrentSubscriptions = options.maxConcurrentSubscriptions ?? this.maxSubscriptions;
+    this.retryRejectedSubscriptions = options.retryRejectedSubscriptions ?? false;
     this.maxPending = options.maxPendingRequests ?? 512;
     this.reconnectBase = options.reconnectBaseMs ?? 1000;
     this.reconnectMax = options.reconnectMaxMs ?? 30_000;
     if (!boundedInteger(this.timeout, 1, 300_000) || !boundedInteger(this.connectTimeout, 1, 300_000) ||
         !boundedInteger(this.maxBytes, 128, 8_388_608) || !boundedInteger(this.maxSubscriptions, 1, 2000) ||
+        !boundedInteger(this.maxConcurrentSubscriptions, 1, this.maxSubscriptions) ||
+        typeof this.retryRejectedSubscriptions !== 'boolean' ||
         !boundedInteger(this.maxPending, 1, 4096) || !boundedInteger(this.reconnectBase, 1, 300_000) ||
         !boundedInteger(this.reconnectMax, this.reconnectBase, 3_600_000)) throw new RpcStreamError('RPC_CONFIG_INVALID');
     if (options.heartbeat) {
@@ -204,6 +229,10 @@ export class RpcStream {
   getStatus(): RpcStreamStatus {
     return {state: this.state, generation: this.generation, desiredSubscriptions: this.desired.size,
       activeSubscriptions: this.active.size, activeKeys: [...this.active.keys()].sort(), pendingRequests: this.pending.size,
+      subscribingSubscriptions: this.subscribing.size, queuedSubscriptions: this.queuedSubscriptions(),
+      maxConcurrentSubscriptions: this.maxConcurrentSubscriptions,peakConcurrentSubscriptions:this.peakConcurrentSubscriptions,
+      retryingSubscriptions:[...this.subscriptionRetryState.values()].filter(value=>value.timer!==undefined).length,
+      subscriptionRetries:this.subscriptionRetries,
       reconnectAttempt: this.reconnectAttempt, reconnects: this.reconnects, requestsSent: this.requestsSent,
       messagesReceived: this.messagesReceived, notificationsReceived: this.notificationsReceived,
       ...(this.connectedAt === undefined ? {} : {connectedAt: this.connectedAt}),
@@ -246,10 +275,12 @@ export class RpcStream {
       next.set(raw.key, old?.fingerprint === fingerprint ? old : {...spec, fingerprint, revision: ++this.revision});
     }
     this.desired.clear(); for (const [key, value] of next) this.desired.set(key, value);
+    for(const [key,retry] of this.subscriptionRetryState)if(next.get(key)?.revision!==retry.desired.revision)
+      this.clearSubscriptionRetry(key);
     for (const [key, active] of this.active) {
       if (next.get(key)?.revision !== active.desired.revision) this.retire(active);
     }
-    if (this.state === 'open') for (const desired of next.values()) this.subscribe(desired);
+    if (this.state === 'open') this.pumpSubscriptions();
     this.emitStatus();
   }
 
@@ -303,7 +334,7 @@ export class RpcStream {
     // Consumers can issue a chain-identity request here before any subscription is sent.
     this.emitStatus();
     if (!this.current(connection) || this.state !== 'open') return;
-    for (const desired of this.desired.values()) this.subscribe(desired);
+    this.pumpSubscriptions();
     this.scheduleHeartbeat(connection);
   }
 
@@ -333,28 +364,88 @@ export class RpcStream {
     });
   }
 
+  private queuedSubscriptions():number {
+    if(!this.running||this.state!=='open')return 0;
+    let queued=0;
+    for(const desired of this.desired.values())if(this.active.get(desired.key)?.desired.revision!==desired.revision&&
+      !this.subscriptionPending(desired)&&!this.subscriptionRetryPending(desired))queued++;
+    return queued;
+  }
+
+  private subscriptionPending(desired:Desired):boolean {
+    for(const attempt of this.subscribing)if(attempt.generation===this.generation&&attempt.desired.key===desired.key&&
+      attempt.desired.revision===desired.revision)return true;
+    return false;
+  }
+
+  private subscriptionRetryPending(desired:Desired):boolean {
+    const retry=this.subscriptionRetryState.get(desired.key);
+    return retry?.generation===this.generation&&retry.desired.revision===desired.revision&&retry.timer!==undefined;
+  }
+
+  private pumpSubscriptions():void {
+    if(!this.running||this.state!=='open')return;
+    for(const desired of this.desired.values()){
+      if(this.subscribing.size>=this.maxConcurrentSubscriptions)break;
+      if(this.subscriptionRetryPending(desired))continue;
+      this.subscribe(desired);
+    }
+  }
+
   private subscribe(desired: Desired): void {
     const generation = this.generation;
     if (!this.running || this.state !== 'open' || this.desired.get(desired.key)?.revision !== desired.revision ||
         this.active.get(desired.key)?.desired.revision === desired.revision ||
-        this.subscribing.get(desired.key)?.revision === desired.revision) return;
-    this.subscribing.set(desired.key, {revision: desired.revision, generation});
+        this.subscriptionPending(desired)||this.subscriptionRetryPending(desired)||
+        this.subscribing.size>=this.maxConcurrentSubscriptions) return;
+    const attempt:Subscribing={desired,generation};this.subscribing.add(attempt);
+    this.peakConcurrentSubscriptions=Math.max(this.peakConcurrentSubscriptions,this.subscribing.size);
     void this.sendRequest(desired.subscribeMethod, desired.params, this.timeout, result => {
       if (this.generation !== generation || !this.running || this.state !== 'open') return;
       if (!idValid(result)) throw new RpcStreamError('RPC_SUBSCRIPTION_ID_INVALID');
       const id = idKey(result);
       if (this.activeIds.has(id) || this.retiredIds.has(id)) throw new RpcStreamError('RPC_SUBSCRIPTION_ID_CONFLICT');
-      if (this.subscribing.get(desired.key)?.revision === desired.revision) this.subscribing.delete(desired.key);
       const active: Active = {desired, id: result, generation};
       if (this.desired.get(desired.key)?.revision !== desired.revision) {
         this.unsubscribe(active); return;
       }
+      this.clearSubscriptionRetry(desired.key);
       this.active.set(desired.key, active); this.activeIds.set(id, active); this.emitStatus();
     }).catch(error => {
       if (this.generation !== generation || !this.running || this.state !== 'open') return;
+      if(this.retryRejectedSubscriptions&&error instanceof RpcStreamError&&error.code==='RPC_REMOTE_ERROR'){
+        this.lastError='RPC_SUBSCRIBE_FAILED';this.scheduleSubscriptionRetry(desired,generation);return;
+      }
       this.fail(error instanceof RpcStreamError && ['RPC_SUBSCRIPTION_ID_INVALID', 'RPC_SUBSCRIPTION_ID_CONFLICT'].includes(error.code)
         ? error.code : 'RPC_SUBSCRIBE_FAILED');
-    });
+    }).finally(()=>{this.subscribing.delete(attempt);this.pumpSubscriptions();this.emitStatus();});
+  }
+
+  private scheduleSubscriptionRetry(desired:Desired,generation:number):void {
+    if(this.generation!==generation||this.desired.get(desired.key)?.revision!==desired.revision)return;
+    const previous=this.subscriptionRetryState.get(desired.key),attempt=previous?.desired.revision===desired.revision?
+      previous.attempt:0;
+    if(previous?.timer!==undefined)this.clock.clearTimeout(previous.timer);
+    let random=.5;
+    try {const value=this.random();if(Number.isFinite(value))random=Math.max(0,Math.min(1,value));}catch{/* deterministic fallback */}
+    const base=Math.min(this.reconnectMax,this.reconnectBase*2**Math.min(attempt,30));
+    const delay=Math.max(1,Math.min(this.reconnectMax,Math.round(base*(.8+random*.4))));
+    const retry:SubscriptionRetry={desired,generation,attempt:attempt+1};
+    retry.timer=this.clock.setTimeout(()=>{
+      if(this.subscriptionRetryState.get(desired.key)!==retry)return;
+      retry.timer=undefined;
+      if(this.running&&this.state==='open'&&this.generation===generation&&
+          this.desired.get(desired.key)?.revision===desired.revision)this.subscribe(desired);
+      else this.subscriptionRetryState.delete(desired.key);
+      this.emitStatus();
+    },delay);
+    this.subscriptionRetryState.set(desired.key,retry);this.subscriptionRetries++;this.emitStatus();
+  }
+
+  private clearSubscriptionRetry(key:string):void {
+    const retry=this.subscriptionRetryState.get(key);if(!retry)return;
+    if(retry.timer!==undefined)this.clock.clearTimeout(retry.timer);
+    this.subscriptionRetryState.delete(key);
   }
 
   private retire(active: Active): void {
@@ -453,6 +544,7 @@ export class RpcStream {
       try {connection.socket.close(1000);} catch { /* already closed */ }
     }
     for (const pending of this.pending.values()) {this.clock.clearTimeout(pending.timer); pending.reject(new RpcStreamError(code));}
+    for(const key of [...this.subscriptionRetryState.keys()])this.clearSubscriptionRetry(key);
     this.pending.clear(); this.active.clear(); this.activeIds.clear(); this.retiredIds.clear(); this.subscribing.clear();
   }
 

@@ -60,7 +60,8 @@ function fixture(){
   const put=(p:WalletProfile)=>{
     db.prepare('INSERT OR REPLACE INTO wp_profiles(chain,address,computed_at,fresh_until,data) VALUES (?,?,?,?,?)').run(p.chain,p.address,p.computedAt,p.freshUntil,JSON.stringify(p));
     db.prepare('DELETE FROM wp_groups WHERE chain=? AND address=?').run(p.chain,p.address);
-    for(const group of p.groups)db.prepare('INSERT INTO wp_groups VALUES (?,?,?,?)').run(p.chain,p.address,group.id,group.firstObservedAt);
+    for(const group of p.groups)db.prepare('INSERT INTO wp_groups(chain,address,group_id,first_at,computed_at) VALUES (?,?,?,?,?)')
+      .run(p.chain,p.address,group.id,group.firstObservedAt,p.computedAt);
     written.set(p.chain+':'+p.address,structuredClone(p));syncCohorts();
   };
   put(profile(2));for(let i=1;i<=9;i++)put(profile(10+i,i*1000));

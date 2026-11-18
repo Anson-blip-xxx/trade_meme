@@ -17,6 +17,11 @@ test('target residence prevents profile refresh churn, fills vacancies and rotat
   assert.deepEqual(picker.select('robinhood',[token],2,at+60000),[token]);
   assert.deepEqual(picker.select('bsc',[token,other,wallet],2,at+300000),[token,other]);
   assert.deepEqual(picker.select('bsc',[wallet],1,at+330000),[token]);
+  const many=Array.from({length:135},(_,index)=>'0x'+(index+10).toString(16).padStart(40,'0'));
+  assert.equal(new WalletFastTargets().select('bsc',many,135,at).length,135);
+  const judge=new WalletFastJudge(()=>at,()=>0);judge.update({at:new Date(at).toISOString(),validUntil:new Date(at+120000).toISOString(),
+    targets:many.map(wallet=>({chain:'bsc' as const,wallet,groups:['launcher_candidate']})),tokens:[]});
+  assert.equal(judge.status().targets,135);
 });
 function fixture(){const clock={now:at,mono:10},judge=new WalletFastJudge(()=>clock.now,()=>clock.mono);
   const snapshot={at:new Date(at).toISOString(),validUntil:new Date(at+120000).toISOString(),targets:[
@@ -80,6 +85,56 @@ test('paused-chain wallet events never consume receipt requests or record new cl
     onSignal:async()=>{signals++;}});
   t.after(()=>worker.stop());worker.start();worker.enqueue(preview());worker.enqueue({...preview(),chain:'robinhood'});
   await worker.runOnce();assert.equal(worker.status().queued,0);assert.equal(calls,0);assert.equal(signals,0);assert.equal(records,0);
+});
+test('research-only chains persist verified trades without entering signal analysis',async t=>{
+  let calls=0,signals=0,records=0;
+  const worker=new WalletFastResearch({allowedChains:['solana','bsc'],analysisChains:['solana'],now:()=>at+1000,ready:()=>true,
+    verify:async e=>{calls++;return verified(e);},onClassification:()=>true,onTrades:rows=>{records+=rows.length;},
+    onSignal:async()=>{signals++;}});
+  t.after(()=>worker.stop());worker.start();worker.enqueue(preview());await worker.runOnce();
+  assert.equal(calls,1);assert.equal(records,1);assert.equal(signals,0);assert.equal(worker.status().analysisQueued,0);
+});
+test('bounded receipt queue reserves capacity for Solana, priority profiles and an underrepresented EVM chain',async t=>{
+  const worker=new WalletFastResearch({allowedChains:['solana','bsc','robinhood'],analysisChains:['solana'],now:()=>at+1000,ready:()=>false,
+    verify:async e=>verified(e),onClassification:()=>true,onTrades:()=>{},onSignal:async()=>{}});
+  t.after(()=>worker.stop());worker.start();const base=preview();
+  const event=(chain:'bsc'|'solana'|'robinhood',index:number,verdict:FastWalletEvent['verdict']='review_activity'):FastWalletEvent=>({
+    ...base,chain,verdict,wallet:'0x'+(index+100).toString(16).padStart(40,'0'),txHash:'0x'+(index+1000).toString(16).padStart(64,'0')});
+  for(let index=0;index<64;index++)worker.enqueue(event('bsc',index));
+  assert.equal(worker.status().queued,64);assert.deepEqual(worker.status().admission.queuedByChain,{solana:0,bsc:64,robinhood:0});
+  worker.enqueue(event('robinhood',100));
+  worker.enqueue(event('robinhood',101,'priority_review'));
+  worker.enqueue(event('solana',102));
+  worker.enqueue(event('bsc',103));
+  const status=worker.status();
+  assert.equal(status.queued,64);assert.deepEqual(status.admission.queuedByChain,{solana:1,bsc:61,robinhood:2});
+  assert.equal(status.counts.evicted,3);assert.equal(status.counts.fairShareEvicted,1);assert.equal(status.counts.priorityEvicted,2);
+  assert.equal(status.counts.dropped,1);assert.equal(status.admission.rejectedByChain.bsc,1);
+  assert.deepEqual(status.admission.evictedByChain,{solana:0,bsc:3,robinhood:0});
+});
+test('prospective market profile groups retain priority and evict ordinary burst work',async t=>{
+  const worker=new WalletFastResearch({allowedChains:['bsc'],analysisChains:['solana'],now:()=>at+1000,ready:()=>false,
+    verify:async e=>verified(e),onClassification:()=>true,onTrades:()=>{},onSignal:async()=>{}});
+  t.after(()=>worker.stop());worker.start();const ordinary=preview();
+  for(let index=0;index<64;index++)worker.enqueue({...ordinary,verdict:'review_activity',wallet:'0x'+(index+100).toString(16).padStart(40,'0'),
+    txHash:'0x'+(index+1000).toString(16).padStart(64,'0')});
+  const marketEvent=(group:'market_visible_start'|'market_precursor_pattern',index:number)=>{const judge=new WalletFastJudge(()=>at,()=>5);
+    judge.update({at:new Date(at).toISOString(),validUntil:new Date(at+120000).toISOString(),targets:[
+      {chain:'bsc',wallet,groups:[group],profileUntil:new Date(at+60000).toISOString()}],tokens:[]});
+    return {...judge.judge('bsc','wallet:ignored',log({transactionHash:'0x'+index.toString(16).padStart(64,'0')}),meta())[0],
+      txHash:'0x'+index.toString(16).padStart(64,'0')};};
+  const visible=marketEvent('market_visible_start',9001),precursor=marketEvent('market_precursor_pattern',9002);
+  assert.equal(visible.verdict,'priority_review');assert.equal(precursor.verdict,'priority_review');
+  worker.enqueue(visible);worker.enqueue(precursor);const status=worker.status();
+  assert.equal(status.queued,64);assert.equal(status.counts.priorityEvicted,2);assert.equal(status.counts.evicted,2);
+});
+test('Solana receipt verification runs before an older high-profile EVM event',async t=>{
+  const order:string[]=[];const worker=new WalletFastResearch({allowedChains:['solana','bsc'],analysisChains:['solana'],now:()=>at+1000,ready:()=>false,
+    verify:async e=>{order.push(e.chain);return verified(e,'transfer');},onClassification:()=>true,onTrades:()=>{},onSignal:async()=>{}});
+  t.after(()=>worker.stop());worker.start();const base=preview();
+  worker.enqueue({...base,verdict:'priority_review'});
+  worker.enqueue({...base,chain:'solana',wallet:sol,txHash:sig,verdict:'review_activity'});
+  await worker.runOnce();assert.deepEqual(order,['solana']);
 });
 test('transfers, failures and unknown unsupported actions do not enter trade metrics or repeat vendor queries',async t=>{
   for(const kind of ['received_purchase','distribution','transfer','self_transfer','approval','liquidity','wrap','failed','no_change','unknown'] as const){

@@ -88,6 +88,34 @@ test('status recent-window count uses the chain and signal-time covering index',
   }finally{await f.close();}
 });
 
+test('active forward-target selection starts from the bounded target index instead of scanning all tokens',async()=>{
+  const f=fixture({allowedChains:['solana']});
+  try {
+    const observer=f.create();observer.trackForwardTarget(forwardSnapshot({
+      chain:'solana',address:'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263',
+    }));
+    const db=new DatabaseSync(f.options.database,{readOnly:true});try {
+      const plan=db.prepare(`EXPLAIN QUERY PLAN WITH active_targets AS MATERIALIZED (
+        SELECT chain AS target_chain,address AS target_address,MIN(trigger_at) AS forward_trigger_at
+        FROM meme_forward_targets
+        WHERE chain IN (?) AND until_at>?
+        GROUP BY chain,address
+      )
+        SELECT chain,address,last_signal_at,first_seen_at,market_attempt_at,last_sample_at,catalyst_attempt_at,
+          fallback_attempt_at,json_extract(signal,'$.source'),json_extract(catalyst,'$.status'),
+          json_extract(catalyst,'$.expiresAt'),catalyst IS NULL,1 AS forward_target,t.forward_trigger_at
+        FROM active_targets t JOIN meme_tokens
+          ON meme_tokens.chain=t.target_chain AND meme_tokens.address=t.target_address
+        ORDER BY COALESCE(market_attempt_at,''),COALESCE(last_sample_at,''),t.forward_trigger_at,chain,address LIMIT ?`)
+        .all('solana',at(),180).map(row=>String(row.detail)).join(' ');
+      assert.match(plan,/meme_forward_targets_chain_active \(chain=\? AND until_at>\?\)/);
+      assert.match(plan,/sqlite_autoindex_meme_tokens_1 \(chain=\? AND address=\?\)/);
+      assert.doesNotMatch(plan,/meme_tokens_chain_signal/);
+    }finally{db.close();}
+    assert.equal(observer.status().active,1);
+  }finally{await f.close();}
+});
+
 test('runtime status remains a database-free scalar snapshot for HTTP composition',async()=>{
   const f=fixture();try {
     const observer=f.create();observer.register(signal());

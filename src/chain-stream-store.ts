@@ -4,6 +4,7 @@ import {dirname} from 'node:path';
 import {createHash} from 'node:crypto';
 import bs58 from 'bs58';
 import type {Chain} from './types.js';
+import {configureResearchWal} from './research-sqlite.js';
 
 export const object=(v:unknown):v is Record<string,any>=>!!v&&typeof v==='object'&&!Array.isArray(v);
 export function chainAddress(chain:Chain,v:unknown):string|undefined {
@@ -66,8 +67,8 @@ export class ChainStreamStore {
     if(!Number.isSafeInteger(maxBytes)||maxBytes<=0)throw new Error('CHAIN_STORE_LIMIT_INVALID');
     if(path!==':memory:')mkdirSync(dirname(path),{recursive:true,mode:0o700});
     this.db=new DatabaseSync(path);if(path!==':memory:')chmodSync(path,0o600);
-    this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA wal_autocheckpoint=128;
-      CREATE TABLE IF NOT EXISTS chain_events(id TEXT PRIMARY KEY,chain TEXT NOT NULL,wallet TEXT NOT NULL,observed_at TEXT NOT NULL,data TEXT NOT NULL);
+    configureResearchWal(this.db,{busyTimeoutMs:5000,autoCheckpointPages:128});
+    this.db.exec(`CREATE TABLE IF NOT EXISTS chain_events(id TEXT PRIMARY KEY,chain TEXT NOT NULL,wallet TEXT NOT NULL,observed_at TEXT NOT NULL,data TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS chain_events_recent ON chain_events(observed_at DESC);
       CREATE INDEX IF NOT EXISTS chain_events_wallet ON chain_events(chain,wallet,observed_at);
       CREATE TABLE IF NOT EXISTS chain_cursors(key TEXT PRIMARY KEY,value TEXT NOT NULL);

@@ -36,6 +36,17 @@ function fixture(){
     close:()=>{for(const r of readers)r.close();for(const w of workers)w.close();meme.close();sources.close();history.close();rmSync(dir,{recursive:true,force:true});}};
 }
 
+test('derived rank stores use WAL NORMAL without weakening any execution ledger',()=>{
+  const f=fixture();try {const worker=f.create(),raw=worker as unknown as {db:DatabaseSync;walletPages?:DatabaseSync};
+    for(const db of [raw.db,raw.walletPages])if(db){
+      assert.equal(db.prepare('PRAGMA journal_mode').get()!.journal_mode,'wal');
+      assert.equal(db.prepare('PRAGMA synchronous').get()!.synchronous,1);
+      assert.equal(db.prepare('PRAGMA busy_timeout').get()!.timeout,1000);
+      assert.equal(db.prepare('PRAGMA wal_autocheckpoint').get()!.wal_autocheckpoint,64);
+    }
+  }finally{f.close();}
+});
+
 test('rank research separates early transaction references, later backfills and supplier holding-start claims',()=>{
   const f=fixture();try{
     f.rank(60,900,3);f.rank(90,900,1);f.buy(1,40,45);f.buy(2,30,95);f.profit(1);f.profit(2,'-10','40','30');f.profit(3,'100','0','100');f.post();

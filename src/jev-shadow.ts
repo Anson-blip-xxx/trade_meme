@@ -1,9 +1,10 @@
 import {DatabaseSync} from 'node:sqlite';
-import {mkdirSync,chmodSync} from 'node:fs';
+import {mkdirSync,chmodSync,statSync} from 'node:fs';
 import {dirname} from 'node:path';
 import {createHash,randomUUID} from 'node:crypto';
 import {performance} from 'node:perf_hooks';
 import {buildJevRequest,parseJevResponse,JEV_MODEL,JEV_RUBRIC_VERSION,type JevInput,type JevResult} from './jev-input.js';
+import {configureResearchWal} from './research-sqlite.js';
 import type {Chain} from './types.js';
 
 export interface JevShadowOptions {
@@ -54,6 +55,10 @@ const nextDay=(at:number)=>Date.parse(`${day(at)}T00:00:00+08:00`)+86_400_000;
 const finite=(v:unknown):v is number=>typeof v==='number'&&Number.isFinite(v);
 const coded=(code:string)=>Object.assign(new Error(code),{code});
 const tokenKey=(input:JevInput)=>`${input.token.chain}:${input.token.address}`;
+const physicalBytes=(path:string,db?:DatabaseSync)=>{
+  if(path===':memory:')return db?Number(db.prepare('PRAGMA page_count').get()!.page_count)*Number(db.prepare('PRAGMA page_size').get()!.page_size):0;
+  return [path,path+'-wal',path+'-shm'].reduce((sum,file)=>{try{return sum+statSync(file).size;}catch{return sum;}},0);
+};
 const emptyComparison=(input:JevInput):JevComparison=>({eligible:input.baseline.hardChecksPassed&&input.baseline.decision==='BUY_CANDIDATE',
   selected:null,sampleCount:0,method:'observed_price_gross',horizons:{'5':{status:'pending'},'15':{status:'pending'},'60':{status:'pending'}}});
 
@@ -83,8 +88,8 @@ export class JevShadow {
       this.db=new DatabaseSync(options.database);
       if(options.database!==':memory:')chmodSync(options.database,0o600);
       const pageSize=Number(this.db.prepare('PRAGMA page_size').get()!.page_size);
-      // DELETE journaling bounds disk usage without an ever-growing WAL sidecar.
-      this.db.exec(`PRAGMA journal_mode=DELETE; PRAGMA busy_timeout=50; PRAGMA max_page_count=${Math.floor(options.maxBytes/pageSize)};
+      configureResearchWal(this.db,{busyTimeoutMs:50,autoCheckpointPages:32,journalSizeLimitBytes:4*1024*1024});
+      this.db.exec(`PRAGMA max_page_count=${Math.floor(options.maxBytes/pageSize)};
         CREATE TABLE IF NOT EXISTS jev_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS jev_results(id TEXT PRIMARY KEY,report_id TEXT NOT NULL,chain TEXT NOT NULL,address TEXT NOT NULL,name TEXT,
           input_hash TEXT NOT NULL,as_of TEXT NOT NULL,received_at TEXT NOT NULL,completed_at TEXT,latency_ms REAL,status TEXT NOT NULL,
@@ -356,7 +361,7 @@ export class JevShadow {
         usedBytes=aggregate.usedBytes;Object.assign(counts,aggregate.counts);Object.assign(comparison,aggregate.comparison);
         comparison.horizons=aggregate.comparison.horizons.map(row=>({...row}));
       } else if(this.db&&aggregate===undefined){
-        usedBytes=Number(this.db.prepare('PRAGMA page_count').get()!.page_count)*Number(this.db.prepare('PRAGMA page_size').get()!.page_size);
+        usedBytes=physicalBytes(this.options.database,this.db);
         for(const row of this.db.prepare('SELECT status,count(*) AS n FROM jev_results GROUP BY status').all()){
           counts.total+=Number(row.n);if(row.status==='available'||row.status==='unavailable'||row.status==='pending')counts[row.status]+=Number(row.n);
         }

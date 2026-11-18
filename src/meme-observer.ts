@@ -17,6 +17,7 @@ import {archiveMemePrice,backfillMemePriceArchive,initializeMemePriceArchive,MEM
   memePriceArchiveCapacity,memePriceArchiveDeletionCeiling,pruneMemePriceArchive,
   type MemePriceArchiveCapacity} from './meme-price-archive.js';
 import type {ThirdSignalNotificationSnapshot} from './third-signal-strategy.js';
+import {configureResearchWal} from './research-sqlite.js';
 
 type Token=Signal['token'];
 type Row=Record<string,any>;
@@ -130,9 +131,8 @@ export class MemeObserver {
     if(options.database!==':memory:')mkdirSync(dirname(options.database),{recursive:true,mode:0o700});
     this.db=new DatabaseSync(options.database);
     const pageSize=Number(this.db.prepare('PRAGMA page_size').get()!.page_size);
-    this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=1500; PRAGMA wal_autocheckpoint=16; PRAGMA journal_size_limit=4194304;
-      PRAGMA max_page_count=${Math.floor(maxBytes/pageSize)}`);
-    this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=1500; PRAGMA wal_autocheckpoint=16; PRAGMA journal_size_limit=4194304;
+    configureResearchWal(this.db,{busyTimeoutMs:1500,autoCheckpointPages:16,journalSizeLimitBytes:4*1024*1024});
+    this.db.exec(`PRAGMA max_page_count=${Math.floor(maxBytes/pageSize)};
       CREATE TABLE IF NOT EXISTS meme_tokens(chain TEXT,address TEXT,first_seen_at TEXT NOT NULL,last_signal_at TEXT NOT NULL,
         signal TEXT NOT NULL,name TEXT,symbol TEXT,market_attempt_at TEXT,fallback_attempt_at TEXT,catalyst_attempt_at TEXT,last_sample_at TEXT,
         sample_count INTEGER NOT NULL DEFAULT 0,market TEXT,assessment TEXT,catalyst TEXT,social_context TEXT,wallet_context TEXT,gate TEXT,error TEXT,
@@ -165,6 +165,7 @@ export class MemeObserver {
         PRIMARY KEY(run_id,source,chain,address,window_id,ordinal));
       CREATE INDEX IF NOT EXISTS meme_forward_targets_active ON meme_forward_targets(until_at,chain,address);
       CREATE INDEX IF NOT EXISTS meme_forward_targets_token ON meme_forward_targets(chain,address,until_at);
+      CREATE INDEX IF NOT EXISTS meme_forward_targets_chain_active ON meme_forward_targets(chain,until_at,address,trigger_at);
       CREATE TABLE IF NOT EXISTS meme_notification_windows(source TEXT NOT NULL CHECK(source IN ('debot','ave')),
         chain TEXT NOT NULL,address TEXT NOT NULL,window_id TEXT NOT NULL,first_at TEXT NOT NULL,last_at TEXT NOT NULL,
         count INTEGER NOT NULL CHECK(count>=1),PRIMARY KEY(source,chain,address));
@@ -184,7 +185,11 @@ export class MemeObserver {
     // backfill away from the signal event loop. In-memory tests stay inline.
     if(options.database!==':memory:'){
       this.db.exec('PRAGMA wal_autocheckpoint=0');
-      this.maintenance=new MemeMaintenanceRunner({database:options.database,maxBytes:this.maxBytes,reclaimedSnapshots:this.reclaimedSnapshots});
+      this.maintenance=new MemeMaintenanceRunner({database:options.database,maxBytes:this.maxBytes,reclaimedSnapshots:this.reclaimedSnapshots,
+        // Worker data cannot carry a clock function. Preserve an explicitly
+        // injected observer clock as a serializable instant; production omits
+        // `now` and the worker continues to use wall time.
+        ...(options.now?{nowMs:this.now().getTime()}: {})});
       this.maintenance.start();
     }
   }
@@ -256,12 +261,19 @@ export class MemeObserver {
     // Outcome targets survive the ordinary two-hour signal window. Select each
     // token once even when both N3 and N4 are active, with the longest-waiting
     // quote first. These rows always consume the front of maxActive.
-    const targets=this.db.prepare(`SELECT ${samplingFields},1 AS forward_target,
-      (SELECT MIN(t.trigger_at) FROM meme_forward_targets t WHERE t.chain=meme_tokens.chain AND t.address=meme_tokens.address AND t.until_at>?) AS forward_trigger_at
-      FROM meme_tokens WHERE chain IN (${chainSlots}) AND EXISTS (SELECT 1 FROM meme_forward_targets t
-        WHERE t.chain=meme_tokens.chain AND t.address=meme_tokens.address AND t.until_at>?)
-      ORDER BY COALESCE(market_attempt_at,''),COALESCE(last_sample_at,''),forward_trigger_at,chain,address LIMIT ?`)
-      .all(nowIso,...this.chains,nowIso,this.maxActive);
+    // Drive this query from the small, time-bounded target set. Starting from
+    // meme_tokens made SQLite probe the target index once for every token on
+    // the chain (136k rows in production), even when only dozens were active.
+    const targets=this.db.prepare(`WITH active_targets AS MATERIALIZED (
+      SELECT chain AS target_chain,address AS target_address,MIN(trigger_at) AS forward_trigger_at
+      FROM meme_forward_targets
+      WHERE chain IN (${chainSlots}) AND until_at>?
+      GROUP BY chain,address
+    )
+      SELECT ${samplingFields},1 AS forward_target,t.forward_trigger_at
+      FROM active_targets t JOIN meme_tokens ON meme_tokens.chain=t.target_chain AND meme_tokens.address=t.target_address
+      ORDER BY COALESCE(market_attempt_at,''),COALESCE(last_sample_at,''),t.forward_trigger_at,chain,address LIMIT ?`)
+      .all(...this.chains,nowIso,this.maxActive);
     if(targets.length>=this.maxActive)return targets;
     // Filter before every bounded pool, so disabled-chain history cannot crowd
     // active chains out of either fair rotation or deficit-priority research.

@@ -100,6 +100,12 @@ test('Ave wallet nominations survive safety rejection independently of research 
     runtime.aveScanner!.acceptPage(page);
     await eventually(()=>runtime.walletHistory!.stats().nominations===5);
     assert.equal(runtime.walletHistory!.stats().nominations,5);assert.equal(runtime.walletHistory!.stats().events,0);
+    // Nominations are delivered on the priority path. Analysis deliberately
+    // waits for the independent durable source-observation ACK, which can take
+    // more than one event-loop turn when the full test suite is busy.
+    const aveDb=new DatabaseSync(env.AVE_SIGNALS_DATABASE_PATH,{readOnly:true});
+    try {await eventually(()=>Number(aveDb.prepare('SELECT count(*) AS n FROM ave_observation_inbox').get()!.n)===0);}
+    finally {aveDb.close();}
     await runtime.aveScanner!.dispatchOnce();assert.equal(runtime.archive!.list().items[0].decision,'REJECT');
     assert.equal(runtime.walletHistory!.stats().nominations,5);assert.equal(runtime.walletHistory!.stats().events,0);
     assert.equal(runtime.walletHistory!.stats().tokens,0);

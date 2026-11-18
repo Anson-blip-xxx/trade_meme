@@ -6,6 +6,7 @@ import {createHash} from 'node:crypto';
 import {isDeepStrictEqual} from 'node:util';
 import bs58 from 'bs58';
 import type {Chain} from './types.js';
+import {configureResearchWal} from './research-sqlite.js';
 
 type Row=Record<string,any>;
 type Token={chain:Chain;address:string};
@@ -164,7 +165,8 @@ export class TokenRankResearch {
     this.history=readonly(options.historyDatabase);
     if(options.database!==':memory:')mkdirSync(dirname(options.database),{recursive:true,mode:0o700});
     this.db=new DatabaseSync(options.database);if(options.database!==':memory:')chmodSync(options.database,0o600);
-    this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=1000; PRAGMA wal_autocheckpoint=64;
+    configureResearchWal(this.db,{busyTimeoutMs:1000,autoCheckpointPages:64});
+    this.db.exec(`
       CREATE TABLE IF NOT EXISTS tr_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS tr_tokens(chain TEXT,address TEXT,registered_at TEXT,first_rank TEXT,latest_rank TEXT,
         rank_count INTEGER DEFAULT 0,dirty INTEGER DEFAULT 1,refreshed_at TEXT,input_hash TEXT,PRIMARY KEY(chain,address));
@@ -253,7 +255,8 @@ export class TokenRankResearch {
   private openWalletPages(){
     const path=walletPagePath(this.options.database);if(!path)return;
     this.walletPages=new DatabaseSync(path);chmodSync(path,0o600);
-    this.walletPages.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=1000; PRAGMA wal_autocheckpoint=64;
+    configureResearchWal(this.walletPages,{busyTimeoutMs:1000,autoCheckpointPages:64});
+    this.walletPages.exec(`
       CREATE TABLE IF NOT EXISTS tr_wallet_page_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS tr_wallet_latest(chain TEXT NOT NULL,address TEXT NOT NULL,version_id INTEGER NOT NULL,
         computed_at TEXT NOT NULL,registered_at TEXT NOT NULL,early_count INTEGER,realized REAL,PRIMARY KEY(chain,address));

@@ -68,6 +68,23 @@ test('a scan archive failure does not suppress durable wallet evidence or alter 
   } finally {await runtime.close();rmSync(dir,{recursive:true,force:true});}
 });
 
+test('completed wallet research archives only after the entry decision',async()=>{
+  const dir=mkdtempSync(join(tmpdir(),'wallet-runtime-entry-order-'));
+  const cfg=readConfig({DASHBOARD_ENABLED:'false',WALLET_RESEARCH_ENABLED:'true',WALLET_PROFILES_ENABLED:'false',
+    WALLET_HISTORY_DATABASE_PATH:join(dir,'wallets.sqlite'),ORDERS_DATABASE_PATH:join(dir,'orders.sqlite'),ENTRY_MODE:'off'});
+  const runtime=createRuntime(cfg),order:string[]=[];
+  try {
+    runtime.providers.provenance=async()=>pass();runtime.providers.safety=async()=>pass();
+    runtime.providers.evidence=async()=>[];runtime.providers.narrative=async()=>narrative();
+    runtime.providers.research=undefined;runtime.providers.vendor=undefined;
+    runtime.entry.consider=async()=>{order.push('entry');return {status:'skipped',reason:'ENTRY_DISABLED'};};
+    runtime.walletHistory!.captureReport=()=>{order.push('wallet_archive');};
+    const dispatch=Reflect.get(runtime.scanner,'onSignal') as (value:ReturnType<typeof signal>)=>Promise<void>;
+    await dispatch(signal({sourceEventId:'wallet-entry-before-research'}));
+    assert.deepEqual(order,['entry','wallet_archive']);
+  } finally {await runtime.close();rmSync(dir,{recursive:true,force:true});}
+});
+
 test('persistent watch queue operates without dashboard and retains original expiry across runtime restart',async()=>{
   const dir=mkdtempSync(join(tmpdir(),'watch-runtime-'));
   const cfg=readConfig({DASHBOARD_ENABLED:'false',WATCH_RECHECK_ENABLED:'true',SCAN_DATABASE_PATH:join(dir,'scans.sqlite'),

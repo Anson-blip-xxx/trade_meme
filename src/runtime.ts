@@ -26,12 +26,13 @@ import {ChainMonitor} from './chain-monitor.js';
 import {PriceTracker} from './price-tracker.js';
 import {DashboardBalances,dashboardOrders,dashboardSettings} from './dashboard-data.js';
 import {WalletHistory} from './wallet-history.js';
+import {WalletPriceWriterRunner} from './wallet-price-writer.js';
 import {WalletHistoryStatsRunner} from './wallet-history-stats.js';
 import {WalletIndexRunner} from './wallet-index-runner.js';
 import {WalletExitPressureRunner} from './wallet-exit-pressure-runner.js';
 import {FollowupReviewRunner} from './followup-review-runner.js';
 import {loadBundledWalletResearchSeeds} from './wallet-research-seeds.js';
-import {WalletObserver} from './wallet-observer.js';
+import {WalletObserverRunner} from './wallet-observer-runner.js';
 import {WalletProfileRunner} from './wallet-profile-runner.js';
 import {WalletScreeningService} from './wallet-screening-service.js';
 import {SystemMonitor} from './system-monitor.js';
@@ -53,10 +54,10 @@ import {AveSessionClient} from './providers/ave-session.js';
 import {TokenRankResearchRunner} from './token-rank-runner.js';
 import {MarketPriceRouter} from './market-price-router.js';
 import type {Fetcher} from './http.js';
-import {WalletFastRunner} from './wallet-fast-runner.js';
+import {WalletFastRunner,type WalletFastSnapshotPhase} from './wallet-fast-runner.js';
 import {WalletFastResearch} from './wallet-fast-research.js';
 import {WalletActivityVerifier,type WalletActivity} from './wallet-activity.js';
-import {WalletActivityStore} from './wallet-activity-store.js';
+import {WalletFastPersistenceRunner} from './wallet-fast-persistence-runner.js';
 import {WalletFastTargets,mergePinnedWallets,type FastWalletEvent,type FastWalletSnapshot,type FastWalletTarget,type FastTokenCheck} from './wallet-fast.js';
 import {JevShadow,type JevShadowOptions} from './jev-shadow.js';
 import {JevStatusRunner} from './jev-status.js';
@@ -88,6 +89,8 @@ import {GmgnMarketDiscoveryScanner,GmgnMarketDiscoveryStore} from './gmgn-market
 import {LauncherCandidates} from './launcher-candidates.js';
 import {LauncherCandidateRefreshRunner} from './launcher-candidate-refresh-runner.js';
 import {LauncherRevalidator} from './launcher-revalidator.js';
+import {LauncherRealtimeWriterRunner} from './launcher-realtime-writer.js';
+import {LauncherCoverageWriterRunner} from './launcher-coverage-writer.js';
 
 export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;jevInvoke?:JevShadowOptions['invoke'];telegramFetcher?:typeof fetch;
   heldFetcher?:typeof fetch;entryFetcher?:typeof fetch;gmgnFetcher?:typeof fetch;
@@ -96,7 +99,8 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
   const backgroundGmgnEnabled=config.gmgnBackgroundResearchEnabled!==false;
   const backgroundGmgnPausedReason=backgroundGmgnEnabled?undefined:'GMGN_BACKGROUND_RESEARCH_DISABLED';
   let walletFast:WalletFastRunner|undefined,walletFastResearch:WalletFastResearch|undefined;
-  let walletActivity:WalletActivityStore|undefined,walletVerifier:WalletActivityVerifier|undefined;
+  let walletFastPersistence:WalletFastPersistenceRunner|undefined,walletVerifier:WalletActivityVerifier|undefined;
+  let launcherRealtimeWriter:LauncherRealtimeWriterRunner|undefined,launcherCoverageWriter:LauncherCoverageWriterRunner|undefined;
   if(!isPersistentOrderPath(config.ordersDatabase)) throw new Error('PERSISTENT_ORDER_DATABASE_REQUIRED');
   if(config.gmgnApiKey?.trim()==='gmgn_solbscbaseethmonadtron') throw new Error('GMGN_DEMO_KEY_TEST_ONLY');
   const sameDatabase=(a:string,b:string)=>{
@@ -208,13 +212,15 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
   const followupReview=archive?new FollowupReviewRunner({database:config.dashboard.archivePath,intervalMs:60_000}):undefined;
   if(config.watch.enabled)archive?.configureWatch({windowSec:config.watch.windowSec,intervalSec:config.watch.intervalSec,maxSignalAgeSec:config.maxSignalAgeSec});
   const walletHistory=config.walletResearch.enabled?new WalletHistory(config.walletResearch.database,{maxBytes:config.walletResearch.maxBytes}):undefined;
-  const walletStatsRunner=walletHistory?new WalletHistoryStatsRunner({database:config.walletResearch.database,
-    maxBytes:config.walletResearch.maxBytes}):undefined;
-  const walletIndexRunner=walletHistory?new WalletIndexRunner({database:config.walletResearch.database,
-    maxBytes:config.walletResearch.maxBytes}):undefined;
+  const walletPriceWriter=walletHistory&&backgroundGmgnEnabled?new WalletPriceWriterRunner({
+    database:config.walletResearch.database,maxBytes:config.walletResearch.maxBytes}):undefined;
   const fastWalletLimit=(chain:Chain)=>chain==='solana'?Math.min(30,config.chainStream.maxWallets):
     (config.walletFast?.evmMaxWallets??config.chainStream.maxWallets);
   const profileFastTargetLimits:Partial<Record<Chain,number>>={solana:fastWalletLimit('solana'),bsc:fastWalletLimit('bsc'),robinhood:fastWalletLimit('robinhood')};
+  const walletStatsRunner=walletHistory?new WalletHistoryStatsRunner({database:config.walletResearch.database,
+    maxBytes:config.walletResearch.maxBytes}):undefined;
+  const walletIndexRunner=walletHistory?new WalletIndexRunner({database:config.walletResearch.database,
+    maxBytes:config.walletResearch.maxBytes,fastTargetLimits:profileFastTargetLimits}):undefined;
   let walletSeedsError:string|undefined;
   if(walletHistory)try {walletHistory.importResearchSeeds(loadBundledWalletResearchSeeds());}
   catch {walletSeedsError='WALLET_RESEARCH_SEEDS_IMPORT_FAILED';}
@@ -224,7 +230,9 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
     ...(config.chainStream.enabled?{chainDatabase:config.chainStream.database}:{})}):undefined;
   const walletProfilesStatus=()=>walletProfiles?.status()??{enabled:false,running:false,ready:false};
   let launcherCandidates:LauncherCandidates|undefined,launcherRefresh:LauncherCandidateRefreshRunner|undefined,launcherRevalidator:LauncherRevalidator|undefined;
-  let launcherRefreshTimer:ReturnType<typeof setInterval>|undefined,launcherError:string|undefined;
+  let launcherRefreshTimer:ReturnType<typeof setInterval>|undefined,launcherError:string|undefined,launcherShutdownError:string|undefined,
+    walletPriceShutdownError:string|undefined,walletFastResearchShutdownError:string|undefined,walletFastPersistenceShutdownError:string|undefined,
+    walletObserverShutdownError:string|undefined,chainStreamShutdownError:string|undefined;
   const openLauncherCandidates=()=>{
     if(!config.launcherCandidates.enabled)return;
     if(!launcherCandidates){
@@ -234,6 +242,10 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       try {launcherCandidates=new LauncherCandidates({...config.launcherCandidates,profileDatabase:config.walletProfiles.database,busyTimeoutMs:25});}
       catch {launcherError='LAUNCHER_CANDIDATE_STORE_OPEN_FAILED';return;}
     }
+    if(config.walletFast?.enabled&&config.chainStream.enabled&&!launcherCoverageWriter)try {
+      launcherCoverageWriter=new LauncherCoverageWriterRunner({...config.launcherCandidates,
+        profileDatabase:config.walletProfiles.database,busyTimeoutMs:100});
+    }catch {launcherError='LAUNCHER_COVERAGE_WRITER_OPEN_FAILED';}
     if(!launcherRefresh)try {launcherRefresh=new LauncherCandidateRefreshRunner({...config.launcherCandidates,
       profileDatabase:config.walletProfiles.database,intervalMs:config.launcherCandidates.refreshIntervalSec*1000});}
     catch {launcherError='LAUNCHER_CANDIDATE_REFRESH_RUNNER_FAILED';}
@@ -245,13 +257,14 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
           recordResult:result=>launcherCandidates?.recordRevalidation(result)??false,
           onActivity:activity=>{if(activity.eventAt)launcherCandidates?.observeActivity(activity);},
         }});}catch {launcherError='LAUNCHER_REVALIDATOR_START_FAILED';}
-    if(launcherRefresh&&(!endpoint||launcherRevalidator))launcherError=undefined;
+    if(launcherRefresh&&(!endpoint||launcherRevalidator)&&(!config.walletFast?.enabled||launcherCoverageWriter))launcherError=undefined;
   };
   const launcherCandidatesStatus=(details=true)=>{
-    const revalidation=launcherRevalidator?.status(),revalidator=details?revalidation:revalidation?((({recent:_,...rest})=>rest)(revalidation)):undefined;
-    return {...(launcherCandidates?.status()??{ready:false,records:0,cap:config.launcherCandidates.cap}),
+    const refresh=launcherRefresh?.status(),revalidation=launcherRevalidator?.status(),revalidator=details?revalidation:revalidation?((({recent:_,...rest})=>rest)(revalidation)):undefined;
+    return {...(refresh?.result??{ready:false,records:0,cap:config.launcherCandidates.cap}),
       enabled:config.launcherCandidates.enabled,storeReady:!!launcherCandidates,refreshScheduled:!!launcherRefreshTimer,
-      running:!!launcherCandidates&&launcherRefresh?.status().running===true,refresh:launcherRefresh?.status(),revalidator,
+      running:!!launcherCandidates&&refresh?.running===true,refresh,revalidator,
+      realtimeWriter:launcherRealtimeWriter?.status(),coverageWriter:launcherCoverageWriter?.status(),
       ...(launcherError?{runtimeError:launcherError}:{})};
   };
   const walletScreening=walletHistory&&walletProfiles&&config.walletScreening.enabled?new WalletScreeningService(walletHistory,walletProfiles.reader,
@@ -265,7 +278,8 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
   let entryAuditError:string|undefined;
   const exitShadow=config.exitShadow.enabled?new ExitShadow(config.exitShadow.database,config.exitShadow):undefined;
   const walletExitPressure=exitShadow&&walletHistory?new WalletExitPressureRunner({database:config.walletResearch.database}):undefined;
-  const walletObserver=walletHistory&&backgroundGmgnEnabled?new WalletObserver({history:walletHistory,client,config,chains:config.scannerChains,
+  const walletObserver=walletHistory&&backgroundGmgnEnabled?new WalletObserverRunner({database:config.walletResearch.database,
+    maxBytes:config.walletResearch.maxBytes,priceWriter:walletPriceWriter,client,chains:config.scannerChains,
     intervalMs:config.walletResearch.intervalSec*1000,maxRequestsPerCycle:config.walletResearch.maxRequestsPerCycle}):undefined;
   let archiveCaptureError:string|undefined,walletCaptureError:string|undefined;
   let memeCaptureError:string|undefined;
@@ -388,7 +402,20 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
                     `discovery_${candidate.feed}_first_seen_wallets`);
       }});
   }
+  const fastTokenCache=new Map<string,FastTokenCheck&{evaluatedAt:string}>();
+  const cacheFastToken=(item:Stored)=>{
+    if(item.status!=='completed'||!item.report)return;const report=item.report,key=`${report.signal.token.chain}:${report.signal.token.address}`,
+      current=fastTokenCache.get(key);
+    if(current&&current.evaluatedAt>report.evaluatedAt)return;
+    const value:FastTokenCheck&{evaluatedAt:string}={...report.signal.token,
+      state:report.safety.status==='fail'||report.provenance.status==='fail'?'fail':
+        report.safety.status==='pass'&&report.provenance.status==='pass'?'pass':'unknown',
+      validUntil:report.validUntil,evaluatedAt:report.evaluatedAt};
+    fastTokenCache.delete(key);fastTokenCache.set(key,value);
+    while(fastTokenCache.size>500)fastTokenCache.delete(fastTokenCache.keys().next().value!);
+  };
   const captureStoreChange=(item:Stored)=>{
+    cacheFastToken(item);
     // The two research archives are independent observers; a failed archive must
     // neither suppress the other nor roll back the signal / affect order submission.
     if(archive)try {archive.capture(item);archiveCaptureError=undefined;}catch {archiveCaptureError='SCAN_ARCHIVE_WRITE_FAILED';}
@@ -977,7 +1004,8 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
         const {activeWallets,...summary}=row;return {...summary,activeWalletCount:Array.isArray(activeWallets)?activeWallets.length:0};
       }):rest.chains}))(fast));
     const research=walletFastResearch?.status(),researchStatus=!research||details?research:((({recent:_,...rest})=>rest)(research));
-    const activity=walletActivity?.status(),activityStatus=!activity||details?activity:((({recent:_,...rest})=>rest)(activity));
+    const persistence=walletFastPersistence?.status(),activity=persistence?.activity,
+      activityStatus=!activity||details?activity:((({recent:_,...rest})=>rest)(activity));
     return {...monitorStatus,
     walletFast:walletFast?{...fastStatus,research:{...researchStatus,
       // Compatibility fields describe broad background discovery only. The
@@ -988,7 +1016,8 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       walletTriggeredOnDemandResearchBlockedReason:walletTriggeredResearchReady()?undefined:closed?'SERVICE_STOPPING':
         !config.gmgnApiKey?.trim()?'GMGN_API_KEY_MISSING':client.cooldownUntil>Date.now()?'GMGN_RATE_LIMITED':
           active>=2?'RESEARCH_BUSY':scanner.getStatus().inFlight?'SCANNER_BUSY':'WALLET_ON_DEMAND_RESEARCH_UNAVAILABLE'},
-      activity:activityStatus}:{enabled:false}};}
+      activity:activityStatus,persistence:persistence?{...persistence,activity:activityStatus}:undefined,
+      launcherLiveness:launcherRealtimeWriter?.status(),launcherCoverage:launcherCoverageWriter?.status()}:{enabled:false}};}
     catch{return {enabled:config.chainStream.enabled,mode:'observation_only',captureError:'CHAIN_STATUS_READ_FAILED',chains:[],recentEvents:[]};}};
   const tracking=archive?new PriceTracker({archive:{
     pendingTokens:(limit,now)=>mergeTokens(positionPriceTokens(),(exitShadow?.trackingTokens(180,now)??[]).filter(t=>acceptsChain(t.chain)),
@@ -1105,54 +1134,64 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
     const fastTargets=new WalletFastTargets();
     const activityPath=config.walletFast.database??resolve(dirname(config.walletResearch.database),'wallet-activity.sqlite');
     if([...protectedPaths,config.database].some(path=>path&&sameDatabase(path,activityPath)))throw new Error('WALLET_ACTIVITY_DATABASE_MUST_BE_SEPARATE');
-    walletActivity=new WalletActivityStore(activityPath,config.walletFast.maxBytes);walletVerifier=new WalletActivityVerifier(config.chainStream.endpoints);
+    walletVerifier=new WalletActivityVerifier(config.chainStream.endpoints);
+    walletFastPersistence=new WalletFastPersistenceRunner({activityDatabase:activityPath,
+      activityMaxBytes:config.walletFast.maxBytes??128*1024*1024,historyDatabase:config.walletResearch.database,
+      historyMaxBytes:config.walletResearch.maxBytes,...(config.launcherCandidates.enabled?{launcher:{
+        database:config.launcherCandidates.database,profileDatabase:config.walletProfiles.database,
+        cap:config.launcherCandidates.cap,maxBytes:config.launcherCandidates.maxBytes,
+        freshAfterSec:config.launcherCandidates.freshAfterSec,liveAfterSec:config.launcherCandidates.liveAfterSec,
+        coverageAfterSec:config.launcherCandidates.coverageAfterSec,busyTimeoutMs:100}}:{})});
+    if(config.launcherCandidates.enabled)launcherRealtimeWriter=new LauncherRealtimeWriterRunner({...config.launcherCandidates,
+      profileDatabase:config.walletProfiles.database,busyTimeoutMs:100,targetLimits:fastWalletCapacityByChain,
+      capacity:1000,batchSize:500,delayMs:25});
     walletFastResearch=new WalletFastResearch({
       allowedChains:Object.keys(config.chainStream.endpoints) as Chain[],analysisChains:config.scannerChains,
       // Chain receipt classification and durable buy/sell observations continue
       // independently. A confirmed buy is an explicit on-demand trigger even
       // when broad GMGN discovery is paused by focused mode.
       ready:walletTriggeredResearchReady,
-      verify:dependencies.walletActivityVerify??(event=>walletVerifier!.verify(event)),onClassification:result=>{
-        let archived=false,launcher=false,history=false;
-        try {archived=walletActivity!.record(result);}catch{/* Candidate capture and trade history must remain independent. */}
-        if(result.classification==='retracted'){
-          try {history=walletHistory.retractVerifiedTrade({chain:result.chain,wallet:result.wallet,txHash:result.txHash,checkedAt:result.checkedAt});}
-          catch{/* Durable classifier capture remains independent from derived wallet history. */}
-          try {launcher=launcherCandidates?.retractActivity({chain:result.chain,wallet:result.wallet,txHash:result.txHash,checkedAt:result.checkedAt})===true;}
-          catch{/* Optional launcher storage cannot block classification. */}
-        }else if(result.eventAt)try {launcher=launcherCandidates?.observeActivity(result)===true;}catch{/* Optional launcher storage cannot block classification. */}
-        return archived||launcher||history;
-      },
-      onTrades:trades=>walletHistory.recordTrades(trades),onSignal});
+      verify:dependencies.walletActivityVerify??(event=>walletVerifier!.verify(event)),
+      onClassification:result=>{
+        // Keep the exposed research runner usable in isolation (tests and
+        // maintenance probes may start it without starting the whole runtime).
+        // Production start() is idempotent and still starts this worker first.
+        walletFastPersistence!.start();return walletFastPersistence!.persist(result);
+      },onTrades:()=>{},onSignal});
     // Candidate liveness is chain-wide research. scannerChains still gates signal
     // analysis and trading, but must not hide configured chains from RPC ACKs.
     walletFast=new WalletFastRunner({endpoints:config.chainStream.endpoints,maxWallets:streamWalletCapacity,
       maxWalletsByChain:fastWalletCapacityByChain,
-      onEvent:event=>{walletFastResearch?.enqueue(event);
-        try {launcherCandidates?.observeRealtime({chain:event.chain,wallet:event.wallet,observedAt:event.receivedAt,source:'wallet_fast'});}
-        catch{/* Optional liveness storage cannot block the durable classification queue. */}},
-      onCoverageBatch:updates=>{launcherCandidates?.replaceCoverageBatch(updates);},snapshot:()=>{
+      onEvent:event=>{
+        // Admission is synchronous and bounded. Retractions must enter the
+        // research drain before the socket runner can finish its own shutdown.
+        walletFastResearch?.enqueue(event);
+        // Liveness is a latest-per-wallet research field. Coalescing it off the
+        // MessagePort callback keeps the worker ACK independent of SQLite IO.
+        launcherRealtimeWriter?.enqueue({chain:event.chain,wallet:event.wallet,observedAt:event.receivedAt,source:'wallet_fast'});},
+      onCoverageBatch:updates=>{if(config.launcherCandidates.enabled&&!launcherCoverageWriter?.enqueue(updates))
+        throw new Error('LAUNCHER_COVERAGE_ENQUEUE_FAILED');},snapshot:timing=>{
+        const measured=<T>(phase:WalletFastSnapshotPhase,work:()=>T):T=>timing?timing.measure(phase,work):work();
         const now=Date.now(),targets:FastWalletTarget[]=[],tokens:FastTokenCheck[]=[];
         for(const chain of Object.keys(config.chainStream.endpoints) as Chain[]){
           const limit=fastWalletLimit(chain),addresses=new Set<string>();
-          for(const address of launcherCandidates?.streamTargets(chain,limit)??[])addresses.add(address);
+          const launcher=measured('launcherTargets',()=>launcherRealtimeWriter?.targetSnapshot(chain,limit)??
+            {targets:[],membership:new Set<string>()});
+          for(const address of launcher.targets)addresses.add(address);
           // Reserve room for multiple research cohorts rather than only the largest reported profits.
-          for(const address of walletProfiles?.fastTargetAddresses(chain,limit)??[])addresses.add(address);
-          for(const address of walletHistory.streamWalletTargets(chain,limit))addresses.add(address);
-          const selected=mergePinnedWallets(chain,fastTargets.select(chain,[...addresses],limit,now),config.chainStream.pinnedWallets?.[chain]),
-            profiles=new Map((walletProfiles?.fastMetadata(selected.map(address=>({chain,address})))??[]).map(p=>[p.address,p])),
-            launchers=new Set(launcherCandidates?.addresses(chain)??[]);
-          for(const wallet of selected){
+          for(const address of measured('profileMetadata',()=>walletProfiles?.fastTargetAddresses(chain,limit)??[]))addresses.add(address);
+          for(const address of measured('walletHistoryTargets',()=>walletIndexRunner?.fastTargetAddresses(chain,limit)??[]))addresses.add(address);
+          const selected=measured('targetAssembly',()=>mergePinnedWallets(chain,fastTargets.select(chain,[...addresses],limit,now),
+            config.chainStream.pinnedWallets?.[chain]));
+          const profiles=measured('profileMetadata',()=>new Map((walletProfiles?.fastMetadata(selected.map(address=>({chain,address})))??[])
+            .map(p=>[p.address,p])));
+          measured('targetAssembly',()=>{for(const wallet of selected){
             const p=profiles.get(wallet),groups:string[]=[...(p?.groups??[])];
-            if(launchers.has(wallet)&&!groups.includes('launcher_candidate'))groups.push('launcher_candidate');
+            if(launcher.membership.has(wallet)&&!groups.includes('launcher_candidate'))groups.push('launcher_candidate');
             targets.push({chain,wallet,groups,profileUntil:p?.freshUntil});
-          }
+          }});
         }
-        const cachedTokens=new Set<string>();
-        for(const item of store.list().slice(0,500).sort((a,b)=>(b.report?.evaluatedAt??'').localeCompare(a.report?.evaluatedAt??'')))if(item.report){const r=item.report;
-          const key=`${r.signal.token.chain}:${r.signal.token.address}`;if(cachedTokens.has(key))continue;cachedTokens.add(key);
-          tokens.push({...r.signal.token,state:r.safety.status==='fail'||r.provenance.status==='fail'?'fail':
-            r.safety.status==='pass'&&r.provenance.status==='pass'?'pass':'unknown',validUntil:r.validUntil});}
+        measured('storeTokens',()=>{for(const {evaluatedAt:_,...token} of fastTokenCache.values())tokens.push(token);});
         return {at:new Date(now).toISOString(),validUntil:new Date(now+120000).toISOString(),targets,tokens} satisfies FastWalletSnapshot;
       }});
   }
@@ -1252,14 +1291,17 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
   let reconcileTimer:ReturnType<typeof setInterval>|undefined;
   let debotSyncTimer:ReturnType<typeof setInterval>|undefined;
   const walletResearchStatus=()=>{
-      // This is an O(1) memory read. Large historical COUNT queries belong to
-      // the dedicated worker and must never run in the HTTP / stream loop.
+      // This performs only bounded in-memory reads. Large historical COUNT
+      // queries belong to dedicated workers and must never run in the HTTP loop.
       const stats=walletStatsRunner?.snapshot();
       const index=walletIndexRunner?.snapshot();
+      const pausedReason=!config.walletResearch.enabled?'WALLET_RESEARCH_DISABLED':
+        !backgroundGmgnEnabled?backgroundGmgnPausedReason:!config.gmgnApiKey?.trim()?'GMGN_API_KEY_MISSING':undefined;
       return {enabled:config.walletResearch.enabled,store:stats?.store,seedsError:walletSeedsError,
         statsComputedAt:stats?.computedAt,statsLastAttemptAt:stats?.lastAttemptAt,
         statsStale:stats?.stale??false,statsState:stats?.state??'disabled',statsError:stats?.error,statsWorker:stats?.worker,
-        observer:walletObserver?.getStatus()??{enabled:false,running:false,pausedReason:backgroundGmgnPausedReason},
+        observer:{...(walletObserver?.getStatus()??{enabled:false,running:false}),...(pausedReason?{pausedReason}:{})},
+        priceWriter:{...(walletPriceWriter?.status()??{state:'stopped',running:false,ready:false}),...(pausedReason?{pausedReason}:{})},
         profiles:walletProfilesStatus(),screening:walletScreening?{...walletScreening.status(),discoveryEnabled:backgroundGmgnEnabled}:undefined,
         localIndex:index??{running:false,inFlight:false,invalidationMs:0,invalidationProcessed:0,invalidationPending:0,coordinationMs:0,associationMs:0,restarts:0},
         captureError:walletCaptureError??index?.workerError??index?.invalidationError??index?.coordinationError??index?.associationError,
@@ -1337,7 +1379,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
     }catch{priceTargetError='PRICE_STREAM_TARGET_REFRESH_FAILED';}
   };
   sourceObservation?.start();
-  return {client,providers,store,orders,entry,dailyReview,scanner,debotScanner,debotStream,debotPublicFallback,debotAuth,archive,followupReview,tracking,priceRouter,walletHistory,walletIndexRunner,walletObserver,walletResearchStatus,walletAssociationsStatus,walletProfiles,walletProfilesStatus,launcherCandidates:()=>launcherCandidates,launcherCandidatesStatus,walletScreening,watchRechecker,exitShadow,chainMonitor,chainStreamStatus,walletFastResearch,memeObserver,sourceEvidence,sourceObservation,aveScanner,aveSession,tokenRankResearch,jevShadow,telegram,tradeNotifications,telegramStatus,heldMonitor,heldTracking,
+  return {client,providers,store,orders,entry,dailyReview,scanner,debotScanner,debotStream,debotPublicFallback,debotAuth,archive,followupReview,tracking,priceRouter,walletHistory,walletIndexRunner,walletObserver,walletPriceWriter,walletResearchStatus,walletAssociationsStatus,walletProfiles,walletProfilesStatus,launcherCandidates:()=>launcherCandidates,launcherCandidatesStatus,walletScreening,watchRechecker,exitShadow,chainMonitor,chainStreamStatus,walletFastResearch,memeObserver,sourceEvidence,sourceObservation,aveScanner,aveSession,tokenRankResearch,jevShadow,telegram,tradeNotifications,telegramStatus,heldMonitor,heldTracking,
     signalCounting,telegramControls,telegramPositions,manualClose,directSell,manualNativeBuy,telegramTokenCard,gmgnMarketScanner,
     gmgnMarketDiscovery,gmgnMarketDiscoveryStore,
     executionStatus:()=>{const counting=signalCounting.executionState();return {
@@ -1409,7 +1451,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       syncLiveLatencyPriority();
       openLauncherCandidates();launcherRefresh?.start();launcherRevalidator?.start();
       if(config.launcherCandidates.enabled&&!launcherRefreshTimer){launcherRefreshTimer=setInterval(()=>{
-        openLauncherCandidates();launcherRefresh?.start();launcherRevalidator?.start();
+        openLauncherCandidates();launcherRefresh?.start();launcherRevalidator?.start();launcherCoverageWriter?.start();
       },config.launcherCandidates.refreshIntervalSec*1000);launcherRefreshTimer.unref();}
       walletStatsRunner?.start();
       gmgnPlusRunner?.start();
@@ -1457,7 +1499,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
         if(closed||active>=4||!config.gmgnApiKey?.trim()||client.cooldownUntil>Date.now()||scanner.getStatus().inFlight)return false;
         await onSignal(signal);
       }:undefined);
-      if(config.gmgnApiKey?.trim())walletObserver?.start();
+      if(config.gmgnApiKey?.trim()){walletPriceWriter?.start();walletObserver?.start();}
       if(backgroundGmgnEnabled&&config.scannerEnabled&&config.gmgnApiKey?.trim()) scanner.start();
       debotScanner?.start();
       aveScanner?.start();
@@ -1475,10 +1517,15 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       // Start the low-latency worker after every synchronous startup hook has
       // returned. Otherwise chain notifications can sit in the main-thread
       // mailbox while large local indexes are still opening.
-      walletFastResearch?.start();walletFast?.start();
+      launcherCoverageWriter?.start();launcherRealtimeWriter?.start();walletFastPersistence?.start();walletFastResearch?.start();walletFast?.start();
     },
     async close(){
-      if(closed) return;closed=true;
+      if(closed){if(walletFastResearchShutdownError)throw new Error(walletFastResearchShutdownError);
+        if(launcherShutdownError)throw new Error(launcherShutdownError);
+        if(walletFastPersistenceShutdownError)throw new Error(walletFastPersistenceShutdownError);
+        if(walletObserverShutdownError)throw new Error(walletObserverShutdownError);
+        if(walletPriceShutdownError)throw new Error(walletPriceShutdownError);
+        if(chainStreamShutdownError)throw new Error(chainStreamShutdownError);return;}closed=true;
       // Establish the market poll fence before the first await in shutdown.
       // The returned promise drains only work admitted before this point.
       const gmgnMarketStop=gmgnMarketScanner?.stop();
@@ -1506,8 +1553,31 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       await heldTracking?.stop();await heldMonitor?.stop();
       priceRouter.close();
       await launcherRevalidator?.stop();await launcherRefresh?.stop();
-      await walletFast?.stop();walletVerifier?.stop();await walletFastResearch?.stop();walletActivity?.close();
-      await Promise.all([chainMonitor?.stop(),tracking?.stop(),balances?.stop(),walletObserver?.stop(),system?.stop(),watchRechecker?.stop()]);
+      await walletFast?.stop();
+      try {if(launcherRealtimeWriter&&!(await launcherRealtimeWriter.stop()))
+        launcherError=launcherShutdownError='LAUNCHER_REALTIME_SHUTDOWN_UNDRAINED';}
+      catch {launcherError=launcherShutdownError='LAUNCHER_REALTIME_SHUTDOWN_UNDRAINED';}
+      try {if(launcherCoverageWriter&&!(await launcherCoverageWriter.stop()))
+        launcherError=launcherShutdownError='LAUNCHER_COVERAGE_SHUTDOWN_UNDRAINED';}
+      catch {launcherError=launcherShutdownError='LAUNCHER_COVERAGE_SHUTDOWN_UNDRAINED';}
+      try {if(walletFastResearch&&!(await walletFastResearch.stop()))
+        walletFastResearchShutdownError='WALLET_FAST_RESEARCH_SHUTDOWN_UNDRAINED';}
+      catch {walletFastResearchShutdownError='WALLET_FAST_RESEARCH_SHUTDOWN_UNDRAINED';}
+      walletVerifier?.stop();
+      try {if(walletFastPersistence&&!(await walletFastPersistence.stop()))
+        walletFastPersistenceShutdownError='WALLET_FAST_PERSISTENCE_SHUTDOWN_UNDRAINED';}
+      catch {walletFastPersistenceShutdownError='WALLET_FAST_PERSISTENCE_SHUTDOWN_UNDRAINED';}
+      const walletObserverStop=walletObserver?.stop();
+      const chainMonitorStop=chainMonitor?.stop();
+      await Promise.all([tracking?.stop(),balances?.stop(),system?.stop(),watchRechecker?.stop()]);
+      try {if(chainMonitorStop&&!(await chainMonitorStop))chainStreamShutdownError='CHAIN_EVENT_WRITER_SHUTDOWN_UNDRAINED';}
+      catch {chainStreamShutdownError='CHAIN_EVENT_WRITER_SHUTDOWN_UNDRAINED';}
+      try {if(walletObserverStop&&!(await walletObserverStop))
+        walletObserverShutdownError='WALLET_OBSERVER_SHUTDOWN_UNDRAINED';}
+      catch {walletObserverShutdownError='WALLET_OBSERVER_SHUTDOWN_UNDRAINED';}
+      try {if(walletPriceWriter&&!(await walletPriceWriter.stop()))
+        walletPriceShutdownError='WALLET_PRICE_WRITER_STOP_TIMEOUT';}
+      catch {walletPriceShutdownError='WALLET_PRICE_WRITER_STOP_TIMEOUT';}
       await walletExitPressure?.stop();
       await walletIndexRunner?.stop();
       if(gmgnPlusRunner)await gmgnPlusRunner.stop();else gmgnPlusArchive?.close();
@@ -1529,5 +1599,11 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       signalCounting.close();
       store.close();orders.close();dailyReview?.close();archive?.close();walletHistory?.close();exitShadow?.close();
       gmgnMarketDiscoveryStore?.close();
+      if(walletFastResearchShutdownError)throw new Error(walletFastResearchShutdownError);
+      if(launcherShutdownError)throw new Error(launcherShutdownError);
+      if(walletFastPersistenceShutdownError)throw new Error(walletFastPersistenceShutdownError);
+      if(walletObserverShutdownError)throw new Error(walletObserverShutdownError);
+      if(walletPriceShutdownError)throw new Error(walletPriceShutdownError);
+      if(chainStreamShutdownError)throw new Error(chainStreamShutdownError);
     }};
 }

@@ -76,7 +76,10 @@ test('runtime reserves the extra slot in both watchers while keeping automatic s
   let automatic=Array.from({length:10},(_,i)=>pub(i+1));
   const profileEvm=Array.from({length:135},(_,i)=>'0x'+(i+1).toString(16).padStart(40,'0')),evm=profileEvm.slice(0,10);
   const limits:{chain:string;limit:number}[]=[],profileLimits:{chain:string;limit:number}[]=[];
-  runtime.walletHistory!.streamWalletTargets=(chain,limit=10)=>{limits.push({chain,limit});return chain==='solana'?automatic:evm;};
+  let fastSnapshotBuilding=false;
+  runtime.walletHistory!.streamWalletTargets=(chain)=>{if(fastSnapshotBuilding)throw new Error('MAIN_THREAD_WALLET_HISTORY_SQLITE_FORBIDDEN');
+    return chain==='solana'?automatic:evm;};
+  runtime.walletIndexRunner!.fastTargetAddresses=(chain,limit=10)=>{limits.push({chain,limit});return chain==='solana'?automatic:evm;};
   runtime.walletProfiles!.fastTargetAddresses=(chain,limit=30)=>{profileLimits.push({chain,limit});return chain==='bsc'?profileEvm.slice(0,limit):[];};
   try {
     runtime.start();assert.ok(fast);assert.ok(monitor);
@@ -84,7 +87,8 @@ test('runtime reserves the extra slot in both watchers while keeping automatic s
     assert.equal(monitor.config.maxWallets,11);assert.equal(config.chainStream.maxWallets,10);
     assert.deepEqual(monitor.wallets('solana',11),[...automatic,pin]);
     assert.deepEqual(monitor.wallets('bsc',11),evm);
-    const snapshot=fast.snapshot();
+    const originalStoreList=runtime.store.list.bind(runtime.store);runtime.store.list=()=>{throw new Error('MAIN_THREAD_STORE_SQLITE_FORBIDDEN');};
+    fastSnapshotBuilding=true;const snapshot=fast.snapshot();fastSnapshotBuilding=false;runtime.store.list=originalStoreList;
     assert.deepEqual(snapshot.targets.filter(t=>t.chain==='solana').map(t=>t.wallet),[...automatic,pin]);
     assert.equal(snapshot.targets.filter(t=>t.chain==='bsc').length,135);
     const pinned=snapshot.targets.find(t=>t.wallet===pin)!;

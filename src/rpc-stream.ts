@@ -59,10 +59,27 @@ export interface RpcStreamStatus {
   queuedSubscriptions?: number;
   maxConcurrentSubscriptions?: number;
   peakConcurrentSubscriptions?: number;
+  /** Unsubscribe requests sent but not yet acknowledged. */
+  unsubscribingSubscriptions?:number;
+  /** Retired subscriptions waiting for an unsubscribe-window slot. */
+  queuedUnsubscriptions?:number;
+  maxConcurrentUnsubscriptions?:number;
+  peakConcurrentUnsubscriptions?:number;
   /** Explicit server rejections waiting for an isolated retry. */
   retryingSubscriptions?: number;
   /** Cumulative isolated retries; ambiguous failures still reconnect the socket. */
   subscriptionRetries?: number;
+  /** Timed-out subscription requests still eligible for a same-generation late ACK. */
+  lateSubscriptionAcksPending?:number;
+  /** Cumulative late subscription responses matched to a retained tombstone. */
+  lateSubscriptionAcksReceived?:number;
+  /** Cumulative valid late IDs sent through the independent unsubscribe queue. */
+  lateSubscriptionAcksRetired?:number;
+  /** Late ACKs whose ID is already the current active subscription and must be preserved. */
+  lateSubscriptionAcksMatchedActive?:number;
+  /** Tombstone-capacity exhaustion forces a reconnect so unknown remote subscriptions are discarded. */
+  lateSubscriptionAckOverflows?:number;
+  maxLateSubscriptionAcks?:number;
   reconnectAttempt: number;
   reconnects: number;
   requestsSent: number;
@@ -84,10 +101,14 @@ export interface RpcStreamOptions {
   connectTimeoutMs?: number;
   maxMessageBytes?: number;
   maxSubscriptions?: number;
-  /** Bound only subscription requests; ordinary RPC and unsubscribe requests remain independent. */
+  /** Bound subscription requests; ordinary RPC requests remain independent. */
   maxConcurrentSubscriptions?: number;
+  /** Bound unsubscribe requests during large target rotations. */
+  maxConcurrentUnsubscriptions?:number;
   /** Retry explicit JSON-RPC subscription rejections without discarding healthy subscriptions. */
   retryRejectedSubscriptions?: boolean;
+  /** Retry a bounded number of ambiguous subscription ACK timeouts in place. */
+  retryTimedOutSubscriptions?:boolean;
   maxPendingRequests?: number;
   reconnectBaseMs?: number;
   reconnectMaxMs?: number;
@@ -100,12 +121,14 @@ interface Desired extends RpcSubscription {revision: number; fingerprint: string
 interface Active {desired: Desired; id: string | number; generation: number;}
 interface Subscribing {desired: Desired; generation: number;}
 interface SubscriptionRetry {desired: Desired; generation: number; attempt: number; timer?: unknown;}
+interface LateSubscriptionAck {desired:Desired;generation:number;}
 interface Pending {
   generation: number;
   timer: unknown;
   resolve(value: unknown): void;
   reject(error: RpcStreamError): void;
   onResult?: (result: unknown) => void;
+  lateSubscription?:Desired;
 }
 interface Connection {socket: RpcSocket; generation: number; listeners: [string, (event: any) => void][];}
 
@@ -150,7 +173,10 @@ export class RpcStream {
   private readonly maxBytes: number;
   private readonly maxSubscriptions: number;
   private readonly maxConcurrentSubscriptions: number;
+  private readonly maxConcurrentUnsubscriptions:number;
+  private readonly maxLateSubscriptionAcks:number;
   private readonly retryRejectedSubscriptions: boolean;
+  private readonly retryTimedOutSubscriptions:boolean;
   private readonly maxPending: number;
   private readonly reconnectBase: number;
   private readonly reconnectMax: number;
@@ -162,7 +188,10 @@ export class RpcStream {
   private readonly activeIds = new Map<string, Active>();
   private readonly retiredIds = new Set<string>();
   private readonly subscribing = new Set<Subscribing>();
+  private readonly unsubscribeQueue=new Map<string,Active>();
+  private readonly unsubscribing=new Map<string,Active>();
   private readonly subscriptionRetryState = new Map<string,SubscriptionRetry>();
+  private readonly lateSubscriptionAcks=new Map<number,LateSubscriptionAck>();
   private readonly pending = new Map<number, Pending>();
   private connection?: Connection;
   private connectTimer?: unknown;
@@ -179,7 +208,12 @@ export class RpcStream {
   private messagesReceived = 0;
   private notificationsReceived = 0;
   private peakConcurrentSubscriptions = 0;
+  private peakConcurrentUnsubscriptions=0;
   private subscriptionRetries = 0;
+  private lateSubscriptionAcksReceived=0;
+  private lateSubscriptionAcksRetired=0;
+  private lateSubscriptionAcksMatchedActive=0;
+  private lateSubscriptionAckOverflows=0;
   private connectedAt?: number;
   private lastMessageAt?: number;
   private lastHeartbeatAt?: number;
@@ -201,14 +235,19 @@ export class RpcStream {
     this.maxBytes = options.maxMessageBytes ?? 1_048_576;
     this.maxSubscriptions = options.maxSubscriptions ?? 200;
     this.maxConcurrentSubscriptions = options.maxConcurrentSubscriptions ?? this.maxSubscriptions;
+    this.maxConcurrentUnsubscriptions=options.maxConcurrentUnsubscriptions??this.maxSubscriptions;
+    this.maxLateSubscriptionAcks=Math.min(4096,this.maxSubscriptions*3);
     this.retryRejectedSubscriptions = options.retryRejectedSubscriptions ?? false;
+    this.retryTimedOutSubscriptions=options.retryTimedOutSubscriptions??false;
     this.maxPending = options.maxPendingRequests ?? 512;
     this.reconnectBase = options.reconnectBaseMs ?? 1000;
     this.reconnectMax = options.reconnectMaxMs ?? 30_000;
     if (!boundedInteger(this.timeout, 1, 300_000) || !boundedInteger(this.connectTimeout, 1, 300_000) ||
         !boundedInteger(this.maxBytes, 128, 8_388_608) || !boundedInteger(this.maxSubscriptions, 1, 2000) ||
         !boundedInteger(this.maxConcurrentSubscriptions, 1, this.maxSubscriptions) ||
+        !boundedInteger(this.maxConcurrentUnsubscriptions,1,this.maxSubscriptions)||
         typeof this.retryRejectedSubscriptions !== 'boolean' ||
+        typeof this.retryTimedOutSubscriptions!=='boolean'||
         !boundedInteger(this.maxPending, 1, 4096) || !boundedInteger(this.reconnectBase, 1, 300_000) ||
         !boundedInteger(this.reconnectMax, this.reconnectBase, 3_600_000)) throw new RpcStreamError('RPC_CONFIG_INVALID');
     if (options.heartbeat) {
@@ -231,8 +270,17 @@ export class RpcStream {
       activeSubscriptions: this.active.size, activeKeys: [...this.active.keys()].sort(), pendingRequests: this.pending.size,
       subscribingSubscriptions: this.subscribing.size, queuedSubscriptions: this.queuedSubscriptions(),
       maxConcurrentSubscriptions: this.maxConcurrentSubscriptions,peakConcurrentSubscriptions:this.peakConcurrentSubscriptions,
+      unsubscribingSubscriptions:this.unsubscribing.size,queuedUnsubscriptions:this.unsubscribeQueue.size,
+      maxConcurrentUnsubscriptions:this.maxConcurrentUnsubscriptions,
+      peakConcurrentUnsubscriptions:this.peakConcurrentUnsubscriptions,
       retryingSubscriptions:[...this.subscriptionRetryState.values()].filter(value=>value.timer!==undefined).length,
       subscriptionRetries:this.subscriptionRetries,
+      lateSubscriptionAcksPending:this.lateSubscriptionAcks.size,
+      lateSubscriptionAcksReceived:this.lateSubscriptionAcksReceived,
+      lateSubscriptionAcksRetired:this.lateSubscriptionAcksRetired,
+      lateSubscriptionAcksMatchedActive:this.lateSubscriptionAcksMatchedActive,
+      lateSubscriptionAckOverflows:this.lateSubscriptionAckOverflows,
+      maxLateSubscriptionAcks:this.maxLateSubscriptionAcks,
       reconnectAttempt: this.reconnectAttempt, reconnects: this.reconnects, requestsSent: this.requestsSent,
       messagesReceived: this.messagesReceived, notificationsReceived: this.notificationsReceived,
       ...(this.connectedAt === undefined ? {} : {connectedAt: this.connectedAt}),
@@ -338,7 +386,8 @@ export class RpcStream {
     this.scheduleHeartbeat(connection);
   }
 
-  private sendRequest(method: string, input: readonly unknown[], timeout: number, onResult?: (result: unknown) => void): Promise<unknown> {
+  private sendRequest(method: string, input: readonly unknown[], timeout: number, onResult?: (result: unknown) => void,
+    lateSubscription?:Desired): Promise<unknown> {
     let params: unknown[];
     try {if (!methodValid(method)) throw new Error(); params = copyParams(input);}
     catch {return Promise.reject(new RpcStreamError('RPC_REQUEST_INVALID'));}
@@ -350,10 +399,11 @@ export class RpcStream {
     const payload = JSON.stringify({jsonrpc: '2.0', id, method, params});
     if (Buffer.byteLength(payload) > this.maxBytes) return Promise.reject(new RpcStreamError('RPC_MESSAGE_TOO_LARGE'));
     return new Promise((resolve, reject) => {
-      const pending: Pending = {generation: connection.generation, resolve, reject, onResult,
+      const pending: Pending = {generation: connection.generation, resolve, reject, onResult,lateSubscription,
         timer: this.clock.setTimeout(() => {
           if (this.pending.get(id) !== pending) return;
           this.pending.delete(id); this.lastError = 'RPC_REQUEST_TIMEOUT';
+          if(pending.lateSubscription)this.rememberLateSubscriptionAck(id,pending.generation,pending.lateSubscription);
           reject(new RpcStreamError('RPC_REQUEST_TIMEOUT')); this.emitStatus();
         }, timeout)};
       this.pending.set(id, pending);
@@ -411,20 +461,25 @@ export class RpcStream {
       }
       this.clearSubscriptionRetry(desired.key);
       this.active.set(desired.key, active); this.activeIds.set(id, active); this.emitStatus();
-    }).catch(error => {
+    },this.retryTimedOutSubscriptions?desired:undefined).catch(error => {
       if (this.generation !== generation || !this.running || this.state !== 'open') return;
       if(this.retryRejectedSubscriptions&&error instanceof RpcStreamError&&error.code==='RPC_REMOTE_ERROR'){
         this.lastError='RPC_SUBSCRIBE_FAILED';this.scheduleSubscriptionRetry(desired,generation);return;
+      }
+      if(this.retryTimedOutSubscriptions&&error instanceof RpcStreamError&&error.code==='RPC_REQUEST_TIMEOUT'&&
+          this.scheduleSubscriptionRetry(desired,generation,3)){
+        this.lastError='RPC_SUBSCRIBE_FAILED';return;
       }
       this.fail(error instanceof RpcStreamError && ['RPC_SUBSCRIPTION_ID_INVALID', 'RPC_SUBSCRIPTION_ID_CONFLICT'].includes(error.code)
         ? error.code : 'RPC_SUBSCRIBE_FAILED');
     }).finally(()=>{this.subscribing.delete(attempt);this.pumpSubscriptions();this.emitStatus();});
   }
 
-  private scheduleSubscriptionRetry(desired:Desired,generation:number):void {
-    if(this.generation!==generation||this.desired.get(desired.key)?.revision!==desired.revision)return;
+  private scheduleSubscriptionRetry(desired:Desired,generation:number,maxAttempts?:number):boolean {
+    if(this.generation!==generation||this.desired.get(desired.key)?.revision!==desired.revision)return false;
     const previous=this.subscriptionRetryState.get(desired.key),attempt=previous?.desired.revision===desired.revision?
       previous.attempt:0;
+    if(maxAttempts!==undefined&&attempt>=maxAttempts)return false;
     if(previous?.timer!==undefined)this.clock.clearTimeout(previous.timer);
     let random=.5;
     try {const value=this.random();if(Number.isFinite(value))random=Math.max(0,Math.min(1,value));}catch{/* deterministic fallback */}
@@ -439,13 +494,31 @@ export class RpcStream {
       else this.subscriptionRetryState.delete(desired.key);
       this.emitStatus();
     },delay);
-    this.subscriptionRetryState.set(desired.key,retry);this.subscriptionRetries++;this.emitStatus();
+    this.subscriptionRetryState.set(desired.key,retry);this.subscriptionRetries++;this.emitStatus();return true;
   }
 
   private clearSubscriptionRetry(key:string):void {
     const retry=this.subscriptionRetryState.get(key);if(!retry)return;
     if(retry.timer!==undefined)this.clock.clearTimeout(retry.timer);
     this.subscriptionRetryState.delete(key);
+  }
+
+  private rememberLateSubscriptionAck(requestId:number,generation:number,desired:Desired):void {
+    if(!this.running||this.state!=='open'||generation!==this.generation)return;
+    if(this.lateSubscriptionAcks.size>=this.maxLateSubscriptionAcks){
+      this.lateSubscriptionAckOverflows++;this.fail('RPC_RECONNECT_REQUESTED');return;
+    }
+    this.lateSubscriptionAcks.set(requestId,{desired,generation});
+  }
+
+  private handleLateSubscriptionAck(late:LateSubscriptionAck,result:unknown):void {
+    if(late.generation!==this.generation||this.state!=='open'||!idValid(result)){
+      if(!idValid(result))this.fail('RPC_SUBSCRIPTION_ID_INVALID');return;
+    }
+    const key=idKey(result);
+    if(this.activeIds.has(key)){this.lateSubscriptionAcksMatchedActive++;return;}
+    this.lateSubscriptionAcksRetired++;
+    this.unsubscribe({desired:late.desired,id:result,generation:late.generation});
   }
 
   private retire(active: Active): void {
@@ -456,13 +529,29 @@ export class RpcStream {
 
   private unsubscribe(active: Active): void {
     if (active.generation !== this.generation || this.state !== 'open') return;
-    this.retiredIds.add(idKey(active.id));
+    const key=idKey(active.id);this.retiredIds.add(key);
     if (this.retiredIds.size > 4096) {this.fail('RPC_RECONNECT_REQUESTED'); return;}
-    void this.sendRequest(active.desired.unsubscribeMethod, [active.id], this.timeout, result => {
-      if (result !== true) throw new RpcStreamError('RPC_UNSUBSCRIBE_FAILED');
-    }).catch(() => {
-      if (this.running && this.generation === active.generation && this.state === 'open') this.fail('RPC_UNSUBSCRIBE_FAILED');
-    });
+    if(this.unsubscribeQueue.has(key)||this.unsubscribing.has(key))return;
+    this.unsubscribeQueue.set(key,active);this.pumpUnsubscriptions();
+  }
+
+  private pumpUnsubscriptions():void {
+    if(!this.running||this.state!=='open')return;
+    while(this.unsubscribing.size<this.maxConcurrentUnsubscriptions&&this.unsubscribeQueue.size){
+      const entry=this.unsubscribeQueue.entries().next().value as [string,Active]|undefined;if(!entry)break;
+      const [key,active]=entry;this.unsubscribeQueue.delete(key);
+      if(active.generation!==this.generation)continue;
+      this.unsubscribing.set(key,active);
+      this.peakConcurrentUnsubscriptions=Math.max(this.peakConcurrentUnsubscriptions,this.unsubscribing.size);
+      void this.sendRequest(active.desired.unsubscribeMethod,[active.id],this.timeout,result=>{
+        if(result!==true)throw new RpcStreamError('RPC_UNSUBSCRIBE_FAILED');
+      }).catch(()=>{
+        if(this.running&&this.generation===active.generation&&this.state==='open')this.fail('RPC_UNSUBSCRIBE_FAILED');
+      }).finally(()=>{
+        this.unsubscribing.delete(key);this.pumpUnsubscriptions();this.emitStatus();
+      });
+    }
+    this.emitStatus();
   }
 
   private message(connection: Connection, data: unknown): void {
@@ -480,7 +569,16 @@ export class RpcStream {
       if (Object.hasOwn(packet, 'id')) {
         if (typeof packet.id !== 'number') continue;
         const pending = this.pending.get(packet.id);
-        if (!pending || pending.generation !== connection.generation) continue;
+        if (!pending || pending.generation !== connection.generation) {
+          const late=this.lateSubscriptionAcks.get(packet.id);
+          if(!late||late.generation!==connection.generation)continue;
+          const success=Object.hasOwn(packet,'result'),failed=Object.hasOwn(packet,'error');
+          this.lateSubscriptionAcks.delete(packet.id);this.lateSubscriptionAcksReceived++;
+          if(success===failed){this.fail('RPC_MESSAGE_INVALID');break;}
+          this.lastMessageAt=this.clock.now();this.reconnectAttempt=0;
+          if(success)this.handleLateSubscriptionAck(late,packet.result);
+          this.emitStatus();continue;
+        }
         const success = Object.hasOwn(packet, 'result'), failed = Object.hasOwn(packet, 'error');
         if (success === failed) {this.fail('RPC_MESSAGE_INVALID'); break;}
         this.pending.delete(packet.id); this.clock.clearTimeout(pending.timer); this.lastMessageAt = this.clock.now();
@@ -546,6 +644,7 @@ export class RpcStream {
     for (const pending of this.pending.values()) {this.clock.clearTimeout(pending.timer); pending.reject(new RpcStreamError(code));}
     for(const key of [...this.subscriptionRetryState.keys()])this.clearSubscriptionRetry(key);
     this.pending.clear(); this.active.clear(); this.activeIds.clear(); this.retiredIds.clear(); this.subscribing.clear();
+    this.unsubscribeQueue.clear();this.unsubscribing.clear();this.lateSubscriptionAcks.clear();
   }
 
   private clearTimer(key: 'connectTimer' | 'heartbeatTimer' | 'reconnectTimer'): void {

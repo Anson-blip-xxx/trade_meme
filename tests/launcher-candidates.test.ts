@@ -150,6 +150,26 @@ test('realtime, verified activity and coverage are distinct persisted states wit
   } finally {f.close();}
 });
 
+test('realtime batch deduplicates wallets, keeps the latest observation and never overwrites newer liveness',()=>{
+  const one=profile(1,'A',{evidenceAt:iso(100)}),two=profile(2,'A',{evidenceAt:iso(100)}),
+    f=fixture([{profile:one,route:'A'},{profile:two,route:'A'}],{freshAfterSec:60,liveAfterSec:30});
+  try {
+    f.store.refresh();const older=new Date(f.clock.value-8_000).toISOString(),newer=new Date(f.clock.value-2_000).toISOString(),
+      stale=new Date(f.clock.value-5_000).toISOString();
+    assert.equal(f.store.observeRealtimeBatch([
+      {chain:'bsc',wallet:one.address,observedAt:older,source:'wallet_fast'},
+      {chain:'bsc',wallet:one.address,observedAt:newer,source:'wallet_fast'},
+      {chain:'bsc',wallet:two.address,observedAt:older,source:'wallet_fast'},
+      {chain:'bsc',wallet:address(9999),observedAt:newer,source:'wallet_fast'},
+    ]),2);
+    assert.equal(f.store.get('bsc',one.address)?.liveSeenAt,newer);
+    assert.equal(f.store.get('bsc',two.address)?.liveSeenAt,older);
+    assert.equal(f.store.observeRealtimeBatch([{chain:'bsc',wallet:one.address,observedAt:stale,source:'wallet_fast'}]),0);
+    assert.equal(f.store.get('bsc',one.address)?.liveSeenAt,newer);
+    assert.throws(()=>f.store.observeRealtimeBatch([{chain:'bsc',wallet:one.address,observedAt:newer,checkedAt:newer,source:'wallet_fast'}]));
+  } finally {f.close();}
+});
+
 test('coverage renews an unchanged ACK set and clears only the removed difference',()=>{
   const one=profile(1,'A'),two=profile(2,'A'),three=profile(3,'A'),f=fixture([
     {profile:one,route:'A'},{profile:two,route:'A'},{profile:three,route:'A'}],{coverageAfterSec:20});
@@ -190,6 +210,33 @@ test('coverage batch commits chains together while an empty set clears only its 
     assert.equal(f.store.get('bsc',bsc.address)?.monitored,false);assert.equal(f.store.get('bsc',bsc.address)?.coverageAt,undefined);
     assert.equal(f.store.get('robinhood',robinhood.address)?.monitored,true);
     assert.equal(f.store.get('robinhood',robinhood.address)?.coverageAt,at);
+  } finally {f.close();}
+});
+
+test('coverage batch result distinguishes capacity failure from a successful zero-match update',()=>{
+  const p=profile(1,'A'),f=fixture([{profile:p,route:'A'}]);
+  try {f.store.refresh();const db=(f.store as unknown as {db:DatabaseSync}).db;
+    db.exec(`CREATE TRIGGER lc_test_capacity BEFORE UPDATE ON lc_candidates
+      BEGIN SELECT RAISE(ABORT,'database or disk is full'); END;`);
+    const result=f.store.replaceCoverageBatchResult([{chain:'bsc',wallets:[p.address],at:new Date(f.clock.value).toISOString()}]);
+    assert.deepEqual(result,{counts:{bsc:0},capacityReached:true});
+    assert.equal(f.store.status().capacityReached,true);assert.equal(f.store.get('bsc',p.address)?.monitored,false);
+  } finally {f.close();}
+});
+
+test('realtime batch result distinguishes a successful zero-match update from capacity failure',()=>{
+  const p=profile(1,'A'),f=fixture([{profile:p,route:'A'}]);
+  try {f.store.refresh();const observedAt=new Date(f.clock.value).toISOString();
+    assert.deepEqual(f.store.observeRealtimeBatchResult([
+      {chain:'bsc',wallet:address(9999),observedAt,source:'wallet_fast'},
+    ]),{changed:0,capacityReached:false});
+    const db=(f.store as unknown as {db:DatabaseSync}).db;
+    db.exec(`CREATE TRIGGER lc_test_realtime_capacity BEFORE UPDATE ON lc_candidates
+      BEGIN SELECT RAISE(ABORT,'database or disk is full'); END;`);
+    assert.deepEqual(f.store.observeRealtimeBatchResult([
+      {chain:'bsc',wallet:p.address,observedAt,source:'wallet_fast'},
+    ]),{changed:0,capacityReached:true});
+    assert.equal(f.store.get('bsc',p.address)?.liveSeenAt,undefined);
   } finally {f.close();}
 });
 

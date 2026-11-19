@@ -3,9 +3,15 @@ import assert from 'node:assert/strict';
 import {mkdtempSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
+import {DatabaseSync} from 'node:sqlite';
 import {readConfig} from '../src/config.js';
 import {createRuntime} from '../src/runtime.js';
 import {WalletHistory} from '../src/wallet-history.js';
+import {LauncherCandidates} from '../src/launcher-candidates.js';
+import {WalletFastRunner} from '../src/wallet-fast-runner.js';
+import {WalletFastPersistenceRunner} from '../src/wallet-fast-persistence-runner.js';
+import {WalletFastResearch} from '../src/wallet-fast-research.js';
+import type {FastWalletEvent} from '../src/wallet-fast.js';
 import type {Report} from '../src/types.js';
 import type {WalletAnalysis,WalletRecord} from '../src/research/wallet-types.js';
 import {signal,pass,narrative,now} from './helpers.js';
@@ -114,5 +120,133 @@ test('dashboard and status never run wallet stats or graph maintenance on the ma
     runtime.start();
     runtime.walletResearchStatus();runtime.dashboardOverview();runtime.walletResearchStatus();assert.equal(counts,0);
     assert.equal(runtime.walletResearchStatus().localIndex.running,true);
+  } finally {await runtime.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('wallet price writer exposes an explicit pause reason when background research cannot start',async()=>{
+  for(const [environment,reason] of [
+    [{GMGN_BACKGROUND_RESEARCH_ENABLED:'true'},'GMGN_API_KEY_MISSING'],
+    [{GMGN_BACKGROUND_RESEARCH_ENABLED:'false'},'GMGN_BACKGROUND_RESEARCH_DISABLED'],
+  ] as const){
+    const dir=mkdtempSync(join(tmpdir(),'wallet-price-runtime-'));
+    const cfg=readConfig({...environment,WALLET_RESEARCH_ENABLED:'true',WALLET_PROFILES_ENABLED:'false',
+      WALLET_HISTORY_DATABASE_PATH:join(dir,'history.sqlite'),ORDERS_DATABASE_PATH:join(dir,'orders.sqlite')});
+    const runtime=createRuntime(cfg);
+    try{
+      const status=runtime.walletResearchStatus();
+      assert.equal(status.observer.running,false);assert.equal(status.observer.pausedReason,reason);
+      assert.equal(status.priceWriter.running,false);assert.equal(status.priceWriter.ready,false);
+      assert.equal(status.priceWriter.pausedReason,reason);
+    }finally{await runtime.close();rmSync(dir,{recursive:true,force:true});}
+  }
+});
+
+test('runtime reports a fixed wallet price shutdown error only after closing the remaining stores',async()=>{
+  const dir=mkdtempSync(join(tmpdir(),'wallet-price-shutdown-'));
+  const cfg=readConfig({DASHBOARD_ENABLED:'false',WALLET_RESEARCH_ENABLED:'true',WALLET_PROFILES_ENABLED:'false',
+    WALLET_HISTORY_DATABASE_PATH:join(dir,'history.sqlite'),ORDERS_DATABASE_PATH:join(dir,'orders.sqlite'),ENTRY_MODE:'off'});
+  const runtime=createRuntime(cfg);let laterStoreClosed=false;
+  runtime.walletPriceWriter!.stop=async()=>false;
+  const originalClose=runtime.store.close.bind(runtime.store);
+  runtime.store.close=()=>{laterStoreClosed=true;originalClose();};
+  try {
+    await assert.rejects(runtime.close(),{message:'WALLET_PRICE_WRITER_STOP_TIMEOUT'});
+    assert.equal(laterStoreClosed,true,'shutdown must finish later cleanup before exposing the price-writer error');
+    await assert.rejects(runtime.close(),{message:'WALLET_PRICE_WRITER_STOP_TIMEOUT'});
+  } finally {rmSync(dir,{recursive:true,force:true});}
+});
+
+test('runtime reports an undrained chain-event writer only after closing the remaining stores',async()=>{
+  const dir=mkdtempSync(join(tmpdir(),'chain-event-shutdown-'));
+  const cfg=readConfig({DASHBOARD_ENABLED:'false',CHAIN_STREAM_ENABLED:'true',
+    SCAN_DATABASE_PATH:join(dir,'scans.sqlite'),CHAIN_STREAM_DATABASE_PATH:join(dir,'stream.sqlite'),
+    ORDERS_DATABASE_PATH:join(dir,'orders.sqlite'),ENTRY_MODE:'off'});
+  const runtime=createRuntime(cfg),chainMonitor=runtime.chainMonitor!;let laterStoreClosed=false;
+  const originalStop=chainMonitor.stop.bind(chainMonitor),originalClose=runtime.store.close.bind(runtime.store);
+  chainMonitor.stop=async()=>false;
+  runtime.store.close=()=>{laterStoreClosed=true;originalClose();};
+  try {
+    await assert.rejects(runtime.close(),{message:'CHAIN_EVENT_WRITER_SHUTDOWN_UNDRAINED'});
+    assert.equal(laterStoreClosed,true,'shutdown must finish later cleanup before exposing the chain writer error');
+    await assert.rejects(runtime.close(),{message:'CHAIN_EVENT_WRITER_SHUTDOWN_UNDRAINED'});
+  } finally {await originalStop();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('runtime surfaces an undrained wallet-fast persistence worker after completing later cleanup',async t=>{
+  const dir=mkdtempSync(join(tmpdir(),'wallet-fast-persistence-shutdown-'));
+  const cfg=readConfig({DASHBOARD_ENABLED:'false',WALLET_RESEARCH_ENABLED:'true',WALLET_PROFILES_ENABLED:'false',
+    LAUNCHER_CANDIDATES_ENABLED:'false',CHAIN_STREAM_ENABLED:'true',WALLET_FAST_ENABLED:'true',
+    SOLANA_STREAM_HTTP_URL:'https://rpc.invalid',SOLANA_STREAM_WS_URL:'wss://rpc.invalid',
+    WALLET_HISTORY_DATABASE_PATH:join(dir,'history.sqlite'),WALLET_ACTIVITY_DATABASE_PATH:join(dir,'activity.sqlite'),
+    SCAN_DATABASE_PATH:join(dir,'scans.sqlite'),CHAIN_STREAM_DATABASE_PATH:join(dir,'stream.sqlite'),
+    ORDERS_DATABASE_PATH:join(dir,'orders.sqlite'),ENTRY_MODE:'off'});
+  t.mock.method(WalletFastPersistenceRunner.prototype,'stop',async()=>false);
+  const runtime=createRuntime(cfg);let laterStoreClosed=false,originalClose=runtime.store.close.bind(runtime.store);
+  runtime.store.close=()=>{laterStoreClosed=true;originalClose();};
+  try {await assert.rejects(runtime.close(),{message:'WALLET_FAST_PERSISTENCE_SHUTDOWN_UNDRAINED'});
+    assert.equal(laterStoreClosed,true);await assert.rejects(runtime.close(),{message:'WALLET_FAST_PERSISTENCE_SHUTDOWN_UNDRAINED'});
+  } finally {rmSync(dir,{recursive:true,force:true});}
+});
+
+test('runtime drains wallet-fast research before persistence and reports failure after later cleanup',async t=>{
+  const dir=mkdtempSync(join(tmpdir(),'wallet-fast-research-shutdown-'));
+  const cfg=readConfig({DASHBOARD_ENABLED:'false',WALLET_RESEARCH_ENABLED:'true',WALLET_PROFILES_ENABLED:'false',
+    LAUNCHER_CANDIDATES_ENABLED:'false',CHAIN_STREAM_ENABLED:'true',WALLET_FAST_ENABLED:'true',
+    SOLANA_STREAM_HTTP_URL:'https://rpc.invalid',SOLANA_STREAM_WS_URL:'wss://rpc.invalid',
+    WALLET_HISTORY_DATABASE_PATH:join(dir,'history.sqlite'),WALLET_ACTIVITY_DATABASE_PATH:join(dir,'activity.sqlite'),
+    SCAN_DATABASE_PATH:join(dir,'scans.sqlite'),CHAIN_STREAM_DATABASE_PATH:join(dir,'stream.sqlite'),
+    ORDERS_DATABASE_PATH:join(dir,'orders.sqlite'),ENTRY_MODE:'off'});
+  const order:string[]=[];t.mock.method(WalletFastResearch.prototype,'stop',async()=>{order.push('research');return false;});
+  t.mock.method(WalletFastPersistenceRunner.prototype,'stop',async()=>{order.push('persistence');return true;});
+  const runtime=createRuntime(cfg);let laterStoreClosed=false,originalClose=runtime.store.close.bind(runtime.store);
+  runtime.store.close=()=>{laterStoreClosed=true;originalClose();};
+  try {await assert.rejects(runtime.close(),{message:'WALLET_FAST_RESEARCH_SHUTDOWN_UNDRAINED'});
+    assert.deepEqual(order,['research','persistence']);assert.equal(laterStoreClosed,true);
+    await assert.rejects(runtime.close(),{message:'WALLET_FAST_RESEARCH_SHUTDOWN_UNDRAINED'});
+  } finally {rmSync(dir,{recursive:true,force:true});}
+});
+
+test('a retraction accepted while the socket runner stops enters the research drain synchronously',async t=>{
+  const dir=mkdtempSync(join(tmpdir(),'wallet-fast-retraction-shutdown-')),stamp=new Date().toISOString();
+  const event:FastWalletEvent={id:'shutdown-retraction',chain:'solana',wallet:'11111111111111111111111111111111',
+    txHash:'shutdown-retraction-signature',receivedAt:stamp,judgedAt:stamp,processingMs:0,kind:'wallet_mention',verdict:'retracted',
+    groups:['launcher_candidate'],profileFresh:true,cachedSafety:'unknown',commitment:'processed',removed:true,buyVerified:false,tradingEnabled:false};
+  const cfg=readConfig({DASHBOARD_ENABLED:'false',WALLET_RESEARCH_ENABLED:'true',WALLET_PROFILES_ENABLED:'false',
+    LAUNCHER_CANDIDATES_ENABLED:'false',CHAIN_STREAM_ENABLED:'true',WALLET_FAST_ENABLED:'true',
+    SOLANA_STREAM_HTTP_URL:'https://rpc.invalid',SOLANA_STREAM_WS_URL:'wss://rpc.invalid',
+    WALLET_HISTORY_DATABASE_PATH:join(dir,'history.sqlite'),WALLET_ACTIVITY_DATABASE_PATH:join(dir,'activity.sqlite'),
+    SCAN_DATABASE_PATH:join(dir,'scans.sqlite'),CHAIN_STREAM_DATABASE_PATH:join(dir,'stream.sqlite'),
+    ORDERS_DATABASE_PATH:join(dir,'orders.sqlite'),ENTRY_MODE:'off'});
+  let onEvent:((value:FastWalletEvent)=>void)|undefined;const admitted:FastWalletEvent[]=[];
+  t.mock.method(WalletFastRunner.prototype,'start',function(this:WalletFastRunner){onEvent=(this as unknown as {options:{onEvent:(value:FastWalletEvent)=>void}}).options.onEvent;});
+  t.mock.method(WalletFastRunner.prototype,'stop',async()=>{assert.ok(onEvent);onEvent(event);});
+  t.mock.method(WalletFastResearch.prototype,'start',()=>{});
+  t.mock.method(WalletFastResearch.prototype,'enqueue',(value:FastWalletEvent)=>{admitted.push(value);});
+  t.mock.method(WalletFastResearch.prototype,'stop',async()=>true);
+  t.mock.method(WalletFastPersistenceRunner.prototype,'start',()=>{});
+  t.mock.method(WalletFastPersistenceRunner.prototype,'stop',async()=>true);
+  const runtime=createRuntime(cfg);
+  try {runtime.start();await runtime.close();assert.deepEqual(admitted,[event]);}
+  finally {rmSync(dir,{recursive:true,force:true});}
+});
+
+test('dashboard launcher summary uses the worker cache instead of a main-thread candidate scan',async t=>{
+  const dir=mkdtempSync(join(tmpdir(),'launcher-dashboard-cache-')),profiles=join(dir,'profiles.sqlite');
+  const db=new DatabaseSync(profiles);db.exec(`
+    CREATE TABLE wp_profiles(chain TEXT,address TEXT,computed_at TEXT NOT NULL,fresh_until TEXT NOT NULL,data TEXT NOT NULL,
+      source_wallet INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(chain,address));
+    CREATE TABLE wp_groups(chain TEXT,address TEXT,group_id TEXT,first_at TEXT NOT NULL,PRIMARY KEY(chain,address,group_id));
+    CREATE INDEX wp_groups_filter ON wp_groups(group_id,chain,address);
+  `);db.close();
+  const cfg=readConfig({WALLET_RESEARCH_ENABLED:'true',WALLET_PROFILES_ENABLED:'false',LAUNCHER_CANDIDATES_ENABLED:'true',
+    WALLET_HISTORY_DATABASE_PATH:join(dir,'history.sqlite'),WALLET_PROFILES_DATABASE_PATH:profiles,
+    LAUNCHER_CANDIDATES_DATABASE_PATH:join(dir,'launcher.sqlite'),ORDERS_DATABASE_PATH:join(dir,'orders.sqlite')});
+  const runtime=createRuntime(cfg);
+  try {runtime.start();const deadline=Date.now()+5000;
+    while(!runtime.launcherCandidatesStatus().refresh?.result&&Date.now()<deadline)await new Promise(resolve=>setTimeout(resolve,20));
+    assert.ok(runtime.launcherCandidatesStatus().refresh?.result);
+    t.mock.method(LauncherCandidates.prototype,'status',()=>{throw new Error('MAIN_THREAD_LAUNCHER_STATUS_FORBIDDEN');});
+    assert.equal(runtime.dashboardOverview().launcherCandidates.records,0);
+    assert.equal(runtime.launcherCandidatesStatus().records,0);
   } finally {await runtime.close();rmSync(dir,{recursive:true,force:true});}
 });

@@ -7,6 +7,8 @@ import type {Chain} from '../src/types.js';
 import type {ScanPrice,ScanToken} from '../src/scan-archive.js';
 import type {RpcStreamOptions,RpcStreamStatus,RpcSubscription} from '../src/rpc-stream.js';
 import type {PoolDiscovery,PoolPriceResult,VerifiedPool} from '../src/chain-prices.js';
+import type {ChainEventWriter,ChainEventWriterStatus} from '../src/chain-event-writer.js';
+import type {ChainEvent} from '../src/chain-stream-store.js';
 
 const GENESIS='5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d';
 const evm=(n:number)=>'0x'+n.toString(16).padStart(40,'0');
@@ -41,7 +43,7 @@ class Stream {
     desiredSubscriptions:this.specs.length,pendingRequests:0,reconnectAttempt:0,reconnects:Math.max(0,this.generation-1),requestsSent:this.calls.length,messagesReceived:0,notificationsReceived:0};}
   notify(key:string,data:unknown,generation=this.generation){this.options.onNotification(key,data,{generation,receivedAt:0,subscriptionId:'s'});}
 }
-function fixture(t:TestContext,chain:Chain='bsc',opts:{tokens?:ScanToken[];wallets?:string[];maxPools?:number;autoAck?:boolean}={}){
+function fixture(t:TestContext,chain:Chain='bsc',opts:{tokens?:ScanToken[];wallets?:string[];maxPools?:number;autoAck?:boolean;liveWriter?:ChainEventWriter}={}){
   const clock=new Clock(),store=new ChainStreamStore(':memory:'),prices:ScanPrice[]=[],calls:{method:string;params:readonly unknown[]}[]=[],pairCalls:string[]=[];
   let tokens=opts.tokens??[],wallets=opts.wallets??[],rpcStopped=false,marketStopped=false;
   let handler:(method:string,params:readonly unknown[])=>unknown=method=>{
@@ -60,7 +62,7 @@ function fixture(t:TestContext,chain:Chain='bsc',opts:{tokens?:ScanToken[];walle
     endpoints:{[chain]:{http:'https://rpc.invalid',ws:'wss://rpc.invalid'}}},store,clock,tokens:()=>tokens,wallets:()=>wallets,onPrice:p=>prices.push(p),
     market:{pairs:(chain,address)=>pairs(chain,address),anchor:async(chain,address)=>({chain,address,priceUsd:1,observedAt:new Date(clock.now()).toISOString(),source:'vendor_reference'}),stop:()=>{marketStopped=true;}},
     httpFactory:()=>rpc,streamFactory:options=>{stream=new Stream(options);stream.handler=()=>chain==='robinhood'?'0x1237':'0x38';stream.autoAck=opts.autoAck??true;return stream;},
-    discoverPool:(...args)=>discover(...args),readPoolPrice:(...args)=>read(...args)});
+    discoverPool:(...args)=>discover(...args),readPoolPrice:(...args)=>read(...args),liveWriter:opts.liveWriter});
   t.after(()=>monitor.stop());
   return {monitor,clock,store,stream,prices,calls,pairCalls,
     setHandler:(fn:typeof handler)=>{handler=fn;},setPairs:(fn:typeof pairs)=>{pairs=fn;},setDiscover:(fn:typeof discover)=>{discover=fn;},setRead:(fn:typeof read)=>{read=fn;},
@@ -88,6 +90,39 @@ test('HTTP and EVM websocket identities must both match; pre-identity notificati
   f.stream.handler=()=> '0x1'; // Already-issued request used 0x38; HTTP mismatch still rejects.
   wait.resolve('0x1');await flush();assert.equal(f.status().identityVerified,false);assert.equal(f.store.stats().events,0);
   assert.deepEqual(f.stream.reasons,['RPC_CHAIN_IDENTITY_MISMATCH']);assert.equal(f.pairCalls.length,0);
+});
+
+test('trusted EVM websocket callbacks admit live events without touching SQLite',async t=>{
+  const accepted:ChainEvent[]=[];
+  const emptyStatus=():ChainEventWriterStatus=>({state:'ready',running:true,ready:true,countOwnership:'external',pending:0,inFlight:0,capacity:8,accepted:accepted.length,
+    coalesced:0,rejectedInvalid:0,rejectedCapacity:0,rejectedClosed:0,completed:0,inserted:0,
+    insertedByChain:{bsc:0,solana:0,robinhood:0},failedAttempts:0,droppedAfterRetries:0,droppedOnStop:0,unconfirmedOnStop:0,
+    unpersistedEvents:0,restarts:0,pendingIncompleteReasons:[],unpersistedIncompleteReasons:[],lastBatchMs:0,maxBatchMs:0,oldestPendingMs:0});
+  const liveWriter:ChainEventWriter={start(){},enqueue(value){accepted.push(value);return true;},markIncomplete(){},status:emptyStatus,async stop(){return true;}};
+  const f=fixture(t,'bsc',{wallets:[W],liveWriter});await f.open();
+  let sqliteCalls=0;f.store.record=()=>{sqliteCalls++;throw new Error('SQLITE_BUSY');};
+  f.stream.notify('wallet:from',log());
+  assert.equal(accepted.length,1);assert.equal(accepted[0].source,'live');assert.equal(sqliteCalls,0);
+});
+
+test('the in-memory writer defers live SQLite work and counts each row once',async t=>{
+  const f=fixture(t,'bsc',{wallets:[W]});await f.open();
+  f.stream.notify('wallet:from',log());assert.equal(f.store.stats().events,0);
+  await new Promise<void>(resolve=>setImmediate(resolve));
+  assert.equal(f.store.stats().events,1);const status=f.monitor.getStatus();
+  assert.equal(status.liveEventWriter.countOwnership,'shared');assert.equal(status.liveEventWriter.inserted,1);
+  assert.equal(status.store.events,1);assert.equal(status.chains.find(row=>row.chain==='bsc')?.events,1);
+});
+
+test('chain monitor returns and retains an undrained writer shutdown result',async t=>{
+  let stops=0;const status:ChainEventWriterStatus={state:'ready',running:true,ready:true,countOwnership:'external',pending:1,inFlight:0,
+    capacity:1,accepted:1,coalesced:0,rejectedInvalid:0,rejectedCapacity:0,rejectedClosed:0,completed:0,inserted:0,
+    insertedByChain:{bsc:0,solana:0,robinhood:0},failedAttempts:0,droppedAfterRetries:0,droppedOnStop:0,unconfirmedOnStop:0,
+    unpersistedEvents:1,restarts:0,pendingIncompleteReasons:[],unpersistedIncompleteReasons:[],lastBatchMs:0,maxBatchMs:0,oldestPendingMs:1};
+  const liveWriter:ChainEventWriter={start(){},enqueue(){return true;},markIncomplete(){},status:()=>status,
+    async stop(){stops++;status.state='stopped';status.shutdownDrained=false;status.shutdownError='CHAIN_EVENT_WRITER_SHUTDOWN_UNDRAINED';return false;}};
+  const f=fixture(t,'bsc',{liveWriter});f.monitor.start();
+  assert.equal(await f.monitor.stop(),false);assert.equal(await f.monitor.stop(),false);assert.equal(stops,1);
 });
 
 test('correct HTTP identity cannot make a websocket on another EVM chain trusted',async t=>{

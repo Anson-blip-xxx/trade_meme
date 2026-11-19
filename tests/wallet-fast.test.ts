@@ -145,9 +145,20 @@ test('transfers, failures and unknown unsupported actions do not enter trade met
 });
 test('retraction during asynchronous enrichment prevents dispatch; queue and request budgets remain bounded',async t=>{
   let release!:(value:WalletActivity)=>void,signals=0;const worker=new WalletFastResearch({now:()=>at+1000,ready:()=>true,verify:()=>new Promise(done=>{release=done;}),onClassification:()=>true,onTrades:()=>{},onSignal:async()=>{signals++;}});
-  t.after(()=>worker.stop());worker.start();const e=preview();worker.enqueue(e);const done=worker.runOnce();worker.enqueue({...e,removed:true,verdict:'retracted'});release(verified());await done;assert.equal(signals,0);
+  t.after(()=>worker.stop(10));worker.start();const e=preview();worker.enqueue(e);const done=worker.runOnce();worker.enqueue({...e,removed:true,verdict:'retracted'});release(verified());await done;assert.equal(signals,0);
   for(let i=0;i<50;i++)worker.enqueue({...e,txHash:'0x'+(i+10).toString(16).padStart(64,'0')});
   assert.equal(worker.status().queued,4);assert.equal(worker.status().counts.perWalletDropped,46);
+});
+test('retraction while the original classification waits for durable ACK blocks trades and dispatch',async()=>{
+  let entered!:()=>void,release!:()=>void,trades=0,signals=0;
+  const began=new Promise<void>(resolve=>{entered=resolve;}),gate=new Promise<void>(resolve=>{release=resolve;});
+  const worker=new WalletFastResearch({now:()=>at+1000,ready:()=>true,verify:async e=>verified(e),
+    onClassification:async result=>{if(result.classification==='buy'){entered();await gate;}return true;},
+    onTrades:()=>{trades++;},onSignal:async()=>{signals++;}});
+  worker.start();const event=preview();worker.enqueue(event);const running=worker.runOnce();await began;
+  worker.enqueue({...event,removed:true,verdict:'retracted'});release();await running;
+  assert.equal(trades,0);assert.equal(signals,0);assert.equal(worker.status().analysisQueued,0);
+  assert.equal(worker.status().counts.retracted,1);assert.equal(await worker.stop(),true);
 });
 test('chain classification proceeds while screening is busy; sell evidence is recorded without buy dispatch',async t=>{
   let ready=false,now=at+1000,calls=0,signals=0,records=0;
@@ -161,4 +172,39 @@ test('retry pending chain confirmation at most three times; unavailable persiste
   t.after(()=>w.stop());w.start();w.enqueue(preview());for(let i=0;i<4;i++){await w.runOnce();now+=4000;}assert.equal(calls,3);assert.equal(signals,0);
   for(const mode of ['persistence','identity']){const worker=new WalletFastResearch({now:()=>at+1000,ready:()=>true,verify:async e=>({...verified(e),...(mode==='identity'?{wallet:other}:{})}),onClassification:()=>false,onTrades:()=>{throw new Error('must not record');},onSignal:async()=>{signals++;}});
     t.after(()=>worker.stop());worker.start();worker.enqueue(preview());await worker.runOnce();assert.equal(signals,0);}
+});
+test('shutdown drains an in-flight verification and every queued classification through persistence ACK',async()=>{
+  let releaseVerify!:()=>void,releasePersistence!:()=>void,verifyCalls=0;
+  const verifyGate=new Promise<void>(resolve=>{releaseVerify=resolve;}),persistenceGate=new Promise<void>(resolve=>{releasePersistence=resolve;});
+  const persisted:string[]=[];
+  const worker=new WalletFastResearch({now:()=>at+1000,ready:()=>false,verify:async e=>{
+    verifyCalls++;if(verifyCalls===1)await verifyGate;return verified(e,'transfer');
+  },onClassification:async result=>{persisted.push(result.txHash);if(persisted.length===2)await persistenceGate;return true;},onTrades:()=>{},onSignal:async()=>{}});
+  worker.start();const first=preview(),second={...first,txHash:'0x'+'b'.repeat(64)};
+  worker.enqueue(first);worker.enqueue(second);void worker.runOnce();
+  while(verifyCalls<1)await new Promise<void>(resolve=>setImmediate(resolve));
+  const stopped=worker.stop(1000);releaseVerify();
+  while(persisted.length<2)await new Promise<void>(resolve=>setImmediate(resolve));
+  let settled=false;void stopped.then(()=>{settled=true;});await new Promise<void>(resolve=>setImmediate(resolve));assert.equal(settled,false);
+  releasePersistence();assert.equal(await stopped,true);assert.deepEqual(persisted,[first.txHash,second.txHash]);
+  const status=worker.status();assert.equal(status.queued,0);assert.equal(status.persistenceInFlight,0);
+  assert.equal(status.counts.droppedOnStop,0);assert.equal(status.counts.unconfirmedOnStop,0);
+});
+test('bounded shutdown reports queued drops and an unconfirmed active verification',async()=>{
+  let started!:()=>void;const began=new Promise<void>(resolve=>{started=resolve;});
+  const worker=new WalletFastResearch({now:()=>at+1000,ready:()=>false,verify:async()=>{started();return new Promise<WalletActivity>(()=>{});},
+    onClassification:()=>true,onTrades:()=>{},onSignal:async()=>{}});
+  worker.start();const first=preview();worker.enqueue(first);worker.enqueue({...first,txHash:'0x'+'c'.repeat(64)});void worker.runOnce();await began;
+  assert.equal(await worker.stop(10),false);const status=worker.status();assert.equal(status.stopped,true);assert.equal(status.counts.droppedOnStop,1);
+  assert.equal(status.counts.unconfirmedOnStop,1);assert.equal(status.queued,0);
+});
+test('a persistence ACK arriving after shutdown timeout cannot continue into trade or signal dispatch',async()=>{
+  let entered!:()=>void,release!:()=>void,trades=0,signals=0;const began=new Promise<void>(resolve=>{entered=resolve;});
+  const gate=new Promise<void>(resolve=>{release=resolve;});
+  const worker=new WalletFastResearch({now:()=>at+1000,ready:()=>true,verify:async e=>verified(e),
+    onClassification:async()=>{entered();await gate;return true;},onTrades:()=>{trades++;},onSignal:async()=>{signals++;}});
+  worker.start();worker.enqueue(preview());const running=worker.runOnce();await began;
+  assert.equal(await worker.stop(10),false);const before=worker.status().counts.unconfirmedOnStop;release();await running;
+  const status=worker.status();assert.equal(trades,0);assert.equal(signals,0);assert.equal(status.analysisQueued,0);
+  assert.equal(status.counts.unconfirmedOnStop,before);
 });

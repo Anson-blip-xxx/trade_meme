@@ -21,7 +21,7 @@
     "demo": "node --import tsx scripts/demo.ts",
     "typecheck": "tsc --noEmit",
     "build": "tsc",
-    "test": "node --import tsx --test tests/*.test.ts",
+    "test": "node --import tsx --test --test-concurrency=2 tests/*.test.ts",
     "check": "npm run typecheck && npm test",
     "start": "node --env-file-if-exists=.env dist/src/server.js"
   },

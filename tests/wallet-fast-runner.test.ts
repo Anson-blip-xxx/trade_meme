@@ -4,12 +4,55 @@ import {createServer} from 'node:http';
 import {createRequire} from 'node:module';
 import {once} from 'node:events';
 import bs58 from 'bs58';
-import {WalletFastRunner} from '../src/wallet-fast-runner.js';
+import {WalletFastRunner,type WalletFastSnapshotPhase} from '../src/wallet-fast-runner.js';
 import type {FastWalletEvent} from '../src/wallet-fast.js';
 
 // ws is already pinned by socket.io-client's engine.io-client dependency.
 const {WebSocketServer}=createRequire(import.meta.url)('ws');
 async function until(check:()=>boolean,timeout=8000){const end=Date.now()+timeout;while(!check()){if(Date.now()>end)throw new Error('TEST_WAIT_TIMEOUT');await new Promise(r=>setTimeout(r,20));}}
+
+test('snapshot telemetry preserves the total and records each instrumented construction phase',async()=>{
+  let posted:unknown;
+  const runner=new WalletFastRunner({endpoints:{},maxWallets:10,snapshot:timing=>{
+    const run=<T>(phase:WalletFastSnapshotPhase,value:T)=>timing!.measure(phase,()=>value);
+    const targets=run('launcherTargets',[] as never[]);run('walletHistoryTargets',[]);run('profileMetadata',[]);
+    run('targetAssembly',targets);run('storeTokens',[]);const now=Date.now();
+    return {at:new Date(now).toISOString(),validUntil:new Date(now+60_000).toISOString(),targets:[],tokens:[]};
+  },onEvent:()=>{}});
+  (runner as any).running=true;(runner as any).worker={postMessage:(message:unknown)=>{posted=message;}};
+  (runner as any).refresh();const build=runner.status().snapshotBuild;
+  assert.equal((posted as any).type,'snapshot');assert.equal(build.samples,1);
+  assert.deepEqual(Object.keys(build.phases),['launcherTargets','walletHistoryTargets','profileMetadata','targetAssembly','storeTokens','postMessage']);
+  for(const phase of Object.values(build.phases) as any[]){assert.equal(phase.samples,1);assert.ok(phase.p50Ms>=0);}
+  assert.equal(build.phases.launcherTargets.basis,'launcher_target_selection_and_membership');
+  assert.equal(build.phases.postMessage.basis,'worker_snapshot_post_message');
+  (runner as any).worker=undefined;await runner.stop();
+});
+
+test('recurring snapshots are offset from the 30 second reconciler while health checks stay independent',async()=>{
+  const now=new Date().toISOString(),runner=new WalletFastRunner({endpoints:{},maxWallets:10,
+    snapshot:()=>({at:now,validUntil:new Date(Date.now()+60_000).toISOString(),targets:[],tokens:[]}),onEvent:()=>{}});
+  (runner as any).launch=()=>{};runner.start();
+  const build=runner.status().snapshotBuild;
+  assert.deepEqual(build.schedule,{intervalMs:30_000,offsetMs:7_500,earlyRefreshMs:1_000,healthCheckMs:5_000});
+  assert.equal((runner as any).refreshTimer._idleTimeout,7_500);
+  assert.equal((runner as any).earlyRefreshTimer._idleTimeout,1_000);
+  assert.equal((runner as any).watchdog._idleTimeout,5_000);
+  assert.ok(build.schedule.healthCheckMs<build.schedule.intervalMs);
+  let terminated=0;(runner as any).worker={terminate:()=>{terminated++;}};(runner as any).lastStatusAt=Date.now()-45_001;
+  (runner as any).checkHealth();assert.equal(terminated,1);assert.equal(runner.status().error,'FAST_WALLET_WORKER_TIMEOUT');
+  (runner as any).worker=undefined;
+  await runner.stop();
+});
+
+test('one early snapshot refresh fills worker caches before the staggered recurring refresh',async()=>{
+  const now=new Date().toISOString(),runner=new WalletFastRunner({endpoints:{},maxWallets:10,
+    snapshot:()=>({at:now,validUntil:new Date(Date.now()+60_000).toISOString(),targets:[],tokens:[]}),onEvent:()=>{}});
+  let refreshes=0;(runner as any).launch=()=>{refreshes++;};(runner as any).refresh=()=>{refreshes++;};runner.start();
+  try {assert.equal(refreshes,1);await new Promise(resolve=>setTimeout(resolve,1_100));assert.equal(refreshes,2);
+    assert.equal((runner as any).refreshTimer._idleTimeout,7_500);
+  } finally {(runner as any).worker=undefined;await runner.stop();}
+});
 
 test('one worker status publishes all due chain coverage through one batch callback',()=>{
   const batches:{chain:string;wallets:string[];at:string}[][]=[],now=new Date().toISOString(),runner=new WalletFastRunner({
@@ -56,6 +99,10 @@ test('independent worker subscribes processed, verifies the endpoint and judges 
   assert.equal(events[0].verdict,'priority_review');assert.equal(events[0].buyVerified,false);
   assert.ok(Date.parse(events[0].judgedAt)<end,'worker produces the verdict without waiting for the main event loop');
   assert.ok(runner.status().mainThreadHandoff.maxMs>=0);
+  assert.equal(runner.status().mainThreadCallback.samples,1);assert.ok(runner.status().mainThreadCallback.maxMs>=0);
+  assert.equal(runner.status().mainThreadCallback.basis,'main_thread_event_callback');
+  assert.equal(runner.status().workerAck.samples,1);assert.ok(runner.status().workerAck.maxMs>=runner.status().mainThreadCallback.maxMs);
+  assert.equal(runner.status().workerAck.basis,'main_thread_event_batch_receipt_to_worker_ack_post');
   assert.ok(runner.status().recentEvents[0].handoffMs>=300);
   assert.ok(Number.isFinite(Date.parse(runner.status().recentEvents[0].mainThreadReceivedAt)));
   const encoded=JSON.stringify(runner.status());assert.equal(encoded.includes('127.0.0.1'),false);
@@ -84,7 +131,10 @@ test('Solana coverage requires the WebSocket live slot to match the verified HTT
     onEvent:()=>{},onCoverage:(_chain,wallets)=>coverage.push(wallets)});
   t.after(async()=>{await runner.stop();for(const client of sockets.clients)client.terminate();await new Promise<void>(r=>sockets.close(()=>r()));
     server.closeAllConnections();await new Promise<void>(r=>server.close(()=>r()));});
-  runner.start();await until(()=>runner.status().chains?.[0]?.error==='FAST_WALLET_IDENTITY_FAILED');
+  // The full suite starts many worker threads concurrently. Keep the assertion
+  // about the resulting identity state, while allowing scheduler starvation in
+  // the test process itself; production RPC deadlines remain unchanged.
+  runner.start();await until(()=>runner.status().chains?.[0]?.error==='FAST_WALLET_IDENTITY_FAILED',30_000);
   assert.equal(runner.status().chains[0].identityVerified,false);assert.equal(coverage.some(wallets=>wallets.includes(wallet)),false);
 });
 
@@ -115,7 +165,7 @@ test('a recovered event callback clears current error but retains the last diagn
   assert.doesNotMatch(JSON.stringify(runner.status()),/private callback detail/);
 });
 
-test('Solana wallet-fast advances 31 subscriptions through four-ACK windows across reconnects',async t=>{
+test('Solana wallet-fast advances 31 subscriptions through a bounded four-ACK window',async t=>{
   const wallets=Array.from({length:30},(_,index)=>bs58.encode(new Uint8Array(32).fill(index+1)));
   const server=createServer((req,res)=>{let raw='';req.on('data',chunk=>raw+=chunk);req.on('end',()=>{const body=JSON.parse(raw);
     res.setHeader('content-type','application/json');res.end(JSON.stringify({jsonrpc:'2.0',id:body.id,
@@ -143,7 +193,11 @@ test('Solana wallet-fast advances 31 subscriptions through four-ACK windows acro
   runner.start();await until(()=>coverage.some(active=>active.length===30),10000);
   let chain=runner.status().chains[0];assert.equal(connections[0].peak,4);assert.equal(connections[0].subscribeMethods.length,31);
   assert.equal(chain.maxConcurrentSubscriptions,4);assert.equal(chain.peakConcurrentSubscriptions,4);
+  assert.equal(chain.maxConcurrentUnsubscriptions,1);
   assert.equal(chain.subscribingSubscriptions,0);assert.equal(chain.queuedSubscriptions,0);assert.equal(chain.activeSubscriptions,31);
+  assert.equal(chain.lateSubscriptionAcksPending,0);assert.equal(chain.lateSubscriptionAcksReceived,0);
+  assert.equal(chain.lateSubscriptionAcksRetired,0);assert.equal(chain.lateSubscriptionAcksMatchedActive,0);
+  assert.equal(chain.lateSubscriptionAckOverflows,0);assert.equal(chain.maxLateSubscriptionAcks,96);
   const firstFull=coverage.findIndex(active=>active.length===30);connections[0].socket.close();
   await until(()=>coverage.slice(firstFull+1).some(active=>active.length===0));
   await until(()=>connections.length>=2&&coverage.slice(firstFull+1).some(active=>active.length===30),12000);

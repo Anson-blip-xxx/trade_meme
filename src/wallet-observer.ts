@@ -151,7 +151,10 @@ export interface WalletObserverOptions {
     'captureTokenTraders' | 'recordCollection' | 'watchTargets' | 'markTargetChecked' | 'recordPrice'> &
     Partial<Pick<WalletHistory, 'associationTargets' | 'markAssociationTargetChecked' | 'captureFunding' |
       'getWalletObserverCursor' | 'setWalletObserverCursor' | 'researchSeedTarget' | 'markResearchSeedChecked' |
-      'prepareWriteCapacity'>>;
+      'prepareWriteCapacity' | 'recordTradesDurable' | 'recordCollectionDurable'>>;
+  /** Optional isolated writer; history.recordPrice remains the compatibility fallback. */
+  priceWriter?:{recordPrice:(...args:Parameters<WalletHistory['recordPrice']>)=>
+    WalletObserverPriceWriteResult|boolean|void|Promise<WalletObserverPriceWriteResult|boolean|void>};
   client: Pick<GmgnClient, 'get' | 'cooldownUntil'> & Partial<Pick<GmgnClient, 'recordRateLimit'>>;
   config?: Config;
   chains?: Chain[];
@@ -159,6 +162,9 @@ export interface WalletObserverOptions {
   maxRequestsPerCycle?: number;
   now?: () => Date;
 }
+export type WalletObserverPriceWriteReason = 'WALLET_PRICE_WRITE_QUEUE_FULL'|'WALLET_PRICE_WRITE_TIMEOUT'|
+  'WALLET_PRICE_WRITE_FAILED'|'WALLET_PRICE_WRITER_UNAVAILABLE'|'WALLET_PRICE_INPUT_INVALID';
+export interface WalletObserverPriceWriteResult {accepted:boolean;reason?:WalletObserverPriceWriteReason;retryable?:boolean;}
 export interface WalletObserverCycle {
   chain: Chain; status: 'ok' | 'partial' | 'cooldown' | 'stopped'; startedAt: string; completedAt: string;
   requests: number; accepted: number; reasons: string[]; coverage: 'one_page_sample';
@@ -169,6 +175,7 @@ class ObserverHalt extends Error {}
 /** Persistent observational research only; never gates or initiates a trade. */
 export class WalletObserver {
   private readonly history: WalletObserverOptions['history'];
+  private readonly priceWriter:NonNullable<WalletObserverOptions['priceWriter']>;
   private readonly client: WalletObserverOptions['client'];
   private readonly now: () => Date;
   private readonly interval: number;
@@ -201,7 +208,8 @@ export class WalletObserver {
     const chains = options.chains ?? CHAINS;
     if (!Array.isArray(chains) || !chains.length || chains.some(chain => !CHAINS.includes(chain))) throw new Error('WALLET_OBSERVER_CONFIG_INVALID');
     this.chains = [...new Set(chains)];
-    this.history = options.history; this.client = options.client; this.now = options.now ?? (() => new Date());
+    this.history = options.history;this.priceWriter=options.priceWriter??options.history;
+    this.client = options.client; this.now = options.now ?? (() => new Date());
     try {
       const saved = parseWalletObserverCursor(this.history.getWalletObserverCursor?.());
       if (saved && JSON.stringify(saved.chains) === JSON.stringify(this.chains)) this.restoreCursor(saved);
@@ -214,14 +222,22 @@ export class WalletObserver {
       received: parsed.received, accepted: parsed.trades.length, rejected: parsed.rejected, hasMore: parsed.hasMore,
       coverage: 'one_page_sample' as const, reason: parsed.invalidReason as string | undefined};
     try {
-      this.history.recordTrades(parsed.trades);
-      this.history.recordCollection({source: `gmgn_${page.kind}_feed`, chain: page.chain,
+      const tradesPersisted = parsed.trades.length === 0 || (this.history.recordTradesDurable
+        ? this.history.recordTradesDurable(parsed.trades) : (this.history.recordTrades(parsed.trades), true));
+      const collection = {source: `gmgn_${page.kind}_feed`, chain: page.chain,
         startedAt: page.fetchedAt, completedAt: page.fetchedAt, status: parsed.invalidReason || parsed.rejected ? 'partial' : 'ok',
         requests: 0, accepted: parsed.trades.length, rejected: parsed.rejected, coverage: 'one_page_sample', hasMore: parsed.hasMore,
-        reason: parsed.invalidReason});
+        reason: parsed.invalidReason} as const;
+      const collectionPersisted = tradesPersisted && (this.history.recordCollectionDurable
+        ? this.history.recordCollectionDurable(collection) : (this.history.recordCollection(collection), true));
+      if (!tradesPersisted || !collectionPersisted) {
+        this.lastFeedError = 'WALLET_HISTORY_CAPACITY_REACHED'; report.status = 'unavailable'; report.reason = this.lastFeedError;
+        return {...report, persisted: false, retryable: true};
+      }
       this.lastFeedError = undefined;
-    } catch {this.lastFeedError = 'WALLET_HISTORY_WRITE_FAILED'; report.status = 'unavailable'; report.reason = this.lastFeedError;}
-    return report;
+      return {...report, persisted: true, retryable: false};
+    } catch {this.lastFeedError = 'WALLET_HISTORY_WRITE_FAILED'; report.status = 'unavailable'; report.reason = this.lastFeedError;
+      return {...report, persisted: false, retryable: true};}
   }
 
   getStatus() {
@@ -298,6 +314,7 @@ export class WalletObserver {
     this.pending = this.pendingByChain.get(this.chains[this.cursor % this.chains.length]);
     const report = await this.executeCycle(generation);
     const retry = generation !== this.generation || report.status === 'cooldown' || report.reasons.some(value =>
+      ['WALLET_PRICE_WRITE_QUEUE_FULL','WALLET_PRICE_WRITER_UNAVAILABLE'].includes(value) ||
       /(?:_FAILED|_TIMEOUT|_MISSING|_ABORTED|_BUDGET_REACHED|_SCHEMA_INVALID)$/.test(value));
     if (retry) {
       const unfinished = new Map(this.pendingByChain); this.restoreCursor(checkpoint); this.pendingByChain = unfinished;
@@ -480,7 +497,7 @@ export class WalletObserver {
       if (object(info) && matchesChain(info, chain) && address(info.address, chain) === target.address) {
         const price = object(info.price) ? decimal(info.price.price) : null;
         if (price !== null && Number.isFinite(Number(price)) && Number(price) > 0)
-          this.history.recordPrice(target, Number(price), this.now().toISOString(), 'gmgn_token_info_sample');
+          await this.recordObservedPrice(target, Number(price), this.now().toISOString(), 'gmgn_token_info_sample', reason);
         const signal: Signal = {source: 'gmgn', sourceEventId: 'wallet-observer', occurredAt: this.now().toISOString(),
           token: target, text: '', evidenceUrls: [], claim: 'unspecified'};
         const scopedClient = {get: request} as unknown as GmgnClient;
@@ -574,7 +591,7 @@ export class WalletObserver {
       if (object(info) && matchesChain(info, chain) && address(info.address, chain) === target.address) {
         const price = object(info.price) ? decimal(info.price.price) : null;
         if (price !== null && Number.isFinite(Number(price)) && Number(price) > 0)
-          this.history.recordPrice(target, Number(price), this.now().toISOString(), 'gmgn_token_info_sample');
+          await this.recordObservedPrice(target, Number(price), this.now().toISOString(), 'gmgn_token_info_sample', reason);
       } else if (info !== undefined) reason('GMGN_TOKEN_INFO_SCHEMA_INVALID');
     }
 
@@ -651,6 +668,21 @@ export class WalletObserver {
     {source: kind === 'native_transfer' ? 'gmgn_association_trader_funding' : 'gmgn_association_wallet_funding', observedAt});
   }
 
+  private async recordObservedPrice(target:Token,priceUsd:number,observedAt:string,provider:string,
+    reason:(value:string)=>void):Promise<void> {
+    try {
+      const result=await this.priceWriter.recordPrice(target,priceUsd,observedAt,provider);
+      if(result===false){reason('WALLET_PRICE_WRITE_QUEUE_FULL');return;}
+      if(object(result)){
+        if(result.accepted===true)return;
+        const code=typeof result.reason==='string'&&['WALLET_PRICE_WRITE_QUEUE_FULL','WALLET_PRICE_WRITE_TIMEOUT',
+          'WALLET_PRICE_WRITE_FAILED','WALLET_PRICE_WRITER_UNAVAILABLE','WALLET_PRICE_INPUT_INVALID'].includes(result.reason)
+          ?result.reason:'WALLET_PRICE_WRITE_FAILED';
+        reason(code);
+      }
+    } catch {reason('WALLET_PRICE_WRITE_FAILED');}
+  }
+
   private finish(report: WalletObserverCycle, generation: number): WalletObserverCycle {
     report.completedAt = this.now().toISOString();
     if (generation !== this.generation) report.status = 'stopped';
@@ -663,3 +695,8 @@ export class WalletObserver {
     return report;
   }
 }
+
+/** Serializable observer state mirrored by the worker-backed runner. */
+export type WalletObserverStatus = ReturnType<WalletObserver['getStatus']>;
+/** Result produced after a feed page has been persisted by the observer. */
+export type WalletObserverFeedReport = ReturnType<WalletObserver['observeFeed']>;

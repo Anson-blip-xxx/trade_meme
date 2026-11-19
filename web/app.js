@@ -442,6 +442,26 @@
   function text(id, value) { $(id).textContent = value; }
   function scalar(value, fallback = '—') { return typeof value === 'string' || typeof value === 'number' ? String(value) : fallback; }
   function finite(value) { return typeof value === 'number' && Number.isFinite(value); }
+  function workerCount(value, fields) { return fields.reduce((total, field) => total + (finite(value?.[field]) ? Math.max(0, value[field]) : 0), 0); }
+  function workerHealth(value) {
+    if (!value || typeof value !== 'object') return {configured:false, ready:false, paused:false, pending:0, dropped:0, rejected:0, restarts:0, errors:[], problem:false};
+    const pending = workerCount(value, ['pending', 'pendingChains', 'pendingTargets', 'pendingFeeds', 'inFlight', 'inFlightFeeds', 'networkInFlight', 'durablePendingJobs', 'persistenceInFlight']);
+    const dropped = workerCount(value, ['droppedAfterRetries', 'droppedOnStop', 'droppedFeeds', 'retryCapacityDrops', 'terminalFailures']);
+    const rejected = workerCount(value, ['rejectedCapacity', 'rejectedClosed', 'networkRejectedCapacity', 'pricesRejected']);
+    const restarts = finite(value.restarts) ? Math.max(0, value.restarts) : 0;
+    const errors = [...new Set([...['error', 'targetError', 'shutdownError', 'closeError', 'workerError'].map(field => value[field]),value.activity?.error]
+      .filter(item => typeof item === 'string' && item))];
+    const ready = value.ready === true, paused = ['GMGN_BACKGROUND_RESEARCH_DISABLED', 'WALLET_RESEARCH_DISABLED'].includes(value.pausedReason),
+      unready = value.ready === false || value.running === false && value.state !== 'idle' && value.state !== 'stopped';
+    return {configured:true, ready, paused, pending, dropped, rejected, restarts, errors,
+      problem:errors.length > 0 || dropped > 0 || rejected > 0 || restarts > 0 || !paused && (unready || pending > 0 && !ready)};
+  }
+  function workerStatusText(value) {
+    const health = workerHealth(value); if (!health.configured) return '未启用';
+    const state = health.paused ? '按配置暂停' : health.ready ? '就绪' : value?.state === 'starting' || value?.running ? '启动或恢复中' : '未就绪';
+    return `${state} · 待处理 ${count(health.pending)} · 丢弃 ${count(health.dropped)} · 拒绝 ${count(health.rejected)} · 重启 ${count(health.restarts)}`;
+  }
+  function workerErrorText(value) { return workerHealth(value).errors.map(item => reasonNames[item] || item).join('；'); }
   function numeric(value) { return (typeof value === 'number' || typeof value === 'string' && value.trim() !== '') && Number.isFinite(Number(value)) ? Number(value) : undefined; }
   function count(value) { return finite(value) ? new Intl.NumberFormat('zh-CN').format(value) : '—'; }
   function percent(value) { return finite(value) ? `${value > 0 ? '+' : ''}${new Intl.NumberFormat('en-US', {maximumFractionDigits: 2}).format(value)}%` : '—'; }
@@ -1531,12 +1551,20 @@
     text('status-scanner-note', marketRunning ? `Market 最近 ${time(marketCycle.completedAt)} · 实时新增 ${count(marketCycle.liveNewEvents)} 条 · 间隔 ${count(market.intervalMs)} ms` : cooling ? `恢复时间 ${time(scanner.cooldownUntil)}` : scannerPaused ? 'GMGN 后台研究已暂停；DeBot / Ave 继续接收信号' : cycle.completedAt ? `最近 ${time(cycle.completedAt)} · 接收 ${count(cycle.received)} 条` : '等待第一轮扫描完成');
     text('status-watch-note', `复评：${watchRecheckLabel(watch)}${watch?.enabled ? ` · 待复评 ${count(watch.queue?.scheduled)} 条${watch.queue?.due > 0 ? `（到期排队 ${count(watch.queue.due)}）` : ''}` : ''}`);
     statusDot('status-scanner-dot', scanProblem ? 'watch' : scannerPaused && !marketRunning ? 'neutral' : 'pass');
+    const observerWorker=observer.worker?{...observer.worker,ready:observer.ready,running:observer.running,state:observer.state}:undefined,
+      fastWorkers=data.chainStream?.walletFast||{},launcherWorkers=data.launcherCandidates||{};
+    const walletWorkers=[['分类持久化 Worker',fastWorkers.persistence],['观察器 Worker',observerWorker],['价格持久化 Worker',research.priceWriter],
+      ['启动器活跃写入 Worker',launcherWorkers.realtimeWriter||fastWorkers.launcherLiveness],['启动器覆盖写入 Worker',launcherWorkers.coverageWriter||fastWorkers.launcherCoverage]]
+      .filter(([,value])=>value&&typeof value==='object');
+    const walletWorkerProblems=walletWorkers.filter(([,value])=>workerHealth(value).problem);
     const walletError = store.error || research.captureError || observer.feedError;
     const walletCooling = observer.cooldownUntil && Date.parse(observer.cooldownUntil) > Date.now();
     const observerPaused = observer.pausedReason === 'GMGN_BACKGROUND_RESEARCH_DISABLED';
-    const walletProblem = Boolean(walletError || research.enabled && !observerPaused && (!observer.running || walletCooling || walletCycle.status === 'partial'));
-    text('status-wallet', walletError ? '保存异常' : !research.enabled ? '未启用' : observerPaused ? '本地积累中 · 增强采集已暂停' : walletCooling ? '归档运行 · 增强采集冷却' : observer.running ? observer.inFlight ? '正在增强采集' : '持续积累中' : '增强采集未运行');
-    text('status-wallet-note', walletError ? reasonNames[walletError] || scalar(walletError) : `${count(store.wallets)} 个钱包 · ${count(store.events)} 条活动${walletCycle.status === 'partial' ? ' · 增强数据待补全' : ''}`);
+    const walletProblem = Boolean(walletError || walletWorkerProblems.length || research.enabled && !observerPaused && (!observer.running || walletCooling || walletCycle.status === 'partial'));
+    text('status-wallet', walletError ? '保存异常' : walletWorkerProblems.length ? '后台 Worker 需关注' : !research.enabled ? '未启用' : observerPaused ? '本地积累中 · 增强采集已暂停' : walletCooling ? '归档运行 · 增强采集冷却' : observer.running ? observer.inFlight ? '正在增强采集' : '持续积累中' : '增强采集未运行');
+    text('status-wallet-note', walletError ? reasonNames[walletError] || scalar(walletError) : walletWorkerProblems.length ?
+      walletWorkerProblems.map(([label,value])=>`${label}：${workerErrorText(value)||workerStatusText(value)}`).join(' · ') :
+      `${count(store.wallets)} 个钱包 · ${count(store.events)} 条活动${walletCycle.status === 'partial' ? ' · 增强数据待补全' : ''}`);
     statusDot('status-wallet-dot', walletProblem ? 'watch' : research.enabled ? 'pass' : 'neutral');
     const successCount = balances.filter(balance => balance.status === 'ok').length, failed = balances.filter(balance => ['stale', 'unavailable', 'error'].includes(balance.status));
     const balanceProblem = failed.length > 0;
@@ -1552,11 +1580,12 @@
     const protectionError = data.exitProtection?.captureError || data.exitProtection?.status?.lastError;
     text('system-protection-link', protectionError ? '动态保护：影子记录异常' : data.exitProtection?.enabled ? '动态保护：影子研究' : '动态保护：未启用');
     const stream = data.chainStream, streamChains = Array.isArray(stream?.chains) ? stream.chains : [];
-    const streamIssue = Boolean(stream?.enabled && (!stream.running || stream.store?.incomplete || streamChains.some(chain => ['reconnecting', 'degraded'].includes(chain.state) || chain.state === 'live' && chain.identityVerified !== true || hasGapIssue(chain.gap?.incomplete))));
+    const streamWriterHealth=workerHealth(stream?.liveEventWriter);
+    const streamIssue = Boolean(stream?.enabled && (!stream.running || stream.store?.incomplete || streamWriterHealth.problem || streamChains.some(chain => ['reconnecting', 'degraded'].includes(chain.state) || chain.state === 'live' && chain.identityVerified !== true || hasGapIssue(chain.gap?.incomplete))));
     const streamLive = streamChains.filter(chain => chain.state === 'live' && chain.identityVerified === true).length;
     text('chain-stream-summary-text', !stream ? '链上订阅：状态未知' : !stream.enabled ? '链上订阅：未启用' : !stream.running ? '链上订阅：未运行' : `链上订阅：${streamLive} / ${streamChains.length} 个网络已连接`);
     statusDot('chain-stream-summary-dot', streamIssue ? 'watch' : streamLive ? 'pass' : 'neutral');
-    text('chain-stream-summary-note', streamIssue ? '连接或补数需关注 · 查看各链详情；实盘保护仍需单独核实。' : '仅观察目标钱包与池，连接正常不代表实盘保护就绪。');
+    text('chain-stream-summary-note', streamIssue ? `连接、补数或实时写入需关注${streamWriterHealth.problem ? ` · ${workerErrorText(stream?.liveEventWriter)||workerStatusText(stream?.liveEventWriter)}` : ''}` : '仅观察目标钱包与池，连接正常不代表实盘保护就绪。');
     const debot = data.debotStream, debotScanner = data.debotScanner;
     text('debot-summary-text', `DeBot：${debotStreamLabel(debot, debotScanner)}`);
     text('debot-summary-note', debot?.authorized && debot?.connected ? `最近推送延迟 ${debotDelay(debot.lastSignalDelayMs)} · 登录与连接详情` : '邮箱 + Authenticator 登录 · 查看实时信号设置');
@@ -1613,14 +1642,23 @@
     const node=$('wallet-fast-status'),openFolds=[...node.querySelectorAll('details')].map(item=>item.open);node.replaceChildren();
     node.append(el('h3','','聪明钱包直听 · 快速预判'));
     if(!data?.enabled){node.append(el('p','','独立钱包监听尚未启用。'));return;}
-    const metric=data.latency||{},ms=value=>finite(value)?`${value.toFixed(2)} ms`:'待采样';
-    node.append(badge(data.running&&!data.statusStale?'监听运行中':'监听状态待确认',data.running&&!data.statusStale?'pass':'watch'),
+    const metric=data.latency||{},snapshot=data.snapshotBuild||{},phases=snapshot.phases||{},ms=value=>finite(value)?`${value.toFixed(2)} ms`:'待采样';
+    const workers=[['分类持久化 Worker',data.persistence],['启动器活跃写入 Worker',data.launcherLiveness],['订阅覆盖写入 Worker',data.launcherCoverage]]
+      .filter(([,value])=>value&&typeof value==='object');
+    const workerProblems=workers.filter(([,value])=>workerHealth(value).problem),healthy=data.running&&!data.statusStale&&!workerProblems.length;
+    node.append(badge(healthy?'监听运行中':data.running?'监听需关注':'监听状态待确认',healthy?'pass':'watch'),
       el('p','',`口径：节点消息进入监听程序 → 完成快速预判。目标 <100ms；不含节点传输、交易详情补查、完整风控及下单。`));
     const grid=el('div','wallet-fast-metrics');
     for(const [label,value] of [['P50',metric.p50Ms],['P95',metric.p95Ms],['P99',metric.p99Ms],['启动后最大耗时',metric.maxMs]])grid.append(protectionMetric(label,ms(value),'已观测处理耗时'));
     node.append(grid,el('p','',`累计 ${count(metric.samples)} 次钱包通知 · 分位数取最近 ${count(metric.windowSamples)} 次 · ≥100ms ${count(metric.over100Ms)} 次。当前测量不代表未来每次都达标。`));
-    node.append(kv('名单数量 / 名单状态',`${count(data.targets)} / ${data.snapshotFresh?'有效':'已过期，暂停预判'}`),kv('送达研究线程 P99',ms(data.mainThreadHandoff?.p99Ms)),kv('监听事件循环延迟 P99',ms(data.eventLoopP99Ms)),kv('拥塞丢弃事件',count(data.droppedEvents)));
-    if(data.error||data.droppedEvents||!data.snapshotFresh||data.statusStale)node.append(el('p','notice warning',`监听存在异常或覆盖缺口：${scalar(data.error,'请查看名单时效、拥塞数量与连接状态')}。不保证完整捕获。`));
+    node.append(kv('名单数量 / 名单状态',`${count(data.targets)} / ${data.snapshotFresh?'有效':'已过期，暂停预判'}`),
+      kv('送达主线程 P99',ms(data.mainThreadHandoff?.p99Ms)),kv('单事件主线程回调 P99',ms(data.mainThreadCallback?.p99Ms)),
+      kv('整批回调至 Worker ACK P99',ms(data.workerAck?.p99Ms)),kv('主线程快照构建 P99',ms(snapshot.p99Ms)),
+      kv('快照阶段 P99',`启动器 ${ms(phases.launcherTargets?.p99Ms)} · 历史名单 ${ms(phases.walletHistoryTargets?.p99Ms)} · 画像 ${ms(phases.profileMetadata?.p99Ms)} · 组装 ${ms(phases.targetAssembly?.p99Ms)} · 风险缓存 ${ms(phases.storeTokens?.p99Ms)} · Worker 投递 ${ms(phases.postMessage?.p99Ms)}`),
+      kv('监听事件循环延迟 P99',ms(data.eventLoopP99Ms)),kv('拥塞丢弃事件',count(data.droppedEvents)));
+    for(const [label,value] of workers)node.append(kv(label,workerStatusText(value)));
+    const workerErrors=workerProblems.map(([label,value])=>`${label}：${workerErrorText(value)||'未就绪、有丢弃/拒绝或发生过重启'}`);
+    if(data.error||data.droppedEvents||!data.snapshotFresh||data.statusStale||workerProblems.length)node.append(el('p','notice warning',`监听存在异常或覆盖缺口：${[data.error,...workerErrors].filter(Boolean).join('；')||'请查看名单时效、拥塞数量与连接状态'}。不保证完整捕获。`));
     const chains=el('div','price-router-tags');for(const c of data.chains||[])chains.append(badge(`${chainName(c.chain)} · ${c.identityVerified&&c.activeSubscriptions===c.desiredSubscriptions?'已连接':'连接待恢复'} · ${count(c.watchedWallets)} 钱包 · 订阅 ${count(c.activeSubscriptions)}/${count(c.desiredSubscriptions)}`,c.identityVerified&&c.activeSubscriptions===c.desiredSubscriptions?'neutral':'watch'));node.append(chains);
     const research=data.research||{};
     const broad=research.broadBackgroundResearchEnabled===false?'广泛 GMGN 后台发现已暂停':'广泛 GMGN 后台发现已启用';
@@ -1653,7 +1691,7 @@
   }
   function renderChainStream() {
     renderWalletFast((state.chainStream||state.overview?.chainStream)?.walletFast);
-    const data = state.chainStream || state.overview?.chainStream, chains = Array.isArray(data?.chains) ? data.chains.filter(chain => chain && typeof chain === 'object') : [], store = data?.store || {};
+    const data = state.chainStream || state.overview?.chainStream, chains = Array.isArray(data?.chains) ? data.chains.filter(chain => chain && typeof chain === 'object') : [], store = data?.store || {},writer=data?.liveEventWriter,writerHealth=workerHealth(writer);
     const cards = $('chain-stream-cards'); cards.replaceChildren(); for (const chain of chains) cards.append(chainStreamCard(chain));
     const empty = $('chain-stream-empty'); empty.hidden = chains.length > 0;
     empty.textContent = state.resourceErrors.chainStream && !data ? '暂时无法读取链上订阅状态，页面会自动重试。' : !data ? '正在读取链上订阅状态…' : !data.enabled ? '链上长连接尚未启用。这里不提供交易或订阅开关。' : '等待服务端返回各链的订阅状态。';
@@ -1662,10 +1700,11 @@
     if (state.resourceErrors.chainStream) warnings.push('链上监控详情暂时无法更新，下方保留最近成功读取的状态。');
     if (data?.enabled && !data.running) warnings.push('链上观察进程当前未运行。');
     if (data?.captureError) warnings.push(streamErrorLabel(data.captureError));
+    if (writerHealth.problem) warnings.push(`实时事件写入：${workerErrorText(writer)||workerStatusText(writer)}`);
     if (store.incomplete) warnings.push('链上事件存档存在缺失，不能将当前列表视为完整历史。');
     if (chains.some(chain => hasGapIssue(chain.gap?.incomplete))) warnings.push('部分网络仍有未覆盖的历史范围，请查看各链补数状态。');
     $('chain-stream-warning').hidden = warnings.length === 0; text('chain-stream-warning', warnings.join(' '));
-    text('chain-stream-storage-note', `已存 ${count(store.events)} 条事件 · ${bytes(store.bytes)} / ${bytes(store.maxBytes)}`);
+    text('chain-stream-storage-note', `已存 ${count(store.events)} 条事件 · ${bytes(store.bytes)} / ${bytes(store.maxBytes)}${writerHealth.configured ? ` · 实时写入 ${workerStatusText(writer)}` : ''}`);
     text('chain-stream-coverage-note', data?.coverage === 'targeted_observation' ? '仅目标观察 · EVM 代币转账 / Solana 钱包交易提及 · 非全链覆盖' : '覆盖范围尚未确认');
     const container = $('chain-stream-events'); const openEvents = new Set([...container.querySelectorAll('details[data-chain-event-id][open]')].map(item => item.dataset.chainEventId)); container.replaceChildren();
     const events = Array.isArray(data?.recentEvents) ? data.recentEvents.filter(event => event && typeof event === 'object') : [];
@@ -2376,8 +2415,14 @@
     runtime.append(kv('服务启动时间', date(system.startedAt, true)), kv('连续运行', duration(system.uptimeSec)), kv('服务器 CPU', `${plainPercent(system.cpu?.usagePct)} · ${scalar(system.cpu?.cores)} 核`), kv('服务器内存', `${bytes(system.memory?.usedBytes)} / ${bytes(system.memory?.totalBytes)}`), kv('机器人进程内存', bytes(system.memory?.processRssBytes)), kv('磁盘已用 / 总量', `${bytes(system.disk?.usedBytes)} / ${bytes(system.disk?.totalBytes)}`), kv('磁盘可用空间', bytes(system.disk?.freeBytes)), kv('资源采样时间', date(system.sampledAt, true)));
     if (Array.isArray(system.warnings) && system.warnings.length) runtime.append(reasonList(system.warnings));
     runtime.append(kv('钱包历史采集', research.enabled ? '已启用 · 长期保留' : '未启用'), kv('钱包历史 / 容量上限', `${bytes(research.store?.bytes)} / ${bytes(research.store?.maxBytes)}`), kv('最近钱包观测', date(research.store?.lastObservedAt, true)), kv('最近钱包增强采集', date(research.observer?.lastCycle?.completedAt, true)));
+    const fast=data.chainStream?.walletFast||{},observerWorker=research.observer?.worker?{...research.observer.worker,ready:research.observer.ready,running:research.observer.running,state:research.observer.state}:undefined,
+      researchWorkers=[['钱包直听分类持久化',fast.persistence],['钱包观察器 Worker',observerWorker],['钱包价格 Worker',research.priceWriter]]
+      .filter(([,value])=>value&&typeof value==='object'),researchWorkerProblems=researchWorkers.filter(([,value])=>workerHealth(value).problem);
+    for(const [label,value] of researchWorkers)runtime.append(kv(label,workerStatusText(value)));
     const researchError = research.store?.error || research.captureError || research.observer?.feedError;
     if (researchError) runtime.append(el('p', 'detail-message detail-error', reasonNames[researchError] || scalar(researchError)));
+    if(researchWorkerProblems.length)runtime.append(el('p','detail-message detail-error',researchWorkerProblems
+      .map(([label,value])=>`${label}：${workerErrorText(value)||workerStatusText(value)}`).join('；')));
     const evidence = data.corroboration, rank = data.tokenRankResearch, profiles = research.profiles || {}, launchers = data.launcherCandidates || {};
     const priorityState = worker => worker?.livePriority === true
       ? worker.workerLivePriority === true ? '实盘计数优先 · 单条低频维护' : '正在切换到实盘计数优先'
@@ -2391,8 +2436,13 @@
       kv('近期证据 / 链上活跃 / 已确认订阅', `${count(launcherDimensions.evidenceFresh)} / ${count(launcherDimensions.liveSeen)} / ${count(launcherDimensions.monitored)}`),
       kv('实时可核验 / 已确认交易且监听中', `${count(launcherDimensions.realtimeReady)} / ${count(launcherDimensions.verifiedTradeMonitored)}`),
       kv('Solana 链上复核', launchers.revalidator?.running?`运行中 · 累计检查 ${count(launchers.revalidator.counts?.checked)} 个`:'未运行'));
+    const launcherWorkers=[['启动器活跃写入 Worker',launchers.realtimeWriter],['启动器覆盖写入 Worker',launchers.coverageWriter]]
+      .filter(([,value])=>value&&typeof value==='object'),launcherWorkerProblems=launcherWorkers.filter(([,value])=>workerHealth(value).problem);
+    for(const [label,value] of launcherWorkers)runtime.append(kv(label,workerStatusText(value)));
     if(launchers.runtimeError||launchers.error||launchers.revalidator?.error)
       runtime.append(el('p','detail-message detail-error',scalar(launchers.runtimeError||launchers.error||launchers.revalidator?.error)));
+    if(launcherWorkerProblems.length)runtime.append(el('p','detail-message detail-error',launcherWorkerProblems
+      .map(([label,value])=>`${label}：${workerErrorText(value)||workerStatusText(value)}`).join('；')));
     renderPersistentStore(runtime, '来源账本', evidence, {records:evidence?.events,maxRecords:evidence?.maxEvents,recordLabel:'通知数 / 条数上限',errors:[evidence?.error,evidence?.captureError]});
     renderPersistentStore(runtime, '涨幅榜研究', rank, {records:rank?.tokens,recordLabel:'已登记币数',errors:[rank?.error]});
     runtime.append(kv('涨幅榜研究批处理', priorityState(rank)), kv('涨幅榜研究已登记钱包 / 待更新币数', `${count(rank?.wallets)} / ${count(rank?.pending)}`), kv('涨幅榜研究最近更新', date(rank?.lastRunAt, true)));

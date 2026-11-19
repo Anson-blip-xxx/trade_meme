@@ -69,6 +69,10 @@ export interface LauncherCandidateList {
 }
 
 export interface LauncherCoverageUpdate {chain:Chain;wallets:readonly string[];at:string}
+export interface LauncherCoverageBatchResult {
+  counts:Partial<Record<Chain,number>>;capacityReached:boolean;
+}
+export interface LauncherRealtimeBatchResult {changed:number;capacityReached:boolean}
 
 export interface LauncherCandidatesOptions {
   database:string;profileDatabase:string;cap?:number;maxBytes?:number;
@@ -358,6 +362,43 @@ export class LauncherCandidates {
     }catch(error){if(sqliteCapacity(error)){this.markCapacity();return false;}throw error;}
   }
 
+  /**
+   * Persist high-volume stream liveness in one transaction. This deliberately
+   * accepts only direct observations; revalidation evidence still goes through
+   * observeRealtime so its signature and classification fields remain atomic.
+   */
+  observeRealtimeBatchResult(inputs:readonly LauncherRealtimeObservation[]):LauncherRealtimeBatchResult {
+    if(!Array.isArray(inputs)||inputs.length>1000)throw new Error('LAUNCHER_REALTIME_BATCH_INVALID');
+    const now=this.currentTime(),latest=new Map<string,{chain:Chain;wallet:string;at:number;source:string}>();
+    for(const input of inputs){
+      const network=chain(input?.chain),wallet=network&&chainAddress(network,input.wallet),at=time(input?.observedAt),
+        origin=input?.source??'realtime';
+      if(!network||!wallet||at===undefined||at>now||!source(origin)||input.checkedAt!==undefined||
+        input.latestSignature!==undefined||input.blockTime!==undefined||input.slot!==undefined||input.state!==undefined||
+        input.newSignature!==undefined||input.classification!==undefined||input.error!==undefined)
+        throw new Error('LAUNCHER_REALTIME_BATCH_INVALID');
+      const key=`${network}:${wallet}`,prior=latest.get(key);
+      if(!prior||at>prior.at)latest.set(key,{chain:network,wallet,at,source:origin});
+    }
+    if(!latest.size)return {changed:0,capacityReached:false};
+    const updatedAt=iso(now),update=this.statement(`UPDATE lc_candidates
+      SET live_seen_at=?,live_source=?,updated_at=?
+      WHERE chain=? AND address=? AND (live_seen_at IS NULL OR live_seen_at<?)`);
+    let changed=0;this.db.exec('BEGIN IMMEDIATE');
+    try {
+      for(const row of latest.values()){
+        const observedAt=iso(row.at);changed+=Number(update.run(observedAt,row.source,updatedAt,row.chain,row.wallet,observedAt).changes);
+      }
+      this.db.exec('COMMIT');return {changed,capacityReached:false};
+    }catch(error){
+      this.db.exec('ROLLBACK');if(sqliteCapacity(error)){this.markCapacity();return {changed:0,capacityReached:true};}throw error;
+    }
+  }
+
+  observeRealtimeBatch(inputs:readonly LauncherRealtimeObservation[]):number {
+    return this.observeRealtimeBatchResult(inputs).changed;
+  }
+
   observeActivity(input:LauncherActivityObservation):boolean {
     const now=this.currentTime(),network=chain(input?.chain),wallet=network&&chainAddress(network,input.wallet),hash=network&&transaction(network,input.txHash),
       checked=time(input?.checkedAt),event=time(input?.eventAt);
@@ -409,7 +450,7 @@ export class LauncherCandidates {
     }catch(error){if(sqliteCapacity(error)){this.markCapacity();return false;}throw error;}
   }
 
-  replaceCoverageBatch(updates:readonly LauncherCoverageUpdate[]):Partial<Record<Chain,number>> {
+  replaceCoverageBatchResult(updates:readonly LauncherCoverageUpdate[]):LauncherCoverageBatchResult {
     const now=this.currentTime();
     if(!Array.isArray(updates)||updates.length>CHAINS.length)throw new Error('LAUNCHER_COVERAGE_INVALID');
     const seen=new Set<Chain>(),prepared:{chain:Chain;at:string;wallets:string}[]=[];
@@ -421,7 +462,7 @@ export class LauncherCandidates {
       if(selected.some(wallet=>!wallet))throw new Error('LAUNCHER_COVERAGE_INVALID');
       seen.add(validChain);prepared.push({chain:validChain,at:iso(checked),wallets:JSON.stringify(selected)});
     }
-    const counts:Partial<Record<Chain,number>>={};if(!prepared.length)return counts;
+    const counts:Partial<Record<Chain,number>>={};if(!prepared.length)return {counts,capacityReached:false};
     const updatedAt=iso(now),clear=this.statement(`UPDATE lc_candidates SET monitored=0,coverage_at=NULL,updated_at=?
       WHERE chain=? AND monitored=1 AND NOT EXISTS(
         SELECT 1 FROM json_each(?) AS selected WHERE selected.type='text' AND selected.value=lc_candidates.address)`),
@@ -432,10 +473,14 @@ export class LauncherCandidates {
         clear.run(updatedAt,value.chain,value.wallets);
         counts[value.chain]=Number(update.run(value.at,updatedAt,value.chain,value.wallets).changes);
       }
-      this.db.exec('COMMIT');return counts;
+      this.db.exec('COMMIT');return {counts,capacityReached:false};
     }catch(error){this.db.exec('ROLLBACK');if(sqliteCapacity(error)){
-      this.markCapacity();for(const value of prepared)counts[value.chain]=0;return counts;
+      this.markCapacity();for(const value of prepared)counts[value.chain]=0;return {counts,capacityReached:true};
     }throw error;}
+  }
+
+  replaceCoverageBatch(updates:readonly LauncherCoverageUpdate[]):Partial<Record<Chain,number>> {
+    return this.replaceCoverageBatchResult(updates).counts;
   }
 
   replaceCoverage(network:Chain,wallets:readonly string[],at:string):number {

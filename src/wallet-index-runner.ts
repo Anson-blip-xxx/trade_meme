@@ -2,6 +2,8 @@ import {Worker} from 'node:worker_threads';
 import {createRequire} from 'node:module';
 import {pathToFileURL} from 'node:url';
 import type {WalletAssociationStats} from './wallet-associations.js';
+import {chainAddress} from './chain-stream-store.js';
+import type {Chain} from './types.js';
 
 export interface WalletIndexRunnerOptions {
   database:string;
@@ -9,6 +11,7 @@ export interface WalletIndexRunnerOptions {
   intervalMs?:number;
   coordinationQuota?:number;
   associationQuota?:number;
+  fastTargetLimits?:Partial<Record<Chain,number>>;
 }
 
 export interface WalletIndexSnapshot {
@@ -33,6 +36,9 @@ export interface WalletIndexSnapshot {
   lastAttemptAt?:string;
   completedAt?:string;
   restarts:number;
+  fastTargetsAt?:string;
+  fastTargetCounts:Partial<Record<Chain,number>>;
+  fastTargetError?:string;
 }
 
 /** Runs the two derived wallet graph indexes away from the HTTP and stream loop. */
@@ -65,6 +71,9 @@ export class WalletIndexRunner {
   private workerError?:string;
   private lastAttemptAt?:string;
   private completedAt?:string;
+  private fastTargets:Partial<Record<Chain,string[]>>={};
+  private fastTargetsAt?:string;
+  private fastTargetError?:string;
 
   constructor(private readonly options:WalletIndexRunnerOptions) {
     this.intervalMs=options.intervalMs??30_000;
@@ -89,8 +98,19 @@ export class WalletIndexRunner {
       ...(this.coordinationError?{coordinationError:this.coordinationError}:{}),
       ...(this.associationError?{associationError:this.associationError}:{}),
       ...(this.workerError?{workerError:this.workerError}:{}),
-      lastAttemptAt:this.lastAttemptAt,completedAt:this.completedAt,restarts:this.restarts};
+      lastAttemptAt:this.lastAttemptAt,completedAt:this.completedAt,restarts:this.restarts,
+      fastTargetsAt:this.fastTargetsAt,fastTargetCounts:Object.fromEntries(
+        Object.entries(this.fastTargets).map(([chain,addresses])=>[chain,addresses?.length??0])),
+      ...(this.fastTargetError?{fastTargetError:this.fastTargetError}:{})};
   }
+
+  /** Worker-produced bounded cohort; this accessor never opens SQLite. */
+  fastTargetAddresses(chain:Chain,limit=this.fastTargetLimit(chain)):string[] {
+    return (this.fastTargets[chain]??[]).slice(0,Math.max(1,Math.min(this.fastTargetLimit(chain),Math.trunc(limit))));
+  }
+
+  private fastTargetLimit(chain:Chain):number {const value=this.options.fastTargetLimits?.[chain]??(chain==='solana'?30:200);
+    return Math.max(1,Math.min(chain==='solana'?30:200,Math.trunc(value)));}
 
   start():void {
     if(this.running)return;
@@ -116,7 +136,7 @@ export class WalletIndexRunner {
         `import {register} from ${JSON.stringify(pathToFileURL(createRequire(import.meta.url).resolve('tsx/esm/api')).href)};register();await import(${JSON.stringify(entry.href)});`)):entry;
       const worker=new Worker(url,{workerData:{database:this.options.database,maxBytes:this.options.maxBytes,
         intervalMs:this.intervalMs,coordinationQuota:this.coordinationQuota,associationQuota:this.associationQuota,
-        livePriority:this.livePriority},env:{},execArgv:[]});
+        livePriority:this.livePriority,fastTargetLimits:this.options.fastTargetLimits},env:{},execArgv:[]});
       this.worker=worker;this.workerLivePriority=undefined;
       worker.on('message',message=>{
         if(this.worker!==worker)return;
@@ -140,6 +160,14 @@ export class WalletIndexRunner {
           if(typeof status.associationStatsRefreshedAt==='string')this.associationStatsRefreshedAt=status.associationStatsRefreshedAt;
           this.coordinationError=status.coordinationError==='WALLET_COORDINATION_REFRESH_FAILED'?status.coordinationError:undefined;
           this.associationError=status.associationError==='WALLET_ASSOCIATION_REFRESH_FAILED'?status.associationError:undefined;
+          if(message.fastTargets&&typeof message.fastTargets==='object'){
+            const next:Partial<Record<Chain,string[]>>={};
+            for(const chain of ['bsc','solana','robinhood'] as Chain[]){const values=message.fastTargets[chain];if(!Array.isArray(values))continue;
+              next[chain]=[...new Set(values.map((value:unknown)=>chainAddress(chain,value)).filter((value:unknown):value is string=>typeof value==='string'))]
+                .slice(0,this.fastTargetLimit(chain));}
+            this.fastTargets=next;this.fastTargetsAt=typeof message.fastTargetsAt==='string'&&Number.isFinite(Date.parse(message.fastTargetsAt))?
+              message.fastTargetsAt:new Date().toISOString();this.fastTargetError=undefined;
+          }else if(message.fastTargetError==='WALLET_STREAM_TARGET_READ_FAILED')this.fastTargetError=message.fastTargetError;
           this.completedAt=typeof status.completedAt==='string'?status.completedAt:new Date().toISOString();
           this.inFlight=false;this.workerError=undefined;
         }

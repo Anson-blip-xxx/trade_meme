@@ -42,6 +42,7 @@ function fixture(extra:Record<string,string>={}){
     AVE_SIGNALS_DATABASE_PATH:join(dir,'ave.sqlite'),AVE_SESSION_PATH:join(dir,'ave-session.json'),
     SOURCE_EVIDENCE_DATABASE_PATH:join(dir,'sources.sqlite'),MEME_DATABASE_PATH:join(dir,'meme.sqlite'),
     WALLET_HISTORY_DATABASE_PATH:join(dir,'history.sqlite'),WALLET_PROFILES_DATABASE_PATH:join(dir,'profiles.sqlite'),
+    LAUNCHER_CANDIDATES_DATABASE_PATH:join(dir,'launcher.sqlite'),
     WALLET_SCREENING_DATABASE_PATH:join(dir,'screening.sqlite'),TOKEN_RANK_RESEARCH_DATABASE_PATH:join(dir,'rank.sqlite'),
     CHAIN_STREAM_DATABASE_PATH:join(dir,'chain.sqlite'),WALLET_ACTIVITY_DATABASE_PATH:join(dir,'activity.sqlite'),...extra};
   return {dir,config:readConfig(env)};

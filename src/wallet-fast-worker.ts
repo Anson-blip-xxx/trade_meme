@@ -51,10 +51,13 @@ for(const chain of ['bsc','solana','robinhood'] as const){
   const endpoint=options.endpoints[chain];if(!endpoint)continue;
   const context={} as Context;contexts.set(chain,context);
   context.stream=new RpcStream({url:endpoint.ws,maxSubscriptions:32,
-    // Public Solana RPCs commonly reject a reconnect burst of head + 30 log
-    // subscriptions. Advance the desired set through a four-ACK window while
-    // leaving the smaller/chunked EVM subscription set fully concurrent.
-    ...(chain==='solana'?{maxConcurrentSubscriptions:4,retryRejectedSubscriptions:true}:{}),maxMessageBytes:262144,
+    // Production showed that a fully serialized cold start times out repeatedly,
+    // while this endpoint reaches 31/31 through a small four-ACK window. Target
+    // retirement stays serialized so a 30-wallet rotation cannot emit an
+    // unsubscribe burst; EVM's smaller chunk set remains fully concurrent.
+    ...(chain==='solana'?{maxConcurrentSubscriptions:4,maxConcurrentUnsubscriptions:1,
+      retryRejectedSubscriptions:true,retryTimedOutSubscriptions:true}:{}),
+    maxMessageBytes:262144,
     heartbeat:chain==='solana'?{mode:'message_idle',intervalMs:15000,timeoutMs:45000}:{method:'eth_chainId',intervalMs:15000,timeoutMs:10000},
     onStatus:status=>{
       if(status.state==='backoff')context.lastDisconnect={at:new Date().toISOString(),reason:status.lastError??'RPC_CONNECTION_CLOSED'};
@@ -122,6 +125,15 @@ const status=()=>{
       subscribingSubscriptions:s.subscribingSubscriptions,queuedSubscriptions:s.queuedSubscriptions,
       retryingSubscriptions:s.retryingSubscriptions,subscriptionRetries:s.subscriptionRetries,
       maxConcurrentSubscriptions:s.maxConcurrentSubscriptions,peakConcurrentSubscriptions:s.peakConcurrentSubscriptions,
+      unsubscribingSubscriptions:s.unsubscribingSubscriptions,queuedUnsubscriptions:s.queuedUnsubscriptions,
+      maxConcurrentUnsubscriptions:s.maxConcurrentUnsubscriptions,
+      peakConcurrentUnsubscriptions:s.peakConcurrentUnsubscriptions,
+      lateSubscriptionAcksPending:s.lateSubscriptionAcksPending,
+      lateSubscriptionAcksReceived:s.lateSubscriptionAcksReceived,
+      lateSubscriptionAcksRetired:s.lateSubscriptionAcksRetired,
+      lateSubscriptionAcksMatchedActive:s.lateSubscriptionAcksMatchedActive,
+      lateSubscriptionAckOverflows:s.lateSubscriptionAckOverflows,
+      maxLateSubscriptionAcks:s.maxLateSubscriptionAcks,
       lastMessageAt:s.lastMessageAt?new Date(s.lastMessageAt).toISOString():undefined,lastDisconnect:c.lastDisconnect,error:c.error??s.lastError};}),
     coverage:'rpc_subscription_acknowledged_wallets',replay:'historical_observer_separate',buyVerified:false,tradingEnabled:false}});
 };

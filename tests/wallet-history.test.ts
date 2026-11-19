@@ -116,7 +116,7 @@ test('7d全钱包利润只取最新vendor snapshot，不累计；token累计利�
   } finally {history.close();}
 });
 
-test('涨幅以首次已观察买入之后的实际价格为基线，不用未知单位或倒序价伪造历史高点',()=>{
+test('涨幅以首次已观察买入之后的实际价格为基线，并合并延迟到达的中间高点',()=>{
   const {history,setNow}=fixture();
   try {
     history.recordTrade(trade({priceUsd:'0.01',amountUnit:'atomic'}));
@@ -126,10 +126,10 @@ test('涨幅以首次已观察买入之后的实际价格为基线，不用未�
     history.recordPrice(token,60,iso(25),'gmgn_info');history.recordPrice(token,3,iso(40),'gmgn_info');
     history.recordPrice(token,-1,iso(50),'gmgn_info');history.recordPrice(token,100,iso(101),'gmgn_info');
     const gain=history.getWallet('bsc',address(1))!.wallet.gain!;
-    assert.equal(gain.baselinePriceUsd,2);assert.equal(gain.maxGainPct,200);assert.equal(gain.peakPriceUsd,6);
+    assert.equal(gain.baselinePriceUsd,2);assert.equal(gain.maxGainPct,2900);assert.equal(gain.peakPriceUsd,60);
     assert.equal(gain.baselineAt,iso(20));assert.equal(gain.kind,'first_post_observed_buy_quote');
     setNow(40*86_400);history.recordPrice(token,8,iso(40*86_400),'gmgn_info');
-    assert.equal(history.getWallet('bsc',address(1))!.wallet.gain!.maxGainPct,300);
+    assert.equal(history.getWallet('bsc',address(1))!.wallet.gain!.maxGainPct,2900);
     assert.equal(history.stats().events,1); // No 30-day research pruning.
   } finally {history.close();}
 });

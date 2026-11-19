@@ -24,6 +24,7 @@ export interface ChainEvent {
   verification:'rpc_confirmed'|'rpc_observed';removed?:boolean;
 }
 export interface SolReplayProgress {until:string;latest:string;before:string;lastSlot:number;}
+export interface ChainStreamStoreOptions {busyTimeoutMs?:number;}
 function solProgress(value:unknown):value is SolReplayProgress {
   return object(value)&&signature(value.until)&&signature(value.latest)&&signature(value.before)&&natural(value.lastSlot);
 }
@@ -62,19 +63,30 @@ function cursorKey(key:unknown):boolean {
 }
 /** Durable observations and independent per-wallet cursors. Capacity stops collection; it never silently deletes evidence. */
 export class ChainStreamStore {
-  private db:DatabaseSync;private eventCount=0;
-  constructor(private path:string,private maxBytes=256*1024*1024) {
+  private db:DatabaseSync;private eventCount=0;private liveEventCount=0;
+  private eventCountsByChain:Record<Chain,number>={bsc:0,solana:0,robinhood:0};
+  private liveEventCountsByChain:Record<Chain,number>={bsc:0,solana:0,robinhood:0};
+  constructor(private path:string,private maxBytes=256*1024*1024,options:ChainStreamStoreOptions={}) {
+    const busyTimeoutMs=options.busyTimeoutMs??5_000;
     if(!Number.isSafeInteger(maxBytes)||maxBytes<=0)throw new Error('CHAIN_STORE_LIMIT_INVALID');
+    if(!Number.isSafeInteger(busyTimeoutMs)||busyTimeoutMs<0||busyTimeoutMs>5_000)throw new Error('CHAIN_STORE_BUSY_TIMEOUT_INVALID');
     if(path!==':memory:')mkdirSync(dirname(path),{recursive:true,mode:0o700});
     this.db=new DatabaseSync(path);if(path!==':memory:')chmodSync(path,0o600);
-    configureResearchWal(this.db,{busyTimeoutMs:5000,autoCheckpointPages:128});
+    configureResearchWal(this.db,{busyTimeoutMs,autoCheckpointPages:128});
     this.db.exec(`CREATE TABLE IF NOT EXISTS chain_events(id TEXT PRIMARY KEY,chain TEXT NOT NULL,wallet TEXT NOT NULL,observed_at TEXT NOT NULL,data TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS chain_events_recent ON chain_events(observed_at DESC);
       CREATE INDEX IF NOT EXISTS chain_events_wallet ON chain_events(chain,wallet,observed_at);
       CREATE TABLE IF NOT EXISTS chain_cursors(key TEXT PRIMARY KEY,value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS chain_sol_replays(key TEXT PRIMARY KEY,data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS chain_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);`);
-    this.eventCount=Number(this.db.prepare('SELECT count(*) AS n FROM chain_events').get()!.n);
+    const counts=this.db.prepare(`SELECT chain,COUNT(*) AS events,
+      SUM(CASE WHEN json_extract(data,'$.source')='live' THEN 1 ELSE 0 END) AS live_events
+      FROM chain_events GROUP BY chain`).all() as {chain:string;events:number|bigint;live_events:number|bigint}[];
+    for(const row of counts)if(['bsc','solana','robinhood'].includes(row.chain)){
+      const chain=row.chain as Chain,events=Number(row.events),liveEvents=Number(row.live_events);
+      this.eventCountsByChain[chain]=events;this.liveEventCountsByChain[chain]=liveEvents;
+      this.eventCount+=events;this.liveEventCount+=liveEvents;
+    }
   }
   record(input:ChainEvent):boolean {
     const event=validatedEvent(input);if(!event)return false;
@@ -88,7 +100,8 @@ export class ChainStreamStore {
       return false;
     }
     if(this.bytes()+JSON.stringify(event).length*3+16384>this.maxBytes){this.markIncomplete('CHAIN_STORE_CAPACITY');throw new Error('CHAIN_STORE_CAPACITY');}
-    this.db.prepare('INSERT INTO chain_events VALUES (?,?,?,?,?)').run(event.id,event.chain,event.wallet,event.observedAt,JSON.stringify(event));this.eventCount++;return true;
+    this.db.prepare('INSERT INTO chain_events VALUES (?,?,?,?,?)').run(event.id,event.chain,event.wallet,event.observedAt,JSON.stringify(event));
+    this.eventCount++;this.eventCountsByChain[event.chain]++;if(event.source==='live'){this.liveEventCount++;this.liveEventCountsByChain[event.chain]++;}return true;
   }
   cursor(key:string):string|undefined {if(!cursorKey(key))throw new Error('CHAIN_CURSOR_INVALID');return this.db.prepare('SELECT value FROM chain_cursors WHERE key=?').get(key)?.value as string|undefined;}
   checkpoint(key:string,value:string):void {
@@ -120,7 +133,8 @@ export class ChainStreamStore {
     if(!Number.isSafeInteger(limit)||limit<1||limit>100)throw new Error('CHAIN_STORE_QUERY_INVALID');
     return this.db.prepare('SELECT data FROM chain_events ORDER BY observed_at DESC,id LIMIT ?').all(limit).map(r=>JSON.parse(String(r.data)));
   }
-  stats(){return {events:this.eventCount,bytes:this.bytes(),maxBytes:this.maxBytes,
+  stats(){return {events:this.eventCount,eventsByChain:{...this.eventCountsByChain},liveEvents:this.liveEventCount,
+    liveEventsByChain:{...this.liveEventCountsByChain},bytes:this.bytes(),maxBytes:this.maxBytes,
     incomplete:!!this.db.prepare("SELECT value FROM chain_meta WHERE key='incomplete'").get()};}
   close(){this.db.close();}
   private bytes(){return this.path===':memory:'?Number(this.db.prepare('PRAGMA page_count').get()!.page_count)*Number(this.db.prepare('PRAGMA page_size').get()!.page_size):

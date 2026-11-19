@@ -127,6 +127,25 @@ test('feed persistence uses no network requests and records malformed-page cover
   assert.equal(JSON.stringify(observer.getStatus()).includes('SECRET'), false);
 });
 
+test('feed acknowledgement requires both trade and collection durability while legacy sinks remain compatible', () => {
+  const f = fixture(), p = provider(); let collections = 0;
+  f.history.recordTradesDurable = () => false;
+  f.history.recordCollectionDurable = () => {collections++; return true;};
+  const observer = new WalletObserver({history: f.history, client: p.client, now});
+  const blockedTrades = observer.observeFeed(page([row()]));
+  assert.equal(blockedTrades.persisted, false); assert.equal(blockedTrades.retryable, true);
+  assert.equal(blockedTrades.reason, 'WALLET_HISTORY_CAPACITY_REACHED'); assert.equal(collections, 0);
+
+  f.history.recordTradesDurable = () => true;
+  f.history.recordCollectionDurable = () => {collections++; return false;};
+  const blockedCollection = observer.observeFeed(page([row()]));
+  assert.equal(blockedCollection.persisted, false); assert.equal(blockedCollection.retryable, true); assert.equal(collections, 1);
+
+  f.history.recordCollectionDurable = () => true;
+  const persisted = observer.observeFeed(page([row()]));
+  assert.equal(persisted.persisted, true); assert.equal(persisted.retryable, false);
+});
+
 test('scanner observation runs before buy/age/cap filtering and isolates callback mutation or failure', async () => {
   const seen: GmgnFeedPage[] = [], signals: unknown[] = [];
   const raw = {list: [row(), row('sell'), {...row(), transaction_hash: tx(3), timestamp: 100}]};
@@ -164,6 +183,48 @@ test('collector stays within nine reads, discovers untagged profitable wallets a
   assert.deepEqual(f.trades.map(item => item.side), ['sell', 'transferIn']);
   assert.equal(p.calls[7].query.token_address, undefined); assert.equal(f.collections[0].hasMore, true);
   assert.equal(f.marked.length, 1); assert.equal(cycle.coverage, 'one_page_sample');
+});
+
+test('collector sends token prices to an isolated writer when one is supplied',async()=>{
+  const f=fixture(),p=provider(),prices:Parameters<WalletHistory['recordPrice']>[]=[];
+  const observer=new WalletObserver({history:f.history,client:p.client,now,
+    priceWriter:{recordPrice:(...args)=>{prices.push(args);}}});
+  await observer.runOnce();
+  assert.equal(f.prices.length,0);assert.equal(prices.length,1);
+  assert.equal(prices[0][0].address,f.targets[0].address);assert.equal(prices[0][1],2);
+  assert.equal(prices[0][3],'gmgn_token_info_sample');
+});
+
+test('a full isolated price queue is reported as partial research coverage',async()=>{
+  const f=fixture(),p=provider();let accept=false;
+  const observer=new WalletObserver({history:f.history,client:p.client,now,chains:['bsc'],
+    priceWriter:{recordPrice:()=>accept}});
+  const cycle=await observer.runOnce();
+  assert.equal(cycle.status,'partial');assert.ok(cycle.reasons.includes('WALLET_PRICE_WRITE_QUEUE_FULL'));
+  assert.equal(f.prices.length,0);assert.equal(f.marked.length,0);
+  assert.equal(observer.getStatus().marketSampling.pendingTargets[0]?.address,f.targets[0].address);
+  accept=true;const retried=await observer.runOnce();
+  assert.equal(retried.chain,cycle.chain);assert.equal(f.marked.length,1);
+  assert.equal(observer.getStatus().marketSampling.pendingTargets.length,0);
+});
+
+test('an asynchronous isolated price writer result is part of cycle coverage',async()=>{
+  const f=fixture(),p=provider(),observer=new WalletObserver({history:f.history,client:p.client,now,
+    priceWriter:{recordPrice:async()=>false}});
+  const cycle=await observer.runOnce();
+  assert.equal(cycle.status,'partial');assert.ok(cycle.reasons.includes('WALLET_PRICE_WRITE_QUEUE_FULL'));
+  assert.equal(f.prices.length,0);
+});
+
+test('price ACK timeout and write failure retain the observer target for a later cycle',async()=>{
+  const f=fixture(),p=provider();let reason:'WALLET_PRICE_WRITE_TIMEOUT'|'WALLET_PRICE_WRITE_FAILED'='WALLET_PRICE_WRITE_TIMEOUT';
+  const observer=new WalletObserver({history:f.history,client:p.client,now,chains:['bsc'],priceWriter:{recordPrice:async()=>
+    ({accepted:false,reason,retryable:true})}});
+  const timedOut=await observer.runOnce();assert.ok(timedOut.reasons.includes('WALLET_PRICE_WRITE_TIMEOUT'));
+  assert.equal(f.marked.length,0);assert.equal(observer.getStatus().marketSampling.pendingTargets.length,1);
+  reason='WALLET_PRICE_WRITE_FAILED';const failed=await observer.runOnce();
+  assert.ok(failed.reasons.includes('WALLET_PRICE_WRITE_FAILED'));assert.equal(f.marked.length,0);
+  assert.equal(observer.getStatus().marketSampling.pendingTargets.length,1);
 });
 
 test('cycles fairly rotate BSC, SOL and Robinhood independent of candidate eligibility', async () => {

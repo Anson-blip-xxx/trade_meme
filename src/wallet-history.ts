@@ -1,4 +1,4 @@
-import {DatabaseSync,type SQLInputValue} from 'node:sqlite';
+import {DatabaseSync,type SQLInputValue,type StatementSync} from 'node:sqlite';
 import {mkdirSync,chmodSync,statSync} from 'node:fs';
 import {dirname} from 'node:path';
 import {createHash} from 'node:crypto';
@@ -15,6 +15,29 @@ import {configureResearchWal} from './research-sqlite.js';
 
 export interface WalletHistoryToken {chain:Chain;address:string;}
 export interface WalletHistoryOptions {maxBytes?:number;now?:()=>Date;}
+export interface WalletPriceWriteOptions {
+  /** Historical buy rows read, and unique wallets updated, per short transaction. */
+  batchSize?:number;
+  /** Cooperative cancellation is checked between database transactions. */
+  shouldContinue?:()=>boolean;
+  /** The worker uses this boundary to receive stop messages between batches. */
+  yieldBetweenBatches?:()=>Promise<void>;
+}
+export interface WalletPriceWriteResult {
+  accepted:boolean;priceStored:boolean;buyerEventsScanned:number;buyerWalletsProjected:number;batches:number;
+  stopped:boolean;capacityReached:boolean;
+}
+export interface WalletPriceAdmissionResult {
+  accepted:boolean;id?:string;priceStored:boolean;pending:boolean;capacityReached:boolean;
+}
+export interface WalletPriceRecoveryOptions extends WalletPriceWriteOptions {
+  /** Bound one recovery slice; callers may resume another slice after yielding. */
+  maxJobs?:number;maxBatches?:number;
+}
+export interface WalletPriceRecoveryResult {
+  jobsVisited:number;jobsCompleted:number;buyerEventsScanned:number;buyerWalletsProjected:number;batches:number;
+  pending:boolean;pendingJobs:number;stopped:boolean;capacityReached:boolean;
+}
 export interface WalletHistoryRetentionOptions {scanLimit?:number;}
 export interface WalletHistoryRetentionResult {
   scanned:number;deleted:number;observationsDeleted:number;
@@ -305,9 +328,27 @@ export const WALLET_COORDINATION_INVALIDATION_SQL=`UPDATE wh_metrics SET coordin
   WHERE f.chain=? AND f.funding_address=a.value
     AND m.chain=f.chain AND m.address=f.wallet)`;
 
+export const WALLET_PRICE_BUYER_PAGE_SQL=`SELECT rowid AS event_rowid,wallet,observed_at,event_at FROM wh_events INDEXED BY wh_events_token
+  WHERE chain=? AND token_address=? AND side='buy' AND rowid<=? AND (event_at,rowid)>(?,?)
+  ORDER BY event_at,rowid LIMIT ?`;
+
+interface WalletPriceProjectionPage {
+  found:boolean;completed:boolean;buyerEventsScanned:number;buyerWalletsProjected:number;capacityReached:boolean;
+}
+interface WalletPriceProjectionJob {
+  chain:Chain;address:string;observedAt:string;priceUsd:number;provider:string;highEventRowid:number;
+  cursorEventAt:string;cursorEventRowid:number;createdAt:string;updatedAt:string;
+}
+const PRICE_JOB_PREFIX='price_projection_job_v1:';
+const priceJobKey=(id:string)=>PRICE_JOB_PREFIX+id;
+
 /** Long-lived research evidence; bounded retention coalesces only unchanged vendor refreshes. */
 export class WalletHistory {
   private readonly db:DatabaseSync;
+  private readonly priceGainRead:StatementSync;
+  private readonly priceGainWrite:StatementSync;
+  private readonly priceGainMetricBestRead:StatementSync;
+  private readonly priceGainMetricWrite:StatementSync;
   private readonly now:()=>Date;
   private readonly maxBytes:number;
   private error?:string;
@@ -423,6 +464,11 @@ export class WalletHistory {
     this.db.exec('CREATE INDEX IF NOT EXISTS wh_assoc_candidate ON wh_assoc_relations(chain,candidate,first_at)');
     this.db.exec(`CREATE INDEX IF NOT EXISTS wh_stream_relations ON wh_assoc_relations(chain,token_count DESC,forward_count DESC,updated_at DESC,candidate,leader) WHERE token_count>0 AND dirty=0;
       CREATE INDEX IF NOT EXISTS wh_stream_recent_wallets ON wh_wallets(chain,last_at DESC,address);`);
+    this.priceGainRead=this.db.prepare('SELECT data FROM wh_gains WHERE chain=? AND wallet=? AND token_address=?');
+    this.priceGainWrite=this.db.prepare('INSERT INTO wh_gains VALUES (?,?,?,?) ON CONFLICT(chain,wallet,token_address) DO UPDATE SET data=excluded.data');
+    this.priceGainMetricBestRead=this.db.prepare(`SELECT data FROM wh_gains WHERE chain=? AND wallet=?
+      ORDER BY CAST(json_extract(data,'$.maxGainPct') AS REAL) DESC,token_address LIMIT 1`);
+    this.priceGainMetricWrite=this.db.prepare('UPDATE wh_metrics SET gain_pct=?,gain_data=? WHERE chain=? AND address=?');
     if(this.activeBytes()>=this.maxBytes) this.error=CAPACITY;
   }
 
@@ -451,10 +497,14 @@ export class WalletHistory {
     this.append(value,()=>this.db.prepare("INSERT INTO wh_meta(key,value) VALUES('wallet_observer_cursor_v1',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(serialized));
     return this.error!==CAPACITY&&this.db.prepare("SELECT value FROM wh_meta WHERE key='wallet_observer_cursor_v1'").get()?.value===serialized;
   }
-  recordTrades(inputs:WalletTradeObservation[]):void {
+  recordTrades(inputs:WalletTradeObservation[]):void {this.recordTradesDurable(inputs);}
+
+  /** Exact persistence result for worker durability boundaries. Legacy callers
+   * may continue using recordTrades when the write is observational only. */
+  recordTradesDurable(inputs:WalletTradeObservation[]):boolean {
     const normalized=Array.isArray(inputs)?inputs.slice(0,2_000).map(value=>this.trade(value)).filter((v):v is WalletTradeObservation=>!!v):[];
-    if(!normalized.length) return;
-    this.append(normalized,()=>{const changes=this.associationChanges(),associationTrades:WalletTradeObservation[]=[];
+    if(!normalized.length)return false;
+    return this.append(normalized,()=>{const changes=this.associationChanges(),associationTrades:WalletTradeObservation[]=[];
       for(const value of normalized)if(this.putTrade(value,changes))associationTrades.push(value);
       this.associations.recordTrades(associationTrades);
       this.flushAssociationChanges(changes);});
@@ -905,14 +955,17 @@ export class WalletHistory {
       candidateWallet:target.candidateWallet?addr(target.candidateWallet,token.chain):undefined,historicalRelationship:target.historicalRelationship===true},observed);
   }
 
-  recordCollection(value:WalletCollectionObservation):void {
+  recordCollection(value:WalletCollectionObservation):void {this.recordCollectionDurable(value);}
+
+  /** Exact persistence result for worker feed acknowledgements. */
+  recordCollectionDurable(value:WalletCollectionObservation):boolean {
     const completed=this.observed(value?.completedAt),started=at(value?.startedAt);
     if(!completed||!started||started>completed||!source(value.source)||value.chain!==undefined&&!chainValid(value.chain)||
-      !['ok','partial','cooldown','stopped'].includes(value.status)||count(value.requests)===null||count(value.accepted)===null||value.coverage!=='one_page_sample') return;
+      !['ok','partial','cooldown','stopped'].includes(value.status)||count(value.requests)===null||count(value.accepted)===null||value.coverage!=='one_page_sample') return false;
     const data={source:value.source,chain:value.chain,startedAt:started,completedAt:completed,observedAt:completed,
       status:value.status,requests:value.requests,accepted:value.accepted,rejected:count(value.rejected)??undefined,
       coverage:'one_page_sample',hasMore:typeof value.hasMore==='boolean'?value.hasMore:null,reason:code(value.reason)};
-    this.append(data,()=>this.observation('collection',data));
+    return this.append(data,()=>this.observation('collection',data));
   }
 
   watchTargets(limit=20,now=this.now(),chain?:Chain):WalletHistoryToken[] {
@@ -959,21 +1012,112 @@ export class WalletHistory {
       const buyers=this.db.prepare("SELECT wallet,MIN(observed_at) AS observed FROM wh_events INDEXED BY wh_events_token WHERE chain=? AND token_address=? AND side='buy' GROUP BY wallet")
         .all(target.chain,target.address);
       for(const buyer of buyers) {
-        if(observed<=String(buyer.observed)) continue;
-        const prior=this.db.prepare('SELECT data FROM wh_gains WHERE chain=? AND wallet=? AND token_address=?').get(target.chain,buyer.wallet!,target.address);
-        const old=prior?JSON.parse(String(prior.data)) as WalletGainEvidence:undefined;
-        if(old&&observed<=old.latestAt) continue;
-        const baseline=old?.baselinePriceUsd??priceUsd,gain=(priceUsd/baseline-1)*100;if(!Number.isFinite(gain)) continue;
-        const peak=!old||priceUsd>old.peakPriceUsd;
-        const data:WalletGainEvidence={tokenAddress:target.address,baselineAt:old?.baselineAt??observed,baselinePriceUsd:baseline,
-          peakAt:peak?observed:old!.peakAt,peakPriceUsd:peak?priceUsd:old!.peakPriceUsd,maxGainPct:Math.max(old?.maxGainPct??0,gain),
-          latestAt:observed,latestPriceUsd:priceUsd,source:provider,kind:'first_post_observed_buy_quote'};
-        this.db.prepare('INSERT INTO wh_gains VALUES (?,?,?,?) ON CONFLICT(chain,wallet,token_address) DO UPDATE SET data=excluded.data')
-          .run(target.chain,buyer.wallet!,target.address,JSON.stringify(data));
-        this.db.prepare('UPDATE wh_metrics SET gain_pct=?,gain_data=? WHERE chain=? AND address=? AND (gain_pct IS NULL OR gain_pct<=?)')
-          .run(data.maxGainPct,JSON.stringify(data),target.chain,buyer.wallet!,data.maxGainPct);
+        this.projectPriceGain(target,priceUsd,observed,provider,String(buyer.wallet),String(buyer.observed));
       }
     });
+  }
+
+  /**
+   * Worker-oriented price projection. The price row and a durable projection
+   * job are committed together. Every short page advances the job cursor in the
+   * same transaction as its gains, so a worker/process restart resumes exactly
+   * after the last committed page. The rowid high-water mark freezes the event
+   * set at quote admission and excludes later backfills from this quote.
+   */
+  async recordPriceIncremental(value:WalletHistoryToken,priceUsd:number,observedAt:string,provider:string,
+    options:WalletPriceWriteOptions={}):Promise<WalletPriceWriteResult> {
+    const empty=(accepted=false):WalletPriceWriteResult=>({accepted,priceStored:false,buyerEventsScanned:0,
+      buyerWalletsProjected:0,batches:0,stopped:false,capacityReached:false});
+    const batchSize=options.batchSize??64;
+    if(!Number.isSafeInteger(batchSize)||batchSize<1||batchSize>256)return empty();
+    const shouldContinue=options.shouldContinue??(()=>true),yieldBetweenBatches=options.yieldBetweenBatches??
+      (()=>new Promise<void>(resolve=>setImmediate(resolve)));
+    if(!shouldContinue())return {...empty(true),stopped:true};
+    const admission=this.admitPriceProjection(value,priceUsd,observedAt,provider);
+    if(!admission.accepted)return empty();
+    if(admission.capacityReached)return {...empty(true),capacityReached:true};
+    const result:WalletPriceWriteResult={accepted:true,priceStored:admission.priceStored,
+      buyerEventsScanned:0,buyerWalletsProjected:0,batches:0,stopped:false,capacityReached:false};
+    if(!admission.id)return result;
+    let pending=admission.pending;
+    while(pending) {
+      if(!shouldContinue()){result.stopped=true;break;}
+      const page=this.projectPriceJobPage(admission.id,batchSize);
+      if(page.capacityReached){result.capacityReached=true;break;}
+      if(!page.found){pending=false;break;}
+      result.buyerEventsScanned+=page.buyerEventsScanned;
+      result.buyerWalletsProjected+=page.buyerWalletsProjected;
+      if(page.buyerEventsScanned)result.batches++;
+      pending=!page.completed;
+      if(!pending)break;
+      await yieldBetweenBatches();
+    }
+    return result;
+  }
+
+  /** Fast worker-side ingress. This commits the immutable quote and its durable
+   * projection job but performs no historical scan. */
+  admitPriceProjection(value:WalletHistoryToken,priceUsd:number,observedAt:string,provider:string):WalletPriceAdmissionResult {
+    const target=this.target(value),observed=this.observed(observedAt);
+    if(!target||!observed||!source(provider)||!Number.isFinite(priceUsd)||priceUsd<=0)
+      return {accepted:false,priceStored:false,pending:false,capacityReached:false};
+    const id=digest([target.chain,target.address,observed,provider,priceUsd]),createdAt=this.now().toISOString();
+    let priceStored=false,pending=false;
+    const committed=this.append({target,priceUsd,observed,provider},()=>{
+      this.putToken(target,observed);
+      priceStored=Number(this.db.prepare('INSERT OR IGNORE INTO wh_prices VALUES (?,?,?,?,?,?)')
+        .run(id,target.chain,target.address,observed,priceUsd,provider).changes)>0;
+      if(priceStored){
+        const high=Number(this.db.prepare(`SELECT COALESCE(MAX(rowid),0) AS high FROM wh_events
+          WHERE chain=? AND token_address=? AND side='buy'`).get(target.chain,target.address)!.high);
+        const job:WalletPriceProjectionJob={chain:target.chain,address:target.address,observedAt:observed,priceUsd,
+          provider,highEventRowid:high,cursorEventAt:'',cursorEventRowid:0,createdAt,updatedAt:createdAt};
+        this.db.prepare('INSERT INTO wh_meta(key,value) VALUES(?,?)').run(priceJobKey(id),JSON.stringify(job));
+      }
+      pending=!!this.db.prepare('SELECT 1 FROM wh_meta WHERE key=?').get(priceJobKey(id));
+    });
+    return {accepted:true,id,priceStored:committed&&priceStored,pending:committed&&pending,
+      capacityReached:!committed&&this.error===CAPACITY};
+  }
+
+  pendingPriceProjectionJobs():number {
+    return Number(this.db.prepare('SELECT count(*) AS n FROM wh_meta WHERE key GLOB ?').get(PRICE_JOB_PREFIX+'*')!.n);
+  }
+
+  /** Resume a bounded slice of durable jobs, oldest quote first. Repeating this
+   * method eventually drains the queue while every individual transaction stays
+   * bounded by batchSize. */
+  async recoverPriceProjectionJobs(options:WalletPriceRecoveryOptions={}):Promise<WalletPriceRecoveryResult> {
+    const batchSize=options.batchSize??64,maxJobs=options.maxJobs??8,maxBatches=options.maxBatches??64,
+      shouldContinue=options.shouldContinue??(()=>true),yieldBetweenBatches=options.yieldBetweenBatches??
+        (()=>new Promise<void>(resolve=>setImmediate(resolve)));
+    if(!Number.isSafeInteger(batchSize)||batchSize<1||batchSize>256||!Number.isSafeInteger(maxJobs)||maxJobs<1||maxJobs>256||
+      !Number.isSafeInteger(maxBatches)||maxBatches<1||maxBatches>4096)throw new Error('WALLET_PRICE_RECOVERY_INVALID');
+    const result:WalletPriceRecoveryResult={jobsVisited:0,jobsCompleted:0,buyerEventsScanned:0,
+      buyerWalletsProjected:0,batches:0,pending:false,pendingJobs:0,stopped:false,capacityReached:false};
+    const jobs=this.db.prepare(`SELECT key FROM wh_meta WHERE key GLOB ?
+      ORDER BY json_extract(value,'$.observedAt'),key LIMIT ?`).all(PRICE_JOB_PREFIX+'*',maxJobs);
+    let pageTransactions=0;
+    for(const row of jobs){
+      if(pageTransactions>=maxBatches)break;
+      const id=String(row.key).slice(PRICE_JOB_PREFIX.length);result.jobsVisited++;
+      for(;;){
+        if(!shouldContinue()){result.stopped=true;break;}
+        const page=this.projectPriceJobPage(id,batchSize);pageTransactions++;
+        if(page.capacityReached){result.capacityReached=true;break;}
+        if(!page.found){result.jobsCompleted++;break;}
+        result.buyerEventsScanned+=page.buyerEventsScanned;
+        result.buyerWalletsProjected+=page.buyerWalletsProjected;
+        if(page.buyerEventsScanned)result.batches++;
+        if(page.completed){result.jobsCompleted++;break;}
+        if(pageTransactions>=maxBatches)break;
+        await yieldBetweenBatches();
+      }
+      if(result.stopped||result.capacityReached||pageTransactions>=maxBatches)break;
+      await yieldBetweenBatches();
+    }
+    result.pendingJobs=this.pendingPriceProjectionJobs();result.pending=result.pendingJobs>0;
+    return result;
   }
 
   /** Only evidence already locally observed at the price sample's time can influence research. */
@@ -1224,6 +1368,64 @@ export class WalletHistory {
   private reusableBytes():number {
     return Number(this.db.prepare('PRAGMA freelist_count').get()!.freelist_count)*
       Number(this.db.prepare('PRAGMA page_size').get()!.page_size);
+  }
+  private projectPriceJobPage(id:string,batchSize:number):WalletPriceProjectionPage {
+    const key=priceJobKey(id);let found=false,completed=false,scanned=0,projected=0;
+    const wrote=this.append({priceProjectionJob:id,batchSize},()=>{
+      const row=this.db.prepare('SELECT value FROM wh_meta WHERE key=?').get(key);
+      if(!row){completed=true;return;}
+      found=true;
+      const job=JSON.parse(String(row.value)) as WalletPriceProjectionJob,
+        target={chain:job.chain,address:job.address},observed=job.observedAt,
+        price=job.priceUsd,provider=job.provider,high=job.highEventRowid,
+        cursorAt=job.cursorEventAt,cursorRowid=job.cursorEventRowid;
+      const rows=this.db.prepare(WALLET_PRICE_BUYER_PAGE_SQL)
+        .all(target.chain,target.address,high,cursorAt,cursorRowid,batchSize);
+      scanned=rows.length;
+      if(!rows.length){this.db.prepare('DELETE FROM wh_meta WHERE key=?').run(key);completed=true;return;}
+      const buyers=new Map<string,string>();
+      for(const row of rows){
+        const wallet=String(row.wallet),buyerObserved=String(row.observed_at),old=buyers.get(wallet);
+        if(!old||buyerObserved<old)buyers.set(wallet,buyerObserved);
+      }
+      for(const [wallet,buyerObserved] of buyers)
+        if(this.projectPriceGain(target,price,observed,provider,wallet,buyerObserved))projected++;
+      const last=rows.at(-1)!,eventAt=String(last.event_at),eventRowid=Number(last.event_rowid),updatedAt=this.now().toISOString();
+      if(rows.length<batchSize){this.db.prepare('DELETE FROM wh_meta WHERE key=?').run(key);completed=true;}
+      else {job.cursorEventAt=eventAt;job.cursorEventRowid=eventRowid;job.updatedAt=updatedAt;
+        this.db.prepare('UPDATE wh_meta SET value=? WHERE key=?').run(JSON.stringify(job),key);}
+    });
+    if(!wrote)return {found:false,completed:false,buyerEventsScanned:0,buyerWalletsProjected:0,
+      capacityReached:this.error===CAPACITY};
+    return {found,completed,buyerEventsScanned:scanned,buyerWalletsProjected:projected,capacityReached:false};
+  }
+  private projectPriceGain(target:WalletHistoryToken,priceUsd:number,observed:string,provider:string,
+    wallet:string,buyerObserved:string):boolean {
+    if(observed<=buyerObserved)return false;
+    const prior=this.priceGainRead.get(target.chain,wallet,target.address);
+    const old=prior?JSON.parse(String(prior.data)) as WalletGainEvidence:undefined;
+    let baselineAt=old?.baselineAt??observed,baselinePriceUsd=old?.baselinePriceUsd??priceUsd,
+      peakAt=old?.peakAt??observed,peakPriceUsd=old?.peakPriceUsd??priceUsd,
+      latestAt=old?.latestAt??observed,latestPriceUsd=old?.latestPriceUsd??priceUsd,source=old?.source??provider;
+    // These three facts have independent time semantics. A delayed earlier
+    // quote can replace the baseline; an out-of-order middle quote can replace
+    // the peak; only a strictly later quote can replace latest.
+    if(observed<baselineAt){baselineAt=observed;baselinePriceUsd=priceUsd;}
+    if(priceUsd>peakPriceUsd||priceUsd===peakPriceUsd&&observed<peakAt){peakAt=observed;peakPriceUsd=priceUsd;}
+    if(observed>latestAt){latestAt=observed;latestPriceUsd=priceUsd;source=provider;}
+    // The baseline sample is itself eligible to be the peak.
+    if(baselinePriceUsd>peakPriceUsd){peakAt=baselineAt;peakPriceUsd=baselinePriceUsd;}
+    const maxGainPct=(peakPriceUsd/baselinePriceUsd-1)*100;
+    if(!Number.isFinite(maxGainPct))return false;
+    const data:WalletGainEvidence={tokenAddress:target.address,baselineAt,baselinePriceUsd,peakAt,peakPriceUsd,maxGainPct,
+      latestAt,latestPriceUsd,source,kind:'first_post_observed_buy_quote'};
+    const serialized=JSON.stringify(data);
+    if(prior&&serialized===String(prior.data))return false;
+    this.priceGainWrite.run(target.chain,wallet,target.address,serialized);
+    const best=this.priceGainMetricBestRead.get(target.chain,wallet);
+    if(best){const bestData=String(best.data),bestGain=Number((JSON.parse(bestData) as WalletGainEvidence).maxGainPct);
+      this.priceGainMetricWrite.run(bestGain,bestData,target.chain,wallet);}
+    return true;
   }
   private append(evidence:unknown,write:()=>unknown):boolean {
     const estimate=Buffer.byteLength(JSON.stringify(evidence)??'')*3+32_768;

@@ -6,6 +6,7 @@ import {RpcStream,type RpcSubscription,type RpcStreamStatus} from './rpc-stream.
 import {ChainHttp,DexPoolData} from './chain-data.js';
 import {ChainStreamStore,chainAddress,evmTransfers,solWalletEvent,object,hexNumber,TRANSFER_TOPIC} from './chain-stream-store.js';
 import {discoverPool,readPoolPrice,type VerifiedPool} from './chain-prices.js';
+import {ChainEventWriterRunner,DeferredChainEventWriter,type ChainEventWriter} from './chain-event-writer.js';
 
 interface WatchedPool {token:ScanToken;pool:VerifiedPool;subscriptions:RpcSubscription[];sampledAt?:number;validUntil?:number;sampledGeneration?:number;dirty:boolean;lastError?:string;}
 type MonitorRpc=Pick<ChainHttp,'request'|'stop'>;
@@ -21,7 +22,7 @@ export interface ChainMonitorOptions {
   config:Config['chainStream'];tokens:()=>ScanToken[];wallets:(chain:Chain,limit:number)=>string[];onPrice:(price:ScanPrice)=>void;
   store?:ChainStreamStore;market?:Pick<DexPoolData,'pairs'|'anchor'|'stop'>;httpFactory?:(url:string)=>MonitorRpc;
   streamFactory?:(options:ConstructorParameters<typeof RpcStream>[0])=>MonitorStream;
-  clock?:ChainMonitorClock;discoverPool?:typeof discoverPool;readPoolPrice?:typeof readPoolPrice;
+  clock?:ChainMonitorClock;discoverPool?:typeof discoverPool;readPoolPrice?:typeof readPoolPrice;liveWriter?:ChainEventWriter;
 }
 const CHAINS:Chain[]=['bsc','solana','robinhood'];
 // Full mainnet-beta getGenesisHash value, not the shortened CAIP chain reference.
@@ -46,9 +47,13 @@ const nativeClock:ChainMonitorClock={now:()=>Date.now(),setInterval:(callback,ms
 /** Targeted read-only chain observations. No signing, order submission, ownership conclusions, or historical price replay. */
 export class ChainMonitor {
   private readonly store:ChainStreamStore;private readonly market:NonNullable<ChainMonitorOptions['market']>;private readonly clock:ChainMonitorClock;
+  private readonly liveWriter:ChainEventWriter;
   private contexts=new Map<Chain,Context>();private running=false;private timer?:unknown;private jobs=new Set<Promise<unknown>>();private closed=false;
+  private stopPromise?:Promise<boolean>;
   constructor(private options:ChainMonitorOptions) {
     this.store=options.store??new ChainStreamStore(options.config.database,options.config.maxBytes);this.market=options.market??new DexPoolData();this.clock=options.clock??nativeClock;
+    this.liveWriter=options.liveWriter??(options.config.database===':memory:'?new DeferredChainEventWriter(this.store):
+      new ChainEventWriterRunner({database:options.config.database,maxBytes:options.config.maxBytes}));
     if(!options.config.enabled)return;
     for(const chain of CHAINS) {
       const endpoint=options.config.endpoints[chain];if(!endpoint)continue;
@@ -64,12 +69,14 @@ export class ChainMonitor {
       this.contexts.set(chain,context);
     }
   }
-  start(){if(this.running||this.closed||!this.options.config.enabled)return;this.running=true;
+  start(){if(this.running||this.closed||!this.options.config.enabled)return;this.running=true;this.liveWriter.start();
     for(const c of this.contexts.values()){this.subscriptions(c);c.stream.start();}
     this.timer=this.clock.setInterval(()=>this.tick(),5000);this.tick();}
-  async stop(){if(this.closed)return;this.running=false;this.closed=true;if(this.timer!==undefined)this.clock.clearInterval(this.timer);this.timer=undefined;
+  stop():Promise<boolean>{if(this.stopPromise)return this.stopPromise;if(this.closed)return Promise.resolve(this.liveWriter.status().shutdownDrained!==false);
+    this.stopPromise=this.performStop();return this.stopPromise;}
+  private async performStop():Promise<boolean>{this.running=false;this.closed=true;if(this.timer!==undefined)this.clock.clearInterval(this.timer);this.timer=undefined;
     for(const c of this.contexts.values()){c.identityGeneration=undefined;c.stream.stop();c.rpc.stop();}this.market.stop();
-    await Promise.allSettled([...this.jobs]);this.store.close();}
+    await Promise.allSettled([...this.jobs]);let drained=false;try{drained=await this.liveWriter.stop();}finally{this.store.close();}return drained;}
   private fresh(at:number|undefined,maxAge:number):boolean {const age=this.clock.now()-(at??NaN);return Number.isFinite(age)&&age>=0&&age<maxAge;}
   private current(c:Context,generation:number):boolean {
     if(!this.running||!c.stream)return false;const status=c.stream.getStatus();
@@ -81,7 +88,7 @@ export class ChainMonitor {
       this.fresh(Date.parse(c.lastHeadAt??''),45000)&&this.fresh(p.sampledAt,90000)&&this.clock.now()<(p.validUntil??0)&&!p.lastError&&status.activeKeys.includes('head')&&
       p.subscriptions.length>0&&p.subscriptions.every(s=>status.activeKeys.includes(s.key));
   }
-  getStatus(){return {enabled:this.options.config.enabled,running:this.running,mode:'observation_only',coverage:'targeted_observation',
+  getStatus(){const writer=this.liveWriter.status(),store=this.store.stats();return {enabled:this.options.config.enabled,running:this.running,mode:'observation_only',coverage:'targeted_observation',
     scope:'evm_erc20_transfers_and_solana_wallet_mentions',chains:CHAINS.map(chain=>{
       const c=this.contexts.get(chain);if(!c)return {chain,state:'disabled',identityVerified:false,watchedWallets:0,watchedPools:0};
       const s=c.stream.getStatus(),verified=this.current(c,s.generation);
@@ -93,8 +100,9 @@ export class ChainMonitor {
         lastMessageAt:s.lastMessageAt?new Date(s.lastMessageAt).toISOString():undefined,lastHeadAt:c.lastHeadAt,
         watchedWallets:c.wallets.size,watchedPools:c.pools.size,coveredPrices:covered,unsupportedPools:c.unsupported.size,
         fallbackTokens:Math.max(0,c.targets.length-covered),latestPriceAt:latest?new Date(latest).toISOString():undefined,
-        lastError:c.lastError??s.lastError,gap:{...c.gap},events:c.events,poolPriceSamples:c.poolPriceSamples};}),
-      store:this.store.stats(),recentEvents:this.store.recent()};}
+        lastError:c.lastError??s.lastError??writer.error,gap:{...c.gap,...(writer.unpersistedEvents?{pending:true,incomplete:true}:{})},
+        events:c.events+(writer.insertedByChain[c.chain]??0),poolPriceSamples:c.poolPriceSamples};}),
+      liveEventWriter:writer,store:{...store,events:store.events+(writer.countOwnership==='external'?writer.inserted:0)},recentEvents:this.store.recent()};}
   private run(work:Promise<unknown>){this.jobs.add(work);void work.catch(()=>{}).finally(()=>this.jobs.delete(work));}
   private connection(c:Context,status:RpcStreamStatus){
     if(!this.running||!c.stream)return;
@@ -208,7 +216,9 @@ export class ChainMonitor {
         // Solana WS offers subscriptions, not getGenesisHash. A notification only marks work
         // pending; the next bounded HTTP pass verifies wallet membership on the known chain.
         c.gap.pending=true;c.backfilled.delete(key.slice(7));
-      }else for(const event of evmTransfers(c.chain,data,c.wallets,'live',new Date(this.clock.now())))if(this.store.record(event))c.events++;
+      }else for(const event of evmTransfers(c.chain,data,c.wallets,'live',new Date(this.clock.now())))if(!this.liveWriter.enqueue(event)){
+        c.lastError='CHAIN_LIVE_EVENT_NOT_PERSISTED';c.gap.pending=true;c.gap.incomplete=true;
+        this.liveWriter.markIncomplete('CHAIN_LIVE_EVENT_NOT_PERSISTED');}
     }else for(const p of c.pools.values())if(p.subscriptions.some(sub=>sub.key===key))p.dirty=true;
   }catch(error){c.lastError=safeCode(error,'CHAIN_EVENT_WRITE_FAILED');c.gap.pending=true;c.gap.incomplete=true;}}
   private incomplete(c:Context,code:string){c.gap.incomplete=true;c.gap.pending=true;c.lastError=code;this.store.markIncomplete(code);}

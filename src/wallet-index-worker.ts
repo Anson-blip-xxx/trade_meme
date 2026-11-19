@@ -2,6 +2,7 @@ import {parentPort,workerData} from 'node:worker_threads';
 import {performance} from 'node:perf_hooks';
 import {WalletHistory} from './wallet-history.js';
 import {walletIndexNextDelay} from './wallet-index-policy.js';
+import type {Chain} from './types.js';
 
 interface Options {
   database:string;
@@ -10,6 +11,7 @@ interface Options {
   coordinationQuota:number;
   associationQuota:number;
   livePriority:boolean;
+  fastTargetLimits?:Partial<Record<Chain,number>>;
 }
 
 const options=workerData as Options;
@@ -32,6 +34,13 @@ const run=async()=>{
   if(stopping)return;
   const attemptedAt=new Date().toISOString();
   parentPort!.postMessage({type:'working',at:attemptedAt});
+
+  let fastTargets:Partial<Record<Chain,string[]>>|undefined,fastTargetError:string|undefined;
+  const fastTargetsAt=new Date().toISOString();
+  try {fastTargets={};for(const chain of ['bsc','solana','robinhood'] as Chain[]){
+    const limit=options.fastTargetLimits?.[chain]??(chain==='solana'?30:200);
+    fastTargets[chain]=history.streamWalletTargets(chain,limit);
+  }}catch {fastTargets=undefined;fastTargetError='WALLET_STREAM_TARGET_READ_FAILED';}
 
   let invalidationError:string|undefined,coordinationError:string|undefined,associationError:string|undefined;
   let invalidationMs=0,invalidationProcessed=0,coordinationMs=0,coordinationProcessed=0,associationMs=0,associationProcessed=0;
@@ -59,7 +68,8 @@ const run=async()=>{
   // whole coalesced queue has drained.
   if(invalidationPending>0) {
     parentPort!.postMessage({type:'status',status:{invalidationMs,invalidationProcessed,invalidationPending,invalidationError,
-      coordinationMs,coordinationProcessed,associationMs,associationProcessed,coordinationError,associationError,completedAt:new Date().toISOString()}});
+      coordinationMs,coordinationProcessed,associationMs,associationProcessed,coordinationError,associationError,completedAt:new Date().toISOString()},
+      fastTargets,fastTargetsAt,fastTargetError});
     schedule(walletIndexNextDelay(options.intervalMs,{invalidationPending,processed:invalidationProcessed,livePriority}));return;
   }
   // Small transactions run until a wall-clock budget expires. Wallet degrees
@@ -102,7 +112,7 @@ const run=async()=>{
   parentPort!.postMessage({type:'status',status:{invalidationMs,invalidationProcessed,invalidationPending,invalidationError,
     coordinationMs,coordinationProcessed,associationMs,associationProcessed,associationStats,associationStatsMs,
     ...(associationStatsAt?{associationStatsRefreshedAt:new Date(associationStatsAt).toISOString()}:{}),coordinationError,associationError,
-    completedAt:new Date().toISOString()}});
+    completedAt:new Date().toISOString()},fastTargets,fastTargetsAt,fastTargetError});
   const processed=invalidationProcessed+coordinationProcessed+associationProcessed;
   // One final short cycle proves the queue is empty before returning to the
   // normal cadence; live counting uses a longer catch-up delay.

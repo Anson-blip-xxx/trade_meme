@@ -41,6 +41,18 @@ test('wallet-index worker drains above current production ingress across bounded
   } finally {await runner.stop();rmSync(directory,{recursive:true,force:true});}
 });
 
+test('wallet-index worker publishes bounded stream targets for main-thread snapshot assembly',async()=>{
+  const directory=mkdtempSync(join(tmpdir(),'wallet-index-fast-targets-')),database=join(directory,'history.sqlite');
+  const candidate=address(71),history=new WalletHistory(database),stamp=new Date().toISOString();
+  history.recordTrade({chain:'bsc',wallet:candidate,tokenAddress:address(72),txHash:hash(71),side:'buy',eventAt:stamp,
+    observedAt:stamp,source:'test'});history.close();
+  const runner=new WalletIndexRunner({database,maxBytes:512*1024*1024,intervalMs:30_000,fastTargetLimits:{bsc:1}});
+  try {runner.start();await waitFor(()=>runner.fastTargetAddresses('bsc',1)[0]===candidate);
+    assert.deepEqual(runner.fastTargetAddresses('bsc',200),[candidate]);
+    assert.equal(runner.snapshot().fastTargetCounts.bsc,1);assert.ok(runner.snapshot().fastTargetsAt);
+  } finally {await runner.stop();rmSync(directory,{recursive:true,force:true});}
+});
+
 test('live priority caps one invalidation cycle and switching it off resumes catch-up',async()=>{
   const directory=mkdtempSync(join(tmpdir(),'wallet-index-live-priority-')),database=join(directory,'history.sqlite');
   const history=new WalletHistory(database),db=(history as unknown as {db:DatabaseSync}).db;

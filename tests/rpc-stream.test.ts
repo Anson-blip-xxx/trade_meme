@@ -61,7 +61,9 @@ const code = (error: unknown, expected: string) => error instanceof RpcStreamErr
 test('constructor rejects invalid settings with fixed codes and never echoes endpoint secrets', () => {
   for (const extra of [{url: 'https://provider.invalid/secret'}, {url: 'wss://user:secret@provider.invalid'},
     {url: 'wss://provider.invalid/#secret'}, {requestTimeoutMs: 0}, {maxMessageBytes: 1}, {reconnectMaxMs: 1},
-    {maxConcurrentSubscriptions:0},{maxSubscriptions:2,maxConcurrentSubscriptions:3},{retryRejectedSubscriptions:'yes' as any},
+    {maxConcurrentSubscriptions:0},{maxSubscriptions:2,maxConcurrentSubscriptions:3},{maxConcurrentUnsubscriptions:0},
+    {maxSubscriptions:2,maxConcurrentUnsubscriptions:3},{retryRejectedSubscriptions:'yes' as any},
+    {retryTimedOutSubscriptions:'yes' as any},
     {heartbeat: {mode: 'request', method: 'bad/method/secret', intervalMs: 100} as const}])
     assert.throws(() => fixture(extra), error => code(error, 'RPC_CONFIG_INVALID'));
 });
@@ -81,6 +83,39 @@ test('subscription ACK window drains a 31-target burst without exceeding configu
   }
   assert.equal(f.stream.getStatus().activeSubscriptions,31);assert.equal(f.stream.getStatus().subscribingSubscriptions,0);
   assert.equal(f.stream.getStatus().queuedSubscriptions,0);assert.equal(f.stream.getStatus().peakConcurrentSubscriptions,4);
+  f.stream.stop();await flush();
+});
+
+test('a full target rotation bounds subscribe and unsubscribe request bursts independently',async()=>{
+  const original=Array.from({length:30},(_,index)=>sub(`old:${index}`,[`old-${index}`]));
+  const replacement=Array.from({length:30},(_,index)=>sub(`new:${index}`,[`new-${index}`]));
+  const f=fixture({maxSubscriptions:64,maxConcurrentSubscriptions:1,maxConcurrentUnsubscriptions:1});
+  f.stream.setSubscriptions(original);const socket=f.open();
+  for(let index=0;index<original.length;index++){
+    assert.equal(socket.sent.length,index+1);socket.response(index,`old-id-${index}`);await flush();
+  }
+  f.stream.setSubscriptions(replacement);
+  assert.deepEqual(socket.sent.slice(30).map(item=>item.method),['eth_unsubscribe','eth_subscribe']);
+  assert.deepEqual({unsubscribing:f.stream.getStatus().unsubscribingSubscriptions,
+    queuedUnsubscriptions:f.stream.getStatus().queuedUnsubscriptions,
+    subscribing:f.stream.getStatus().subscribingSubscriptions,queuedSubscriptions:f.stream.getStatus().queuedSubscriptions},
+  {unsubscribing:1,queuedUnsubscriptions:29,subscribing:1,queuedSubscriptions:29});
+  const answered=new Set<number>(Array.from({length:30},(_,index)=>index));
+  for(let turns=0;turns<100&&answered.size<90;turns++){
+    const pending=socket.sent.map((request,index)=>({request,index})).filter(({index})=>!answered.has(index));
+    assert.ok(pending.length<=2,'at most one subscribe and one unsubscribe may be pending');
+    for(const {request,index} of pending){
+      answered.add(index);socket.response(index,request.method==='eth_unsubscribe'?true:`new-id-${index}`);
+    }
+    await flush();
+    assert.ok((f.stream.getStatus().unsubscribingSubscriptions??0)<=1);
+    assert.ok((f.stream.getStatus().subscribingSubscriptions??0)<=1);
+  }
+  assert.equal(socket.sent.length,90);assert.equal(answered.size,90);
+  assert.equal(f.stream.getStatus().activeSubscriptions,30);
+  assert.equal(f.stream.getStatus().queuedUnsubscriptions,0);
+  assert.equal(f.stream.getStatus().unsubscribingSubscriptions,0);
+  assert.equal(f.stream.getStatus().peakConcurrentUnsubscriptions,1);
   f.stream.stop();await flush();
 });
 
@@ -108,6 +143,65 @@ test('isolated rejection mode still reconnects after an ambiguous subscription t
   await f.clock.advance(50);
   assert.equal(f.stream.getStatus().state,'backoff');assert.equal(f.stream.getStatus().lastError,'RPC_SUBSCRIBE_FAILED');
   assert.equal(f.stream.getStatus().activeSubscriptions,0);assert.equal(f.stream.getStatus().subscriptionRetries,0);
+  f.stream.stop();await flush();
+});
+
+test('bounded timeout retry preserves healthy subscription ACKs before reconnecting',async()=>{
+  const f=fixture({maxConcurrentSubscriptions:2,retryTimedOutSubscriptions:true});
+  f.stream.setSubscriptions([sub('healthy',['healthy']),sub('slow',['slow'])]);const socket=f.open();
+  socket.response(0,'healthy-id');await flush();
+  await f.clock.advance(50);
+  assert.equal(f.stream.getStatus().state,'open');assert.deepEqual(f.stream.getStatus().activeKeys,['healthy']);
+  assert.deepEqual({retrying:f.stream.getStatus().retryingSubscriptions,retries:f.stream.getStatus().subscriptionRetries,
+    reconnects:f.stream.getStatus().reconnects,latePending:f.stream.getStatus().lateSubscriptionAcksPending},
+  {retrying:1,retries:1,reconnects:0,latePending:1});
+  await f.clock.advance(100);assert.equal(socket.sent[2].params[0],'slow');
+  socket.response(2,'slow-id');await flush();assert.deepEqual(f.stream.getStatus().activeKeys,['healthy','slow']);
+  assert.equal(f.stream.getStatus().retryingSubscriptions,0);assert.equal(f.stream.getStatus().reconnects,0);
+  socket.response(1,'orphaned-slow-id');await flush();
+  assert.deepEqual(socket.sent[3],{jsonrpc:'2.0',id:4,method:'eth_unsubscribe',params:['orphaned-slow-id']});
+  assert.deepEqual({pending:f.stream.getStatus().lateSubscriptionAcksPending,received:f.stream.getStatus().lateSubscriptionAcksReceived,
+    retired:f.stream.getStatus().lateSubscriptionAcksRetired,matched:f.stream.getStatus().lateSubscriptionAcksMatchedActive},
+  {pending:0,received:1,retired:1,matched:0});
+  socket.notification('orphaned-slow-id',{ignored:true});socket.notification('slow-id',{kept:true});
+  assert.deepEqual(f.events.map(event=>event.result),[{kept:true}]);socket.response(3,true);await flush();
+  f.stream.stop();await flush();
+});
+
+test('a late timeout ACK cannot retire or overwrite a newer active subscription with the same ID',async()=>{
+  const f=fixture({maxSubscriptions:1,maxConcurrentSubscriptions:1,retryTimedOutSubscriptions:true});
+  f.stream.setSubscriptions([sub('slow',['slow'])]);const socket=f.open();
+  await f.clock.advance(50);assert.equal(f.stream.getStatus().lateSubscriptionAcksPending,1);
+  await f.clock.advance(100);socket.response(1,'shared-id');await flush();
+  assert.deepEqual(f.stream.getStatus().activeKeys,['slow']);socket.response(0,'shared-id');await flush();
+  assert.equal(socket.sent.length,2,'matching a current active ID must not enqueue an unsubscribe');
+  assert.deepEqual({pending:f.stream.getStatus().lateSubscriptionAcksPending,received:f.stream.getStatus().lateSubscriptionAcksReceived,
+    retired:f.stream.getStatus().lateSubscriptionAcksRetired,matched:f.stream.getStatus().lateSubscriptionAcksMatchedActive},
+  {pending:0,received:1,retired:0,matched:1});
+  socket.notification('shared-id',{kept:true});assert.deepEqual(f.events.map(event=>event.result),[{kept:true}]);
+  f.stream.stop();await flush();
+});
+
+test('disconnect clears same-generation late ACK tombstones and stale callbacks cannot revive them',async()=>{
+  const f=fixture({maxSubscriptions:1,maxConcurrentSubscriptions:1,retryTimedOutSubscriptions:true});
+  f.stream.setSubscriptions([sub('slow',['slow'])]);const socket=f.open(),handler=[...socket.listeners.get('message')!][0];
+  await f.clock.advance(50);assert.equal(f.stream.getStatus().lateSubscriptionAcksPending,1);
+  f.stream.forceReconnect();assert.equal(f.stream.getStatus().lateSubscriptionAcksPending,0);
+  handler({data:JSON.stringify({jsonrpc:'2.0',id:socket.sent[0].id,result:'stale-id'})});
+  assert.equal(socket.sent.length,1);assert.equal(f.stream.getStatus().lateSubscriptionAcksReceived,0);
+  f.stream.stop();await flush();assert.equal(f.clock.tasks.size,0);
+});
+
+test('late ACK tombstones are bounded and capacity exhaustion reconnects to clear remote state',async()=>{
+  const f=fixture({maxSubscriptions:1,maxConcurrentSubscriptions:1,retryTimedOutSubscriptions:true});
+  f.stream.setSubscriptions([sub('slow',['slow'])]);f.open();
+  assert.equal(f.stream.getStatus().maxLateSubscriptionAcks,3);
+  await f.clock.advance(50);assert.equal(f.stream.getStatus().lateSubscriptionAcksPending,1);
+  await f.clock.advance(150);assert.equal(f.stream.getStatus().lateSubscriptionAcksPending,2);
+  await f.clock.advance(250);assert.equal(f.stream.getStatus().lateSubscriptionAcksPending,3);
+  await f.clock.advance(450);
+  assert.equal(f.stream.getStatus().state,'backoff');assert.equal(f.stream.getStatus().lateSubscriptionAcksPending,0);
+  assert.equal(f.stream.getStatus().lateSubscriptionAckOverflows,1);assert.equal(f.stream.getStatus().reconnects,1);
   f.stream.stop();await flush();
 });
 

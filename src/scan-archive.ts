@@ -12,6 +12,7 @@ import {StrategyObservation} from './strategy-observation.js';
 import {SignalFollowup,type FollowupListOptions} from './signal-followup.js';
 import type {FollowupWalletEvidence} from './wallet-history.js';
 import {configureResearchWal} from './research-sqlite.js';
+import {ScanArchiveStatsRunner,type ScanArchiveStatsRefresh} from './scan-archive-stats.js';
 
 export interface ScanToken {chain:Chain;address:string;}
 export interface ScanCheck {status:Status;reasons:string[];}
@@ -62,12 +63,17 @@ export interface ScanRecord extends ScanToken {
   performance?:ScanPerformance;
   observation?:ScanObservation;
 }
-export interface ScanArchiveOptions {retentionDays?:number;maxEntries?:number;trackingHours?:number;followupEnabled?:boolean;now?:()=>Date;}
+export interface ScanArchiveOptions {
+  retentionDays?:number;maxEntries?:number;trackingHours?:number;followupEnabled?:boolean;now?:()=>Date;
+  /** Primarily for bounded worker integration tests; production defaults to 15 seconds. */
+  statsRefreshMs?:number;
+}
 export interface ScanListOptions {limit?:number;offset?:number;chain?:Chain;decision?:Report['decision'];search?:string;eligible?:boolean;}
 export interface ScanArchiveStats {
   total:number;eligible:number;tracking:number;maxGainPct?:number;
   byStatus:Record<Stored['status'],number>;byDecision:Record<Report['decision']|'PENDING',number>;
   comparison?:ReturnType<StrategyObservation['summary']>;
+  refresh?:ScanArchiveStatsRefresh;
 }
 export interface ScanPrice extends ScanToken {
   priceUsd:number;observedAt:string;source:string;metadata?:PriceEvidence;
@@ -228,16 +234,18 @@ export class ScanArchive {
   private readonly retentionDays:number;
   private readonly maxEntries:number;
   private readonly trackingMs:number;
+  private readonly statsRunner?:ScanArchiveStatsRunner;
   private watch?:WatchOptions;
   private cachedOverview?:{at:number;value:{total:number;eligible:number;tracking:number;maxGainPct?:number;computedAt:string}};
   private cachedStats?:{at:number;value:ScanArchiveStats};
   private nextRetentionAt=0;
   constructor(path:string,options:ScanArchiveOptions={}) {
     this.retentionDays=options.retentionDays??30;this.maxEntries=options.maxEntries??10_000;
-    const hours=options.trackingHours??24;
+    const hours=options.trackingHours??24,statsRefreshMs=options.statsRefreshMs??STATS_CACHE_MS;
     if(!Number.isFinite(this.retentionDays)||this.retentionDays<=0||this.retentionDays>365||
       !Number.isSafeInteger(this.maxEntries)||this.maxEntries<1||this.maxEntries>100_000||
-      !Number.isFinite(hours)||hours<=0||hours>168) throw new Error('SCAN_ARCHIVE_CONFIG_INVALID');
+      !Number.isFinite(hours)||hours<=0||hours>168||!Number.isSafeInteger(statsRefreshMs)||statsRefreshMs<10)
+      throw new Error('SCAN_ARCHIVE_CONFIG_INVALID');
     this.trackingMs=hours*3_600_000;this.now=options.now??(()=>new Date());
     if(path!==':memory:') mkdirSync(dirname(path),{recursive:true,mode:0o700});
     this.db=new DatabaseSync(path);if(path!==':memory:') chmodSync(path,0o600);
@@ -289,6 +297,10 @@ export class ScanArchive {
     this.comparison=new StrategyObservation(this.db);
     if(options.followupEnabled)this.followup=new SignalFollowup(this.db,{persistedReviewReads:true});
     this.prune();
+    if(path!==':memory:'){
+      this.statsRunner=new ScanArchiveStatsRunner({database:path,trackingMs:this.trackingMs,now:this.now,refreshMs:statsRefreshMs});
+      this.statsRunner.start();
+    }
   }
 
   capture(entry:Stored):void {this.captureRecord(entry);}
@@ -502,6 +514,11 @@ export class ScanArchive {
   }
 
   stats():ScanArchiveStats {
+    if(this.statsRunner){
+      const snapshot=this.statsRunner.snapshot(),value=snapshot.values?.stats??{total:0,eligible:0,tracking:0,
+        byStatus:{processing:0,completed:0,interrupted:0},byDecision:{BUY_CANDIDATE:0,WATCH:0,REJECT:0,PENDING:0}};
+      return {...value,refresh:snapshot.refresh};
+    }
     const now=this.now(),at=now.getTime();
     if(this.cachedStats&&at>=this.cachedStats.at&&at-this.cachedStats.at<STATS_CACHE_MS)
       return structuredClone(this.cachedStats.value);
@@ -526,6 +543,10 @@ export class ScanArchive {
 
   /** Home counters only; no retention sweep, comparisons, payloads or external calls. */
   overviewStats(now=this.now()) {
+    if(this.statsRunner){
+      const snapshot=this.statsRunner.snapshot(),value=snapshot.values?.overview??{total:0,eligible:0,tracking:0};
+      return {...value,refresh:snapshot.refresh};
+    }
     if(this.cachedOverview&&now.getTime()>=this.cachedOverview.at&&now.getTime()-this.cachedOverview.at<15000)return {...this.cachedOverview.value};
     const row=this.db.prepare(`SELECT count(*) AS total,SUM(eligible_at IS NOT NULL) AS eligible,
       SUM(eligible_at>? AND eligible_at<=?) AS tracking,MAX(max_gain_pct) AS gain FROM scan_summaries`)
@@ -646,6 +667,7 @@ export class ScanArchive {
         this.write(record,at);
       }
       this.db.exec('COMMIT');
+      this.statsRunner?.invalidate();
     } catch(error) {this.db.exec('ROLLBACK');throw error;}
   }
 
@@ -666,6 +688,7 @@ export class ScanArchive {
           lastErrorAt:now.toISOString(),lastError:error};this.write(record,now.toISOString());
       }
       this.db.exec('COMMIT');
+      this.statsRunner?.invalidate();
     } catch(error) {this.db.exec('ROLLBACK');throw error;}
   }
 
@@ -680,7 +703,7 @@ export class ScanArchive {
     this.db.exec('BEGIN IMMEDIATE');
     try {this.pruneInside(now);this.db.exec('COMMIT');} catch(error) {this.db.exec('ROLLBACK');throw error;}
   }
-  close():void {this.db.close();}
+  close():void {this.statsRunner?.stop();this.db.close();}
   private watchRow(id:string):WatchRow|undefined {
     return this.db.prepare('SELECT * FROM watch_jobs WHERE id=?').get(id) as unknown as WatchRow|undefined;
   }
@@ -771,10 +794,10 @@ export class ScanArchive {
       .run(record.id,record.chain,record.address,record.status,record.receivedAt,record.decision??null,
         record.performance?.eligibleAt??null,lastAttempt??null,lease??null,record.performance?.status??null,
         record.performance?.maxGainPct??null,JSON.stringify(record));
-    // Dashboard aggregates are informational and may lag ordinary inserts or
-    // price updates by STATS_CACHE_MS. Invalidating on every live quote made an
-    // overview request rescan the archive on the source-event thread. Explicit
-    // retention maintenance below still invalidates immediately.
+    this.statsRunner?.invalidate();
+    // File-backed dashboard aggregates refresh in a worker and may lag ordinary
+    // writes by STATS_CACHE_MS. The invalidation above only advances its snapshot;
+    // it never scans the archive on this source-event thread.
   }
   private maybeMaintain(now:Date):void {
     if(Number.isFinite(now.getTime())&&now.getTime()>=this.nextRetentionAt)this.maintenance(now);
@@ -810,5 +833,6 @@ export class ScanArchive {
       record.performance={...record.performance!,status:'ended'};this.write(record);aggregateChanged=true;
     }
     if(aggregateChanged)this.cachedStats=undefined;
+    this.statsRunner?.invalidate();
   }
 }

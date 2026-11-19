@@ -104,6 +104,7 @@ export class WalletPriceWriterRunner {
   private error?:string;
   private closeError?:'WALLET_PRICE_WRITER_STOP_TIMEOUT';
   private stopPromise?:Promise<boolean>;
+  private terminating?:{worker:Worker;promise:Promise<void>};
 
   constructor(private readonly options:WalletPriceWriterOptions) {
     this.maxPendingTargets=options.maxPendingTargets??1_024;
@@ -148,7 +149,7 @@ export class WalletPriceWriterRunner {
     this.state='starting';this.launch();
     this.watchdog=setInterval(()=>{
       if(this.worker&&this.inFlight&&Date.now()-this.inFlight.startedAt>this.workerTimeoutMs){
-        this.error='WALLET_PRICE_WRITER_TIMEOUT';void this.worker.terminate().catch(()=>{});
+        this.error='WALLET_PRICE_WRITER_TIMEOUT';void this.terminateWorker(this.worker);
       }
     },Math.min(10_000,Math.max(100,Math.floor(this.workerTimeoutMs/4))));
     this.watchdog.unref();
@@ -238,10 +239,12 @@ export class WalletPriceWriterRunner {
     const worker=this.worker;
     if(worker)await new Promise<void>(done=>{
       let settled=false;
-      const finish=()=>{if(settled)return;settled=true;clearTimeout(timeout);done();};
-      const timeout=setTimeout(()=>{void worker.terminate().then(finish,finish);},3_000);
-      worker.once('exit',finish);
-      try{worker.postMessage('stop');}catch{void worker.terminate().then(finish,finish);}
+      const exited=()=>finish(),finish=()=>{if(settled)return;settled=true;clearTimeout(timeout);worker.off('exit',exited);done();};
+      // Worker.terminate() cannot interrupt a synchronous native SQLite call.
+      // Do not make the runtime shutdown deadline depend on that promise.
+      const timeout=setTimeout(()=>{worker.unref();void this.terminateWorker(worker);finish();},3_000);
+      worker.once('exit',exited);
+      try{worker.postMessage('stop');}catch{worker.unref();void this.terminateWorker(worker);finish();}
     });
     this.worker=undefined;this.ready=false;this.recovering=false;this.projectionIdle=true;
     this.inFlight=undefined;this.state='stopped';this.resolveDrainers();return drained;
@@ -290,7 +293,19 @@ export class WalletPriceWriterRunner {
     for(const item of items)this.pending.delete(item.key);
     const id=++this.batchId;this.inFlight={id,items,startedAt:Date.now()};
     try{this.worker.postMessage({type:'batch',batchId:id,items});}
-    catch{const batch=this.inFlight;this.inFlight=undefined;if(batch)for(const item of batch.items)this.retryItem(item);void this.worker.terminate().catch(()=>{});}
+    catch{const batch=this.inFlight;this.inFlight=undefined;if(batch)for(const item of batch.items)this.retryItem(item);
+      void this.terminateWorker(this.worker);}
+  }
+
+  /** Node adds an exit listener for every terminate() call. Share one request
+   * while a native SQLite call is still preventing the worker from exiting. */
+  private terminateWorker(worker:Worker):Promise<void> {
+    if(this.terminating?.worker===worker)return this.terminating.promise;
+    const record={worker,promise:Promise.resolve()};
+    try{record.promise=worker.terminate().then(()=>{},()=>{});}
+    catch{/* A synchronously failed termination is already settled. */}
+    record.promise=record.promise.finally(()=>{if(this.terminating===record)this.terminating=undefined;});
+    this.terminating=record;return record.promise;
   }
 
   private handleIngressResult(message:WorkerIngressResult):void {

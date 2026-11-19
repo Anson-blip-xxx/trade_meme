@@ -265,6 +265,48 @@ test('first-seen callback failures remain in a durable outbox and replay exactly
   }finally{scanner.stop();store.close();rmSync(directory,{recursive:true,force:true});}
 });
 
+test('a pending candidate failure yields after one attempt while feed polling continues',async()=>{
+  let now=new Date(at),trendingCalls=0,candidateCalls=0;
+  const store=new GmgnMarketDiscoveryStore({path:':memory:',maxBytes:2*1024*1024,maxObservations:100,now:()=>now});
+  store.apply(normalizeGmgnMarketTrending({rank:[trendingRow(),trendingRow({address:address(70)}),
+    trendingRow({address:address(71)})]}),now,{leftCensored:true});
+  const client:GmgnMarketDiscoveryClient={
+    async getMarketTrending(){trendingCalls++;return {rank:[]};},
+    async getMarketTrenches(){return {new_creation:[],near_completion:[],completed:[]};},
+  };
+  const scanner=new GmgnMarketDiscoveryScanner({client,store,intervalMs:1_000,maxCandidates:7,now:()=>now,
+    onCandidate(){candidateCalls++;throw new Error('candidate store busy');}});
+  try{
+    assert.equal(store.status().pendingCandidateDeliveries,3);
+    await scanner.pollNow();
+    assert.equal(candidateCalls,1,'one downstream failure must backpressure the pending batch');
+    assert.equal(store.status().pendingCandidateDeliveries,3,'failed and unattempted candidates remain durable');
+    assert.equal(scanner.status().candidateErrors,1);assert.equal(trendingCalls,1,'feed polling must continue after relay backpressure');
+    assert.equal(scanner.status().feeds.trending.polls,1);
+  }finally{scanner.stop();store.close();}
+});
+
+test('a direct tracking failure skips later tracking callbacks but still delivers non-tracking events',async()=>{
+  let now=new Date(at);const first=address(72),second=address(73),ordinary=address(74),calls:string[]=[];
+  const store=new GmgnMarketDiscoveryStore({path:':memory:',maxBytes:2*1024*1024,maxObservations:100,now:()=>now});
+  store.apply(normalizeGmgnMarketTrending({rank:[trendingRow({address:first}),trendingRow({address:second}),
+    trendingRow({address:ordinary})]}),now);
+  now=new Date(now.getTime()+30_001);
+  const client:GmgnMarketDiscoveryClient={
+    async getMarketTrending(){return {rank:[trendingRow({address:first,smart_degen_count:3}),
+      trendingRow({address:second,smart_degen_count:3}),trendingRow({address:ordinary,price:'0.002'})]};},
+    async getMarketTrenches(){return {new_creation:[],near_completion:[],completed:[]};},
+  };
+  const scanner=new GmgnMarketDiscoveryScanner({client,store,intervalMs:1_000,maxCandidates:7,now:()=>now,
+    onCandidate(event){calls.push(event.tokenAddress);if(event.walletTrackingRecommended)throw new Error('candidate store busy');}});
+  try{
+    await scanner.pollNow();
+    assert.deepEqual(calls,[first,ordinary]);
+    assert.equal(scanner.status().candidateErrors,1);
+    assert.equal(store.status().pendingCandidateDeliveries,2,'both failed and skipped tracking events remain in the outbox');
+  }finally{scanner.stop();store.close();}
+});
+
 test('scanner records invalid feed schemas as errors rather than successful empty polls',async()=>{
   const client:GmgnMarketDiscoveryClient={
     async getMarketTrending(){return {code:0,data:{}};},

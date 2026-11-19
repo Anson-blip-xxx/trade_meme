@@ -11,6 +11,7 @@ import {LauncherCandidates} from '../src/launcher-candidates.js';
 import {WalletFastRunner} from '../src/wallet-fast-runner.js';
 import {WalletFastPersistenceRunner} from '../src/wallet-fast-persistence-runner.js';
 import {WalletFastResearch} from '../src/wallet-fast-research.js';
+import {GmgnPlusArchiveRunner} from '../src/gmgn-plus-archive.js';
 import type {FastWalletEvent} from '../src/wallet-fast.js';
 import type {Report} from '../src/types.js';
 import type {WalletAnalysis,WalletRecord} from '../src/research/wallet-types.js';
@@ -153,6 +154,122 @@ test('runtime reports a fixed wallet price shutdown error only after closing the
     await assert.rejects(runtime.close(),{message:'WALLET_PRICE_WRITER_STOP_TIMEOUT'});
     assert.equal(laterStoreClosed,true,'shutdown must finish later cleanup before exposing the price-writer error');
     await assert.rejects(runtime.close(),{message:'WALLET_PRICE_WRITER_STOP_TIMEOUT'});
+  } finally {rmSync(dir,{recursive:true,force:true});}
+});
+
+test('an early scanner stop rejection is reported only after the remaining stores close',async()=>{
+  const dir=mkdtempSync(join(tmpdir(),'runtime-early-stop-failure-'));
+  const cfg=readConfig({DASHBOARD_ENABLED:'false',TELEGRAM_ENABLED:'false',DEBOT_SCANNER_ENABLED:'true',
+    DEBOT_TRANSPORT:'anonymous_poll',DEBOT_SIGNALS_DATABASE_PATH:join(dir,'debot.sqlite'),
+    MEME_OBSERVER_ENABLED:'false',AVE_SCANNER_ENABLED:'false',GMGN_MARKET_SIGNAL_ENABLED:'false',
+    ORDERS_DATABASE_PATH:join(dir,'orders.sqlite'),ENTRY_MODE:'off'});
+  const runtime=createRuntime(cfg),scanner=runtime.debotScanner!;let storeClosed=false,calls=0;
+  const originalStop=scanner.stop.bind(scanner),originalStoreClose=runtime.store.close.bind(runtime.store);
+  scanner.stop=async()=>{if(++calls===1)throw new Error('EARLY_SCANNER_STOP_FAILED');await originalStop();};
+  runtime.store.close=()=>{storeClosed=true;originalStoreClose();};
+  try {
+    await assert.rejects(runtime.close(),{message:'EARLY_SCANNER_STOP_FAILED'});
+    assert.equal(storeClosed,true);
+  } finally {rmSync(dir,{recursive:true,force:true});}
+});
+
+test('runtime waits for every grouped stop before closing stores when a sibling rejects',async()=>{
+  const dir=mkdtempSync(join(tmpdir(),'runtime-grouped-stop-failure-'));
+  const cfg=readConfig({DASHBOARD_ENABLED:'true',DASHBOARD_ACCESS_TOKEN:'grouped-stop-access-token-with-32-characters',
+    SCAN_DATABASE_PATH:join(dir,'scans.sqlite'),WATCH_RECHECK_ENABLED:'true',TELEGRAM_ENABLED:'false',
+    DEBOT_SCANNER_ENABLED:'false',AVE_SCANNER_ENABLED:'false',MEME_OBSERVER_ENABLED:'false',GMGN_MARKET_SIGNAL_ENABLED:'false',
+    ORDERS_DATABASE_PATH:join(dir,'orders.sqlite'),ENTRY_MODE:'off'});
+  const runtime=createRuntime(cfg);let releaseDelayed!:(value:void)=>void,delayedStopped=false,storeClosed=false;
+  runtime.tracking!.stop=async()=>{throw new Error('PASSIVE_FIRST_STOP_FAILED');};
+  runtime.watchRechecker!.stop=()=>new Promise<void>(resolve=>{releaseDelayed=()=>{delayedStopped=true;resolve();};});
+  const originalStoreClose=runtime.store.close.bind(runtime.store);
+  runtime.store.close=()=>{assert.equal(delayedStopped,true,'store closed before every grouped stop settled');
+    storeClosed=true;originalStoreClose();};
+  const closing=runtime.close();
+  try {
+    await new Promise<void>(resolve=>setImmediate(resolve));
+    assert.equal(storeClosed,false);releaseDelayed();
+    await assert.rejects(closing,{message:'PASSIVE_FIRST_STOP_FAILED'});assert.equal(storeClosed,true);
+  } finally {if(releaseDelayed)releaseDelayed();await closing.catch(()=>{});rmSync(dir,{recursive:true,force:true});}
+});
+
+test('runtime abandons late cleanup before it can enter synchronous store closes',async()=>{
+  const dir=mkdtempSync(join(tmpdir(),'runtime-shutdown-deadline-'));
+  const cfg=readConfig({DASHBOARD_ENABLED:'false',TELEGRAM_ENABLED:'false',WALLET_RESEARCH_ENABLED:'true',
+    WALLET_PROFILES_ENABLED:'false',WALLET_SCREENING_ENABLED:'false',TOKEN_RANK_RESEARCH_ENABLED:'false',
+    LAUNCHER_CANDIDATES_ENABLED:'false',DEBOT_SCANNER_ENABLED:'false',AVE_SCANNER_ENABLED:'false',
+    MEME_OBSERVER_ENABLED:'false',GMGN_MARKET_SIGNAL_ENABLED:'false',
+    WALLET_HISTORY_DATABASE_PATH:join(dir,'history.sqlite'),ORDERS_DATABASE_PATH:join(dir,'orders.sqlite'),ENTRY_MODE:'off'});
+  const runtime=createRuntime(cfg,{shutdownTimeoutMs:40});let releaseObserver!:(value:boolean)=>void,storeClosed=false;
+  runtime.walletObserver!.stop=()=>new Promise<boolean>(resolve=>{releaseObserver=resolve;});
+  const originalClose=runtime.store.close.bind(runtime.store);
+  runtime.store.close=()=>{storeClosed=true;originalClose();};
+  try {
+    const started=Date.now();
+    await assert.rejects(runtime.close(),{message:'RUNTIME_SHUTDOWN_TIMEOUT'});
+    assert.ok(Date.now()-started<2000,'runtime deadline should reject well before the service stop deadline');
+    assert.equal(storeClosed,false,'the timed-out drain must not close stores underneath active work');
+    releaseObserver(true);
+    await new Promise(resolve=>setTimeout(resolve,100));
+    assert.equal(storeClosed,false,'expired background cleanup must not enter blocking SQLite closes');
+    await assert.rejects(runtime.close(),{message:'RUNTIME_SHUTDOWN_TIMEOUT'});
+  } finally {
+    if(releaseObserver)releaseObserver(true);
+    try{runtime.walletHistory?.close();}catch{}
+    try{runtime.orders.close();}catch{}
+    if(!storeClosed)try{originalClose();}catch{}
+    rmSync(dir,{recursive:true,force:true});
+  }
+});
+
+test('runtime begins wallet observer drain before waiting for wallet-fast shutdown',async t=>{
+  const dir=mkdtempSync(join(tmpdir(),'runtime-shutdown-overlap-'));
+  const cfg=readConfig({DASHBOARD_ENABLED:'false',TELEGRAM_ENABLED:'false',WALLET_RESEARCH_ENABLED:'true',
+    WALLET_PROFILES_ENABLED:'false',WALLET_SCREENING_ENABLED:'false',TOKEN_RANK_RESEARCH_ENABLED:'false',
+    LAUNCHER_CANDIDATES_ENABLED:'false',DEBOT_SCANNER_ENABLED:'false',AVE_SCANNER_ENABLED:'false',
+    MEME_OBSERVER_ENABLED:'false',GMGN_MARKET_SIGNAL_ENABLED:'false',CHAIN_STREAM_ENABLED:'true',WALLET_FAST_ENABLED:'true',
+    SOLANA_STREAM_HTTP_URL:'https://rpc.invalid',SOLANA_STREAM_WS_URL:'wss://rpc.invalid',
+    WALLET_HISTORY_DATABASE_PATH:join(dir,'history.sqlite'),WALLET_ACTIVITY_DATABASE_PATH:join(dir,'activity.sqlite'),
+    SCAN_DATABASE_PATH:join(dir,'scans.sqlite'),CHAIN_STREAM_DATABASE_PATH:join(dir,'stream.sqlite'),
+    ORDERS_DATABASE_PATH:join(dir,'orders.sqlite'),ENTRY_MODE:'off'});
+  let releaseFast!:(value:void)=>void,releaseObserver!:(value:boolean)=>void,fastStarted=false,observerStarted=false;
+  t.mock.method(WalletFastRunner.prototype,'stop',()=>{fastStarted=true;return new Promise<void>(resolve=>{releaseFast=resolve;});});
+  const runtime=createRuntime(cfg);runtime.walletObserver!.stop=timeoutMs=>{
+    observerStarted=true;assert.equal(timeoutMs,15_000);return new Promise<boolean>(resolve=>{releaseObserver=resolve;});
+  };
+  const closing=runtime.close();
+  try {
+    const fastBy=Date.now()+2000;
+    while(!fastStarted&&Date.now()<fastBy)await new Promise(resolve=>setTimeout(resolve,10));
+    assert.equal(fastStarted,true);assert.equal(observerStarted,true,
+      'observer drain must already be running while wallet-fast stop is pending');
+    releaseFast();releaseObserver(true);await closing;
+  } finally {if(releaseFast)releaseFast();if(releaseObserver)releaseObserver(true);await closing.catch(()=>{});rmSync(dir,{recursive:true,force:true});}
+});
+
+test('runtime fences GMGN Plus scheduling synchronously before its archive drain',async t=>{
+  const dir=mkdtempSync(join(tmpdir(),'runtime-gmgn-plus-fence-')),events:string[]=[];
+  const cfg=readConfig({DASHBOARD_ENABLED:'false',TELEGRAM_ENABLED:'false',GMGN_API_KEY:'gmgn-test-key',
+    GMGN_PLUS_ARCHIVE_ENABLED:'true',GMGN_PLUS_ARCHIVE_MARKET_ENABLED:'false',GMGN_PLUS_ARCHIVE_CHAINS:'sol',
+    GMGN_PLUS_ARCHIVE_DATABASE_PATH:join(dir,'gmgn-plus.sqlite'),GMGN_MARKET_SIGNAL_ENABLED:'false',
+    DEBOT_SCANNER_ENABLED:'false',AVE_SCANNER_ENABLED:'false',MEME_OBSERVER_ENABLED:'false',
+    ORDERS_DATABASE_PATH:join(dir,'orders.sqlite'),ENTRY_MODE:'off'});
+  const originalBegin=GmgnPlusArchiveRunner.prototype.beginStop,originalStop=GmgnPlusArchiveRunner.prototype.stop;
+  t.mock.method(GmgnPlusArchiveRunner.prototype,'beginStop',function(this:GmgnPlusArchiveRunner){
+    events.push('fence');return originalBegin.call(this);
+  });
+  t.mock.method(GmgnPlusArchiveRunner.prototype,'stop',async function(this:GmgnPlusArchiveRunner){
+    events.push('drain');return originalStop.call(this);
+  });
+  const runtime=createRuntime(cfg);let storeClosed=false;const originalStoreClose=runtime.store.close.bind(runtime.store);
+  runtime.store.close=()=>{storeClosed=true;originalStoreClose();};
+  try {
+    runtime.beginClose();runtime.beginClose();
+    assert.deepEqual(events,['fence'],'the scheduling fence must run before close yields');
+    assert.equal(storeClosed,false,'beginClose must leave shared stores open for draining HTTP handlers');
+    const closing=runtime.close();
+    await closing;assert.deepEqual(events,['fence','drain','fence']);
+    assert.equal(storeClosed,true);
   } finally {rmSync(dir,{recursive:true,force:true});}
 });
 

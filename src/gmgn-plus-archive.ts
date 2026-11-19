@@ -432,7 +432,8 @@ export class GmgnPlusArchiveRunner {
     marketSignals:this.options.marketEnabled===false?'disabled':this.options.dedicatedMarketChains?.length?'hybrid_dedicated_and_round_robin':'round_robin',
     coverage:'deduplicated_latest_feeds_plus_cursor_backfill',entryPipeline:false};}
   start(){if(this.running)return;this.running=true;this.tick(0);}
-  async stop(){this.running=false;clearTimeout(this.timer);this.timer=undefined;await this.inFlight?.catch(()=>{});this.options.archive.close();}
+  beginStop(){this.running=false;clearTimeout(this.timer);this.timer=undefined;}
+  async stop(){this.beginStop();await this.inFlight?.catch(()=>{});this.options.archive.close();}
   runOnce(){if(this.inFlight)return this.inFlight;const run=this.execute();this.inFlight=run;void run.then(
     ()=>{if(this.inFlight===run)this.inFlight=undefined;},()=>{if(this.inFlight===run)this.inFlight=undefined;});return run;}
   private tick(delay:number){if(!this.running)return;this.timer=setTimeout(()=>{this.timer=undefined;void this.runOnce().catch(()=>{}).finally(()=>{

@@ -52,18 +52,11 @@ test('runtime wires Trending, Trenches and compact Kline research without enabli
   const runtime=createRuntime(config,{gmgnFetcher:fetcher});
   try {
     assert.ok(runtime.gmgnMarketDiscovery);assert.ok(runtime.walletHistory);
-    const walletHistory=runtime.walletHistory,
-      captureMarketCandidate=walletHistory.captureMarketCandidate.bind(walletHistory);
-    walletHistory.captureMarketCandidate=()=>false;
+    const walletHistory=runtime.walletHistory,walletDb=(walletHistory as unknown as {db:DatabaseSync}).db;
     await runtime.gmgnMarketDiscovery.pollNow();
     let status=runtime.dashboardOverview().gmgnMarketDiscovery;
-    assert.equal(status.candidateErrors,1);
-    assert.equal(status.store.pendingCandidateDeliveries,1,'failed WalletHistory writes remain durable and unacked');
-    let walletDb=(walletHistory as unknown as {db:DatabaseSync}).db;
-    assert.equal(Number(walletDb.prepare("SELECT count(*) AS n FROM wh_observations WHERE kind='market_candidate'").get()!.n),0);
-    walletHistory.captureMarketCandidate=captureMarketCandidate;
-    await runtime.gmgnMarketDiscovery.pollNow();
-    status=runtime.dashboardOverview().gmgnMarketDiscovery;
+    assert.equal(status.candidateErrors,0);assert.equal(status.candidateWriter.completed,1);
+    assert.equal(status.candidateWriter.pending,0);assert.equal(status.candidateWriter.error,undefined);
     assert.equal(status.store.pendingCandidateDeliveries,0,'the pending candidate is acked only after WalletHistory accepts it');
     assert.equal(Number(walletDb.prepare("SELECT count(*) AS n FROM wh_observations WHERE kind='market_candidate'").get()!.n),1);
     // Scanner unit tests cover the production 30 s cadence. Reset only its

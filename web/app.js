@@ -1362,8 +1362,9 @@
   }
   function renderHome() {
     const data = state.home || {}, stats = data.stats || {}, settings = data.settings || {}, status = data.status || {};
-    text('metric-total', count(stats.total)); text('metric-eligible', count(stats.eligible)); text('metric-tracking', count(stats.tracking)); text('metric-peak', percent(stats.maxGainPct)); text('candidate-count', count(stats.eligible));
-    text('metric-total-note', finite(settings.scanRetentionDays) ? `最近 ${settings.scanRetentionDays} 天 · 信号档案` : '保留期内的全部信号');
+    const statsReady = stats.refresh?.state !== 'loading', visibleStats = statsReady ? stats : {};
+    text('metric-total', count(visibleStats.total)); text('metric-eligible', count(visibleStats.eligible)); text('metric-tracking', count(visibleStats.tracking)); text('metric-peak', percent(visibleStats.maxGainPct)); text('candidate-count', count(visibleStats.eligible));
+    text('metric-total-note', !statsReady ? '档案汇总正在后台加载' : stats.refresh?.state === 'stale' ? '显示上次成功汇总 · 刷新暂不可用' : finite(settings.scanRetentionDays) ? `最近 ${settings.scanRetentionDays} 天 · 信号档案` : '保留期内的全部信号');
     const strip = $('home-service-strip'); strip.replaceChildren();
     strip.append(badge(status.scannerPausedReason === 'GMGN_BACKGROUND_RESEARCH_DISABLED' ? 'GMGN · 交易与按需查询' : status.scannerRunning ? '扫描运行中' : '扫描待确认', status.scannerRunning ? 'pass' : 'neutral'), badge(`DeBot · ${{live:'实时连接',connected:'已连接',authorized:'已认证',disabled:'未启用',connecting:'连接中',authorizing:'认证中',auth_required:'需要登录',disconnected:'已断开',error:'连接异常',stopped:'已停止',subscribed:'实时订阅'}[status.debotState] || scalar(status.debotState, '读取中')}`, ['live','connected','authorized','subscribed'].includes(status.debotState) ? 'pass' : 'neutral'), badge(status.trackingRunning ? '价格追踪运行中' : '价格追踪待确认', status.trackingRunning ? 'pass' : 'neutral'), el('span','home-uptime',`连续运行 ${duration(status.uptimeSec)}`), el('span','home-mode',entryModeLabel(data.entryMode)));
     const details = el('button','text-button','查看运行状态 ↗'); details.type = 'button'; details.addEventListener('click', () => setView('system')); strip.append(details);
@@ -2413,6 +2414,9 @@
     const mode = entryModeLabel(data.entryMode);
     const system = data.system || {}; const research = data.walletResearch || state.walletStatus || {};
     runtime.append(kv('服务启动时间', date(system.startedAt, true)), kv('连续运行', duration(system.uptimeSec)), kv('服务器 CPU', `${plainPercent(system.cpu?.usagePct)} · ${scalar(system.cpu?.cores)} 核`), kv('服务器内存', `${bytes(system.memory?.usedBytes)} / ${bytes(system.memory?.totalBytes)}`), kv('机器人进程内存', bytes(system.memory?.processRssBytes)), kv('磁盘已用 / 总量', `${bytes(system.disk?.usedBytes)} / ${bytes(system.disk?.totalBytes)}`), kv('磁盘可用空间', bytes(system.disk?.freeBytes)), kv('资源采样时间', date(system.sampledAt, true)));
+    const archiveStats=data.stats?.refresh;
+    if(archiveStats){runtime.append(kv('扫描档案汇总', archiveStats.state==='loading'?'后台加载中':archiveStats.state==='stale'?'刷新异常 · 显示上次成功结果':'后台汇总正常'),kv('档案汇总时间',date(archiveStats.computedAt,true)));
+      if(archiveStats.error)runtime.append(el('p','detail-message detail-error',`档案汇总异常：${scalar(archiveStats.error)}`));}
     if (Array.isArray(system.warnings) && system.warnings.length) runtime.append(reasonList(system.warnings));
     runtime.append(kv('钱包历史采集', research.enabled ? '已启用 · 长期保留' : '未启用'), kv('钱包历史 / 容量上限', `${bytes(research.store?.bytes)} / ${bytes(research.store?.maxBytes)}`), kv('最近钱包观测', date(research.store?.lastObservedAt, true)), kv('最近钱包增强采集', date(research.observer?.lastCycle?.completedAt, true)));
     const fast=data.chainStream?.walletFast||{},observerWorker=research.observer?.worker?{...research.observer.worker,ready:research.observer.ready,running:research.observer.running,state:research.observer.state}:undefined,

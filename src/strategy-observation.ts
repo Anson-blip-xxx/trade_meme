@@ -12,6 +12,24 @@ interface Comparison extends ScanToken {
 const GROUPS:ComparisonGroup[]=['one_smart_group','profile_pending','no_confirmed_group'];
 const HORIZONS=[3600,21600,86400];
 
+export function readStrategyObservationSummary(db:DatabaseSync,now:Date) {
+  const totals=db.prepare(`SELECT count(*) AS registered,SUM(ends_at>?) AS active,
+    SUM(samples>0) AS sampled FROM strategy_comparisons`).get(now.toISOString())!;
+  const metrics=db.prepare('SELECT cohort,gain_1h,gain_6h,gain_24h FROM strategy_comparisons').all();
+  const rows=db.prepare('SELECT record FROM strategy_comparisons ORDER BY registered_at DESC LIMIT 12').all()
+    .map(r=>JSON.parse(String(r.record)) as Comparison);
+  return {mode:'observation_only',selection:'first_arrivals_per_group_with_capacity_limit',maxActive:6,
+    registered:Number(totals.registered),active:Number(totals.active??0),sampled:Number(totals.sampled??0),
+    groups:GROUPS.map(group=>({group,registered:metrics.filter(r=>r.cohort===group).length,
+      horizons:HORIZONS.map((seconds,i)=>{
+        const column=['gain_1h','gain_6h','gain_24h'][i];
+        const values=metrics.filter(r=>r.cohort===group&&r[column]!==null).map(r=>Number(r[column])).sort((a,b)=>a-b);
+        return {seconds,covered:values.length,medianGainPct:values.length?(values[Math.floor(values.length/2)]+values[Math.floor((values.length-1)/2)])/2:null};
+      })})),
+    items:rows.slice(0,12).map(r=>({...r,performance:{...r.performance,points:undefined,
+      status:r.endsAt<=now.toISOString()?'ended':r.performance.status}}))};
+}
+
 /** Forward control observations, never an entry authorization or a simulated fill. */
 export class StrategyObservation {
   constructor(private readonly db:DatabaseSync) {
@@ -96,20 +114,6 @@ export class StrategyObservation {
     return Number(expired.changes)+Number(overflow.changes)>0;
   }
   summary(now:Date) {
-    const totals=this.db.prepare(`SELECT count(*) AS registered,SUM(ends_at>?) AS active,
-      SUM(samples>0) AS sampled FROM strategy_comparisons`).get(now.toISOString())!;
-    const metrics=this.db.prepare('SELECT cohort,gain_1h,gain_6h,gain_24h FROM strategy_comparisons').all();
-    const rows=this.db.prepare('SELECT record FROM strategy_comparisons ORDER BY registered_at DESC LIMIT 12').all()
-      .map(r=>JSON.parse(String(r.record)) as Comparison);
-    return {mode:'observation_only',selection:'first_arrivals_per_group_with_capacity_limit',maxActive:6,
-      registered:Number(totals.registered),active:Number(totals.active??0),sampled:Number(totals.sampled??0),
-      groups:GROUPS.map(group=>({group,registered:metrics.filter(r=>r.cohort===group).length,
-        horizons:HORIZONS.map((seconds,i)=>{
-          const column=['gain_1h','gain_6h','gain_24h'][i];
-          const values=metrics.filter(r=>r.cohort===group&&r[column]!==null).map(r=>Number(r[column])).sort((a,b)=>a-b);
-          return {seconds,covered:values.length,medianGainPct:values.length?(values[Math.floor(values.length/2)]+values[Math.floor((values.length-1)/2)])/2:null};
-        })})),
-      items:rows.slice(0,12).map(r=>({...r,performance:{...r.performance,points:undefined,
-        status:r.endsAt<=now.toISOString()?'ended':r.performance.status}}))};
+    return readStrategyObservationSummary(this.db,now);
   }
 }

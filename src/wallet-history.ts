@@ -331,6 +331,8 @@ export const WALLET_COORDINATION_INVALIDATION_SQL=`UPDATE wh_metrics SET coordin
 export const WALLET_PRICE_BUYER_PAGE_SQL=`SELECT rowid AS event_rowid,wallet,observed_at,event_at FROM wh_events INDEXED BY wh_events_token
   WHERE chain=? AND token_address=? AND side='buy' AND rowid<=? AND (event_at,rowid)>(?,?)
   ORDER BY event_at,rowid LIMIT ?`;
+export const WALLET_PRICE_HIGH_WATER_SQL=`SELECT COALESCE(MAX(rowid),0) AS high
+  FROM wh_events INDEXED BY wh_events_token WHERE chain=? AND token_address=? AND side='buy'`;
 
 interface WalletPriceProjectionPage {
   found:boolean;completed:boolean;buyerEventsScanned:number;buyerWalletsProjected:number;capacityReached:boolean;
@@ -1055,21 +1057,23 @@ export class WalletHistory {
     return result;
   }
 
-  /** Fast worker-side ingress. This commits the immutable quote and its durable
-   * projection job but performs no historical scan. */
+  /** Fast worker-side ingress. This reads one indexed high-water before the
+   * transaction, then commits the immutable quote and its durable projection job. */
   admitPriceProjection(value:WalletHistoryToken,priceUsd:number,observedAt:string,provider:string):WalletPriceAdmissionResult {
     const target=this.target(value),observed=this.observed(observedAt);
     if(!target||!observed||!source(provider)||!Number.isFinite(priceUsd)||priceUsd<=0)
       return {accepted:false,priceStored:false,pending:false,capacityReached:false};
     const id=digest([target.chain,target.address,observed,provider,priceUsd]),createdAt=this.now().toISOString();
+    // Freeze the buyer set before taking SQLite's single WAL writer lock. The
+    // explicit covering index prevents MAX(rowid) from choosing wh_events_side
+    // and scanning every historical buy while all other writers are blocked.
+    const high=Number(this.db.prepare(WALLET_PRICE_HIGH_WATER_SQL).get(target.chain,target.address)!.high);
     let priceStored=false,pending=false;
     const committed=this.append({target,priceUsd,observed,provider},()=>{
       this.putToken(target,observed);
       priceStored=Number(this.db.prepare('INSERT OR IGNORE INTO wh_prices VALUES (?,?,?,?,?,?)')
         .run(id,target.chain,target.address,observed,priceUsd,provider).changes)>0;
       if(priceStored){
-        const high=Number(this.db.prepare(`SELECT COALESCE(MAX(rowid),0) AS high FROM wh_events
-          WHERE chain=? AND token_address=? AND side='buy'`).get(target.chain,target.address)!.high);
         const job:WalletPriceProjectionJob={chain:target.chain,address:target.address,observedAt:observed,priceUsd,
           provider,highEventRowid:high,cursorEventAt:'',cursorEventRowid:0,createdAt,updatedAt:createdAt};
         this.db.prepare('INSERT INTO wh_meta(key,value) VALUES(?,?)').run(priceJobKey(id),JSON.stringify(job));

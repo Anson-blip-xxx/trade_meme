@@ -1,6 +1,6 @@
 import type {ReviewPageOptions} from './daily-review-store.js';
 import {reviewWindow} from './daily-review.js';
-import {createServer,type IncomingMessage,type ServerResponse} from 'node:http';
+import {createServer,type IncomingMessage,type Server,type ServerResponse} from 'node:http';
 import {randomBytes,createHash,timingSafeEqual} from 'node:crypto';
 import {readFileSync} from 'node:fs';
 import {resolve} from 'node:path';
@@ -17,6 +17,7 @@ import type {FollowupListOptions} from './signal-followup.js';
 import type {LauncherCandidates,LauncherCandidateProfileRoute,LauncherCandidateState} from './launcher-candidates.js';
 
 export interface DashboardPageOptions {limit:number;offset:number;chain?:Chain;}
+export interface DrainableHttpServer extends Server {drainActiveRequests?:()=>Promise<void>;}
 type Awaitable<T>=T|Promise<T>;
 function pageOptions(url:URL,maxLimit=100):DashboardPageOptions {
   const bounded=(name:string,def:number,max:number)=>{const raw=url.searchParams.get(name);if(raw===null)return def;
@@ -102,6 +103,8 @@ export function buildDashboard(config:Config,services:DashboardServices,assetDir
   const token=config.dashboard.token;
   if(!token||token.length<32||token===config.ingestToken||token===config.gmgnApiKey) throw new Error('DASHBOARD_SEPARATE_TOKEN_REQUIRED');
   const sessions=new Map<string,number>(),attempts=new Map<string,{count:number;expires:number}>();
+  let acceptingRequests=true,activeRequests=0;
+  const requestDrainWaiters=new Set<()=>void>();
   const assets=new Map(['/dashboard/','/dashboard/app.js','/dashboard/styles.css'].map((path,i)=>[path,{
     body:readFileSync(resolve(assetDirectory,['index.html','app.js','styles.css'][i])),
     type:['text/html; charset=utf-8','text/javascript; charset=utf-8','text/css; charset=utf-8'][i]}]));
@@ -123,6 +126,9 @@ export function buildDashboard(config:Config,services:DashboardServices,assetDir
     return !!expires&&expires>Date.now();
   };
   const server=createServer(async(req,res)=>{
+    if(!acceptingRequests){try{send(res,503,{error:'SERVICE_STOPPING'});}catch{}return;}
+    activeRequests++;
+    try {
     res.setHeader('cache-control','no-store');res.setHeader('x-content-type-options','nosniff');
     res.setHeader('referrer-policy','no-referrer');res.setHeader('x-frame-options','DENY');
     res.setHeader('content-security-policy',"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
@@ -480,7 +486,15 @@ export function buildDashboard(config:Config,services:DashboardServices,assetDir
       send(res,404,{error:'NOT_FOUND'});
     } catch(error) {send(res,error instanceof Error&&error.message==='INVALID_FILTER'?400:500,
       {error:error instanceof Error&&error.message==='INVALID_FILTER'?'INVALID_FILTER':'DASHBOARD_UNAVAILABLE'});}
-  });
+    } finally {
+      activeRequests--;
+      if(!activeRequests){for(const resolve of requestDrainWaiters)resolve();requestDrainWaiters.clear();}
+    }
+  }) as DrainableHttpServer;
+  server.drainActiveRequests=()=>{
+    acceptingRequests=false;
+    return activeRequests===0?Promise.resolve():new Promise<void>(resolve=>requestDrainWaiters.add(resolve));
+  };
   server.headersTimeout=10000;server.requestTimeout=15000;
   server.on('close',()=>{sessions.clear();attempts.clear();});
   return server;

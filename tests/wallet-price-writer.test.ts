@@ -4,8 +4,10 @@ import {mkdtempSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {spawnSync} from 'node:child_process';
+import {EventEmitter} from 'node:events';
 import {DatabaseSync} from 'node:sqlite';
-import {WalletHistory,WALLET_PRICE_BUYER_PAGE_SQL,type WalletTradeObservation} from '../src/wallet-history.js';
+import type {Worker} from 'node:worker_threads';
+import {WalletHistory,WALLET_PRICE_BUYER_PAGE_SQL,WALLET_PRICE_HIGH_WATER_SQL,type WalletTradeObservation} from '../src/wallet-history.js';
 import {WalletPriceWriterRunner} from '../src/wallet-price-writer.js';
 
 const address=(n:number)=>'0x'+n.toString(16).padStart(40,'0');
@@ -16,6 +18,37 @@ const trade=(n:number,wallet=n):WalletTradeObservation=>({chain:'bsc',wallet:add
   txHash:hash(n),side:'buy',eventAt:at(-20_000+n),observedAt:at(-10_000+n),source:'test_buy'});
 
 function fileFixture(){const dir=mkdtempSync(join(tmpdir(),'wallet-price-writer-'));return {dir,path:join(dir,'history.sqlite')};}
+
+test('price admission reads its indexed high-water before taking the WAL writer lock',()=>{
+  const f=fileFixture(),history=new WalletHistory(f.path,{maxBytes:32*1024*1024,now:()=>new Date(now+10_000)}),
+    concurrent=new WalletHistory(f.path,{maxBytes:32*1024*1024,now:()=>new Date(now+10_000)});
+  try {
+    history.recordTrade(trade(1));
+    const db=(history as unknown as {db:DatabaseSync}).db,
+      concurrentDb=(concurrent as unknown as {db:DatabaseSync}).db,
+      plan=db.prepare(`EXPLAIN QUERY PLAN ${WALLET_PRICE_HIGH_WATER_SQL}`).all(token.chain,token.address)
+        .map(row=>String(row.detail)).join('\n');
+    assert.match(plan,/USING COVERING INDEX wh_events_token \(chain=\? AND token_address=\? AND side=\?\)/);
+    assert.doesNotMatch(plan,/wh_events_side/);
+
+    concurrentDb.exec('PRAGMA busy_timeout=1');
+    const originalPrepare=db.prepare.bind(db);let concurrentWrite=false;
+    db.prepare=((sql:string)=>{
+      const statement=originalPrepare(sql);
+      if(sql!==WALLET_PRICE_HIGH_WATER_SQL)return statement;
+      return {get:(chain:string,tokenAddress:string)=>{
+        // This fails with SQLITE_BUSY if admission has already opened BEGIN
+        // IMMEDIATE around the historical high-water read.
+        concurrent.recordTrade({...trade(2,2),tokenAddress:address(9_001)});concurrentWrite=true;
+        return statement.get(chain,tokenAddress);
+      }} as ReturnType<DatabaseSync['prepare']>;
+    }) as DatabaseSync['prepare'];
+    try {
+      const result=history.admitPriceProjection(token,2,at(-1_000),'gmgn_token_info_sample');
+      assert.equal(result.accepted,true);assert.equal(result.priceStored,true);assert.equal(concurrentWrite,true);
+    } finally {db.prepare=originalPrepare;}
+  } finally {concurrent.close();history.close();rmSync(f.dir,{recursive:true,force:true});}
+});
 
 test('incremental projection uses bounded short batches and replay is idempotent',async()=>{
   const history=new WalletHistory(':memory:',{maxBytes:32*1024*1024,now:()=>new Date(now+10_000)});
@@ -284,4 +317,36 @@ test('a shutdown drain timeout abandons bounded work without resurrecting it on 
     assert.equal(status.retainedRecoverableOnStop,0);assert.equal(status.closeError,'WALLET_PRICE_WRITER_STOP_TIMEOUT');
     assert.equal(status.durabilityBoundary,'worker_ack');assert.equal(status.durableInventoryUnconfirmedOnStop,false);
   }finally{await writer.stop();rmSync(f.dir,{recursive:true,force:true});}
+});
+
+test('a native-blocked worker has one termination request and cannot hold shutdown open',async t=>{
+  t.mock.timers.enable({apis:['setTimeout']});
+  const f=fileFixture(),writer=new WalletPriceWriterRunner({database:f.path,maxBytes:32*1024*1024,workerTimeoutMs:100});
+  class NativeBlockedWorker extends EventEmitter {
+    terminateCalls=0;
+    postMessage():void {}
+    unref():void {}
+    terminate():Promise<number>{this.terminateCalls++;
+      return new Promise(resolve=>this.once('exit',()=>resolve(1)));}
+  }
+  const worker=new NativeBlockedWorker(),item={key:'blocked',sequence:1,target:token,priceUsd:1,
+    observedAt:at(-1_000),provider:'gmgn_token_info_sample',attempts:0,enqueuedAt:Date.now()};
+  const internal=writer as unknown as {
+    worker:Worker;ready:boolean;state:string;inFlight:{id:number;items:(typeof item)[];startedAt:number};
+    terminateWorker:(worker:Worker)=>Promise<void>;
+  };
+  internal.worker=worker as unknown as Worker;internal.ready=true;internal.state='ready';
+  internal.inFlight={id:1,items:[item],startedAt:Date.now()-1_000};
+  try {
+    const terminations=Array.from({length:12},()=>internal.terminateWorker(worker as unknown as Worker));
+    assert.ok(terminations.every(promise=>promise===terminations[0]));
+    assert.equal(worker.terminateCalls,1);assert.equal(worker.listenerCount('exit'),1,
+      'repeated watchdog ticks must not add Worker.terminate exit listeners');
+    const stopping=writer.stop(1);
+    t.mock.timers.tick(1);await new Promise<void>(resolve=>setImmediate(resolve));
+    t.mock.timers.tick(3_000);assert.equal(await stopping,false);
+    assert.equal(writer.status().state,'stopped');assert.equal(worker.terminateCalls,1,
+      'the stop deadline must reuse an in-progress termination');
+    assert.equal(worker.listenerCount('exit'),1,'the bounded stop listener must be removed after its deadline');
+  } finally {t.mock.timers.reset();rmSync(f.dir,{recursive:true,force:true});}
 });

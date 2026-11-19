@@ -9,6 +9,11 @@ import type {Stored} from '../src/store.js';
 
 const start=Date.parse('2026-10-14T00:00:00Z'),iso=(ms=0)=>new Date(start+ms).toISOString();
 const address=(n=1)=>'0x'+n.toString(16).padStart(40,'0');
+const waitForStats=async(archive:ScanArchive,check:(stats:ReturnType<ScanArchive['stats']>)=>boolean)=>{
+  const deadline=Date.now()+5_000;
+  while(Date.now()<deadline){const stats=archive.stats();if(check(stats))return stats;await new Promise(resolve=>setTimeout(resolve,10));}
+  const stats=archive.stats();assert.equal(check(stats),true,`timed out waiting for archive stats: ${JSON.stringify(stats.refresh)}`);return stats;
+};
 function entry(n=1,patch:Partial<Report>={}):Stored {
   const signal={source:'gmgn' as const,sourceEventId:String(n),token:{chain:'bsc' as const,address:address(n)},occurredAt:iso(),text:'',claim:'unspecified' as const,evidenceUrls:[]};
   const pass={status:'pass' as const,reasons:[],facts:{},checkedAt:iso()};
@@ -42,15 +47,17 @@ test('safety, unsupported modes, expired, withdrawn and demo reports do not ente
     cases.forEach((p,i)=>a.capture(entry(i+1,p)));assert.equal(a.stats().comparison!.registered,0);
   }finally{a.close();}
 });
-test('frozen registration persists across retries and restart, capacity limits quote budget',()=>{
+test('frozen registration persists across retries and restart, capacity limits quote budget',async()=>{
   const dir=mkdtempSync(join(tmpdir(),'comparison-'));const path=join(dir,'scans.sqlite');let ms=0;
-  let a=new ScanArchive(path,{now:()=>new Date(start+ms)});
+  let a=new ScanArchive(path,{now:()=>new Date(start+ms),statsRefreshMs:20});
   try {
-    for(let n=1;n<=10;n++)a.capture(entry(n));assert.equal(a.stats().comparison!.registered,2);
+    for(let n=1;n<=10;n++)a.capture(entry(n));assert.equal((await waitForStats(a,value=>value.comparison?.registered===2)).comparison!.registered,2);
     for(let n=11;n<=14;n++)a.capture(entry(n,{decision:'BUY_CANDIDATE',buyEligible:true}));
     assert.equal(a.trackingTokens().length,3);assert.equal(a.trackingTokens().filter(t=>Number.parseInt(t.address.slice(2),16)<=4).length,1);
-    ms=30000;a.capture(entry(1,{evaluatedAt:iso(ms)}));assert.equal(a.stats().comparison!.items.find(r=>r.address===address())!.registeredAt,iso());
-    a.close();a=new ScanArchive(path,{now:()=>new Date(start+ms)});assert.equal(a.stats().comparison!.registered,2);
+    ms=30000;a.capture(entry(1,{evaluatedAt:iso(ms)}));
+    assert.equal((await waitForStats(a,value=>value.comparison?.items.some(r=>r.address===address())===true)).comparison!.items.find(r=>r.address===address())!.registeredAt,iso());
+    a.close();a=new ScanArchive(path,{now:()=>new Date(start+ms),statsRefreshMs:20});
+    assert.equal((await waitForStats(a,value=>value.comparison?.registered===2)).comparison!.registered,2);
   }finally{a.close();rmSync(dir,{recursive:true,force:true});}
 });
 test('fixed horizons retain coverage, gaps and actual peak drawdown without peak-as-return',()=>{

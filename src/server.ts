@@ -14,7 +14,7 @@ import type {OrderStore} from './orders.js';
 import type {EntryController} from './entry.js';
 import type {GmgnScanner} from './scanner.js';
 import {createRuntime} from './runtime.js';
-import {buildDashboard} from './dashboard.js';
+import {buildDashboard,type DrainableHttpServer} from './dashboard.js';
 import {WalletHistoryDetailRunner} from './wallet-history-detail.js';
 import {reviewSamplingPath} from './daily-review.js';
 import {strategyEvolutionDatabasePath} from './strategy-evolution-signals.js';
@@ -44,9 +44,66 @@ export interface ServerServices {
   orders?:OrderStore;entry?:Pick<EntryController,'consider'|'reconcile'>;scanner?:GmgnScanner;
   executionStatus?:()=>ServerExecutionStatus;
 }
+export const SERVICE_SHUTDOWN_GRACE_MS=5_000;
+export const SERVICE_SHUTDOWN_DEADLINE_MS=110_000;
+type ShutdownHttpServer=Pick<DrainableHttpServer,'close'|'closeAllConnections'|'drainActiveRequests'>;
+export interface ServiceShutdownOptions {
+  servers:ShutdownHttpServer[];
+  beginRuntimeClose:()=>void;
+  closeRuntime:()=>void|Promise<void>;
+  closeAuxiliary?:()=>void|Promise<void>;
+  graceMs?:number;
+  deadlineMs?:number;
+}
+export interface ServiceShutdownResult {timedOut:boolean;errors:unknown[];}
+
+/** Fence producers immediately, drain admitted HTTP work, then close shared stores. */
+export async function shutdownService(options:ServiceShutdownOptions):Promise<ServiceShutdownResult> {
+  const errors:unknown[]=[];
+  const observe=(task:()=>void|Promise<void>):Promise<void>=>{
+    try{return Promise.resolve(task()).catch(error=>{errors.push(error);});}
+    catch(error){errors.push(error);return Promise.resolve();}
+  };
+  try{options.beginRuntimeClose();}catch(error){errors.push(error);}
+  const servers=[...new Set(options.servers)];
+  // Fence request admission before close() snapshots the current connections.
+  // Existing keep-alive sockets may already contain another parsed request.
+  const httpTasks:Promise<void>[]=[];
+  for(const server of servers)if(server.drainActiveRequests)httpTasks.push(observe(server.drainActiveRequests));
+  httpTasks.push(...servers.map(server=>new Promise<void>(resolve=>{
+    let settled=false;
+    const finish=(error?:Error)=>{
+      if(settled)return;settled=true;
+      if(error&&(error as NodeJS.ErrnoException).code!=='ERR_SERVER_NOT_RUNNING')errors.push(error);
+      resolve();
+    };
+    try{server.close(finish);}catch(error){errors.push(error);finish();}
+  })));
+  // A destroyed socket does not cancel an async request handler. buildServer
+  // exposes its admitted-handler drain so runtime databases stay open until
+  // those callbacks have actually returned.
+  const teardown=Promise.all(httpTasks).then(()=>Promise.all([
+    observe(options.closeRuntime),...(options.closeAuxiliary?[observe(options.closeAuxiliary)]:[]),
+  ])).then(()=>{});
+  const tasks=[teardown];
+  const forceConnections=()=>{
+    for(const server of servers)try{server.closeAllConnections();}catch(error){errors.push(error);}
+  };
+  const graceMs=options.graceMs??SERVICE_SHUTDOWN_GRACE_MS;
+  const deadlineMs=options.deadlineMs??SERVICE_SHUTDOWN_DEADLINE_MS;
+  const grace=setTimeout(forceConnections,graceMs);
+  let deadline:ReturnType<typeof setTimeout>|undefined;
+  const completed=Promise.all(tasks).then(()=>true);
+  const timedOut=!(await Promise.race([completed,new Promise<boolean>(resolve=>{
+    deadline=setTimeout(()=>{forceConnections();resolve(false);},deadlineMs);
+  })]));
+  clearTimeout(grace);if(deadline)clearTimeout(deadline);
+  return {timedOut,errors};
+}
 export function buildServer(config:Config,store:Store,providers:Providers=liveProviders(config),services:ServerServices={}) {
   if(!config.ingestToken||config.ingestToken.length<24) throw new Error('INGEST_TOKEN must be at least 24 characters');
-  let active=0;
+  let active=0,activeRequests=0,acceptingRequests=true;
+  const requestDrainWaiters=new Set<()=>void>();
   const executionStatus=()=>{
     const current=services.executionStatus?.();
     return {configuredEntryMode:current?.configuredEntryMode??config.entryMode,
@@ -55,6 +112,8 @@ export function buildServer(config:Config,store:Store,providers:Providers=livePr
       executionReady:current?.executionReady===true,executionStatusAvailable:!!current};
   };
   const server=createServer(async(req,res)=>{
+    if(!acceptingRequests){try{send(res,503,{error:'SERVICE_STOPPING'});}catch{}return;}
+    activeRequests++;
     try {
       const url=new URL(req.url??'/', 'http://localhost');
       if(req.method==='GET'&&url.pathname==='/health') {send(res,200,{status:'ok',version:'0.2.0',...executionStatus(),
@@ -134,8 +193,15 @@ export function buildServer(config:Config,store:Store,providers:Providers=livePr
       else if(e instanceof Error&&e.message==='BODY_TOO_LARGE') send(res,413,{error:'BODY_TOO_LARGE'});
       else if(e instanceof Error&&e.message==='CONTENT_TYPE') send(res,415,{error:'JSON_REQUIRED'});
       else send(res,500,{error:'INTERNAL_ERROR'});
+    } finally {
+      activeRequests--;
+      if(!activeRequests){for(const resolve of requestDrainWaiters)resolve();requestDrainWaiters.clear();}
     }
-  });
+  }) as DrainableHttpServer;
+  server.drainActiveRequests=()=>{
+    acceptingRequests=false;
+    return activeRequests===0?Promise.resolve():new Promise<void>(resolve=>requestDrainWaiters.add(resolve));
+  };
   server.headersTimeout=10000;server.requestTimeout=90000;
   return server;
 }
@@ -206,7 +272,11 @@ if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href) {
   let stopping=false;
   for(const sig of ['SIGINT','SIGTERM']) process.on(sig,()=>{
     if(stopping)return;stopping=true;
-    runtime.scanner.stop();dashboard?.close();
-    server.close(()=>{void (async()=>{await walletQueries?.stop();await runtime.close();process.exit(0);})();});
+    void shutdownService({servers:dashboard?[server,dashboard]:[server],beginRuntimeClose:runtime.beginClose,
+      closeRuntime:()=>runtime.close(),closeAuxiliary:()=>walletQueries?.stop()}).then(result=>{
+      if(result.timedOut)console.error('SERVICE_SHUTDOWN_DEADLINE_EXCEEDED');
+      for(const error of result.errors)console.error('SERVICE_SHUTDOWN_FAILED',error);
+      process.exit(result.timedOut||result.errors.length?1:0);
+    },error=>{console.error('SERVICE_SHUTDOWN_FAILED',error);process.exit(1);});
   });
 }

@@ -12,6 +12,11 @@ import type {Report,Signal} from '../src/types.js';
 const start=Date.parse('2026-10-09T00:00:00.000Z');
 const iso=(offset:number)=>new Date(start+offset).toISOString();
 const address='0x'+'a'.repeat(40);
+const waitForStats=async(archive:ScanArchive,check:(stats:ReturnType<ScanArchive['stats']>)=>boolean,timeoutMs=5_000)=>{
+  const deadline=Date.now()+timeoutMs;
+  while(Date.now()<deadline){const stats=archive.stats();if(check(stats))return stats;await new Promise(resolve=>setTimeout(resolve,10));}
+  const stats=archive.stats();assert.equal(check(stats),true,`timed out waiting for archive stats: ${JSON.stringify(stats.refresh)}`);return stats;
+};
 const check=()=>({status:'pass' as const,reasons:['CHECK_PASSED'],facts:{raw:'SECRET_BODY'},checkedAt:iso(1_000)});
 function stored(id='scan-1',patch:Partial<Report>={}):Stored {
   const signal:Signal={source:'debot',sourceEventId:id,occurredAt:iso(0),token:{chain:'bsc',address},
@@ -103,13 +108,14 @@ test('detailed stats cache is isolated and bounds ordinary write staleness to it
   }finally{archive.close();}
 });
 
-test('stats is a read-only path; explicit maintenance expires processing leases and invalidates its cache',()=>{
+test('stats is a read-only path; explicit maintenance expires processing leases and invalidates its cache',async()=>{
   const dir=mkdtempSync(join(tmpdir(),'meme-scan-stats-read-')),path=join(dir,'scans.sqlite');let elapsed=1_000;
-  const archive=new ScanArchive(path,{now:()=>new Date(start+elapsed)});const db=new DatabaseSync(path);
+  const archive=new ScanArchive(path,{now:()=>new Date(start+elapsed),statsRefreshMs:20});const db=new DatabaseSync(path);
   try {
     const processing=stored('processing');processing.status='processing';processing.report=undefined;processing.leaseExpiresAt=iso(5_000);
     archive.capture(processing);elapsed=20_000;
-    const before=archive.stats();assert.equal(before.byStatus.processing,1);assert.equal(before.byStatus.interrupted,0);
+    const before=await waitForStats(archive,value=>value.byStatus.processing===1);
+    assert.equal(before.byStatus.interrupted,0);assert.equal(before.refresh?.state,'fresh');
     assert.equal(db.prepare("SELECT status FROM scan_summaries WHERE id='processing'").get()!.status,'processing');
     const index=String(db.prepare("SELECT sql FROM sqlite_master WHERE type='index' AND name='scan_summaries_processing_lease'").get()!.sql);
     assert.match(index,/WHERE status='processing'/);
@@ -118,7 +124,8 @@ test('stats is a read-only path; explicit maintenance expires processing leases 
       FROM scan_summaries`).all().map(row=>String(row.detail));
     assert.ok(plan.some(detail=>detail.includes('COVERING INDEX scan_summaries_stats_cover')));
     archive.prune();
-    const after=archive.stats();assert.equal(after.byStatus.processing,0);assert.equal(after.byStatus.interrupted,1);
+    const after=await waitForStats(archive,value=>value.byStatus.interrupted===1);
+    assert.equal(after.byStatus.processing,0);
     assert.equal(db.prepare("SELECT status FROM scan_summaries WHERE id='processing'").get()!.status,'interrupted');
   }finally{db.close();archive.close();rmSync(dir,{recursive:true,force:true});}
 });
@@ -151,16 +158,16 @@ test('hot readers and the scheduled sweep share one minute-gated retention pass'
   }finally{archive.close();}
 });
 
-test('detailed stats rebuild from persisted scalar columns after restart',()=>{
+test('detailed stats rebuild from persisted scalar columns after restart',async()=>{
   const dir=mkdtempSync(join(tmpdir(),'meme-scan-stats-restart-')),path=join(dir,'scans.sqlite');
-  let archive:ScanArchive|undefined=new ScanArchive(path,{now:()=>new Date(start+1_000)});
+  let archive:ScanArchive|undefined=new ScanArchive(path,{now:()=>new Date(start+1_000),statsRefreshMs:20});
   try {
-    archive.capture(stored());assert.equal(archive.stats().total,1);archive.close();archive=undefined;
+    archive.capture(stored());assert.equal((await waitForStats(archive,value=>value.total===1)).total,1);archive.close();archive=undefined;
     const db=new DatabaseSync(path);
     db.prepare(`INSERT INTO scan_summaries(id,chain,address,status,received_at,decision,max_gain_pct,record)
       VALUES ('persisted-extra','bsc',?,'completed',?,'WATCH',12,'{}')`).run('0x'+'b'.repeat(40),iso(0));db.close();
-    archive=new ScanArchive(path,{now:()=>new Date(start+1_000)});
-    const restored=archive.stats();assert.equal(restored.total,2);assert.equal(restored.byStatus.completed,2);
+    archive=new ScanArchive(path,{now:()=>new Date(start+1_000),statsRefreshMs:20});
+    const restored=await waitForStats(archive,value=>value.total===2);assert.equal(restored.byStatus.completed,2);
     assert.equal(restored.byDecision.BUY_CANDIDATE,1);assert.equal(restored.byDecision.WATCH,1);assert.equal(restored.maxGainPct,12);
   }finally{archive?.close();rmSync(dir,{recursive:true,force:true});}
 });

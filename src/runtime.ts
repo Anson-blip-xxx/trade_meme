@@ -91,10 +91,20 @@ import {LauncherCandidateRefreshRunner} from './launcher-candidate-refresh-runne
 import {LauncherRevalidator} from './launcher-revalidator.js';
 import {LauncherRealtimeWriterRunner} from './launcher-realtime-writer.js';
 import {LauncherCoverageWriterRunner} from './launcher-coverage-writer.js';
+import {WalletMarketCandidateWriterRunner} from './wallet-market-candidate-writer.js';
+
+const DEFAULT_RUNTIME_SHUTDOWN_TIMEOUT_MS=90_000;
+const WALLET_OBSERVER_SHUTDOWN_TIMEOUT_MS=15_000;
+type ShutdownSettlement<T>={ok:true;value:T|undefined}|{ok:false;error:unknown};
+const settleShutdown=<T>(task:Promise<T>|undefined):Promise<ShutdownSettlement<T>>=>
+  Promise.resolve(task).then(value=>({ok:true as const,value}),error=>({ok:false as const,error}));
 
 export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;jevInvoke?:JevShadowOptions['invoke'];telegramFetcher?:typeof fetch;
   heldFetcher?:typeof fetch;entryFetcher?:typeof fetch;gmgnFetcher?:typeof fetch;
-  walletActivityVerify?:(event:FastWalletEvent)=>Promise<WalletActivity>}={}) {
+  walletActivityVerify?:(event:FastWalletEvent)=>Promise<WalletActivity>;shutdownTimeoutMs?:number}={}) {
+  const shutdownTimeoutMs=dependencies.shutdownTimeoutMs??DEFAULT_RUNTIME_SHUTDOWN_TIMEOUT_MS;
+  if(!Number.isSafeInteger(shutdownTimeoutMs)||shutdownTimeoutMs<10||shutdownTimeoutMs>110_000)
+    throw new Error('RUNTIME_SHUTDOWN_TIMEOUT_INVALID');
   const acceptsChain=(chain:Signal['token']['chain'])=>config.scannerChains.includes(chain);
   const backgroundGmgnEnabled=config.gmgnBackgroundResearchEnabled!==false;
   const backgroundGmgnPausedReason=backgroundGmgnEnabled?undefined:'GMGN_BACKGROUND_RESEARCH_DISABLED';
@@ -142,6 +152,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
     maxBytes:config.gmgnPlusArchive.maxBytes,maxCandidates:config.gmgnPlusArchive.maxCandidates}):undefined;
   if(config.gmgnPlusArchive?.enabled)protectedPaths.push(config.gmgnPlusArchive.database);
   let gmgnMarketScanner:GmgnMarketSignalScanner|undefined,gmgnMarketDiscovery:GmgnMarketDiscoveryScanner|undefined;
+  let gmgnMarketCandidateWriter:WalletMarketCandidateWriterRunner|undefined;
   const dedicatedGmgnMarketChains=[...new Set(config.scannerChains.map(chain=>chain==='solana'?'sol':chain))] as ('sol'|'bsc'|'robinhood')[];
   const gmgnPlusRunner=gmgnPlusArchive&&config.gmgnApiKey?.trim()?new GmgnPlusArchiveRunner({archive:gmgnPlusArchive,client,
     chains:config.gmgnPlusArchive!.chains,intervalMs:config.gmgnPlusArchive!.intervalSec*1000,
@@ -176,7 +187,9 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
     const pausedReason=!configured?'GMGN_MARKET_DISCOVERY_DISABLED':!backgroundGmgnEnabled?backgroundGmgnPausedReason:
       !config.gmgnApiKey?.trim()?'GMGN_API_KEY_MISSING':!config.scannerChains.includes('solana')?'GMGN_MARKET_DISCOVERY_SOLANA_ONLY':
         !gmgnMarketDiscovery?'GMGN_MARKET_DISCOVERY_UNAVAILABLE':undefined;
-    return {...status,...(pausedReason?{running:false,pausedReason}:{})};
+    const candidateWriter=gmgnMarketCandidateWriter?.status()??{enabled:false,state:'disabled',running:false,ready:false,pending:0,
+      capacity:0,admitted:0,completed:0,failed:0,timedOut:0,rejectedCapacity:0,rejectedClosed:0,restarts:0,oldestPendingMs:0,error:undefined};
+    return {...status,candidateWriter,...(pausedReason?{running:false,pausedReason}:{})};
   };
   if(config.telegram?.enabled&&config.telegram.token&&config.telegram.chatId&&
     [...protectedPaths,'.env',config.ave?.database,config.ave?.sessionPath,config.corroboration?.database,
@@ -212,6 +225,8 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
   const followupReview=archive?new FollowupReviewRunner({database:config.dashboard.archivePath,intervalMs:60_000}):undefined;
   if(config.watch.enabled)archive?.configureWatch({windowSec:config.watch.windowSec,intervalSec:config.watch.intervalSec,maxSignalAgeSec:config.maxSignalAgeSec});
   const walletHistory=config.walletResearch.enabled?new WalletHistory(config.walletResearch.database,{maxBytes:config.walletResearch.maxBytes}):undefined;
+  gmgnMarketCandidateWriter=walletHistory&&config.gmgnMarketDiscovery?.enabled?new WalletMarketCandidateWriterRunner({
+    database:config.walletResearch.database,maxBytes:config.walletResearch.maxBytes}):undefined;
   const walletPriceWriter=walletHistory&&backgroundGmgnEnabled?new WalletPriceWriterRunner({
     database:config.walletResearch.database,maxBytes:config.walletResearch.maxBytes}):undefined;
   const fastWalletLimit=(chain:Chain)=>chain==='solana'?Math.min(30,config.chainStream.maxWallets):
@@ -380,8 +395,8 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
     gmgnMarketDiscovery=new GmgnMarketDiscoveryScanner({client,store:gmgnMarketDiscoveryStore,
       intervalMs:config.gmgnMarketDiscovery.intervalSec*1000,maxCandidates:config.gmgnMarketDiscovery.maxCandidates,
       klineCooldownMs:config.gmgnMarketDiscovery.klineCooldownSec*1000,
-      onCandidate:candidate=>{
-        if(candidate.walletTrackingRecommended&&walletHistory&&!walletHistory.captureMarketCandidate(
+      onCandidate:async candidate=>{
+        if(candidate.walletTrackingRecommended&&gmgnMarketCandidateWriter&&!await gmgnMarketCandidateWriter.capture(
           {chain:'solana',address:candidate.tokenAddress},{source:candidate.source,observedAt:candidate.observedAt,
             kind:candidate.feed,reason:`${candidate.kind}:${candidate.category}`,window:candidate.window,
             changeKind:candidate.kind,category:candidate.category,previousCategory:candidate.previousCategory,
@@ -1047,6 +1062,8 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
   thirdEntry.recoverPrepared();
   const reconciler=new OrderReconciler(orders,entry);
   let closed=false,active=0,archiveMaintenanceError:string|undefined;
+  let closeTask:Promise<void>|undefined,closeState:'idle'|'running'|'complete'|'failed'='idle',closeFailure:unknown;
+  let closeDeadline=0;
   const researchAdmissionWaiters=new Set<()=>void>();
   const waitForResearchAdmission=async(limit:number)=>{
     while(active>=limit)await new Promise<void>(resolve=>researchAdmissionWaiters.add(resolve));
@@ -1378,10 +1395,38 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       refreshPriceSubscriptions();
     }catch{priceTargetError='PRICE_STREAM_TARGET_REFRESH_FAILED';}
   };
+  const establishCloseFences=()=>{
+    closed=true;closeState='running';closeDeadline=Date.now()+shutdownTimeoutMs;
+    // Every call below reaches its admission fence synchronously. The returned
+    // settlements contain late failures until close() finishes the teardown.
+    const gmgnMarketStop=settleShutdown(gmgnMarketScanner?.stop());
+    gmgnMarketDiscovery?.stop();const gmgnMarketDiscoveryDrain=settleShutdown(gmgnMarketDiscovery?.drain());
+    gmgnPlusRunner?.beginStop();
+    const walletObserverStop=settleShutdown(walletObserver?.stop(Math.min(WALLET_OBSERVER_SHUTDOWN_TIMEOUT_MS,shutdownTimeoutMs)));
+    const chainMonitorStop=settleShutdown(chainMonitor?.stop());
+    const passiveStops=[tracking?.stop(),balances?.stop(),system?.stop(),watchRechecker?.stop()].map(settleShutdown);
+    const followupReviewStop=settleShutdown(followupReview?.stop());
+    const reconcilerStop=settleShutdown(reconciler.stop());
+    const walletStatsStop=settleShutdown(walletStatsRunner?.stop());
+    const telegramControlsStop=settleShutdown(telegramControls?.close());
+    const debotStreamStop=settleShutdown(debotStream?.stop());
+    const debotPublicFallbackStop=settleShutdown(debotPublicFallback?.stop());
+    const sourceScannerStops=[aveScanner?.stop(),debotScanner?.stop()].map(settleShutdown);
+    const thirdEntryStop=settleShutdown(thirdEntry?.stop());
+    const launcherMaintenanceStops=[launcherRevalidator?.stop(),launcherRefresh?.stop()].map(settleShutdown);
+    const walletFastStop=settleShutdown(walletFast?.stop());
+    scanner.stop();clearInterval(sweep);clearInterval(reconcileTimer);clearInterval(debotSyncTimer);clearInterval(exitMaintenanceTimer);clearInterval(telegramTimer);
+    clearInterval(launcherRefreshTimer);launcherRefreshTimer=undefined;
+    return {gmgnMarketStop,gmgnMarketDiscoveryDrain,walletObserverStop,chainMonitorStop,passiveStops,followupReviewStop,
+      reconcilerStop,walletStatsStop,telegramControlsStop,debotStreamStop,debotPublicFallbackStop,sourceScannerStops,
+      thirdEntryStop,launcherMaintenanceStops,walletFastStop};
+  };
+  let closeFences:ReturnType<typeof establishCloseFences>|undefined;
+  const beginClose=()=>{if(!closeFences)closeFences=establishCloseFences();};
   sourceObservation?.start();
   return {client,providers,store,orders,entry,dailyReview,scanner,debotScanner,debotStream,debotPublicFallback,debotAuth,archive,followupReview,tracking,priceRouter,walletHistory,walletIndexRunner,walletObserver,walletPriceWriter,walletResearchStatus,walletAssociationsStatus,walletProfiles,walletProfilesStatus,launcherCandidates:()=>launcherCandidates,launcherCandidatesStatus,walletScreening,watchRechecker,exitShadow,chainMonitor,chainStreamStatus,walletFastResearch,memeObserver,sourceEvidence,sourceObservation,aveScanner,aveSession,tokenRankResearch,jevShadow,telegram,tradeNotifications,telegramStatus,heldMonitor,heldTracking,
     signalCounting,telegramControls,telegramPositions,manualClose,directSell,manualNativeBuy,telegramTokenCard,gmgnMarketScanner,
-    gmgnMarketDiscovery,gmgnMarketDiscoveryStore,
+    gmgnMarketDiscovery,gmgnMarketDiscoveryStore,beginClose,
     executionStatus:()=>{const counting=signalCounting.executionState();return {
       configuredEntryMode:config.entryMode,configuredThirdSignalMode:config.thirdSignalExecutionMode,
       executionEnabled:counting.executionEnabled,countingRunning:counting.running,executionReady:counting.executionReady};},
@@ -1456,7 +1501,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       walletStatsRunner?.start();
       gmgnPlusRunner?.start();
       if(backgroundGmgnEnabled)gmgnMarketScanner?.start();
-      if(backgroundGmgnEnabled)gmgnMarketDiscovery?.start();
+      if(backgroundGmgnEnabled&&gmgnMarketDiscovery){gmgnMarketCandidateWriter?.start();gmgnMarketDiscovery.start();}
       walletIndexRunner?.start();
       followupReview?.start();
       jevStatusRunner?.start();
@@ -1520,90 +1565,118 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       launcherCoverageWriter?.start();launcherRealtimeWriter?.start();walletFastPersistence?.start();walletFastResearch?.start();walletFast?.start();
     },
     async close(){
-      if(closed){if(walletFastResearchShutdownError)throw new Error(walletFastResearchShutdownError);
-        if(launcherShutdownError)throw new Error(launcherShutdownError);
-        if(walletFastPersistenceShutdownError)throw new Error(walletFastPersistenceShutdownError);
-        if(walletObserverShutdownError)throw new Error(walletObserverShutdownError);
-        if(walletPriceShutdownError)throw new Error(walletPriceShutdownError);
-        if(chainStreamShutdownError)throw new Error(chainStreamShutdownError);return;}closed=true;
-      // Establish the market poll fence before the first await in shutdown.
-      // The returned promise drains only work admitted before this point.
-      const gmgnMarketStop=gmgnMarketScanner?.stop();
-      gmgnMarketDiscovery?.stop();const gmgnMarketDiscoveryDrain=gmgnMarketDiscovery?.drain();
-      scanner.stop();clearInterval(sweep);clearInterval(reconcileTimer);clearInterval(debotSyncTimer);clearInterval(exitMaintenanceTimer);clearInterval(telegramTimer);
-      clearInterval(launcherRefreshTimer);launcherRefreshTimer=undefined;
-      await telegramControls?.close();
-      // Fence both sources before draining third-signal callbacks. Otherwise a
-      // final socket/page event can be admitted after waitForDispatches returns.
-      await debotStream?.stop();
-      await debotPublicFallback?.stop();
-      await Promise.all([aveScanner?.stop(),debotScanner?.stop()]);
-      await gmgnMarketStop;
-      await gmgnMarketDiscoveryDrain;
-      // No queued Ave sample may run after downstream price consumers begin stopping.
-      priceFanout.close();
-      await thirdEntry?.stop();await signalCounting.waitForDispatches();
-      await manualNativeBuy?.close();
-      await nativeTrading?.stop();
-      clearInterval(manualCloseTimer);await directSell?.stop();await directSellRecovery;
-      await manualClose?.stop();await manualCloseRecovery;
-      for(const task of jevPending)clearImmediate(task);jevPending.clear();
-      await jevStatusRunner?.stop();
-      await jevShadow?.stop();
-      await heldTracking?.stop();await heldMonitor?.stop();
-      priceRouter.close();
-      await launcherRevalidator?.stop();await launcherRefresh?.stop();
-      await walletFast?.stop();
-      try {if(launcherRealtimeWriter&&!(await launcherRealtimeWriter.stop()))
-        launcherError=launcherShutdownError='LAUNCHER_REALTIME_SHUTDOWN_UNDRAINED';}
-      catch {launcherError=launcherShutdownError='LAUNCHER_REALTIME_SHUTDOWN_UNDRAINED';}
-      try {if(launcherCoverageWriter&&!(await launcherCoverageWriter.stop()))
-        launcherError=launcherShutdownError='LAUNCHER_COVERAGE_SHUTDOWN_UNDRAINED';}
-      catch {launcherError=launcherShutdownError='LAUNCHER_COVERAGE_SHUTDOWN_UNDRAINED';}
-      try {if(walletFastResearch&&!(await walletFastResearch.stop()))
-        walletFastResearchShutdownError='WALLET_FAST_RESEARCH_SHUTDOWN_UNDRAINED';}
-      catch {walletFastResearchShutdownError='WALLET_FAST_RESEARCH_SHUTDOWN_UNDRAINED';}
-      walletVerifier?.stop();
-      try {if(walletFastPersistence&&!(await walletFastPersistence.stop()))
-        walletFastPersistenceShutdownError='WALLET_FAST_PERSISTENCE_SHUTDOWN_UNDRAINED';}
-      catch {walletFastPersistenceShutdownError='WALLET_FAST_PERSISTENCE_SHUTDOWN_UNDRAINED';}
-      const walletObserverStop=walletObserver?.stop();
-      const chainMonitorStop=chainMonitor?.stop();
-      await Promise.all([tracking?.stop(),balances?.stop(),system?.stop(),watchRechecker?.stop()]);
-      try {if(chainMonitorStop&&!(await chainMonitorStop))chainStreamShutdownError='CHAIN_EVENT_WRITER_SHUTDOWN_UNDRAINED';}
-      catch {chainStreamShutdownError='CHAIN_EVENT_WRITER_SHUTDOWN_UNDRAINED';}
-      try {if(walletObserverStop&&!(await walletObserverStop))
-        walletObserverShutdownError='WALLET_OBSERVER_SHUTDOWN_UNDRAINED';}
-      catch {walletObserverShutdownError='WALLET_OBSERVER_SHUTDOWN_UNDRAINED';}
-      try {if(walletPriceWriter&&!(await walletPriceWriter.stop()))
-        walletPriceShutdownError='WALLET_PRICE_WRITER_STOP_TIMEOUT';}
-      catch {walletPriceShutdownError='WALLET_PRICE_WRITER_STOP_TIMEOUT';}
-      await walletExitPressure?.stop();
-      await walletIndexRunner?.stop();
-      if(gmgnPlusRunner)await gmgnPlusRunner.stop();else gmgnPlusArchive?.close();
-      await followupReview?.stop();
-      await reconciler.stop();
-      // Stop means no new work. Await current callback before closing its stores.
-      while(active) await new Promise(resolve=>setTimeout(resolve,50));
-      await tokenRankResearch?.stop();
-      await memeObserver?.close();
-      await Promise.all([aveScanner?.close(),debotScanner?.close()]);
-      await sourceObservation?.stop();sourceEvidence?.close();
-      await walletScreening?.close();
-      await walletProfiles?.stop();
-      launcherCandidates?.close();launcherCandidates=undefined;
-      await walletStatsRunner?.stop();
-      heldMonitor?.close();
-      unsubscribeOrderNotifications();positionPriceHealth?.close();tradeNotifications?.close();await telegram?.close();
-      directSell?.close();manualClose?.close();
-      signalCounting.close();
-      store.close();orders.close();dailyReview?.close();archive?.close();walletHistory?.close();exitShadow?.close();
-      gmgnMarketDiscoveryStore?.close();
-      if(walletFastResearchShutdownError)throw new Error(walletFastResearchShutdownError);
-      if(launcherShutdownError)throw new Error(launcherShutdownError);
-      if(walletFastPersistenceShutdownError)throw new Error(walletFastPersistenceShutdownError);
-      if(walletObserverShutdownError)throw new Error(walletObserverShutdownError);
-      if(walletPriceShutdownError)throw new Error(walletPriceShutdownError);
-      if(chainStreamShutdownError)throw new Error(chainStreamShutdownError);
+      beginClose();
+      if(!closeTask){
+        const {gmgnMarketStop,gmgnMarketDiscoveryDrain,walletObserverStop,chainMonitorStop,passiveStops,followupReviewStop,
+          reconcilerStop,walletStatsStop,telegramControlsStop,debotStreamStop,debotPublicFallbackStop,sourceScannerStops,
+          thirdEntryStop,launcherMaintenanceStops,walletFastStop}=closeFences!;
+        const shutdown=(async()=>{
+          const failures:unknown[]=[];
+          // Leave the service-level watchdog time to report and exit. Once this
+          // cutoff passes, continuing into synchronous SQLite close calls can
+          // block the event loop past systemd's stop deadline.
+          const cleanupReserveMs=Math.min(10_000,Math.max(1,Math.floor(shutdownTimeoutMs/4)));
+          const ensureCleanupTime=()=>{if(Date.now()>=closeDeadline-cleanupReserveMs)
+            throw new Error('RUNTIME_SHUTDOWN_TIMEOUT');};
+          const record=<T>(result:ShutdownSettlement<T>)=>{if(!result.ok)failures.push(result.error);return result.ok?result.value:undefined;};
+          const attempt=async<T>(task:()=>T|Promise<T>):Promise<T|undefined>=>{
+            ensureCleanupTime();
+            try{return await task();}catch(error){failures.push(error);return undefined;}
+          };
+          record(await telegramControlsStop);record(await debotStreamStop);record(await debotPublicFallbackStop);
+          for(const result of await Promise.all(sourceScannerStops))record(result);
+          record(await gmgnMarketStop);record(await gmgnMarketDiscoveryDrain);
+          ensureCleanupTime();
+          try {if(gmgnMarketCandidateWriter&&!(await gmgnMarketCandidateWriter.stop()))
+            failures.push(new Error('WALLET_MARKET_CANDIDATE_SHUTDOWN_UNDRAINED'));}
+          catch(error){failures.push(error);}
+          ensureCleanupTime();
+          // GMGN Plus may share the Market archive, so begin its unbounded in-flight
+          // drain only after the Market producer is fully fenced.
+          const gmgnPlusStop=settleShutdown(gmgnPlusRunner?.stop());
+          const sourceObservationStop=settleShutdown(sourceObservation?.stop());
+          // No queued source sample may run after downstream price consumers begin stopping.
+          await attempt(()=>priceFanout.close());
+          record(await thirdEntryStop);
+          await attempt(()=>signalCounting.waitForDispatches());
+          await attempt(()=>manualNativeBuy?.close());
+          await attempt(()=>nativeTrading?.stop());
+          clearInterval(manualCloseTimer);await attempt(()=>directSell?.stop());await attempt(()=>directSellRecovery);
+          await attempt(()=>manualClose?.stop());await attempt(()=>manualCloseRecovery);
+          for(const task of jevPending)clearImmediate(task);jevPending.clear();
+          await attempt(()=>jevStatusRunner?.stop());
+          await attempt(()=>jevShadow?.stop());
+          await attempt(()=>heldTracking?.stop());await attempt(()=>heldMonitor?.stop());
+          await attempt(()=>priceRouter.close());
+          for(const result of await Promise.all(launcherMaintenanceStops))record(result);
+          record(await walletFastStop);
+          ensureCleanupTime();
+          const launcherRealtimeStop=(async()=>{try {if(launcherRealtimeWriter&&!(await launcherRealtimeWriter.stop()))
+            launcherError=launcherShutdownError='LAUNCHER_REALTIME_SHUTDOWN_UNDRAINED';}
+          catch {launcherError=launcherShutdownError='LAUNCHER_REALTIME_SHUTDOWN_UNDRAINED';}})();
+          const launcherCoverageStop=(async()=>{try {if(launcherCoverageWriter&&!(await launcherCoverageWriter.stop()))
+            launcherError=launcherShutdownError='LAUNCHER_COVERAGE_SHUTDOWN_UNDRAINED';}
+          catch {launcherError=launcherShutdownError='LAUNCHER_COVERAGE_SHUTDOWN_UNDRAINED';}})();
+          const walletFastResearchStop=(async()=>{try {if(walletFastResearch&&!(await walletFastResearch.stop()))
+            walletFastResearchShutdownError='WALLET_FAST_RESEARCH_SHUTDOWN_UNDRAINED';}
+          catch {walletFastResearchShutdownError='WALLET_FAST_RESEARCH_SHUTDOWN_UNDRAINED';}})();
+          // Research can still enqueue verified results while it drains. Fence the
+          // verifier and persistence worker only after that producer is done.
+          await walletFastResearchStop;await attempt(()=>walletVerifier?.stop());
+          const walletFastPersistenceStop=(async()=>{try {if(walletFastPersistence&&!(await walletFastPersistence.stop()))
+            walletFastPersistenceShutdownError='WALLET_FAST_PERSISTENCE_SHUTDOWN_UNDRAINED';}
+          catch {walletFastPersistenceShutdownError='WALLET_FAST_PERSISTENCE_SHUTDOWN_UNDRAINED';}})();
+          for(const result of await Promise.all(passiveStops))record(result);
+          await Promise.all([launcherRealtimeStop,launcherCoverageStop,walletFastPersistenceStop]);
+          ensureCleanupTime();
+          const chainMonitorResult=await chainMonitorStop;
+          if(!chainMonitorResult.ok||chainMonitorResult.value===false)chainStreamShutdownError='CHAIN_EVENT_WRITER_SHUTDOWN_UNDRAINED';
+          const walletObserverResult=await walletObserverStop;
+          if(!walletObserverResult.ok||walletObserverResult.value===false)
+            walletObserverShutdownError='WALLET_OBSERVER_SHUTDOWN_UNDRAINED';
+          ensureCleanupTime();
+          try {if(walletPriceWriter&&!(await walletPriceWriter.stop()))
+            walletPriceShutdownError='WALLET_PRICE_WRITER_STOP_TIMEOUT';}
+          catch {walletPriceShutdownError='WALLET_PRICE_WRITER_STOP_TIMEOUT';}
+          ensureCleanupTime();
+          await Promise.all([attempt(()=>walletExitPressure?.stop()),attempt(()=>walletIndexRunner?.stop())]);
+          for(const result of await Promise.all([gmgnPlusStop,followupReviewStop,reconcilerStop]))record(result);
+          ensureCleanupTime();
+          if(!gmgnPlusRunner)await attempt(()=>gmgnPlusArchive?.close());
+          // Stop means no new work. Await current callback before closing its stores.
+          while(active){ensureCleanupTime();await new Promise(resolve=>setTimeout(resolve,50));}
+          await attempt(()=>tokenRankResearch?.stop());
+          await attempt(()=>memeObserver?.close());
+          await Promise.all([attempt(()=>aveScanner?.close()),attempt(()=>debotScanner?.close())]);
+          record(await sourceObservationStop);
+          await attempt(()=>sourceEvidence?.close());
+          await attempt(()=>walletScreening?.close());
+          await attempt(()=>walletProfiles?.stop());
+          await attempt(()=>launcherCandidates?.close());launcherCandidates=undefined;
+          record(await walletStatsStop);
+          await attempt(()=>heldMonitor?.close());
+          await attempt(()=>unsubscribeOrderNotifications());await attempt(()=>positionPriceHealth?.close());
+          await attempt(()=>tradeNotifications?.close());await attempt(()=>telegram?.close());
+          await attempt(()=>directSell?.close());await attempt(()=>manualClose?.close());
+          await attempt(()=>signalCounting.close());
+          ensureCleanupTime();
+          await attempt(()=>store.close());await attempt(()=>orders.close());await attempt(()=>dailyReview?.close());
+          await attempt(()=>archive?.close());await attempt(()=>walletHistory?.close());await attempt(()=>exitShadow?.close());
+          await attempt(()=>gmgnMarketDiscoveryStore?.close());
+          for(const error of [walletFastResearchShutdownError,launcherShutdownError,walletFastPersistenceShutdownError,
+            walletObserverShutdownError,walletPriceShutdownError,chainStreamShutdownError])if(error)failures.push(new Error(error));
+          if(failures.length===1)throw failures[0];
+          if(failures.length>1)throw new AggregateError(failures,'RUNTIME_SHUTDOWN_FAILED');
+        })();
+        closeTask=shutdown.then(()=>{closeState='complete';},error=>{closeState='failed';closeFailure=error;throw error;});
+      }
+      if(closeState==='complete')return;
+      if(closeState==='failed')throw closeFailure;
+      const remaining=closeDeadline-Date.now();
+      if(remaining<=0)throw new Error('RUNTIME_SHUTDOWN_TIMEOUT');
+      let timer:ReturnType<typeof setTimeout>|undefined;
+      try {await Promise.race([closeTask,new Promise<never>((_,reject)=>{
+        timer=setTimeout(()=>reject(new Error('RUNTIME_SHUTDOWN_TIMEOUT')),remaining);
+      })]);}finally{clearTimeout(timer);}
     }};
 }

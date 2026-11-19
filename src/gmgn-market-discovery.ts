@@ -346,7 +346,7 @@ export class GmgnMarketDiscoveryStore {
     const bounded=Math.max(1,Math.min(100,Math.trunc(limit)));
     return this.db.prepare('SELECT data_json FROM gmd_candidate_outbox ORDER BY observed_at,id LIMIT ?').all(bounded).map(row=>{
       const value=JSON.parse(String(row.data_json)) as GmgnMarketDiscoveryObservedCandidate;
-      if(value?.source!=='gmgn_market_discovery'||value.kind!=='first_seen'||typeof value.id!=='string'||
+      if(value?.source!=='gmgn_market_discovery'||!['first_seen','updated','category_transition'].includes(value.kind)||typeof value.id!=='string'||
         typeof value.leftCensored!=='boolean'||!Number.isFinite(Date.parse(value.observedAt)))
         throw new Error('GMGN_MARKET_DISCOVERY_OUTBOX_INVALID');
       return value;
@@ -383,7 +383,7 @@ export class GmgnMarketDiscoveryStore {
         record.category,at,fingerprint,event.kind,JSON.stringify(event.changedFields),json);
       currentPut.run(record.feed,record.window,record.chain,record.address,record.category,at,at,1,fingerprint,json);
       if(result.changes){inserted++;events.push(event);
-        if(delivery&&event.kind==='first_seen')outboxPut.run(event.id,at,JSON.stringify({...event,...delivery}));}}
+        if(delivery&&event.walletTrackingRecommended)outboxPut.run(event.id,at,JSON.stringify({...event,...delivery}));}}
       const continuityLostFeeds=this.prune(at);metaPut.run(at);this.db.exec('COMMIT');
       return {received:page.records.length,inserted,unchanged,capacityReached:false,events,continuityLostFeeds};
     }catch(error){try{this.db.exec('ROLLBACK');}catch{}if(error instanceof Error&&/(SQLITE_FULL|database or disk is full)/i.test(error.message))
@@ -526,13 +526,13 @@ export class GmgnMarketDiscoveryScanner {
     let pending:GmgnMarketDiscoveryObservedCandidate[];
     try{pending=this.options.store.pendingCandidateDeliveries(32);}catch{this.candidateErrors++;return;}
     for(const event of pending)try{await this.options.onCandidate(event);this.options.store.ackCandidateDelivery(event.id);}
-      catch{this.candidateErrors++;}
+      catch{this.candidateErrors++;break;}
   }
-  private async deliverCandidate(event:GmgnMarketDiscoveryCandidate,context:GmgnCandidateDeliveryContext):Promise<void> {
-    if(!this.options.onCandidate)return;
+  private async deliverCandidate(event:GmgnMarketDiscoveryCandidate,context:GmgnCandidateDeliveryContext):Promise<boolean> {
+    if(!this.options.onCandidate)return true;
     try{await this.options.onCandidate({...event,...context});
-      if(event.kind==='first_seen')this.options.store.ackCandidateDelivery(event.id);
-    }catch{this.candidateErrors++;}
+      if(event.walletTrackingRecommended)this.options.store.ackCandidateDelivery(event.id);return true;
+    }catch{this.candidateErrors++;return false;}
   }
   private async runCycle(){await this.deliverPendingCandidates();const now=this.now().getTime(),cooldown=Math.max(now,this.options.client.cooldownUntil??0);
     if(cooldown>now){this.feeds.trending.nextDueAt=Math.max(this.feeds.trending.nextDueAt,cooldown);this.feeds.trenches.nextDueAt=Math.max(this.feeds.trenches.nextDueAt,cooldown);
@@ -575,7 +575,12 @@ export class GmgnMarketDiscoveryScanner {
         for(const lost of write.continuityLostFeeds)this.feedPollContinuous[lost]=false;
         if(!write.continuityLostFeeds.includes(feed)){this.feedPollContinuous[feed]=true;this.options.store.restoreContinuity(feed);}
       }
-      for(const event of write.events)await this.deliverCandidate(event,delivery);
+      let trackingDeliveryAvailable=true;
+      for(const event of write.events){
+        if(event.walletTrackingRecommended&&!trackingDeliveryAvailable)continue;
+        const delivered=await this.deliverCandidate(event,delivery);
+        if(event.walletTrackingRecommended&&!delivered)trackingDeliveryAvailable=false;
+      }
     }catch(error){this.feedPollContinuous[feed]=false;state.errors++;state.lastError=error instanceof Error?error.message.slice(0,300):String(error).slice(0,300);state.idleStreak=Math.min(3,state.idleStreak+1);}
     const multiplier=Math.min(4,2**state.idleStreak);state.nextDueAt=this.now().getTime()+this.intervalMs*multiplier;
   }

@@ -2210,6 +2210,8 @@
       const amountCell = el('td', '', amount); amountCell.append(el('div', 'cell-subtitle', order.amountBasis === 'actual' ? '成交支出' : '计划金额 · 未确认')); row.append(amountCell);
       const status = el('td'); status.append(badge(...(order.entryHolderRiskBlocked?['风控拦截 · 未提交','warning']:orderStatuses[order.status] || [scalar(order.status), 'neutral']))); if (order.mode === 'paper' && order.status !== 'paper_open') status.append(el('div', 'cell-subtitle', '模拟订单'));
       if(order.failureReason)status.append(el('div','cell-subtitle',reasonNames[order.failureReason]||scalar(order.failureReason)));
+      const head=order.launcherEntry,headLabels={head_confirmed:'首条信号前成熟车头已入场',head_corroborating:'信号后成熟钱包跟进',head_weak:'单样本车头候选',head_exited:'成熟车头已有卖出反证',none:'未发现车头证据',unavailable:'车头证据暂不可用'};
+      if(head&&headLabels[head.status])status.append(el('div','cell-subtitle',`${headLabels[head.status]}${head.wallets?.length?` · ${head.wallets.length} 个`:''}`));
       const holderRisk=holderRiskDetails(order.entryHolderRisk);if(holderRisk)status.append(holderRisk);row.append(status);
       const exit = el('td'); exit.append(badge(exitStatuses[order.exit?.state] || '未配置 / 无记录', ['attention', 'unverified'].includes(order.exit?.state) ? 'watch' : order.exit?.state === 'monitoring' ? 'pass' : 'neutral')); if (order.exit?.checkedAt) exit.append(el('div', 'cell-subtitle', date(order.exit.checkedAt))); row.append(exit); body.append(row);
     }
@@ -2432,11 +2434,12 @@
       ? worker.workerLivePriority === true ? '实盘计数优先 · 单条低频维护' : '正在切换到实盘计数优先'
       : worker?.workerLivePriority === false ? '正常处理积压' : worker?.enabled === false ? '未启用' : '等待工作线程状态';
     runtime.append(kv('钱包画像批处理', priorityState(profiles)));
-    const launcherDimensions=launchers.dimensionCounts||{},launcherChains=launchers.chainCounts||{},launcherRoutes=launchers.routeCounts||{};
+    const launcherDimensions=launchers.dimensionCounts||{},launcherChains=launchers.chainCounts||{},launcherRoutes=launchers.routeCounts||{},launcherTiers=launchers.tierCounts||{};
     runtime.append(kv('启动器候选池', !launchers.enabled?'未启用':!launchers.storeReady?'等待候选库':launchers.running?'持续更新中':'候选库已打开'),
       kv('画像压缩结果 / 上限', `${count(launchers.records)} / ${count(launchers.cap)}`),
       kv('候选链分布', `Sol ${count(launcherChains.solana)} · BSC ${count(launcherChains.bsc)} · Robinhood ${count(launcherChains.robinhood)}`),
       kv('候选证据路线', `启动器 ${count(launcherRoutes.A)} · 前置兑现 ${count(launcherRoutes.B)}`),
+      kv('车头画像层级', `成熟直连 ${count(launcherTiers.direct_precursor)} · 成熟关联 ${count(launcherTiers.peer_precursor)} · 单样本观察 ${count(launcherTiers.direct_candidate)}`),
       kv('近期证据 / 链上活跃 / 已确认订阅', `${count(launcherDimensions.evidenceFresh)} / ${count(launcherDimensions.liveSeen)} / ${count(launcherDimensions.monitored)}`),
       kv('实时可核验 / 已确认交易且监听中', `${count(launcherDimensions.realtimeReady)} / ${count(launcherDimensions.verifiedTradeMonitored)}`),
       kv('Solana 链上复核', launchers.revalidator?.running?`运行中 · 累计检查 ${count(launchers.revalidator.counts?.checked)} 个`:'未运行'));

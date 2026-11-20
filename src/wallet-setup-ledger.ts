@@ -25,6 +25,13 @@ export interface WalletSetupLedgerStatus {
   records:number;pending:number;stateCounts:Partial<Record<WalletSetupLedgerState,number>>;withdrawn:number;
   bytes:number;maxBytes:number;capacityReached:boolean;sampleOnly:true;
 }
+export type WalletSetupLedgerRecordStatus='accepted'|'existing'|'rejected';
+export interface WalletSetupLedgerRecordOutcome {
+  setupId:string;ledgerId?:string;status:WalletSetupLedgerRecordStatus;reason:string;
+}
+export interface WalletSetupLedgerRecordResult {
+  status:WalletSetupLedgerRecordStatus;outcomes:WalletSetupLedgerRecordOutcome[];
+}
 export interface WalletSetupLedgerOptions {now?:()=>Date;maxBytes?:number;windowSec?:number;synchronous?:'full'|'normal';}
 type Token={chain:Chain;address:string};
 type StoredEvidence={key:string;event:WalletTradeObservation;conflict:boolean};
@@ -62,6 +69,10 @@ const conflicts=(a:WalletTradeObservation,b:WalletTradeObservation)=>['side','ev
   const first=a[key as keyof WalletTradeObservation],second=b[key as keyof WalletTradeObservation];
   return first!==undefined&&first!==null&&second!==undefined&&second!==null&&first!==second;
 });
+const sameTrade=(a:WalletTradeObservation,b:WalletTradeObservation)=>
+  ['chain','wallet','tokenAddress','txHash','side','eventAt','observedAt','source','eventIndex','amountUnit','amount','usd','priceUsd']
+    .every(key=>a[key as keyof WalletTradeObservation]===b[key as keyof WalletTradeObservation]);
+const sameList=(a:readonly string[],b:readonly string[])=>a.length===b.length&&a.every((value,index)=>value===b[index]);
 function mergeObservation(a:WalletTradeObservation,b:WalletTradeObservation):WalletTradeObservation {
   const merged={...a,observedAt:a.observedAt<b.observedAt?a.observedAt:b.observedAt};
   for(const key of ['eventIndex','amountUnit','amount','usd','priceUsd'] as const)if(merged[key]===undefined&&b[key]!==undefined)Object.assign(merged,{[key]:b[key]});
@@ -127,50 +138,97 @@ export class WalletSetupLedger {
     if(this.database===':memory:')return logical;
     return Math.max(logical,[this.database,this.database+'-wal',this.database+'-shm'].reduce((n,path)=>{try{return n+statSync(path).size;}catch{return n;}},0));
   }
-  record(report:WalletScreeningReport):void {
-    const now=this.time(),token=validToken(report?.token),checkedAt=stamp(report?.checkedAt),validUntil=stamp(report?.validUntil);
-    if(!now||!token||!checkedAt||!validUntil||checkedAt>now||validUntil<=now||validUntil<checkedAt||report.version!==1||!Array.isArray(report.setups))return;
+  record(report:WalletScreeningReport):WalletSetupLedgerRecordResult {
+    const outcomes:WalletSetupLedgerRecordOutcome[]=[],finish=():WalletSetupLedgerRecordResult=>({
+      status:outcomes.some(o=>o.status==='accepted')?'accepted':outcomes.some(o=>o.status==='existing')?'existing':'rejected',outcomes,
+    });
+    let now:string|undefined,token:Token|undefined,checkedAt:string|undefined,validUntil:string|undefined;
+    try {now=this.time();token=validToken(report?.token);checkedAt=stamp(report?.checkedAt);validUntil=stamp(report?.validUntil);}
+    catch {return {status:'rejected',outcomes:[{setupId:'',status:'rejected',reason:'WALLET_SETUP_LEDGER_WRITE_FAILED'}]};}
+    if(!now||!token||!checkedAt||!validUntil||checkedAt>now||validUntil<=now||validUntil<checkedAt||report.version!==1||!Array.isArray(report.setups))
+      return {status:'rejected',outcomes:[{setupId:'',status:'rejected',reason:'WALLET_SETUP_LEDGER_INVALID_REPORT'}]};
     for(const setup of report.setups.slice(0,8)){
-      if(!setup||!['precursor','public_entry'].includes(setup.route)||!['supported','watch','withdrawn'].includes(setup.status))continue;
-      const wallet=chainAddress(token.chain,setup.wallet),leader=chainAddress(token.chain,setup.leader),trigger=trade(setup.trigger,token,now);
-      if(!wallet||!leader||!trigger||trigger.wallet!==wallet||trigger.side!=='buy'||trigger.observedAt>checkedAt||trigger.eventAt>checkedAt||
-        setup.route==='precursor'&&wallet===leader||setup.route==='public_entry'&&wallet!==leader)continue;
-      const id=identity(token,{...setup,wallet,leader},trigger),old=this.db.prepare('SELECT data FROM wsl_setups WHERE id=?').get(id);
-      if(old){
-        // Observation refreshes run on a worker connection.  Preserve any
-        // outcome written between this read and the review update instead of
-        // replacing it with a stale JSON copy.
-        if(setup.status==='withdrawn')for(let attempt=0;attempt<3;attempt++){
-          const current=this.db.prepare('SELECT data FROM wsl_setups WHERE id=?').get(id);if(!current)break;
-          const item=JSON.parse(String(current.data)) as WalletSetupLedgerItem;if(checkedAt<item.review.checkedAt)break;
-          item.review={status:'withdrawn',checkedAt,reasons:strings(setup.reasons)};
-          const saved=this.db.prepare('UPDATE wsl_setups SET data=?,review_withdrawn=1 WHERE id=? AND data=?')
-            .run(JSON.stringify(item),id,String(current.data));
-          if(Number(saved.changes))break;
+      const setupId=typeof setup?.id==='string'?setup.id.slice(0,128):'';
+      try {
+        if(!setup||!['precursor','public_entry'].includes(setup.route)||!['supported','watch','withdrawn'].includes(setup.status)){
+          outcomes.push({setupId,status:'rejected',reason:'WALLET_SETUP_LEDGER_INVALID_SETUP'});continue;
         }
-        continue;
+        const wallet=chainAddress(token.chain,setup.wallet),leader=chainAddress(token.chain,setup.leader),trigger=trade(setup.trigger,token,now);
+        if(!wallet||!leader||!trigger||trigger.wallet!==wallet||trigger.side!=='buy'||trigger.observedAt>checkedAt||trigger.eventAt>checkedAt||
+          setup.route==='precursor'&&wallet===leader||setup.route==='public_entry'&&wallet!==leader){
+          outcomes.push({setupId,status:'rejected',reason:'WALLET_SETUP_LEDGER_INVALID_SETUP'});continue;
+        }
+        const profileComputedAt=setup.profileComputedAt===undefined?undefined:stamp(setup.profileComputedAt),relationKnownAt=setup.relationKnownAt===undefined?undefined:stamp(setup.relationKnownAt),
+          setupReasons=strings(setup.reasons),counterEvidence=strings(setup.counterEvidence),followers=Number.isSafeInteger(setup.followers)&&setup.followers>=0?setup.followers:0,
+          chasePct=finite(setup.chasePct)?setup.chasePct:undefined,profit=setup.profit,profitTime=stamp(profit?.observedAt),
+          normalizedProfit=profit&&finite(profit.realizedProfitUsd)&&finite(profit.percentile)&&profit.percentile>=0&&profit.percentile<=100&&
+            Number.isSafeInteger(profit.cohortSize)&&profit.cohortSize>=0&&profitTime&&profitTime<=checkedAt&&profit.verification==='vendor_claim'?
+            {realizedProfitUsd:profit.realizedProfitUsd,percentile:profit.percentile,cohortSize:profit.cohortSize,observedAt:profitTime,verification:'vendor_claim' as const}:undefined;
+        if(setup.status!=='withdrawn'&&(!finite(setup.priorityScore)||setup.priorityScore<=0||typeof setup.stage!=='string'||setup.stage.length>100)||
+          setup.profileComputedAt!==undefined&&(!profileComputedAt||profileComputedAt>checkedAt)||
+          setup.relationKnownAt!==undefined&&(!relationKnownAt||relationKnownAt>checkedAt)){
+          outcomes.push({setupId,status:'rejected',reason:'WALLET_SETUP_LEDGER_INVALID_SETUP'});continue;
+        }
+        const id=identity(token,{...setup,wallet,leader},trigger),old=this.db.prepare('SELECT data FROM wsl_setups WHERE id=?').get(id);
+        if(old){
+          let currentItem:WalletSetupLedgerItem|undefined;
+          let withdrawalStored=false;
+          // Observation refreshes run on a worker connection. Preserve any
+          // outcome written between this read and the review update.
+          if(setup.status==='withdrawn')for(let attempt=0;attempt<3;attempt++){
+            const current=this.db.prepare('SELECT data FROM wsl_setups WHERE id=?').get(id);if(!current)break;
+            const item=JSON.parse(String(current.data)) as WalletSetupLedgerItem;currentItem=item;
+            if(checkedAt<item.review.checkedAt){withdrawalStored=item.review.status==='withdrawn';break;}
+            item.review={status:'withdrawn',checkedAt,reasons:strings(setup.reasons)};
+            const saved=this.db.prepare('UPDATE wsl_setups SET data=?,review_withdrawn=1 WHERE id=? AND data=?')
+              .run(JSON.stringify(item),id,String(current.data));
+            if(Number(saved.changes)){currentItem=item;withdrawalStored=true;break;}
+          }
+          currentItem??=JSON.parse(String(old.data)) as WalletSetupLedgerItem;
+          const sameIdentity=currentItem.id===id&&currentItem.chain===token.chain&&currentItem.address===token.address&&currentItem.route===setup.route&&
+            currentItem.wallet===wallet&&currentItem.leader===leader;
+          const supportConsistent=sameIdentity&&sameTrade(currentItem.proof.trigger,trigger)&&currentItem.proof.stage===setup.stage&&
+            currentItem.proof.priorityScore===setup.priorityScore&&currentItem.proof.profileComputedAt===profileComputedAt&&
+            currentItem.proof.relationKnownAt===relationKnownAt&&currentItem.proof.chasePct===chasePct&&currentItem.proof.followers===followers&&
+            sameList(currentItem.proof.reasons,setupReasons)&&sameList(currentItem.proof.counterEvidence,counterEvidence)&&
+            JSON.stringify(currentItem.proof.profit)===JSON.stringify(normalizedProfit);
+          if(setup.status==='withdrawn')outcomes.push({setupId,ledgerId:id,status:sameIdentity&&withdrawalStored?'existing':'rejected',
+            reason:sameIdentity&&withdrawalStored?'WALLET_SETUP_LEDGER_WITHDRAWAL_RECORDED':sameIdentity?'WALLET_SETUP_LEDGER_WRITE_FAILED':'WALLET_SETUP_LEDGER_EXISTING_CONFLICT'});
+          else if(supportConsistent&&currentItem.review.status==='active'&&currentItem.proof.status===setup.status&&!currentItem.triggerConflicted&&
+            !currentItem.closedAt&&!['reduced','expired_unconfirmed'].includes(currentItem.state))
+            outcomes.push({setupId,ledgerId:id,status:'existing',reason:'WALLET_SETUP_LEDGER_EXISTING'});
+          else outcomes.push({setupId,ledgerId:id,status:'rejected',reason:currentItem.review.status==='withdrawn'||currentItem.state==='reduced'?
+            'WALLET_SETUP_LEDGER_SUPPORT_WITHDRAWN':'WALLET_SETUP_LEDGER_EXISTING_CONFLICT'});
+          continue;
+        }
+        if(setup.status==='withdrawn'){
+          outcomes.push({setupId,ledgerId:id,status:'rejected',reason:'WALLET_SETUP_LEDGER_INVALID_SETUP'});continue;
+        }
+        const item:WalletSetupLedgerItem={id,...token,route:setup.route,wallet,leader,registeredAt:now,expiresAt:new Date(Date.parse(now)+this.windowMs).toISOString(),lastCheckedAt:now,
+          state:setup.route==='precursor'?'awaiting_leader':'direct_entry',review:{status:'active',checkedAt,reasons:[]},
+          proof:{checkedAt,validUntil,status:setup.status,stage:setup.stage,priorityScore:setup.priorityScore,trigger,reasons:setupReasons,counterEvidence,followers,
+            ...(profileComputedAt?{profileComputedAt}:{}),...(relationKnownAt?{relationKnownAt}:{})},conflicts:0,observationsTruncated:false,sampleOnly:true,ownership:'unknown'};
+        if(chasePct!==undefined)item.proof.chasePct=chasePct;
+        if(normalizedProfit)item.proof.profit=normalizedProfit;
+        const count=Number(this.db.prepare('SELECT count(*) AS n FROM wsl_setups').get()!.n);
+        // Reserve worst-case bounded evidence/review growth for every accepted row.
+        if(BASE_BUDGET+(count+1)*RECORD_BUDGET>this.maxBytes||this.bytes()+RECORD_BUDGET>this.maxBytes){
+          try {this.full();}catch {/* Admission is already rejected; status metadata is best effort. */}
+          outcomes.push({setupId,ledgerId:id,status:'rejected',reason:'WALLET_SETUP_LEDGER_CAPACITY'});continue;
+        }
+        const saved=this.db.prepare('INSERT INTO wsl_setups(id,chain,address,registered_at,expires_at,last_checked_at,state,data) VALUES (?,?,?,?,?,?,?,?)')
+          .run(id,token.chain,token.address,now,item.expiresAt,now,item.state,JSON.stringify(item));
+        if(Number(saved.changes)!==1){outcomes.push({setupId,ledgerId:id,status:'rejected',reason:'WALLET_SETUP_LEDGER_WRITE_FAILED'});continue;}
+        outcomes.push({setupId,ledgerId:id,status:'accepted',reason:'WALLET_SETUP_LEDGER_ACCEPTED'});
+        // Admission is already durable. Clearing a stale capacity warning is
+        // auxiliary and must not turn an accepted row into a rejected result.
+        try {this.db.prepare("DELETE FROM wsl_meta WHERE key='capacity'").run();}catch {/* Retried after the next accepted row. */}
+      }catch {
+        outcomes.push({setupId,status:'rejected',reason:'WALLET_SETUP_LEDGER_WRITE_FAILED'});
       }
-      if(setup.status==='withdrawn'||!finite(setup.priorityScore)||setup.priorityScore<=0||typeof setup.stage!=='string'||setup.stage.length>100)continue;
-      const profileComputedAt=setup.profileComputedAt===undefined?undefined:stamp(setup.profileComputedAt),relationKnownAt=setup.relationKnownAt===undefined?undefined:stamp(setup.relationKnownAt);
-      if(setup.profileComputedAt!==undefined&&(!profileComputedAt||profileComputedAt>checkedAt)||setup.relationKnownAt!==undefined&&(!relationKnownAt||relationKnownAt>checkedAt))continue;
-      const item:WalletSetupLedgerItem={id,...token,route:setup.route,wallet,leader,registeredAt:now,expiresAt:new Date(Date.parse(now)+this.windowMs).toISOString(),lastCheckedAt:now,
-        state:setup.route==='precursor'?'awaiting_leader':'direct_entry',review:{status:'active',checkedAt,reasons:[]},
-        proof:{checkedAt,validUntil,status:setup.status,stage:setup.stage,priorityScore:setup.priorityScore,trigger,reasons:strings(setup.reasons),counterEvidence:strings(setup.counterEvidence),followers:Number.isSafeInteger(setup.followers)&&setup.followers>=0?setup.followers:0,
-          ...(profileComputedAt?{profileComputedAt}:{}),...(relationKnownAt?{relationKnownAt}:{})},conflicts:0,observationsTruncated:false,sampleOnly:true,ownership:'unknown'};
-      if(finite(setup.chasePct))item.proof.chasePct=setup.chasePct;
-      const profit=setup.profit,profitTime=stamp(profit?.observedAt);
-      if(profit&&finite(profit.realizedProfitUsd)&&finite(profit.percentile)&&profit.percentile>=0&&profit.percentile<=100&&Number.isSafeInteger(profit.cohortSize)&&profit.cohortSize>=0&&profitTime&&profitTime<=checkedAt&&profit.verification==='vendor_claim')
-        item.proof.profit={realizedProfitUsd:profit.realizedProfitUsd,percentile:profit.percentile,cohortSize:profit.cohortSize,observedAt:profitTime,verification:'vendor_claim'};
-      const count=Number(this.db.prepare('SELECT count(*) AS n FROM wsl_setups').get()!.n);
-      // Reserve the worst-case bounded evidence/review growth for every accepted row.
-      // Reaching capacity stops new rows, never silently deletes earlier opportunities.
-      if(BASE_BUDGET+(count+1)*RECORD_BUDGET>this.maxBytes||this.bytes()+RECORD_BUDGET>this.maxBytes){this.full();continue;}
-      this.db.prepare('INSERT INTO wsl_setups(id,chain,address,registered_at,expires_at,last_checked_at,state,data) VALUES (?,?,?,?,?,?,?,?)')
-        .run(id,token.chain,token.address,now,item.expiresAt,now,item.state,JSON.stringify(item));
-      // A larger budget may restore admission after a previous capacity stop.
-      // Clear the persisted warning only after a new opportunity was accepted.
-      this.db.prepare("DELETE FROM wsl_meta WHERE key='capacity'").run();
     }
+    if(report.setups.length>8)outcomes.push({setupId:'',status:'rejected',reason:'WALLET_SETUP_LEDGER_SETUP_LIMIT'});
+    return finish();
   }
   pending(limit=20):Token[] {
     const take=Number.isSafeInteger(limit)?Math.max(1,Math.min(100,limit)):20;

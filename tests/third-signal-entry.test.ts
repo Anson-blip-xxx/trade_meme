@@ -23,9 +23,18 @@ function holdingRisk(at:number,address=mint):EntryHolderRiskValues {
     bundler:{value:'0.4',sourceField:'token_top_holders.bundler.amount_percentage',coverage:'complete'},
     ratTrader:{value:'0.3',sourceField:'token_top_holders.rat_trader.amount_percentage',coverage:'complete'}}};
 }
+function launcherSnapshot(query:{tokenAddress:string;decisionAt:string},status:'strong'|'advisory'|'withdrawn'='strong',
+  options:{observedAfterFirst?:boolean}={}) {
+  const at=Date.parse(query.decisionAt),sold=status==='withdrawn';
+  return {version:1,chain:'solana',tokenAddress:query.tokenAddress,status,checkedAt:query.decisionAt,sampleOnly:true,authorizesTrade:false,
+    items:[{wallet,tier:status==='advisory'?'direct_candidate':'peer_precursor',qualifiedAt:new Date(at-20_000).toISOString(),
+      buyAt:new Date(at-3_000).toISOString(),observedAt:new Date(at-(options.observedAfterFirst?500:2_000)).toISOString(),txHash:signature,
+      ...(sold?{soldAt:new Date(at-200).toISOString()}: {})}],reasons:[status==='strong'?'LAUNCHER_MATURE_BUY':'LAUNCHER_NOT_STRONG']};
+}
 function candidate(at:number,overrides:Record<string,unknown>={}):ThirdSignalCandidate {
   return {id:randomUUID(),runId:randomUUID(),windowId:randomUUID(),source:'debot',chain:'solana',address:mint,eventId:randomUUID(),
     count:3,marketCapUsd:100000,occurredAt:new Date(at-100).toISOString(),receivedAt:new Date(at-50).toISOString(),createdAt:new Date(at).toISOString(),
+    firstReceivedAt:new Date(at-1000).toISOString(),
     mode:'live',executionEnabled:true,phase:'live_candidate',name:'Test Meme',symbol:'TST',...overrides} as unknown as ThirdSignalCandidate;
 }
 function fixture(t:{after:(fn:()=>void)=>void},options:{store?:OrderStore;config?:Partial<Config>;enabled?:boolean;
@@ -33,6 +42,7 @@ function fixture(t:{after:(fn:()=>void)=>void},options:{store?:OrderStore;config
   scheduleRequest?:ThirdSignalEntryOptions['scheduleRequest'];noHolderRisk?:boolean;
   maxConcurrent?:number;
   native?:ThirdSignalEntryOptions['native'];
+  launcherEvidence?:ThirdSignalEntryOptions['readLauncherEvidence'];
   holderRisk?:(address:string)=>EntryHolderRiskValues|Promise<EntryHolderRiskValues>}={}) {
   const clock={now:Date.now()+1000},state={active:true,balance:1000000000,balanceReads:0,coverageReads:0,posts:0,quotes:0,riskReads:0},swaps:Record<string,unknown>[]=[];
   const config:Config={...readConfig({}),gmgnApiKey:`test-${randomUUID()}`,gmgnPrivateKey:pem,entryMode:'off',
@@ -67,7 +77,7 @@ function fixture(t:{after:(fn:()=>void)=>void},options:{store?:OrderStore;config
   };
   const controller=new ThirdSignalEntryController(config,store,{enabled:options.enabled??true,isActive:()=>state.active,
     now:()=>new Date(clock.now),fetcher,scheduleRequest:options.scheduleRequest,
-    native:options.native,maxConcurrent:options.maxConcurrent,
+    native:options.native,maxConcurrent:options.maxConcurrent,readLauncherEvidence:options.launcherEvidence,
     readHolderRisk:options.noHolderRisk?undefined:async address=>{state.riskReads++;return options.holderRisk?options.holderRisk(address):holdingRisk(clock.now,address);}});
   return {controller,store,config,state,clock,swaps,fetcher,candidate:()=>candidate(clock.now)};
 }
@@ -90,6 +100,46 @@ test('third-signal GMGN quote and opening POST both use the live-entry scheduler
   const result=await f.controller.consider(f.candidate());
   assert.equal(result.order?.status,'confirmed');assert.equal(f.state.quotes,1);assert.equal(f.state.posts,1);
   assert.deepEqual(priorities,['live_entry','live_entry']);
+});
+
+test('a mature launcher buy known before the first alert is attached and rechecked immediately before submission',async t=>{
+  let reads=0;const queries:{firstSignalAt?:string;maxAgeMs:number}[]=[];
+  const f=fixture(t,{launcherEvidence:query=>{reads++;queries.push(query);return launcherSnapshot(query);}}),entry=f.candidate();
+  const result=await f.controller.consider(entry);
+  assert.equal(result.order?.status,'confirmed');assert.equal(reads,2);assert.equal(f.state.posts,1);
+  assert.ok(queries.every(query=>query.firstSignalAt===entry.firstReceivedAt&&query.maxAgeMs===6*60*60_000));
+  assert.equal((result.order?.details.launcherEntry as {status:string}).status,'head_confirmed');
+  assert.equal((result.order?.details.launcherEntryRevalidated as {status:string}).status,'head_confirmed');
+  assert.equal((result.order?.details.launcherEntry as {authorizesTrade:boolean}).authorizesTrade,false);
+  assert.equal(f.state.riskReads,1);assert.equal(f.state.balanceReads,2);
+});
+
+test('a launcher support retraction after preflight prevents the signed opening request',async t=>{
+  let reads=0;const f=fixture(t,{launcherEvidence:query=>launcherSnapshot(query,++reads===1?'strong':'withdrawn')});
+  const result=await f.controller.consider(f.candidate());
+  assert.equal(result.status,'blocked');assert.equal(result.reason,'ENTRY_LAUNCHER_SUPPORT_WITHDRAWN');
+  assert.equal(result.order?.status,'failed');assert.equal(f.state.posts,0);assert.equal(reads,2);
+  assert.equal(f.store.hasAttemptedOpening('solana',mint),false);
+});
+
+test('a buy discovered only after the first alert is corroboration and never masquerades as a presignal launcher',async t=>{
+  let reads=0;const f=fixture(t,{launcherEvidence:query=>{reads++;return launcherSnapshot(query,'strong',{observedAfterFirst:true});}});
+  const result=await f.controller.consider(f.candidate());
+  assert.equal(result.order?.status,'confirmed');assert.equal(reads,1);assert.equal(f.state.posts,1);
+  assert.equal((result.order?.details.launcherEntry as {status:string}).status,'head_corroborating');
+  assert.equal(result.order?.details.launcherEntryRevalidated,undefined);
+});
+
+test('a causal launcher before the first alert survives a renewed third-signal window spanning ten hours',async t=>{
+  const f=fixture(t,{launcherEvidence:query=>{const at=Date.parse(query.decisionAt),first=Date.parse(query.firstSignalAt!);
+    return {version:1,chain:'solana',tokenAddress:query.tokenAddress,status:'strong',checkedAt:query.decisionAt,sampleOnly:true,authorizesTrade:false,
+      items:[{wallet,tier:'direct_precursor',qualifiedAt:new Date(first-2*60*60_000).toISOString(),
+        buyAt:new Date(first-60*60_000).toISOString(),observedAt:new Date(first-60*60_000+1000).toISOString(),txHash:signature}],
+      reasons:['LAUNCHER_MATURE_BUY'],decisionAt:at};}}),entry=f.candidate();
+  entry.firstReceivedAt=new Date(f.clock.now-10*60*60_000).toISOString();
+  const result=await f.controller.consider(entry);
+  assert.equal(result.order?.status,'confirmed');assert.equal(f.state.posts,1);
+  assert.equal((result.order?.details.launcherEntry as {status:string}).status,'head_confirmed');
 });
 
 test('disabled, stopped, simulated, wrong chain/source/count/cap and stale candidates never request funds or quote',async t=>{

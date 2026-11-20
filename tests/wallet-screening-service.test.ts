@@ -7,6 +7,7 @@ import {tmpdir} from 'node:os';
 import {WalletHistory,type WalletTradeObservation} from '../src/wallet-history.js';
 import {WalletProfiles,WalletProfileReader,type WalletProfile} from '../src/wallet-profiles.js';
 import {WalletScreeningService} from '../src/wallet-screening-service.js';
+import type {WalletScreeningReport} from '../src/wallet-screening.js';
 import type {WalletAnalysis,WalletRecord} from '../src/research/wallet-types.js';
 import type {GmgnResearch} from '../src/research.js';
 import type {Signal,Report} from '../src/types.js';
@@ -141,7 +142,34 @@ test('service combines local history and current analysis into a durable public-
     assert.equal(stored.proof.trigger.priceUsd,'1');assert.equal(stored.proof.profit?.realizedProfitUsd,10000);
     // Analysis-only evidence does not invent an observation in the research source.
     assert.equal(f.history.screeningEvidence(token,f.now()).trades.length,2);
-    f.service.assess(signal,input);assert.equal(f.service.status().records,1);
+    const repeated=f.service.assess(signal,input);assert.equal(repeated.status,'supported');assert.equal(f.service.status().records,1);
+    assert.ok(!repeated.reasons.includes('WALLET_SETUP_NOT_DURABLY_RECORDED'));
+  }finally{await f.close();}
+});
+
+test('ledger capacity downgrades otherwise supported wallet evidence to watch',async t=>{
+  const f=fixture();try{
+    f.history.recordTrades([trade(2,900),trade(3,910)]);
+    const input=research();input.wallets.wallets[2].enrichment.activity!.events.push({type:'buy',txHash:hash(40920),timestamp:iso(920),amount:'200',usd:'200'});
+    t.mock.method(f.service.ledger,'record',(report:WalletScreeningReport)=>({status:'rejected',outcomes:report.setups.map(setup=>({
+      setupId:setup.id,status:'rejected' as const,reason:'WALLET_SETUP_LEDGER_CAPACITY',
+    }))}));
+    const result=f.service.assess(signal,input);
+    assert.equal(result.status,'watch');assert.equal(result.setups[0].status,'watch');
+    assert.ok(result.reasons.includes('WALLET_SETUP_NOT_DURABLY_RECORDED'));
+    assert.ok(result.reasons.includes('WALLET_SETUP_LEDGER_CAPACITY'));assert.equal(f.service.status().records,0);
+  }finally{await f.close();}
+});
+
+test('ledger write failure cannot escape as supported wallet evidence',async t=>{
+  const f=fixture();try{
+    f.history.recordTrades([trade(2,900),trade(3,910)]);
+    const input=research();input.wallets.wallets[2].enrichment.activity!.events.push({type:'buy',txHash:hash(40920),timestamp:iso(920),amount:'200',usd:'200'});
+    t.mock.method(f.service.ledger,'record',()=>{throw new Error('simulated write failure');});
+    const result=f.service.assess(signal,input);
+    assert.equal(result.status,'watch');assert.equal(result.setups[0].status,'watch');
+    assert.ok(result.reasons.includes('WALLET_SETUP_LEDGER_WRITE_FAILED'));
+    assert.equal(f.service.status().error,'WALLET_SETUP_LEDGER_WRITE_FAILED');
   }finally{await f.close();}
 });
 

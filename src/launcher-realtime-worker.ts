@@ -17,9 +17,10 @@ const close=()=>{if(closed)return;closed=true;store.close();parentPort!.close();
 const publishTargets=()=>{
   if(stopping)return;
   try {
-    const chains:Partial<Record<Chain,{targets:string[];membership:string[]}>>={};
+    const chains:Partial<Record<Chain,{targets:string[];priority:string[];membership:string[]}>>={};
     for(const chain of CHAINS){const limit=options.targetLimits[chain];if(!limit)continue;
-      chains[chain]={targets:store.streamTargets(chain,limit),membership:store.addresses(chain)};}
+      const targets=store.streamTargets(chain,limit),mature=new Set(store.matureAddresses(chain));
+      chains[chain]={targets,priority:targets.filter(wallet=>mature.has(wallet)),membership:store.addresses(chain)};}
     parentPort!.postMessage({type:'targets',chains,computedAt:new Date().toISOString()});
   } catch {parentPort!.postMessage({type:'targets-failed',error:'LAUNCHER_REALTIME_TARGET_READ_FAILED'});}
 };

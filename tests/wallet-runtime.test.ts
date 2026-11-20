@@ -11,13 +11,24 @@ import {LauncherCandidates} from '../src/launcher-candidates.js';
 import {WalletFastRunner} from '../src/wallet-fast-runner.js';
 import {WalletFastPersistenceRunner} from '../src/wallet-fast-persistence-runner.js';
 import {WalletFastResearch} from '../src/wallet-fast-research.js';
+import {LauncherRevalidator} from '../src/launcher-revalidator.js';
 import {GmgnPlusArchiveRunner} from '../src/gmgn-plus-archive.js';
 import type {FastWalletEvent} from '../src/wallet-fast.js';
+import type {WalletActivity} from '../src/wallet-activity.js';
 import type {Report} from '../src/types.js';
 import type {WalletAnalysis,WalletRecord} from '../src/research/wallet-types.js';
 import {signal,pass,narrative,now} from './helpers.js';
 
 const walletAddress='0x2222222222222222222222222222222222222222';
+const launcherActivity:WalletActivity={version:1,chain:'solana',wallet:'11111111111111111111111111111111',
+  txHash:'2'.repeat(64),receivedAt:'2026-11-20T01:00:00.000Z',checkedAt:'2026-11-20T01:00:01.000Z',
+  eventAt:'2026-11-20T01:00:00.000Z',classification:'transfer',reasons:['TOKEN_TRANSFER_ONLY'],trades:[],retryable:false,
+  confirmation:'confirmed',transferCount:1,tradingEnabled:false};
+const createProfileDatabase=(path:string)=>{const db=new DatabaseSync(path);db.exec(`
+  CREATE TABLE wp_profiles(chain TEXT,address TEXT,computed_at TEXT NOT NULL,fresh_until TEXT NOT NULL,data TEXT NOT NULL,
+    source_wallet INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(chain,address));
+  CREATE TABLE wp_groups(chain TEXT,address TEXT,group_id TEXT,first_at TEXT NOT NULL,PRIMARY KEY(chain,address,group_id));
+  CREATE INDEX wp_groups_filter ON wp_groups(group_id,chain,address);`);db.close();};
 function report(id:string,decision:'WATCH'|'REJECT'):Report {
   const s=signal({sourceEventId:id});
   const wallet:WalletRecord={chain:'bsc',address:walletAddress,sources:['top_holders'],
@@ -345,6 +356,51 @@ test('a retraction accepted while the socket runner stops enters the research dr
   const runtime=createRuntime(cfg);
   try {runtime.start();await runtime.close();assert.deepEqual(admitted,[event]);}
   finally {rmSync(dir,{recursive:true,force:true});}
+});
+
+test('launcher revalidation uses the unified persistence bridge before advancing its classified activity',async t=>{
+  const dir=mkdtempSync(join(tmpdir(),'launcher-persistence-runtime-')),profiles=join(dir,'profiles.sqlite');createProfileDatabase(profiles);
+  const cfg=readConfig({DASHBOARD_ENABLED:'false',TELEGRAM_ENABLED:'false',WALLET_RESEARCH_ENABLED:'true',WALLET_PROFILES_ENABLED:'false',
+    WALLET_SCREENING_ENABLED:'false',TOKEN_RANK_RESEARCH_ENABLED:'false',LAUNCHER_CANDIDATES_ENABLED:'true',
+    CHAIN_STREAM_ENABLED:'true',WALLET_FAST_ENABLED:'true',SOLANA_STREAM_HTTP_URL:'https://rpc.invalid',SOLANA_STREAM_WS_URL:'wss://rpc.invalid',
+    DEBOT_SCANNER_ENABLED:'false',AVE_SCANNER_ENABLED:'false',MEME_OBSERVER_ENABLED:'false',GMGN_MARKET_SIGNAL_ENABLED:'false',
+    WALLET_HISTORY_DATABASE_PATH:join(dir,'history.sqlite'),WALLET_ACTIVITY_DATABASE_PATH:join(dir,'activity.sqlite'),
+    WALLET_PROFILES_DATABASE_PATH:profiles,LAUNCHER_CANDIDATES_DATABASE_PATH:join(dir,'launcher.sqlite'),
+    SCAN_DATABASE_PATH:join(dir,'scans.sqlite'),CHAIN_STREAM_DATABASE_PATH:join(dir,'stream.sqlite'),
+    ORDERS_DATABASE_PATH:join(dir,'orders.sqlite'),ENTRY_MODE:'off'});
+  let callback:((activity:WalletActivity)=>Promise<void>)|undefined,attempts=0;const lifecycle:string[]=[],persisted:WalletActivity[]=[];
+  t.mock.method(WalletFastPersistenceRunner.prototype,'start',()=>{lifecycle.push('persistence');});
+  t.mock.method(WalletFastPersistenceRunner.prototype,'persist',async(activity:WalletActivity)=>{persisted.push(activity);return ++attempts>1;});
+  t.mock.method(WalletFastPersistenceRunner.prototype,'stop',async()=>true);
+  t.mock.method(LauncherRevalidator.prototype,'start',function(this:LauncherRevalidator){lifecycle.push('revalidator');
+    callback=(this as unknown as {options:{source:{onActivity?:(activity:WalletActivity)=>Promise<void>}}}).options.source.onActivity;});
+  t.mock.method(LauncherRevalidator.prototype,'stop',async()=>{});
+  t.mock.method(LauncherCandidates.prototype,'observeActivity',()=>{throw new Error('MAIN_THREAD_LAUNCHER_ACTIVITY_WRITE_FORBIDDEN');});
+  t.mock.method(WalletFastRunner.prototype,'start',()=>{});t.mock.method(WalletFastRunner.prototype,'stop',async()=>{});
+  t.mock.method(WalletFastResearch.prototype,'start',()=>{});t.mock.method(WalletFastResearch.prototype,'stop',async()=>true);
+  const runtime=createRuntime(cfg);
+  try {runtime.start();assert.ok(callback);assert.ok(lifecycle.indexOf('persistence')<lifecycle.indexOf('revalidator'));
+    await assert.rejects(callback!(launcherActivity),/LAUNCHER_ACTIVITY_PERSISTENCE_REJECTED/);
+    await callback!(launcherActivity);assert.deepEqual(persisted,[launcherActivity,launcherActivity]);
+  } finally {await runtime.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('launcher revalidation rejects classified activity when unified persistence is not configured',async t=>{
+  const dir=mkdtempSync(join(tmpdir(),'launcher-persistence-missing-')),profiles=join(dir,'profiles.sqlite');createProfileDatabase(profiles);
+  const cfg=readConfig({DASHBOARD_ENABLED:'false',TELEGRAM_ENABLED:'false',WALLET_RESEARCH_ENABLED:'true',WALLET_PROFILES_ENABLED:'false',
+    WALLET_SCREENING_ENABLED:'false',TOKEN_RANK_RESEARCH_ENABLED:'false',LAUNCHER_CANDIDATES_ENABLED:'true',
+    CHAIN_STREAM_ENABLED:'false',WALLET_FAST_ENABLED:'false',SOLANA_STREAM_HTTP_URL:'https://rpc.invalid',SOLANA_STREAM_WS_URL:'wss://rpc.invalid',
+    DEBOT_SCANNER_ENABLED:'false',AVE_SCANNER_ENABLED:'false',MEME_OBSERVER_ENABLED:'false',GMGN_MARKET_SIGNAL_ENABLED:'false',
+    WALLET_HISTORY_DATABASE_PATH:join(dir,'history.sqlite'),WALLET_PROFILES_DATABASE_PATH:profiles,
+    LAUNCHER_CANDIDATES_DATABASE_PATH:join(dir,'launcher.sqlite'),SCAN_DATABASE_PATH:join(dir,'scans.sqlite'),
+    ORDERS_DATABASE_PATH:join(dir,'orders.sqlite'),ENTRY_MODE:'off'});
+  let callback:((activity:WalletActivity)=>Promise<void>)|undefined;
+  t.mock.method(LauncherRevalidator.prototype,'start',function(this:LauncherRevalidator){
+    callback=(this as unknown as {options:{source:{onActivity?:(activity:WalletActivity)=>Promise<void>}}}).options.source.onActivity;});
+  t.mock.method(LauncherRevalidator.prototype,'stop',async()=>{});
+  const runtime=createRuntime(cfg);
+  try {runtime.start();assert.ok(callback);await assert.rejects(callback!(launcherActivity),/LAUNCHER_ACTIVITY_PERSISTENCE_UNAVAILABLE/);}
+  finally {await runtime.close();rmSync(dir,{recursive:true,force:true});}
 });
 
 test('dashboard launcher summary uses the worker cache instead of a main-thread candidate scan',async t=>{

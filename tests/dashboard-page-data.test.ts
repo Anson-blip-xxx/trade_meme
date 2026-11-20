@@ -49,6 +49,27 @@ test('order pages project exact holder-risk evidence and token display without l
   }finally{store.close();}
 });
 
+test('order pages project only bounded causal launcher evidence and reject mismatched or malformed envelopes',()=>{
+  const store=new OrderStore(':memory:'),mint='DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263',at=new Date('2026-10-25T00:00:00Z');
+  const item={wallet:mint,txHash:'5'.repeat(64),tier:'direct_precursor',qualifiedAt:'private-qualified-proof',
+    buyAt:'2026-10-24T23:58:00.000Z',observedAt:'2026-10-24T23:58:01.000Z',privateRaw:'do-not-project'};
+  const entry={version:'third-signal-launcher-v1',status:'head_confirmed',tokenAddress:mint,checkedAt:at.toISOString(),
+    firstSignalAt:'2026-10-24T23:59:00.000Z',items:[item],reasons:['private-reason'],sampleOnly:true,authorizesTrade:false};
+  try {
+    const good=store.reserve({eventKey:'launcher-good',chain:'solana',tokenAddress:mint,mode:'live',wallet:'private-wallet',inputToken:mint,
+      inputAmount:'30000000',slippagePct:1,details:{launcherEntry:entry}},5,at).order!;
+    let projected=dashboardOrders(store,{limit:20}).items.find(row=>row.id===good.id)!.launcherEntry!;
+    assert.equal(projected.status,'head_confirmed');assert.equal(projected.wallets.length,1);
+    assert.deepEqual(projected.wallets[0],{wallet:mint,txHash:'5'.repeat(64),tier:'direct_precursor',
+      buyAt:item.buyAt,observedAt:item.observedAt});
+    assert.doesNotMatch(JSON.stringify(projected),/private-qualified-proof|private-reason|do-not-project/);
+    store.update(good.id,['prepared'],{details:{launcherEntry:{...entry,tokenAddress:'11111111111111111111111111111111'}}},at);
+    assert.equal(dashboardOrders(store,{limit:20}).items.find(row=>row.id===good.id)!.launcherEntry,undefined);
+    store.update(good.id,['prepared'],{details:{launcherEntry:{...entry,items:[{...item,tier:'direct_candidate'}]}}},at);
+    assert.equal(dashboardOrders(store,{limit:20}).items.find(row=>row.id===good.id)!.launcherEntry,undefined);
+  } finally {store.close();}
+});
+
 test('exit display metrics migrate history and throttle closed comparison samples without changing policy state',()=>{
   const dir=mkdtempSync(join(tmpdir(),'dashboard-metrics-')),path=join(dir,'shadow.sqlite');
   let at=Date.parse('2026-10-15T00:00:00Z');

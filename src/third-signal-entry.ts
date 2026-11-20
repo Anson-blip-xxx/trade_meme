@@ -13,6 +13,7 @@ import {assessEntryHolderRiskValues,unavailableEntryHolderRisk,normalizeStoredEn
   ENTRY_HOLDER_RISK_MAX_AGE_MS,type EntryHolderRiskValues,type EntryHolderRiskAssessment} from './entry-holder-risk.js';
 
 const SOL=NATIVE_INPUT_TOKENS.solana, MAX_AGE_MS=120_000, QUOTE_MAX_AGE_MS=15_000;
+const LAUNCHER_WINDOW_MS=6*60*60*1000;
 const FUNDING_COVERAGE_BUDGET_MS=6_000,FUNDING_REFRESH_BUDGET_MS=4_000,FUNDING_COVERAGE_CONCURRENCY=4;
 const object=(v:unknown):v is Record<string,unknown>=>v!==null&&typeof v==='object'&&!Array.isArray(v);
 const identifier=(v:unknown):v is string=>typeof v==='string'&&/^[A-Za-z0-9_-]{1,200}$/.test(v);
@@ -34,6 +35,9 @@ export interface ThirdSignalEntryOptions {
   recordRateLimit?:(headers:Headers,payload?:unknown)=>void;
   /** Trusted normalized holding ratios, fetched through the shared GMGN read client. */
   readHolderRisk?:(address:string)=>Promise<EntryHolderRiskValues>;
+  /** Indexed local launcher evidence. It is additive timing evidence and never
+   * authorizes an order or bypasses the ordinary entry gates. */
+  readLauncherEvidence?:(query:{tokenAddress:string;decisionAt:string;firstSignalAt?:string;maxAgeMs:number})=>unknown;
   /** Native executor owns durable signed transactions; this guard is called immediately before broadcasting. */
   native?:{readiness:()=>{ready:boolean;reason?:string};
     execute:(order:OpeningOrder,beforeBroadcast:()=>Promise<void>)=>Promise<OpeningOrder>};
@@ -44,7 +48,19 @@ interface Submission {
   candidate:Readonly<ThirdSignalCandidate>;orderId:string;clientId:string;bodyText:string;quotedAt:number;
   attempted:boolean;failureReason?:string;
   holderRisk:EntryHolderRiskAssessment;
+  launcherEntry:ThirdSignalLauncherEntry;
   funding:FundingSnapshot;
+}
+
+export type ThirdSignalLauncherEntryStatus='head_confirmed'|'head_corroborating'|'head_weak'|'head_exited'|'none'|'unavailable';
+export interface ThirdSignalLauncherEntryItem {
+  wallet:string;tier:'direct_precursor'|'peer_precursor'|'direct_candidate';qualifiedAt:string;
+  buyAt:string;observedAt:string;txHash:string;soldAt?:string;
+}
+export interface ThirdSignalLauncherEntry {
+  version:'third-signal-launcher-v1';status:ThirdSignalLauncherEntryStatus;tokenAddress:string;
+  checkedAt:string;firstSignalAt?:string;items:ThirdSignalLauncherEntryItem[];reasons:string[];
+  sampleOnly:true;authorizesTrade:false;
 }
 
 /** Internal owner-started third-notification route. It does not create or bypass research Reports. */
@@ -115,11 +131,64 @@ export class ThirdSignalEntryController {
       typeof c.marketCapUsd!=='number'||!Number.isFinite(c.marketCapUsd)||c.marketCapUsd<=0||c.marketCapUsd>100000)
       fail('THIRD_ENTRY_CANDIDATE_INVALID');
     if(!this.config.scannerChains.includes('solana'))fail('SIGNAL_CHAIN_DISABLED');
-    const now=this.now().getTime(),occurred=Date.parse(String(c.occurredAt)),received=Date.parse(String(c.receivedAt)),created=Date.parse(String(c.createdAt));
-    if(![now,occurred,received,created].every(Number.isFinite)||occurred>received||received>created||created>now||
+    const now=this.now().getTime(),occurred=Date.parse(String(c.occurredAt)),received=Date.parse(String(c.receivedAt)),created=Date.parse(String(c.createdAt)),
+      first=c.firstReceivedAt===undefined?received:Date.parse(String(c.firstReceivedAt));
+    if(![now,occurred,received,created,first].every(Number.isFinite)||first>received||received-first>2*LAUNCHER_WINDOW_MS||occurred>received||received>created||created>now||
       now-occurred>MAX_AGE_MS||now-received>MAX_AGE_MS||now-created>MAX_AGE_MS)fail('THIRD_ENTRY_CANDIDATE_EXPIRED');
     let active=false;try{active=this.options.isActive(candidate)===true;}catch{}
     if(!active)fail('THIRD_ENTRY_RUN_STOPPED');
+  }
+  private launcherEntry(candidate:Readonly<ThirdSignalCandidate>):ThirdSignalLauncherEntry {
+    const checkedAt=this.now().toISOString(),checked=Date.parse(checkedAt),firstRaw=candidate.firstReceivedAt,
+      first=typeof firstRaw==='string'?Date.parse(firstRaw):NaN,
+      firstSignalAt=Number.isFinite(first)&&first<=Date.parse(candidate.receivedAt)?new Date(first).toISOString():undefined;
+    const base={version:'third-signal-launcher-v1' as const,tokenAddress:candidate.address,checkedAt,
+      ...(firstSignalAt?{firstSignalAt}:{}),sampleOnly:true as const,authorizesTrade:false as const};
+    const unavailable=(why:string):ThirdSignalLauncherEntry=>({...base,status:'unavailable',items:[],reasons:[why]});
+    if(!this.options.readLauncherEvidence)return unavailable('LAUNCHER_EVIDENCE_PROVIDER_UNAVAILABLE');
+    let raw:unknown;
+    try {raw=structuredClone(this.options.readLauncherEvidence({tokenAddress:candidate.address,decisionAt:checkedAt,
+      ...(firstSignalAt?{firstSignalAt}:{}),maxAgeMs:LAUNCHER_WINDOW_MS}));}
+    catch{return unavailable('LAUNCHER_EVIDENCE_READ_FAILED');}
+    if(!object(raw)||raw.version!==1||raw.chain!=='solana'||raw.tokenAddress!==candidate.address||raw.sampleOnly!==true||
+      raw.authorizesTrade!==false||!['strong','advisory','withdrawn','none'].includes(String(raw.status))||
+      !Array.isArray(raw.items)||raw.items.length>50||typeof raw.checkedAt!=='string')return unavailable('LAUNCHER_EVIDENCE_INVALID');
+    const rawChecked=Date.parse(raw.checkedAt);
+    if(!Number.isFinite(rawChecked)||rawChecked>checked||checked-rawChecked>1000)return unavailable('LAUNCHER_EVIDENCE_STALE');
+    const evidenceLower=(firstSignalAt?Date.parse(firstSignalAt):checked)-LAUNCHER_WINDOW_MS,items:ThirdSignalLauncherEntryItem[]=[];
+    for(const value of raw.items){
+      if(!object(value)||!address(value.wallet)||!['direct_precursor','peer_precursor','direct_candidate'].includes(String(value.tier))||
+        typeof value.qualifiedAt!=='string'||typeof value.buyAt!=='string'||typeof value.observedAt!=='string'||!hash(value.txHash))continue;
+      const qualified=Date.parse(value.qualifiedAt),buy=Date.parse(value.buyAt),observed=Date.parse(value.observedAt),
+        sold=typeof value.soldAt==='string'?Date.parse(value.soldAt):undefined;
+      if(![qualified,buy,observed].every(Number.isFinite)||qualified>=buy||buy>observed||observed>rawChecked||
+        buy<evidenceLower||sold!==undefined&&(!Number.isFinite(sold)||sold<=buy||sold>rawChecked))continue;
+      items.push({wallet:value.wallet,tier:value.tier as ThirdSignalLauncherEntryItem['tier'],qualifiedAt:new Date(qualified).toISOString(),
+        buyAt:new Date(buy).toISOString(),observedAt:new Date(observed).toISOString(),txHash:value.txHash,
+        ...(sold===undefined?{}:{soldAt:new Date(sold).toISOString()})});
+    }
+    const reasons=Array.isArray(raw.reasons)?raw.reasons.filter((value):value is string=>typeof value==='string'&&value.length>0&&
+      value.length<=160&&!/[\x00-\x1f\x7f]/.test(value)).slice(0,8):[];
+    const mature=items.filter(item=>item.tier!=='direct_candidate'),active=mature.filter(item=>!item.soldAt),
+      pre=firstSignalAt?active.filter(item=>item.buyAt<=firstSignalAt&&item.observedAt<=firstSignalAt):[],
+      exited=mature.filter(item=>!!item.soldAt),weak=items.filter(item=>item.tier==='direct_candidate'&&!item.soldAt);
+    let status:ThirdSignalLauncherEntryStatus='none',selected:ThirdSignalLauncherEntryItem[]=[];
+    if(pre.length&&raw.status==='strong'){status='head_confirmed';selected=pre;}
+    else if(active.length&&raw.status==='strong'){status='head_corroborating';selected=active;}
+    else if(exited.length&&raw.status==='withdrawn'){status='head_exited';selected=exited;}
+    else if(weak.length&&raw.status==='advisory'){status='head_weak';selected=weak;}
+    else if(raw.status!=='none'||items.length)return unavailable('LAUNCHER_EVIDENCE_INCONSISTENT');
+    return {...base,status,items:selected,reasons};
+  }
+  private revalidateLauncherEntry(order:OpeningOrder,candidate:Readonly<ThirdSignalCandidate>,expected:ThirdSignalLauncherEntry):OpeningOrder {
+    if(expected.status!=='head_confirmed')return order;
+    if(JSON.stringify(order.details.launcherEntry)!==JSON.stringify(expected))fail('ENTRY_LAUNCHER_EVIDENCE_INVALID');
+    const latest=this.launcherEntry(candidate);
+    if(latest.status!=='head_confirmed')fail(latest.status==='head_exited'?'ENTRY_LAUNCHER_SUPPORT_WITHDRAWN':'ENTRY_LAUNCHER_SUPPORT_UNAVAILABLE');
+    const current=new Set(latest.items.map(item=>`${item.wallet}:${item.txHash}:${item.qualifiedAt}`));
+    if(!expected.items.some(item=>current.has(`${item.wallet}:${item.txHash}:${item.qualifiedAt}`)))fail('ENTRY_LAUNCHER_SUPPORT_CHANGED');
+    const saved=this.orders.update(order.id,['prepared'],{details:{...order.details,launcherEntryRevalidated:latest}},this.now());
+    if(!saved)fail('ENTRY_ALREADY_HANDLED');return saved;
   }
   private configuration():{wallet:string;exit:ExitTracking} {
     const wallet=this.config.entryWallets.solana;
@@ -151,14 +220,15 @@ export class ThirdSignalEntryController {
             if(!submission||submission.attempted||init?.body!==submission.bodyText)fail('THIRD_ENTRY_SUBMISSION_DENIED');
             try {
               this.active(submission.candidate);
-              const order=this.orders.get(submission.orderId);if(!order||order.status!=='prepared')fail('ENTRY_ALREADY_HANDLED');
+              let order=this.orders.get(submission.orderId);if(!order||order.status!=='prepared')fail('ENTRY_ALREADY_HANDLED');
               this.requireHolderRisk(this.orders.get(order.id)??order,submission.holderRisk);
               const latest=await this.refreshFundingSnapshot(order.wallet,submission.funding);
               this.active(submission.candidate);
               if(init?.signal?.aborted)fail('THIRD_ENTRY_REQUEST_ABORTED');
               if(this.now().getTime()-submission.quotedAt>QUOTE_MAX_AGE_MS)fail('THIRD_ENTRY_QUOTE_EXPIRED');
               const check=this.orders.checkFunding(order.id,latest,this.now());if(!check.ok)fail(check.reason);
-              this.requireHolderRisk(this.orders.get(order.id)??order,submission.holderRisk);
+              order=this.revalidateLauncherEntry(this.orders.get(order.id)??order,submission.candidate,submission.launcherEntry);
+              this.requireHolderRisk(order,submission.holderRisk);
               // No asynchronous operation is allowed between this committed claim and fetch.
               this.active(submission.candidate);
               const begun=this.orders.beginSubmission(order.id,this.now());if(!begun.order)fail(begun.reason??'ENTRY_ALREADY_HANDLED');
@@ -226,12 +296,13 @@ export class ThirdSignalEntryController {
   }
   private async considerInternal(candidate:Readonly<ThirdSignalCandidate>,wallet:string,exit:ExitTracking,
     releaseAdmission:()=>void):Promise<EntryResult> {
-    let reservation:ReturnType<OrderStore['reserve']>,funding:FundingSnapshot;
+    let reservation:ReturnType<OrderStore['reserve']>,funding:FundingSnapshot;const launcherEntry=this.launcherEntry(candidate);
     try {
       this.active(candidate);funding=await this.fundingSnapshot(wallet);this.active(candidate);
       const eventKey=createHash('sha256').update(JSON.stringify(['third_signal_v1',candidate.runId,candidate.id])).digest('hex');
       reservation=this.orders.reserve({eventKey,chain:'solana',tokenAddress:candidate.address,mode:'live',wallet,inputToken:SOL,inputAmount:'0',
         slippagePct:this.config.entrySlippagePct,exit,details:{executionStrategy:'third_signal_v1',policyVersion:'third_signal_v1',candidate,
+          launcherEntry,
           ...(this.config.solanaExecutionProvider==='pump_native'?{executionProvider:'pump_native'}:{}),
           signal:{source:candidate.source,eventId:candidate.eventId,occurredAt:candidate.occurredAt},
           token:{chain:'solana',address:candidate.address,name:candidate.name,symbol:candidate.symbol}}},this.config.entryMaxOpen,this.now(),funding,
@@ -257,7 +328,8 @@ export class ThirdSignalEntryController {
             this.requireHolderRisk(this.orders.get(order.id)??order,holderRisk);
             const fresh=await this.refreshFundingSnapshot(wallet,funding);this.active(candidate);
             const fundingCheck=this.orders.checkFunding(order.id,fresh,this.now());if(!fundingCheck.ok)fail(fundingCheck.reason);
-            this.requireHolderRisk(this.orders.get(order.id)??order,holderRisk);
+            order=this.revalidateLauncherEntry(this.orders.get(order.id)??order,candidate,launcherEntry);
+            this.requireHolderRisk(order,holderRisk);
             const readiness=this.options.native!.readiness();if(!readiness.ready)fail(readiness.reason??'NATIVE_EXECUTOR_UNAVAILABLE');
             this.active(candidate);
             const begun=this.orders.beginSubmission(order.id,this.now());if(!begun.order)fail(begun.reason??'ENTRY_ALREADY_HANDLED');
@@ -285,7 +357,7 @@ export class ThirdSignalEntryController {
       const saved=this.orders.update(order.id,['prepared'],{details:{...order.details,quote:{...quote,quotedAt:new Date(quotedAt).toISOString()},
         submission:{clientId,bodyHash:createHash('sha256').update(bodyText).digest('hex'),body,createdAt:this.now().toISOString()}}},this.now());
       if(!saved)return {status:'existing',order:this.orders.get(order.id)};order=saved;
-      submission={candidate,orderId:order.id,clientId,bodyText,quotedAt,attempted:false,holderRisk,funding};this.submissions.set(clientId,submission);
+      submission={candidate,orderId:order.id,clientId,bodyText,quotedAt,attempted:false,holderRisk,launcherEntry,funding};this.submissions.set(clientId,submission);
       const result=await this.transport().swap(body,clientId);
       if(!submission.attempted)fail('THIRD_ENTRY_SUBMISSION_DENIED');
       return {status:'created',order:this.applyExecution(order,result)};

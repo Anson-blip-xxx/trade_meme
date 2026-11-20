@@ -40,7 +40,8 @@ test('launcher realtime writer persists liveness and publishes bounded targets w
     assert.equal(f.runner.enqueue({chain:'bsc',wallet:f.wallet,observedAt,source:'wallet_fast'}),true);
     assert.ok(performance.now()-started<25);
     await waitFor(()=>f.runner.status().completed===1);
-    const snapshot=f.runner.targetSnapshot('bsc',10);assert.deepEqual(snapshot.targets,[f.wallet]);assert.equal(snapshot.membership.has(f.wallet),true);
+    const snapshot=f.runner.targetSnapshot('bsc',10);assert.deepEqual(snapshot.targets,[f.wallet]);assert.deepEqual(snapshot.priority,[]);
+    assert.equal(snapshot.membership.has(f.wallet),true);
     const reader=new LauncherCandidates({database:f.database,profileDatabase:f.profiles,cap:100,maxBytes:8*1024*1024});
     try {assert.equal(reader.get('bsc',f.wallet)?.liveSeenAt,observedAt);}finally{reader.close();}
     assert.equal(await f.runner.stop(),true);assert.equal(f.runner.status().running,false);
@@ -54,6 +55,25 @@ test('launcher realtime writer restores its target cache after an unexpected wor
     await waitFor(()=>f.runner.status().restarts>=1&&f.runner.status().ready&&f.runner.status().targetCounts.bsc===1);
     assert.equal(f.runner.targetSnapshot('bsc').membership.has(f.wallet),true);
   } finally {await f.runner.stop();rmSync(f.dir,{recursive:true,force:true});}
+});
+
+test('launcher realtime priority is the mature intersection of selected targets in target order',async()=>{
+  const f=fixture(),db=new DatabaseSync(f.database),source=db.prepare('SELECT * FROM lc_candidates LIMIT 1').get() as Record<string,unknown>,
+    columns=Object.keys(source),insert=db.prepare(`INSERT INTO lc_candidates(${columns.join(',')}) VALUES (${columns.map(()=>'?').join(',')})`),
+    now=Date.now();
+  for(const [id,liveSeenAt] of [[10,null],[20,new Date(now-1000).toISOString()],[30,new Date(now).toISOString()]] as const){
+    const row:Record<string,unknown>={...source,address:address(id),live_seen_at:liveSeenAt,
+      data:JSON.stringify({version:1,tier:'direct_precursor',reasons:['TEST_MATURE'],sampleOnly:true,tradingEnabled:false})};
+    insert.run(...columns.map(column=>row[column] as never));
+  }
+  db.close();
+  const runner=new LauncherRealtimeWriterRunner({database:f.database,profileDatabase:f.profiles,cap:100,maxBytes:8*1024*1024,
+    targetLimits:{bsc:2},delayMs:0,targetRefreshMs:100});
+  try {runner.start();await waitFor(()=>runner.status().ready&&runner.status().targetCounts.bsc===2);
+    const snapshot=runner.targetSnapshot('bsc',2);
+    assert.deepEqual(snapshot.targets,[address(30),address(20)]);
+    assert.deepEqual(snapshot.priority,snapshot.targets);
+  } finally {await runner.stop();await f.runner.stop();rmSync(f.dir,{recursive:true,force:true});}
 });
 
 test('launcher realtime worker completes zero-match batches without a status scan or false capacity error',async()=>{

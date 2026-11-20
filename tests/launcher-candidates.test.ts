@@ -5,6 +5,8 @@ import {mkdtempSync,rmSync} from 'node:fs';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {performance} from 'node:perf_hooks';
+import {createHash} from 'node:crypto';
+import bs58 from 'bs58';
 import {
   LauncherCandidates,type LauncherCandidateProfileRoute,type LauncherRealtimeObservation,type LauncherActivityObservation,
 } from '../src/launcher-candidates.js';
@@ -15,40 +17,52 @@ const base=Date.parse('2026-11-18T00:00:00.000Z');
 const iso=(seconds:number)=>new Date(base+seconds*1000).toISOString();
 const address=(id:number)=>'0x'+id.toString(16).padStart(40,'0');
 const tx=(id:number)=>'0x'+id.toString(16).padStart(64,'0');
+const solAddress=(id:number)=>{const bytes=Buffer.alloc(32);bytes.writeUInt32BE(id,28);return bs58.encode(bytes);};
+const solTx=(id:number)=>{const bytes=Buffer.alloc(64);bytes.writeUInt32BE(id,60);return bs58.encode(bytes);};
 
-function roleQualification(wallet:string,peer:string,knownAt=iso(9_990),evidenceAt=iso(100)):WalletRoleQualification {
+function roleQualification(wallet:string,peer:string,knownAt=iso(950),evidenceAt=iso(100),network:'bsc'|'robinhood'|'solana'='bsc'):WalletRoleQualification {
   const evidenceBase=(Date.parse(evidenceAt)-base)/1000;
   const evidence=Array.from({length:3},(_,index):WalletRoleEvidence=>({
-    tokenAddress:address(100+index),direction:'lead',reason:'test lead',lagSeconds:20,
-    candidateBuy:{wallet,txHash:tx(100+index),eventAt:iso(evidenceBase+index*10),observedAt:iso(evidenceBase+1+index*10),source:'test'},
-    leaderBuy:{wallet:peer,txHash:tx(200+index),eventAt:iso(evidenceBase+20+index*10),observedAt:iso(evidenceBase+21+index*10),source:'test'},
+    tokenAddress:network==='solana'?solAddress(100+index):address(100+index),direction:'lead',reason:'test lead',lagSeconds:20,
+    candidateBuy:{wallet,txHash:network==='solana'?solTx(100+index):tx(100+index),eventAt:iso(evidenceBase+index*10),observedAt:iso(evidenceBase+1+index*10),source:'test'},
+    leaderBuy:{wallet:peer,txHash:network==='solana'?solTx(200+index):tx(200+index),eventAt:iso(evidenceBase+20+index*10),observedAt:iso(evidenceBase+21+index*10),source:'test'},
   }));
   return {version:1,knownAt,evidence};
 }
 
 function profile(id:number,route:LauncherCandidateProfileRoute,options:{evidenceAt?:string;computedAt?:string;invalidQualification?:boolean;
   prospectivePreTokens?:number;selectedTokens?:number;forwardObservedTokens?:number;qualificationKnownAt?:string;
-  chain?:'bsc'|'robinhood'}={}):WalletProfile {
-  const network=options.chain??'bsc',wallet=address(id),peer=address(900+id),evidenceAt=options.evidenceAt??iso(900),computedAt=options.computedAt??iso(1000);
+  chain?:'bsc'|'robinhood'|'solana';directPrecursor?:boolean}={}):WalletProfile {
+  const network=options.chain??'bsc',wallet=network==='solana'?solAddress(id):address(id),peer=network==='solana'?solAddress(900+id):address(900+id),
+    token=(value:number)=>network==='solana'?solAddress(value):address(value),hash=(value:number)=>network==='solana'?solTx(value):tx(value),
+    evidenceAt=options.evidenceAt??iso(900),computedAt=options.computedAt??iso(1000);
   const value:WalletProfile={chain:network,address:wallet,version:1,computedAt,evidenceThroughAt:evidenceAt,
     freshUntil:iso(20_000),status:'current',source:'wallet_history',sampleOnly:true,ownership:'unknown',groups:[],
     metrics:{observedEvents:3,buyEvents:3,sellEvents:0,distinctTokens:3,lastEventAt:evidenceAt,
       associations:{leaders:1,distinctTokens:3,forwardTokens:route==='B'?1:0},chain:{transactions:0,transfers:0}},
     counterparties:[],limitations:[]};
   if(route==='A'){
-    value.groups.push({id:'market_pre_candidate',firstObservedAt:iso(500),evidenceCount:1,reason:'test'});
-    const prospectivePreTokens=options.prospectivePreTokens??1,selectedTokens=options.selectedTokens??1;
-    value.initiatorAnalysis={version:1,chain:network,wallet,computedAt,status:'current',classification:'candidate',sampleOnly:true,
+    value.groups.push({id:options.directPrecursor?'market_precursor_pattern':'market_pre_candidate',firstObservedAt:iso(500),evidenceCount:1,reason:'test'});
+    const prospectivePreTokens=options.prospectivePreTokens??(options.directPrecursor?3:1),selectedTokens=options.selectedTokens??(options.directPrecursor?3:1);
+    const evidenceBase=(Date.parse(evidenceAt)-base)/1000;
+    const screeningEvidence=Array.from({length:options.directPrecursor?3:1},(_,index)=>({tokenAddress:token(500+id+index),direction:'pre' as const,
+      prospective:true,reason:'test',buy:{chain:network,wallet,tokenAddress:token(500+id+index),txHash:hash(500+id+index),side:'buy' as const,
+        eventAt:iso(evidenceBase+index),observedAt:iso(evidenceBase+index),source:'test'},
+      marketFirstSeen:{id:`market-${id}-${index}`,source:'gmgn_market_discovery' as const,kind:'first_seen' as const,chain:network,
+        tokenAddress:token(500+id+index),firstSeenLowerBound:iso(evidenceBase+index+1),firstSeenUpperBound:iso(evidenceBase+index+2),
+        feed:'trending' as const,window:'5m',leftCensored:false}}));
+    value.initiatorAnalysis={version:1,chain:network,wallet,computedAt,status:'current',classification:options.directPrecursor?'precursor':'candidate',sampleOnly:true,
       ownership:'unknown',tradingEnabled:false,dumpAssessment:'unknown',directionalTokens:{pre:1,post:0,ambiguous:0,outsideWindow:0,unmatched:0},
       totalCandidateTokens:selectedTokens,selectedTokens,matchedTokens:selectedTokens,preShare:1,prospectivePreTokens,postActivationExitTokens:0,
-      pendingTokens:0,unobservedTokens:0,evidence:[],screeningEvidence:[{tokenAddress:address(500+id),direction:'pre',prospective:true,reason:'test',
-        buy:{chain:network,wallet,tokenAddress:address(500+id),txHash:tx(500+id),side:'buy',eventAt:evidenceAt,observedAt:evidenceAt,source:'test'}}],
+      pendingTokens:0,unobservedTokens:0,evidence:[],screeningEvidence,
       reasons:[],counterEvidence:[],limitations:[],
       method:{minimumDirectionalTokens:3,minimumDirectionShare:.75,nearTimeSeconds:2,maximumLagSeconds:86400,evidenceLimit:6,qualificationEvidenceLimit:30}};
+    if(options.directPrecursor)value.initiatorAnalysis.qualification={version:1,classification:'precursor',knownAt:iso(Math.max(900,evidenceBase+10)),
+      proofHash:createHash('sha256').update(JSON.stringify(screeningEvidence)).digest('hex'),evidence:structuredClone(screeningEvidence)};
   }else{
     value.groups.push({id:'precursor_pattern',firstObservedAt:iso(500),evidenceCount:3,reason:'test'},
       {id:'forward_validated',firstObservedAt:iso(600),evidenceCount:1,reason:'test'});
-    const qualification=roleQualification(wallet,peer,options.qualificationKnownAt,options.evidenceAt);
+    const qualification=roleQualification(wallet,peer,options.qualificationKnownAt,options.evidenceAt,network);
     if(options.invalidQualification)qualification.evidence[0].leaderBuy!.txHash=qualification.evidence[0].candidateBuy!.txHash;
     value.roleAnalysis={version:1,computedAt,status:'current',ownership:'unknown',sampleOnly:true,limitations:[],
       method:{minimumDirectionalTokens:3,minimumDirectionShare:.75,nearTimeSeconds:2,maximumLagSeconds:86400,evidenceLimitPerPeer:6,screeningEvidenceLimitPerPeer:30},
@@ -88,6 +102,7 @@ test('indexed profile routes select A and validated B while rejecting malformed 
   try {
     const status=f.store.refresh();assert.equal(status.records,2);assert.deepEqual(status.routeCounts,{A:1,B:1});
     assert.equal(f.store.get('bsc',a.address)?.route,'A');assert.equal(f.store.get('bsc',b.address)?.route,'B');
+    assert.equal(f.store.get('bsc',a.address)?.tier,'direct_candidate');assert.equal(f.store.get('bsc',b.address)?.tier,'peer_precursor');
     assert.equal(f.store.get('bsc',invalid.address),undefined);
   } finally {f.close();}
 });
@@ -107,6 +122,131 @@ test('quality gates require prospective A share and recent same-peer forward evi
   } finally {f.close();}
 });
 
+test('mature direct precursors are retained, explicitly tiered and win a one-slot pool over weak candidates',()=>{
+  const weak=profile(1,'A',{chain:'solana'}),mature=profile(2,'A',{chain:'solana',directPrecursor:true}),
+    f=fixture([{profile:weak,route:'A'},{profile:mature,route:'A'}],{cap:1});
+  try {const status=f.store.refresh();assert.equal(status.records,1);
+    const candidate=f.store.get('solana',mature.address)!;assert.equal(candidate.tier,'direct_precursor');
+    assert.equal(candidate.route,'A');assert.equal(f.store.get('solana',weak.address),undefined);
+    assert.deepEqual(f.store.streamTargets('solana',1),[mature.address]);assert.deepEqual(f.store.matureAddresses('solana'),[mature.address]);
+  } finally {f.close();}
+});
+
+test('a self-consistent hash cannot promote a malformed market timing proof to mature precursor',()=>{
+  const corrupt=profile(31,'A',{chain:'solana',directPrecursor:true}),qualification=corrupt.initiatorAnalysis!.qualification!;
+  qualification.evidence[0].marketFirstSeen!.leftCensored=true;
+  qualification.proofHash=createHash('sha256').update(JSON.stringify(qualification.evidence)).digest('hex');
+  const f=fixture([{profile:corrupt,route:'A'}]);
+  try {f.store.refresh();assert.equal(f.store.get('solana',corrupt.address),undefined);}
+  finally {f.close();}
+});
+
+test('exact-token entry evidence is causal, retains earlier tokens and withdraws on a later observed sell',()=>{
+  const mature=profile(1,'A',{chain:'solana',directPrecursor:true}),weak=profile(2,'A',{chain:'solana'}),
+    f=fixture([{profile:mature,route:'A'},{profile:weak,route:'A'}]),tokenA=solAddress(700),tokenB=solAddress(701),
+    decision=new Date(fixtureClock()).toISOString(),firstSignal=new Date(fixtureClock()-10_000).toISOString(),
+    matureBuyAt=new Date(fixtureClock()-30_000).toISOString(),matureObservedAt=new Date(fixtureClock()-29_000).toISOString(),
+    weakBuyAt=new Date(fixtureClock()-20_000).toISOString(),weakObservedAt=new Date(fixtureClock()-19_000).toISOString();
+  function fixtureClock(){return base+10_000_000;}
+  try {
+    f.store.refresh();
+    assert.equal(f.store.observeActivity({chain:'solana',wallet:mature.address,checkedAt:matureObservedAt,eventAt:matureBuyAt,
+      classification:'buy',confirmation:'confirmed',txHash:solTx(700),tokenAddress:tokenA}),true);
+    assert.equal(f.store.observeActivity({chain:'solana',wallet:mature.address,checkedAt:new Date(f.clock.value-15_000).toISOString(),
+      eventAt:new Date(f.clock.value-16_000).toISOString(),classification:'buy',confirmation:'included',txHash:solTx(701),tokenAddress:tokenB}),true);
+    assert.equal(f.store.observeActivity({chain:'solana',wallet:weak.address,checkedAt:weakObservedAt,eventAt:weakBuyAt,
+      classification:'buy',confirmation:'included',txHash:solTx(702),tokenAddress:tokenA}),true);
+    let evidence=f.store.entryEvidence({tokenAddress:tokenA,firstSignalAt:firstSignal,decisionAt:decision});
+    assert.equal(evidence.status,'strong');assert.equal(evidence.authorizesTrade,false);assert.equal(evidence.sampleOnly,true);
+    assert.deepEqual(evidence.items.map(item=>[item.wallet,item.route,item.tier]),[
+      [mature.address,'A','direct_precursor'],[weak.address,'A','direct_candidate'],
+    ]);
+    assert.equal(evidence.items[0].qualifiedAt,mature.initiatorAnalysis!.qualification!.knownAt);assert.equal(evidence.items[0].buyAt,matureBuyAt);
+    const sellAt=new Date(f.clock.value-5_000).toISOString(),sellObservedAt=new Date(f.clock.value-4_000).toISOString();
+    assert.equal(f.store.observeActivity({chain:'solana',wallet:mature.address,checkedAt:sellObservedAt,eventAt:sellAt,
+      classification:'sell',confirmation:'confirmed',txHash:solTx(703),tokenAddress:tokenA}),true);
+    evidence=f.store.entryEvidence({tokenAddress:tokenA,firstSignalAt:firstSignal,decisionAt:decision});
+    assert.equal(evidence.status,'withdrawn');assert.equal(evidence.items[0].soldAt,sellAt);
+    assert.equal(f.store.retractActivity({chain:'solana',wallet:mature.address,checkedAt:decision,txHash:solTx(703)}),true);
+    evidence=f.store.entryEvidence({tokenAddress:tokenA,firstSignalAt:firstSignal,decisionAt:decision});assert.equal(evidence.status,'strong');
+    assert.equal(f.store.retractActivity({chain:'solana',wallet:mature.address,checkedAt:decision,txHash:solTx(700)}),true);
+    evidence=f.store.entryEvidence({tokenAddress:tokenA,firstSignalAt:firstSignal,decisionAt:decision});assert.equal(evidence.status,'advisory');
+    assert.equal(f.store.observeActivity({chain:'solana',wallet:weak.address,checkedAt:sellObservedAt,eventAt:sellAt,
+      classification:'sell',confirmation:'confirmed',txHash:solTx(704),tokenAddress:tokenA}),true);
+    evidence=f.store.entryEvidence({tokenAddress:tokenA,firstSignalAt:firstSignal,decisionAt:decision});assert.equal(evidence.status,'advisory');
+    assert.equal(f.store.observeActivity({chain:'solana',wallet:mature.address,checkedAt:matureObservedAt,eventAt:matureBuyAt,
+      classification:'buy',confirmation:'confirmed',txHash:solTx(700),tokenAddress:tokenA}),false);
+  } finally {f.close();}
+});
+
+test('entry evidence preserves post-signal observations for controller timing checks and rejects malformed activity',()=>{
+  const weak=profile(1,'A',{chain:'solana'}),f=fixture([{profile:weak,route:'A'}]),token=solAddress(800),other=solAddress(801),
+    decision=new Date(f.clock.value).toISOString(),firstSignal=new Date(f.clock.value-10_000).toISOString();
+  try {f.store.refresh();
+    assert.equal(f.store.observeActivity({chain:'solana',wallet:weak.address,checkedAt:new Date(f.clock.value-5_000).toISOString(),
+      eventAt:new Date(f.clock.value-30_000).toISOString(),classification:'buy',confirmation:'confirmed',txHash:solTx(800),tokenAddress:token}),true);
+    const postSignal=f.store.entryEvidence({tokenAddress:token,firstSignalAt:firstSignal,decisionAt:decision});
+    assert.equal(postSignal.status,'advisory');assert.ok(postSignal.items.every(item=>item.observedAt>firstSignal));
+    assert.equal(f.store.entryEvidence({tokenAddress:token,decisionAt:decision}).status,'advisory');
+    assert.equal(f.store.observeActivity({chain:'solana',wallet:weak.address,checkedAt:decision,eventAt:new Date(f.clock.value-2_000).toISOString(),
+      classification:'buy',confirmation:'confirmed',txHash:solTx(801),tokenAddress:token,
+      trades:[{tokenAddress:other,side:'buy'}]}),true);
+    assert.equal(f.store.entryEvidence({tokenAddress:other,decisionAt:decision}).status,'none');
+    assert.equal(f.store.observeActivity({chain:'solana',wallet:weak.address,checkedAt:decision,eventAt:decision,
+      classification:'transfer',confirmation:'confirmed',txHash:solTx(802),tokenAddress:other}),false);
+    assert.equal(f.store.entryEvidence({tokenAddress:token,decisionAt:decision,maxAgeMs:10_000}).status,'none');
+  } finally {f.close();}
+});
+
+test('entry evidence keeps active mature support when another mature wallet sold the same token',()=>{
+  const active=profile(11,'A',{chain:'solana',directPrecursor:true}),exited=profile(12,'A',{chain:'solana',directPrecursor:true}),
+    f=fixture([{profile:active,route:'A'},{profile:exited,route:'A'}]),token=solAddress(811),decision=new Date(f.clock.value).toISOString();
+  try {f.store.refresh();
+    for(const [index,wallet] of [active.address,exited.address].entries())assert.equal(f.store.observeActivity({chain:'solana',wallet,
+      eventAt:new Date(f.clock.value-30_000+index*1000).toISOString(),checkedAt:new Date(f.clock.value-29_000+index*1000).toISOString(),
+      classification:'buy',confirmation:'confirmed',txHash:solTx(811+index),tokenAddress:token}),true);
+    assert.equal(f.store.observeActivity({chain:'solana',wallet:exited.address,eventAt:new Date(f.clock.value-10_000).toISOString(),
+      checkedAt:new Date(f.clock.value-9_000).toISOString(),classification:'sell',confirmation:'confirmed',txHash:solTx(813),tokenAddress:token}),true);
+    const evidence=f.store.entryEvidence({tokenAddress:token,decisionAt:decision,maxAgeMs:6*60*60_000});
+    assert.equal(evidence.status,'strong');assert.equal(evidence.items.length,2);
+    assert.equal(evidence.items.find(item=>item.wallet===active.address)?.soldAt,undefined);
+    assert.ok(evidence.items.find(item=>item.wallet===exited.address)?.soldAt);
+    assert.ok(evidence.reasons.includes('OTHER_MATURE_LAUNCHER_SELL_OBSERVED'));
+  } finally {f.close();}
+});
+
+test('entry evidence uses an inclusive six-hour lower bound and rejects a wider request',()=>{
+  const boundary=profile(21,'A',{chain:'solana',directPrecursor:true}),older=profile(22,'A',{chain:'solana',directPrecursor:true}),
+    f=fixture([{profile:boundary,route:'A'},{profile:older,route:'A'}]),token=solAddress(821);
+  try {f.store.refresh();f.clock.value+=7*60*60_000;
+    const decision=new Date(f.clock.value).toISOString(),lower=f.clock.value-6*60*60_000;
+    assert.equal(f.store.observeActivity({chain:'solana',wallet:boundary.address,eventAt:new Date(lower).toISOString(),
+      checkedAt:new Date(lower+1).toISOString(),classification:'buy',confirmation:'confirmed',txHash:solTx(821),tokenAddress:token}),true);
+    assert.equal(f.store.observeActivity({chain:'solana',wallet:older.address,eventAt:new Date(lower-1).toISOString(),
+      checkedAt:new Date(lower).toISOString(),classification:'buy',confirmation:'confirmed',txHash:solTx(822),tokenAddress:token}),true);
+    const evidence=f.store.entryEvidence({tokenAddress:token,decisionAt:decision,maxAgeMs:6*60*60_000});
+    assert.deepEqual(evidence.items.map(item=>item.wallet),[boundary.address]);
+    assert.throws(()=>f.store.entryEvidence({tokenAddress:token,decisionAt:decision,maxAgeMs:6*60*60_000+1}),
+      /LAUNCHER_ENTRY_EVIDENCE_QUERY_INVALID/);
+  } finally {f.close();}
+});
+
+test('entry evidence never infers an observation time from legacy latest-side columns and the event ledger is bounded per wallet',()=>{
+  const weak=profile(1,'A',{chain:'solana'}),f=fixture([{profile:weak,route:'A'}]),legacyToken=solAddress(900),
+    db=()=>((f.store as unknown as {db:DatabaseSync}).db);
+  try {f.store.refresh();const legacyAt=new Date(f.clock.value-20_000).toISOString();
+    db().prepare(`UPDATE lc_candidates SET last_verified_buy_at=?,last_verified_buy_tx=?,last_verified_buy_token=?,
+      last_verified_buy_observed_at=NULL WHERE chain='solana' AND address=?`).run(legacyAt,solTx(900),legacyToken,weak.address);
+    assert.equal(f.store.entryEvidence(legacyToken,new Date(f.clock.value).toISOString()).status,'none');
+    for(let index=0;index<70;index++)assert.equal(f.store.observeActivity({chain:'solana',wallet:weak.address,
+      checkedAt:new Date(f.clock.value-(70-index)*1000).toISOString(),eventAt:new Date(f.clock.value-(70-index)*1000).toISOString(),
+      classification:'buy',confirmation:'confirmed',txHash:solTx(1000+index),tokenAddress:solAddress(1000+index)}),true);
+    assert.equal(Number((db().prepare("SELECT COUNT(*) AS n FROM lc_trade_events WHERE chain='solana' AND wallet=?").get(weak.address) as {n:number}).n),64);
+    assert.equal(f.store.entryEvidence(solAddress(1000),new Date(f.clock.value).toISOString()).status,'none');
+    assert.equal(f.store.entryEvidence(solAddress(1069),new Date(f.clock.value).toISOString()).status,'advisory');
+  } finally {f.close();}
+});
+
 test('computedAt never promotes an old seed; evidence time alone establishes fresh_verified',()=>{
   const historical=profile(1,'A',{evidenceAt:iso(100),computedAt:iso(9990)}),fresh=profile(2,'A',{evidenceAt:iso(9950),computedAt:iso(200)}),
     f=fixture([{profile:historical,route:'A'},{profile:fresh,route:'A'}],{freshAfterSec:200});
@@ -120,6 +260,7 @@ test('counterparty trades and generic chain observations cannot renew candidate 
   const a=profile(1,'A',{evidenceAt:iso(100)}),b=profile(2,'B',{evidenceAt:iso(100)});
   a.metrics.chain.lastObservedAt=iso(9_990);
   const qualification=b.roleAnalysis!.peers[0].qualification!;qualification.knownAt=iso(9_995);
+  b.roleAnalysis!.computedAt=iso(9_996);b.computedAt=iso(9_997);
   qualification.evidence.forEach((row,index)=>{row.leaderBuy!.eventAt=iso(9_950+index*10);row.leaderBuy!.observedAt=iso(9_951+index*10);});
   const f=fixture([{profile:a,route:'A'},{profile:b,route:'B'}],{freshAfterSec:200});
   try {f.store.refresh();assert.equal(f.store.get('bsc',a.address)?.state,'historical_seed');
@@ -291,8 +432,9 @@ test('retraction clears only an exactly matching latest side and repeated delive
     assert.equal(f.store.retractActivity({chain:'bsc',wallet:p.address,checkedAt,txHash:tx(999)}),false);
     let candidate=f.store.get('bsc',p.address)!;
     assert.equal(candidate.lastVerifiedBuyTx,tx(903));assert.equal(candidate.lastVerifiedSellTx,tx(902));
-    assert.equal(f.store.retractActivity({chain:'bsc',wallet:p.address,checkedAt,txHash:tx(901)}),false);
+    assert.equal(f.store.retractActivity({chain:'bsc',wallet:p.address,checkedAt,txHash:tx(901)}),true);
     assert.equal(f.store.get('bsc',p.address)!.lastVerifiedBuyTx,tx(903));
+    assert.equal(f.store.retractActivity({chain:'bsc',wallet:p.address,checkedAt,txHash:tx(901)}),false);
     assert.equal(f.store.retractActivity({chain:'bsc',wallet:p.address,checkedAt,txHash:tx(903)}),true);
     candidate=f.store.get('bsc',p.address)!;assert.equal(candidate.lastVerifiedBuyTx,undefined);
     assert.equal(candidate.lastVerifiedSellTx,tx(902));assert.equal(candidate.verifiedActivityAt,sellAt);
@@ -363,12 +505,12 @@ test('revalidation persists RPC facts but an unclassified new signature is only 
   } finally {f.close();}
 });
 
-test('cap is deterministic, A precedes B, and list/get/streamTargets expose only the compact pool',()=>{
+test('cap is deterministic, mature peer evidence precedes weak A, and list/get/streamTargets expose only the compact pool',()=>{
   const rows=[{profile:profile(3,'B'),route:'B' as const},{profile:profile(2,'A'),route:'A' as const},{profile:profile(1,'A'),route:'A' as const}],
     f=fixture(rows,{cap:2});
   try {const status=f.store.refresh();assert.equal(status.records,2);assert.equal(status.cap,2);
-    const page=f.store.list({limit:10});assert.equal(page.total,2);assert.deepEqual(page.items.map(x=>x.address),[address(1),address(2)]);
-    assert.deepEqual(f.store.streamTargets('bsc',10),[address(1),address(2)]);assert.equal(f.store.get('bsc',address(3)),undefined);}
+    const page=f.store.list({limit:10});assert.equal(page.total,2);assert.deepEqual(page.items.map(x=>x.address),[address(3),address(1)]);
+    assert.deepEqual(f.store.streamTargets('bsc',10),[address(3),address(1)]);assert.equal(f.store.get('bsc',address(2)),undefined);}
   finally {f.close();}
 });
 
@@ -433,8 +575,10 @@ test('legacy activity migrates without being reinterpreted as a verified buy',()
     assert.equal(candidate.dimensions.verifiedTradeFresh,false);assert.equal(candidate.state,'historical_seed');
   } finally {store.close();}
   const migrated=new DatabaseSync(database,{readOnly:true}),columns=new Set(migrated.prepare('PRAGMA table_info(lc_candidates)').all().map(row=>String(row.name)));
-  for(const column of ['last_verified_buy_at','last_verified_buy_tx','last_verified_buy_token','last_verified_sell_at','last_verified_sell_tx','last_verified_sell_token'])
+  for(const column of ['last_verified_buy_at','last_verified_buy_observed_at','last_verified_buy_tx','last_verified_buy_token',
+    'last_verified_sell_at','last_verified_sell_observed_at','last_verified_sell_tx','last_verified_sell_token'])
     assert.equal(columns.has(column),true);
+  assert.equal(!!migrated.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='lc_trade_events'").get(),true);
   migrated.close();rmSync(dir,{recursive:true,force:true});
 });
 

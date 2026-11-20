@@ -248,6 +248,15 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
   let launcherRefreshTimer:ReturnType<typeof setInterval>|undefined,launcherError:string|undefined,launcherShutdownError:string|undefined,
     walletPriceShutdownError:string|undefined,walletFastResearchShutdownError:string|undefined,walletFastPersistenceShutdownError:string|undefined,
     walletObserverShutdownError:string|undefined,chainStreamShutdownError:string|undefined;
+  const persistLauncherActivity=async(activity:WalletActivity):Promise<void>=>{
+    const persistence=walletFastPersistence;
+    if(!persistence)throw new Error('LAUNCHER_ACTIVITY_PERSISTENCE_UNAVAILABLE');
+    // The revalidator may begin before the socket runner. Start this idempotent
+    // bridge here as well so its classified baseline cannot bypass the unified
+    // activity, launcher and wallet-history durability boundary.
+    persistence.start();
+    if(!await persistence.persist(activity))throw new Error('LAUNCHER_ACTIVITY_PERSISTENCE_REJECTED');
+  };
   const openLauncherCandidates=()=>{
     if(!config.launcherCandidates.enabled)return;
     if(!launcherCandidates){
@@ -270,7 +279,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
         pollIntervalMs:config.launcherCandidates.revalidateIntervalSec*1000,source:{
           listCandidates:limit=>launcherCandidates?.listRevalidation('solana',limit)??[],
           recordResult:result=>launcherCandidates?.recordRevalidation(result)??false,
-          onActivity:activity=>{if(activity.eventAt)launcherCandidates?.observeActivity(activity);},
+          onActivity:persistLauncherActivity,
         }});}catch {launcherError='LAUNCHER_REVALIDATOR_START_FAILED';}
     if(launcherRefresh&&(!endpoint||launcherRevalidator)&&(!config.walletFast?.enabled||launcherCoverageWriter))launcherError=undefined;
   };
@@ -1085,6 +1094,10 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
     onDecision:(report,result,at)=>{try{dailyReview?.recordEntry(report,result,config.entryMode,at);entryAuditError=undefined;}catch{entryAuditError='ENTRY_AUDIT_WRITE_FAILED';}}});
   thirdEntry=new ThirdSignalEntryController(config,orders,{enabled:config.thirdSignalExecutionMode==='live',
     isActive:candidate=>!closed&&signalCounting.isActive(candidate),fetcher:dependencies.entryFetcher,
+    ...(config.launcherCandidates.enabled?{readLauncherEvidence:query=>{
+      if(!launcherCandidates)throw Error('LAUNCHER_EVIDENCE_PROVIDER_UNAVAILABLE');
+      return launcherCandidates.entryEvidence(query);
+    }}:{}),
     // Holder risk is fetched only for a prepared opening, never by price/research timers.
     readHolderRisk:address=>entryHolderReader.readHolderRisk(address),
     ...(config.solanaExecutionProvider==='pump_native'?{native:{
@@ -1226,12 +1239,12 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
         for(const chain of Object.keys(config.chainStream.endpoints) as Chain[]){
           const limit=fastWalletLimit(chain),addresses=new Set<string>();
           const launcher=measured('launcherTargets',()=>launcherRealtimeWriter?.targetSnapshot(chain,limit)??
-            {targets:[],membership:new Set<string>()});
+            {targets:[],priority:[],membership:new Set<string>()});
           for(const address of launcher.targets)addresses.add(address);
           // Reserve room for multiple research cohorts rather than only the largest reported profits.
           for(const address of measured('profileMetadata',()=>walletProfiles?.fastTargetAddresses(chain,limit)??[]))addresses.add(address);
           for(const address of measured('walletHistoryTargets',()=>walletIndexRunner?.fastTargetAddresses(chain,limit)??[]))addresses.add(address);
-          const selected=measured('targetAssembly',()=>mergePinnedWallets(chain,fastTargets.select(chain,[...addresses],limit,now),
+          const selected=measured('targetAssembly',()=>mergePinnedWallets(chain,fastTargets.select(chain,[...addresses],limit,now,launcher.priority),
             config.chainStream.pinnedWallets?.[chain]));
           const profiles=measured('profileMetadata',()=>new Map((walletProfiles?.fastMetadata(selected.map(address=>({chain,address})))??[])
             .map(p=>[p.address,p])));
@@ -1527,7 +1540,7 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
     start(){
       if(closed) return;
       syncLiveLatencyPriority();
-      openLauncherCandidates();launcherRefresh?.start();launcherRevalidator?.start();
+      openLauncherCandidates();launcherRefresh?.start();
       if(config.launcherCandidates.enabled&&!launcherRefreshTimer){launcherRefreshTimer=setInterval(()=>{
         openLauncherCandidates();launcherRefresh?.start();launcherRevalidator?.start();launcherCoverageWriter?.start();
       },config.launcherCandidates.refreshIntervalSec*1000);launcherRefreshTimer.unref();}
@@ -1598,7 +1611,8 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       // Start the low-latency worker after every synchronous startup hook has
       // returned. Otherwise chain notifications can sit in the main-thread
       // mailbox while large local indexes are still opening.
-      launcherCoverageWriter?.start();launcherRealtimeWriter?.start();walletFastPersistence?.start();walletFastResearch?.start();walletFast?.start();
+      launcherCoverageWriter?.start();launcherRealtimeWriter?.start();walletFastPersistence?.start();launcherRevalidator?.start();
+      walletFastResearch?.start();walletFast?.start();
     },
     async close(){
       beginClose();

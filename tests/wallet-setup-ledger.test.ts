@@ -63,8 +63,11 @@ test('wallet opportunity pages use ordered indexes instead of sorting the retain
 
 test('registration freezes the initial proof and real registration time across refreshes and renamed setup IDs',()=>{
   const f=fixture();try{
-    f.ledger.record(report());const first=f.one();assert.equal(first.registeredAt,iso(100));assert.equal(first.state,'awaiting_leader');assert.equal(first.proof.trigger.eventAt,iso(90));
-    f.advance(110);f.ledger.record(report({id:'changed',priorityScore:99,reasons:['changed proof']},{checkedAt:iso(110)}));
+    const accepted=f.ledger.record(report());assert.equal(accepted.status,'accepted');assert.equal(accepted.outcomes[0].status,'accepted');
+    const existing=f.ledger.record(report());assert.equal(existing.status,'existing');assert.equal(existing.outcomes[0].reason,'WALLET_SETUP_LEDGER_EXISTING');
+    const first=f.one();assert.equal(first.registeredAt,iso(100));assert.equal(first.state,'awaiting_leader');assert.equal(first.proof.trigger.eventAt,iso(90));
+    f.advance(110);const conflict=f.ledger.record(report({id:'changed',priorityScore:99,reasons:['changed proof']},{checkedAt:iso(110)}));
+    assert.equal(conflict.status,'rejected');assert.equal(conflict.outcomes[0].reason,'WALLET_SETUP_LEDGER_EXISTING_CONFLICT');
     assert.deepEqual(f.one(),first);assert.equal(f.ledger.status().records,1);
     assert.throws(()=>{(first.proof.reasons as string[]).push('mutated');},TypeError);assert.equal(f.one().proof.reasons.length,1);
   }finally{f.ledger.close();}
@@ -263,8 +266,9 @@ test('Solana addresses and signatures preserve their canonical case',()=>{
 
 test('capacity stops new records while preserving room for existing opportunity observations',()=>{
   const f=fixture({maxBytes:262144});try{
-    for(let i=0;i<20;i++)f.ledger.record(report({trigger:event(90,{wallet,txHash:hash(900+i)})}));
+    const results=[];for(let i=0;i<20;i++)results.push(f.ledger.record(report({trigger:event(90,{wallet,txHash:hash(900+i)})})));
     const count=f.ledger.status().records;assert.ok(count>0&&count<20);assert.equal(f.ledger.status().capacityReached,true);
+    assert.ok(results.some(result=>result.status==='rejected'&&result.outcomes[0]?.reason==='WALLET_SETUP_LEDGER_CAPACITY'));
     f.advance(120);f.ledger.observe(token,[event(105),event(110,{wallet,side:'sell'})]);
     assert.equal(f.ledger.status().records,count);assert.equal(f.ledger.status().stateCounts.reduced,count);assert.ok(f.ledger.status().bytes<=262144);
   }finally{f.ledger.close();}

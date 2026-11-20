@@ -50,6 +50,9 @@ export interface ThirdSignalNotificationSnapshot {
 export interface ThirdSignalCandidate {
   id:string;runId:string;windowId:string;source:ThirdSignalSource;chain:ThirdSignalChain;address:string;
   eventId:string;count:3;marketCapUsd:number;occurredAt:string;receivedAt:string;createdAt:string;
+  /** First receipt in this source-bound six-hour window. New candidates always
+   * carry it; it remains optional while old durable candidate rows age out. */
+  firstReceivedAt?:string;
   name?:string;symbol?:string;mode:ThirdSignalMode;executionEnabled:boolean;phase:'simulation_candidate'|'live_candidate';
 }
 export interface ThirdSignalExecution {
@@ -306,6 +309,7 @@ export class ThirdSignalStrategy {
           reason=run.mode==='live'?'THIRD_SIGNAL_LIVE_CANDIDATE':'THIRD_SIGNAL_SIMULATION_CANDIDATE';
           const candidate:ThirdSignalCandidate={id:candidateId,runId:run.id,windowId,source:input.source,chain:input.chain,address,
             eventId:input.eventId,count:3,marketCapUsd:marketCap,occurredAt:iso(occurred),receivedAt:iso(received),createdAt:iso(now),
+            firstReceivedAt:iso(reset?received:prior.first_at),
             ...(name?{name}:{}),...(symbol?{symbol}:{}),mode:run.mode,executionEnabled:run.mode==='live',phase:run.mode==='live'?'live_candidate':'simulation_candidate'};
           this.db.prepare('INSERT INTO third_signal_candidates VALUES (?,?,?,?,?)').run(candidateId,run.id,windowId,now,JSON.stringify(candidate));
           this.db.prepare(`INSERT INTO third_signal_claims(chain,address,phase,claimed_at,record_id,source)

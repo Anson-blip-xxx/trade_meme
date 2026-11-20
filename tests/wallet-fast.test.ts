@@ -23,6 +23,12 @@ test('target residence prevents profile refresh churn, fills vacancies and rotat
     targets:many.map(wallet=>({chain:'bsc' as const,wallet,groups:['launcher_candidate']})),tokens:[]});
   assert.equal(judge.status().targets,135);
 });
+test('new mature launcher priorities enter immediately without waiting for the five-minute rotation',()=>{
+  const picker=new WalletFastTargets(),first='0x'+'1'.repeat(40),second='0x'+'2'.repeat(40),mature='0x'+'3'.repeat(40);
+  assert.deepEqual(picker.select('bsc',[first,second],2,at),[first,second]);
+  assert.deepEqual(picker.select('bsc',[mature,first,second],2,at+30_000,[mature]),[mature,first]);
+  assert.deepEqual(picker.select('bsc',[second,first],2,at+60_000,[mature]),[mature,first]);
+});
 function fixture(){const clock={now:at,mono:10},judge=new WalletFastJudge(()=>clock.now,()=>clock.mono);
   const snapshot={at:new Date(at).toISOString(),validUntil:new Date(at+120000).toISOString(),targets:[
     {chain:'bsc' as const,wallet,groups:['forward_validated'],profileUntil:new Date(at+60000).toISOString()},

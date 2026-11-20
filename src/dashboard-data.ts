@@ -36,6 +36,24 @@ function projectOrder(order:OpeningOrder) {
   const raw=order.details.token,token=raw&&typeof raw==='object'&&!Array.isArray(raw)?raw as Record<string,unknown>:undefined;
   const display=(value:unknown,max:number)=>typeof value==='string'?value.replace(/[\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069]/g,' ').trim().slice(0,max)||undefined:undefined;
   const matched=token?.chain===order.chain&&token?.address===order.tokenAddress;
+  const launcherRaw=order.details.launcherEntry,launcher=launcherRaw&&typeof launcherRaw==='object'&&!Array.isArray(launcherRaw)?launcherRaw as Record<string,unknown>:undefined;
+  const launcherStatus=['head_confirmed','head_corroborating','head_weak','head_exited','none','unavailable'].includes(String(launcher?.status))?
+    String(launcher!.status):undefined;
+  const launcherEnvelope=launcher?.version==='third-signal-launcher-v1'&&launcher.tokenAddress===order.tokenAddress&&
+    launcher.sampleOnly===true&&launcher.authorizesTrade===false&&!!launcherStatus&&Array.isArray(launcher.items)&&launcher.items.length<=50;
+  const launcherRawItems=launcherEnvelope?launcher!.items as unknown[]:undefined;
+  const launcherItems=launcherRawItems?launcherRawItems.slice(0,10).flatMap((value:unknown)=>{
+      if(!value||typeof value!=='object'||Array.isArray(value))return [];
+      const item=value as Record<string,unknown>,wallet=display(item.wallet,60),txHash=display(item.txHash,100),
+        tier=['direct_precursor','peer_precursor','direct_candidate'].includes(String(item.tier))?String(item.tier):undefined;
+      const buyAt=display(item.buyAt,40),observedAt=display(item.observedAt,40),soldAt=display(item.soldAt,40),mature=tier!=='direct_candidate',
+        tierMatches=launcherStatus==='head_weak'?!mature:['head_confirmed','head_corroborating','head_exited'].includes(launcherStatus!)?mature:true,
+        exitMatches=launcherStatus==='head_exited'?!!soldAt:!soldAt;
+      return wallet&&txHash&&tier&&buyAt&&observedAt&&tierMatches&&exitMatches?[{wallet,txHash,tier,buyAt,observedAt,...(soldAt?{soldAt}:{})}]:[];
+    }):undefined;
+  const launcherEntry=launcherEnvelope&&((launcherStatus==='none'||launcherStatus==='unavailable')?
+    launcherRawItems!.length===0:!!launcherItems?.length)?{status:launcherStatus!,checkedAt:display(launcher!.checkedAt,40),
+      firstSignalAt:display(launcher!.firstSignalAt,40),wallets:launcherItems??[]}:undefined;
   return {id:order.id,chain:order.chain,tokenAddress:order.tokenAddress,
     ...(matched?{name:display(token.name,80),symbol:display(token.symbol,40)}:{}),
     createdAt:order.createdAt,updatedAt:order.updatedAt,status:order.status,mode:order.mode,
@@ -45,6 +63,7 @@ function projectOrder(order:OpeningOrder) {
     amountBasis:order.actualInputAmount?'actual':'requested',
     inputSymbol:nativeCurrency(order.chain).symbol,transactionHash:order.transactionHash,
     failureReason:order.failureReason,
+    ...(launcherEntry?{launcherEntry}:{}),
     entryHolderRisk:normalizeStoredEntryHolderRisk(order.details.entryHolderRisk,{chain:order.chain,address:order.tokenAddress}),
     entryHolderRiskBlocked:order.status==='failed'&&!!order.failureReason?.startsWith('ENTRY_HOLDER_RISK_')&&!order.providerOrderId&&!order.transactionHash,
     // Explicit projection: never return the request body, signing material or raw provider response.

@@ -26,12 +26,13 @@ export function mergePinnedWallets(chain:Chain,automatic:readonly string[],pinne
 /** Keep subscriptions stable while profile evidence continues to refresh every 30 seconds. */
 export class WalletFastTargets {
   private selected=new Map<Chain,{wallets:string[];rotateAt:number}>();
-  select(chain:Chain,candidates:readonly string[],limit:number,now:number):string[]{
+  select(chain:Chain,candidates:readonly string[],limit:number,now:number,priorityCandidates:readonly string[]=[]):string[]{
     const cap=Math.max(1,Math.min(200,Math.trunc(limit)));
-    const previous=this.selected.get(chain);
-    const wallets=previous&&now<previous.rotateAt?previous.wallets.slice(0,cap):[];
+    const previous=this.selected.get(chain),stable=!!previous&&now<previous.rotateAt,wallets:string[]=[];
+    for(const value of priorityCandidates){const wallet=chainAddress(chain,value);if(wallet&&!wallets.includes(wallet)&&wallets.length<cap)wallets.push(wallet);}
+    if(stable)for(const wallet of previous.wallets)if(!wallets.includes(wallet)&&wallets.length<cap)wallets.push(wallet);
     for(const value of candidates){const wallet=chainAddress(chain,value);if(wallet&&!wallets.includes(wallet)&&wallets.length<cap)wallets.push(wallet);}
-    this.selected.set(chain,{wallets,rotateAt:previous&&now<previous.rotateAt?previous.rotateAt:now+300000});
+    this.selected.set(chain,{wallets,rotateAt:stable?previous.rotateAt:now+300000});
     return [...wallets];
   }
 }

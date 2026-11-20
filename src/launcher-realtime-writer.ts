@@ -26,7 +26,7 @@ export class LauncherRealtimeWriterRunner {
   private readonly maxAttempts:number;private readonly restartDelayMs:number;private readonly workerTimeoutMs:number;
   private readonly targetRefreshMs:number;
   private pending=new Map<string,WorkItem>();private inFlight?:{id:number;items:WorkItem[];startedAt:number};
-  private targets:Partial<Record<Chain,{targets:string[];membership:string[]}>>={};private targetsAt?:string;
+  private targets:Partial<Record<Chain,{targets:string[];priority:string[];membership:string[]}>>={};private targetsAt?:string;
   private worker?:Worker;private dispatchTimer?:ReturnType<typeof setTimeout>;private targetTimer?:ReturnType<typeof setInterval>;
   private retry?:ReturnType<typeof setTimeout>;private watchdog?:ReturnType<typeof setInterval>;
   private drainWaiters=new Set<DrainWaiter>();private accepting=true;private running=false;private ready=false;private stopping=false;
@@ -68,9 +68,10 @@ export class LauncherRealtimeWriterRunner {
     this.pending.set(prepared.key,prepared);this.enqueued++;this.schedule();return true;
   }
 
-  targetSnapshot(chain:Chain,limit=this.options.targetLimits[chain]??30):{targets:string[];membership:Set<string>;computedAt?:string}{
+  targetSnapshot(chain:Chain,limit=this.options.targetLimits[chain]??30):{targets:string[];priority:string[];membership:Set<string>;computedAt?:string}{
     const cached=this.targets[chain],size=Math.max(1,Math.min(5000,Math.trunc(limit)));
-    return {targets:(cached?.targets??[]).slice(0,size),membership:new Set(cached?.membership??[]),computedAt:this.targetsAt};
+    return {targets:(cached?.targets??[]).slice(0,size),priority:(cached?.priority??[]).slice(0,size),
+      membership:new Set(cached?.membership??[]),computedAt:this.targetsAt};
   }
 
   status(){let oldest=Infinity;for(const item of this.pending.values())oldest=Math.min(oldest,item.enqueuedAt);
@@ -84,6 +85,7 @@ export class LauncherRealtimeWriterRunner {
       lastBatchMs:this.lastBatchMs,maxBatchMs:this.maxBatchMs,oldestPendingMs:Number.isFinite(oldest)?Math.max(0,Date.now()-oldest):0,
       lastCompletedAt:this.lastCompletedAt,targetsAt:this.targetsAt,
       targetCounts:Object.fromEntries(CHAINS.map(chain=>[chain,this.targets[chain]?.targets.length??0])),
+      priorityTargetCounts:Object.fromEntries(CHAINS.map(chain=>[chain,this.targets[chain]?.priority.length??0])),
       membershipCounts:Object.fromEntries(CHAINS.map(chain=>[chain,this.targets[chain]?.membership.length??0])),
       ...(this.error?{error:this.error}:{}),...(this.targetError?{targetError:this.targetError}:{})};}
 
@@ -126,12 +128,16 @@ export class LauncherRealtimeWriterRunner {
       worker.on('exit',()=>this.handleExit(worker));
     } catch {this.error='LAUNCHER_REALTIME_WRITER_START_FAILED';this.scheduleRestart();}}
   private acceptTargets(message:any):void {if(!message?.chains||typeof message.chains!=='object'||typeof message.computedAt!=='string'||!Number.isFinite(Date.parse(message.computedAt)))return;
-    const next:Partial<Record<Chain,{targets:string[];membership:string[]}>>={};
+    const next:Partial<Record<Chain,{targets:string[];priority:string[];membership:string[]}>>={};
     for(const chain of CHAINS){const row=message.chains[chain];if(!row)continue;const limit=this.options.targetLimits[chain]??0;
-      if(!Array.isArray(row.targets)||!Array.isArray(row.membership)||row.targets.length>limit||row.membership.length>(this.options.cap??5000))continue;
+      if(!Array.isArray(row.targets)||!Array.isArray(row.priority)||!Array.isArray(row.membership)||row.targets.length>limit||
+        row.priority.length>limit||row.membership.length>(this.options.cap??5000))continue;
       const targets:string[]=row.targets.flatMap((v:unknown)=>{const value=chainAddress(chain,v);return value?[value]:[];}),
+        priority:string[]=row.priority.flatMap((v:unknown)=>{const value=chainAddress(chain,v);return value?[value]:[];}),
         membership:string[]=row.membership.flatMap((v:unknown)=>{const value=chainAddress(chain,v);return value?[value]:[];});
-      if(targets.length!==row.targets.length||membership.length!==row.membership.length)continue;next[chain]={targets:[...new Set(targets)],membership:[...new Set(membership)]};}
+      if(targets.length!==row.targets.length||priority.length!==row.priority.length||membership.length!==row.membership.length||
+        priority.some((wallet:string)=>!targets.includes(wallet)||!membership.includes(wallet)))continue;
+      next[chain]={targets:[...new Set(targets)],priority:[...new Set(priority)],membership:[...new Set(membership)]};}
     this.targets=next;this.targetsAt=message.computedAt;this.targetError=undefined;}
   private requestTargets():void {if(!this.ready||!this.worker)return;try{this.worker.postMessage({type:'targets'});}catch{this.targetError='LAUNCHER_REALTIME_TARGET_READ_FAILED';}}
   private schedule(delay=this.delayMs):void {if(this.dispatchTimer||!this.ready||!this.worker||this.inFlight||!this.pending.size)return;

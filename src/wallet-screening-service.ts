@@ -66,8 +66,26 @@ export class WalletScreeningService {
     if(!cohort||now.getTime()-cohort.at>=60000||now.getTime()<cohort.at){cohort={at:now.getTime(),values:this.profiles.profitCohort(signal.token.chain,now)};this.cohorts.set(signal.token.chain,cohort);}
     const result=analyzeWalletScreening({token:signal.token,now:now.toISOString(),trades,profiles,wallets:analysis,
       snapshot:research?.snapshot,profitCohort:cohort.values,truncated:raw.truncated||addresses.length>64||peers.length>128});
-    // A failed durable registration cannot masquerade as a recorded forward observation.
-    this.ledger.record(result);this.error=undefined;
+    // A supported result is trading evidence only after the exact setup has a
+    // durable, matching registration. Capacity and write failures remain watch
+    // research instead of masquerading as recorded forward observations.
+    let recorded:ReturnType<WalletSetupLedger['record']>;
+    try {recorded=this.ledger.record(result);}
+    catch {recorded={status:'rejected',outcomes:result.setups.map(setup=>({setupId:setup.id,status:'rejected',reason:'WALLET_SETUP_LEDGER_WRITE_FAILED'}))};}
+    const outcomes=new Map(recorded.outcomes.map(outcome=>[outcome.setupId,outcome]));
+    let writeFailed=false;
+    for(const setup of result.setups){
+      if(setup.status!=='supported')continue;
+      const outcome=outcomes.get(setup.id);
+      if(outcome&&(outcome.status==='accepted'||outcome.status==='existing'))continue;
+      const reason=outcome?.reason??'WALLET_SETUP_LEDGER_REJECTED';
+      setup.status='watch';setup.reasons=[...new Set([...setup.reasons,'WALLET_SETUP_NOT_DURABLY_RECORDED',reason])];
+      result.reasons.push('WALLET_SETUP_NOT_DURABLY_RECORDED',reason);
+      if(reason==='WALLET_SETUP_LEDGER_WRITE_FAILED')writeFailed=true;
+    }
+    result.reasons=[...new Set(result.reasons)];
+    result.status=result.setups.some(setup=>setup.status==='supported')?'supported':result.setups.length?'watch':'unavailable';
+    this.error=writeFailed?'WALLET_SETUP_LEDGER_WRITE_FAILED':undefined;
     return result;
   }
   /** Re-read local counterevidence after quote/queue waits; the frozen report is never authority for later events. */

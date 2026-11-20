@@ -27,6 +27,7 @@ test('explicit start begins at zero; only the third independent event creates a 
     const third=s.observe(f.event({name:'Example',symbol:'EX'}));
     assert.equal(third.status,'candidate');assert.equal(third.count,3);assert.equal(third.candidate?.marketCapUsd,100000);
     assert.equal(third.candidate?.phase,'simulation_candidate');assert.equal(third.candidate?.executionEnabled,false);
+    assert.equal(third.candidate?.firstReceivedAt,new Date(epoch).toISOString());
     assert.equal(s.observe(f.event()).reason,'AFTER_THIRD_NOTIFICATION');assert.equal(s.candidates().total,1);
     assert.equal(s.status().globalClaims,1);assert.equal(s.list().items[0].count,4);
     assert.equal(statSync(f.path).mode&0o777,0o600);
@@ -47,7 +48,8 @@ test('duplicate delivery is atomically deduplicated across connections and never
 test('independent events renew a six-hour idle window and an exact six-hour gap starts a new count',()=>{
   const f=fixture();try {
     const s=f.open();s.start();s.observe(f.event());f.advance(5*hour);assert.equal(s.observe(f.event()).count,2);
-    f.advance(5*hour);assert.equal(s.observe(f.event()).status,'candidate');
+    f.advance(5*hour);const third=s.observe(f.event());assert.equal(third.status,'candidate');
+    assert.equal(third.candidate?.firstReceivedAt,new Date(epoch).toISOString());
     const prior=s.list().items[0];assert.equal(prior.firstReceivedAt,new Date(epoch).toISOString());
     assert.equal(prior.expiresAt,new Date(epoch+16*hour).toISOString());
     f.advance(6*hour);assert.equal(s.list().items[0].expired,true);

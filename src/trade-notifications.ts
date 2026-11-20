@@ -38,6 +38,7 @@ interface Tracking {
   nativeTiming?:NativeExecutionTiming;
   baseline?:PricePoint;latest?:PricePoint;peak?:PricePoint;milestones:number[];
   baselineKind?:'fill'|'observation';
+  launcherEntry?:{status:'head_confirmed'|'head_corroborating'|'head_weak'|'head_exited';wallets:number};
   closedByAuthority?:true;
 }
 const PRICE_SOURCES=new Set(['dexscreener_token_pairs_sample','gmgn_token_info_sample',
@@ -95,6 +96,31 @@ function nativeTimingText(timing:NativeExecutionTiming|undefined,acceptedAt?:str
   if(timing.confirmedAfterMs!==undefined)return `实际耗时：${duration(timing.confirmedAfterMs)}（执行开始→链上 confirmed 核验）`;
   if(timing.submittedAfterMs!==undefined)return `Jito 回执：${duration(timing.submittedAfterMs)}`;
   return timing.clockInvalid?'实际耗时暂不可核验。':'';
+}
+function launcherEntrySummary(value:unknown,tokenAddress:string):Tracking['launcherEntry']|undefined {
+  if(!object(value)||value.version!=='third-signal-launcher-v1'||value.tokenAddress!==tokenAddress||
+    value.sampleOnly!==true||value.authorizesTrade!==false||
+    !['head_confirmed','head_corroborating','head_weak','head_exited'].includes(String(value.status))||
+    !Array.isArray(value.items)||value.items.length<1||value.items.length>50)return;
+  const status=value.status as NonNullable<Tracking['launcherEntry']>['status'];
+  const valid=value.items.filter(item=>object(item)&&typeof item.wallet==='string'&&item.wallet.length>=32&&item.wallet.length<=44&&
+    typeof item.txHash==='string'&&item.txHash.length>=64&&item.txHash.length<=88&&typeof item.buyAt==='string'&&
+    typeof item.observedAt==='string'&&Number.isFinite(Date.parse(item.buyAt))&&Number.isFinite(Date.parse(item.observedAt))&&
+    ['direct_precursor','peer_precursor','direct_candidate'].includes(String(item.tier))&&
+    (status==='head_weak'?(item.tier==='direct_candidate'&&item.soldAt===undefined):item.tier!=='direct_candidate'&&
+      (status==='head_exited'?typeof item.soldAt==='string':item.soldAt===undefined)));
+  if(!valid.length)return;
+  return {status,wallets:valid.length};
+}
+function launcherEntryText(value:Tracking['launcherEntry'],failureReason?:string):string|undefined {
+  if(!value)return;
+  if(failureReason==='ENTRY_LAUNCHER_SUPPORT_WITHDRAWN')return '车头画像：广播前复核发现原车头已卖出，本次开仓已取消';
+  if(['ENTRY_LAUNCHER_SUPPORT_UNAVAILABLE','ENTRY_LAUNCHER_SUPPORT_CHANGED'].includes(failureReason??''))
+    return '车头画像：广播前未能保留原车头支持，本次开仓已取消';
+  if(value.status==='head_confirmed')return `车头画像：首条信号前确认 ${value.wallets} 个成熟钱包`;
+  if(value.status==='head_corroborating')return `车头画像：首条信号后有 ${value.wallets} 个成熟钱包跟进`;
+  if(value.status==='head_weak')return `车头画像：${value.wallets} 个单样本候选，仅作观察`;
+  return `车头画像：观察到 ${value.wallets} 个成熟钱包的同币卖出反证`;
 }
 
 /** Converts durable order facts and current observed prices into a durable notification outbox.
@@ -184,6 +210,7 @@ export class TradeNotifications {
     const eventKey=`trade:${state.order.id}:${suffix}`;
     const title=state.name||state.symbol||'未命名代币';
     const timing=state.nativeManaged?nativeTimingText(state.nativeTiming,state.instructionAcceptedAt,state.nativeFinalizedAt):'';
+    const launcher=launcherEntryText(state.launcherEntry,state.order.failureReason);
     if(state.manualNative&&['confirmed','failed','unknown'].includes(suffix)){
       const status=suffix==='confirmed'?'✅ 链上成交已确认':suffix==='failed'?`❌ 买入失败 · ${code(state.order.failureReason)}`:
         `⚠️ 结果待链上核验，不会重复下单 · ${code(state.order.failureReason)}`;
@@ -198,7 +225,7 @@ export class TradeNotifications {
         .run(eventKey,text,this.now());
       return;
     }
-    const text=[state.order.mode==='paper'?'【模拟持仓，非实盘】':'【实盘订单】',body,...(timing?[timing]:[]),
+    const text=[state.order.mode==='paper'?'【模拟持仓，非实盘】':'【实盘订单】',body,...(timing?[timing]:[]),...(launcher?[launcher]:[]),
       `代币：${title}${state.symbol&&state.symbol!==title?` (${state.symbol})`:''}`,
       `链：${CHAIN_NAMES[state.order.chain]}`,`CA：${clean(state.order.tokenAddress,120)}`,
       `开仓单：${clean(state.order.id,200)}`,
@@ -261,6 +288,7 @@ export class TradeNotifications {
       Number.isFinite(at(nativeFill.confirmedAt))&&at(nativeFill.confirmedAt)<=this.now()+5000)
       state.nativeFinalizedAt=nativeFill.confirmedAt;
     state.nativeTiming=publicNativeTiming(input.details.nativeExecutionTiming)??state.nativeTiming;
+    state.launcherEntry=launcherEntrySummary(input.details.launcherEntry,input.tokenAddress)??state.launcherEntry;
     state.order=order;
     try {const display=this.options.display?.(input);state.name=clean(display?.name,80)||state.name;
       state.symbol=clean(display?.symbol,40)||state.symbol;} catch { /* Display metadata is optional. */ }

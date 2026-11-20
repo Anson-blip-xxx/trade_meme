@@ -51,6 +51,34 @@ test('提交不等于成交，通知包含名称链 CA 单号哈希和精确原�
   } finally {n.close();}
 });
 
+test('第三次信号订单用一行展示车头入场层级，不把钱包证据明细复制进通知状态',()=>{
+  const {notifications:n,events}=setup(),mint='DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263';
+  const launcherEntry={version:'third-signal-launcher-v1',status:'head_confirmed',tokenAddress:mint,checkedAt:iso(),
+    firstSignalAt:iso(BASE-1000),sampleOnly:true,authorizesTrade:false,reasons:['MATURE_LAUNCHER_PROFILE'],items:[
+      {wallet:'7'.repeat(44),tier:'peer_precursor',qualifiedAt:iso(BASE-5000),buyAt:iso(BASE-3000),
+        observedAt:iso(BASE-2000),txHash:'5'.repeat(64),privateDetail:'launcher-private-detail'}]};
+  try {
+    n.observeOrder(fixture({chain:'solana',tokenAddress:mint,inputToken:'So11111111111111111111111111111111111111112',
+      inputAmount:'30000000',status:'submitted',details:{executionStrategy:'third_signal_v1',launcherEntry}}));
+    assert.match(events[0]!.text,/车头画像：首条信号前确认 1 个成熟钱包/);
+    assert.doesNotMatch(events[0]!.text,/launcher-private-detail|77777777777777777777777777777777777777777777|5555555555555555555555555555555555555555555555555555555555555555/);
+    const db=(n as unknown as {db:DatabaseSync}).db;
+    assert.doesNotMatch(String(db.prepare('SELECT state FROM trade_notification_positions').get()!.state),/launcher-private-detail|77777777777777777777777777777777777777777777|5555555555555555555555555555555555555555555555555555555555555555/);
+  } finally {n.close();}
+});
+
+test('车头支持在广播前撤回时，失败通知不再宣称仍获成熟车头支持',()=>{
+  const {notifications:n,events}=setup(),mint='DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263',launcherEntry={
+    version:'third-signal-launcher-v1',status:'head_confirmed',tokenAddress:mint,checkedAt:iso(),firstSignalAt:iso(BASE-1000),
+    sampleOnly:true,authorizesTrade:false,items:[{wallet:mint,tier:'direct_precursor',qualifiedAt:iso(BASE-5000),
+      buyAt:iso(BASE-3000),observedAt:iso(BASE-2000),txHash:'5'.repeat(64)}]};
+  try {n.observeOrder(fixture({chain:'solana',tokenAddress:mint,inputToken:'So11111111111111111111111111111111111111112',
+    inputAmount:'30000000',status:'failed',failureReason:'ENTRY_LAUNCHER_SUPPORT_WITHDRAWN',details:{launcherEntry}}));
+    assert.equal(events.length,1);assert.match(events[0]!.text,/广播前复核发现原车头已卖出，本次开仓已取消/);
+    assert.doesNotMatch(events[0]!.text,/首条信号前确认 1 个成熟钱包/);
+  } finally {n.close();}
+});
+
 test('原生订单通知展示可核验执行耗时且不泄露计时对象外字段',()=>{
   const {notifications:n,events}=setup(),mint='DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263';
   const timing={version:1 as const,startedAt:iso(),stagesMs:{plan:12,simulation:34,finalGuard:5,broadcastRpc:21,

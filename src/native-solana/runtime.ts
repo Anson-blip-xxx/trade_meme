@@ -12,6 +12,7 @@ import {formatTokenUnits,type SellPercentage} from '../direct-sell.js';
 import {PumpNativeAdapter} from './pump.js';
 import {NativeExecutor,type NativeExecutionResult} from './executor.js';
 import {NativePositionSupervisor,nativeStopLossTriggered,type NativeExternalPrice,type NativePositionState,type NativePositionUpdate,type NativePositionExitResult,type NativePositionBalance,type NativePositionQuote} from './positions.js';
+import {NATIVE_ADAPTIVE_PROTECTION_POLICY,nativeExecutableValueBps} from './adaptive-protection.js';
 import {CURRENT_STOP_LOSS_DROP_PCT} from '../exit-policy.js';
 import {NativeAccountStream,type NativeStreamAccountUpdate} from './stream.js';
 import {NativeInventoryCache} from './inventory.js';
@@ -25,8 +26,10 @@ const JUPITER_EXACT_QUOTE_TTL_MS=1000;
 const JUPITER_AUTOMATIC_QUOTE_TIMEOUT_MS=700;
 interface ExternalPrice extends NativeExternalPrice {receivedAt:number;}
 const gain=(p:NativePositionState)=>p.quote&&BigInt(p.quote.inputAmount)>0n?
-  Number(BigInt(p.quote.outputAmount)*BigInt(p.costBasis.tokenAtoms)*10000n/
+  Number(BigInt(p.quote.minimumOutputAmount)*BigInt(p.costBasis.tokenAtoms)*10000n/
     (BigInt(p.quote.inputAmount)*BigInt(p.costBasis.solLamports)))/100-100:undefined;
+const activeProtectionFloor=(state:NativePositionState['adaptiveProtection'])=>state?.phase==='tail'?state.tailExitFloorBps:
+  state?.phase==='runner'&&!state.runnerArmed?state.runnerSafetyFloorBps:state?.protectionFloorBps;
 
 /** One owner of native buy recovery, holding subscriptions and manual/automatic exits. */
 export class NativeTradingRuntime {
@@ -129,8 +132,16 @@ export class NativeTradingRuntime {
               const latest=await this.adapter.balance(request.wallet,request.mint,'confirmed');
               if((BigInt(latest.amount)*BigInt(request.percent)/100n).toString()!==request.expectedAmount)throw Error('NATIVE_BALANCE_CHANGED');
               const p=this.positions.get(request.orderId);if(!p||p.state==='closed')throw Error('NATIVE_POSITION_NOT_ACTIVE');
-              const output=BigInt(plan.expectedOutputAmount),bought=BigInt(p.buy.outputAmount),cost=BigInt(p.buy.inputAmount),amount=BigInt(request.expectedAmount);
-              if(request.reason==='take_profit'&&output*bought<cost*amount*2n||
+              if(typeof plan.minimumOutputAmount!=='string'||!/^\d{1,78}$/.test(plan.minimumOutputAmount))throw Error('NATIVE_EXIT_TRIGGER_CHANGED');
+              const output=BigInt(plan.minimumOutputAmount),bought=BigInt(p.buy.outputAmount),cost=BigInt(p.buy.inputAmount),amount=BigInt(request.expectedAmount);
+              const protection=request.protection;
+              if(request.reason==='profit_protection'){
+                const floor=protection?.protectionFloorBps;
+                if(protection?.kind!=='profit_protection'||protection.sellPercent!==request.percent||typeof floor!=='string'||!/^\d{1,78}$/.test(floor)||
+                  BigInt(nativeExecutableValueBps({costLamports:cost.toString(),boughtTokenAtoms:bought.toString(),currentTokenAtoms:amount.toString(),
+                    quoteOutputLamports:output.toString(),observationId:'before-broadcast'}))>BigInt(floor))
+                  throw Error('NATIVE_EXIT_TRIGGER_CHANGED');
+              }else if(request.reason==='take_profit'&&output*bought<cost*amount*2n||
                 request.reason==='stop_loss'&&!nativeStopLossTriggered(output,bought,cost,amount,stopLossDropPct))
                 throw Error('NATIVE_EXIT_TRIGGER_CHANGED');
             }});
@@ -492,9 +503,15 @@ export class NativeTradingRuntime {
       `外部实时价格唤醒 · ${p.quote.marketObservedAt??'手动查询'} · Jupiter 精确可卖报价`:
       `链上账户推送 · ${p.quote.marketObservedAt??'手动查询'} · Jupiter 精确可卖报价`):
       `链上账户推送 · 槽位 ${p.quote?.marketSlot??'未知'}`;
-    return `${p.buy.name||p.buy.mint.slice(0,8)} · SOL\nCA：${p.buy.mint}\n当前可卖报价涨幅：${g>=0?'+':''}${g.toFixed(2)}%\n`+
-      `剩余数量：${formatTokenUnits(p.balance!.amount,p.buy.tokenDecimals)}\n预计卖出所得：${SOL(p.quote!.outputAmount)} SOL\n`+
-      `行情：${market}\n按链上成交成本和整仓卖出报价计算，未扣网络费和小费。`;
+    const adaptive=p.adaptiveProtection,relevantFloor=activeProtectionFloor(adaptive);
+    const follow=adaptive?.twoXFollowThrough;
+    const adaptiveLine=adaptive?`动态保护：${adaptive.phase==='core'&&follow?.status==='watching'?'2 倍动能观察':adaptive.phase==='core'?'主仓跟随':adaptive.phase==='runner'&&!adaptive.runnerArmed?'余仓安全保护':adaptive.phase==='runner'?'再启动跟随':adaptive.phase==='tail'?'尾仓保护':'退出完成'}`+
+      `${relevantFloor?` · 触发线 ${(Number(relevantFloor)/100-100).toFixed(2)}%`:''}`+
+      `${adaptive.phase==='runner'&&!adaptive.runnerArmed&&adaptive.runnerRearmValueBps?` · 新高重启 ${(Number(adaptive.runnerRearmValueBps)/100-100).toFixed(2)}%`:''}`+
+      `${follow?.status==='watching'?` · 弱势 ${follow.seen}/${NATIVE_ADAPTIVE_PROTECTION_POLICY.twoXFollowThroughObservations}`:''}\n`:'';
+    return `${p.buy.name||p.buy.mint.slice(0,8)} · SOL\nCA：${p.buy.mint}\n当前可卖报价涨幅：${g>=0?'+':''}${g.toFixed(2)}%\n${adaptiveLine}`+
+      `剩余数量：${formatTokenUnits(p.balance!.amount,p.buy.tokenDecimals)}\n最低可接受卖出所得：${SOL(p.quote!.minimumOutputAmount)} SOL\n`+
+      `行情：${market}\n按链上成交成本和整仓可执行最低报价计算，未扣网络费和小费。`;
   }
   private captureMilestones(p:NativePositionState){
     if(p.state!=='active'||!p.balance||p.balance.amount==='0'||p.balance.provisionalZero||!p.quote||p.lastError||Date.parse(p.quote.expiresAt)<=Date.now())return;
@@ -552,9 +569,13 @@ export class NativeTradingRuntime {
     const name=p.buy.name||p.buy.mint.slice(0,8),header=`${name} · SOL\nCA：${p.buy.mint}\n`;
     if(event.type==='exit_pending'||event.type==='exit_confirmed'||event.type==='exit_failed'){
       const x=p.pendingExit??p.lastExit;
-      if(x){const kind=x.reason==='take_profit'?'止盈':x.reason==='stop_loss'?'止损':'手动卖出';
+      // A fast confirmation may already have superseded a queued pending event.
+      // Do not send an obsolete "waiting" message after the fill is known.
+      const stillPending=event.type!=='exit_pending'||!!x&&current.pendingExit?.operationId===x.operationId;
+      if(x&&stillPending){const kind=x.reason==='profit_protection'?'动态止盈':x.reason==='take_profit'?'止盈':x.reason==='stop_loss'?'止损':'手动卖出';
         this.notice(event.key,`【原生${kind}】\n${header}${event.type==='exit_pending'?'⏳ 已提交执行任务，等待链上确认':
           event.type==='exit_confirmed'?'✅ 链上成交已确认':'⚠️ 本次未成交'} · ${x.percent}%\n`+
+          (x.protection?.protectionFloorBps?`峰值：${(Number(x.protection.peakValueBps)/100-100).toFixed(2)}% · 触发线：${(Number(x.protection.protectionFloorBps)/100-100).toFixed(2)}%\n`:'')+
           (x.inputAmount?`成交数量：${formatTokenUnits(x.inputAmount,p.buy.tokenDecimals)}\n`:'')+
           (x.outputAmount?`收到：${SOL(x.outputAmount)} SOL（未扣网络费用）\n`:'')+
           (x.failureReason?`原因：${x.failureReason}\n`:'')+(x.signature?`https://solscan.io/tx/${x.signature}`:''));
@@ -581,10 +602,19 @@ export class NativeTradingRuntime {
   private persistPosition(p:NativePositionState){
     const order=this.orders.get(p.buy.orderId),b=p.balance,fill=order?.details.nativeFill;
     if(!order||order.exit?.positionClosed||!b||!object(fill))return;
+    const adaptive=p.adaptiveProtection,relevantFloor=activeProtectionFloor(adaptive);
     this.orders.updateNativeProtection(order.id,{provider:'pump_native',
       healthy:p.state==='active'&&!p.lastError&&!b.provisionalZero&&!!p.quote&&Date.parse(p.quote.expiresAt)>Date.now()&&this.positionStreamHealthy(p.buy.orderId),
       checkedAt:b.observedAt,buySignature:p.buy.signature,buySlot:Number(fill.slot),balanceSlot:b.slot,balanceAmount:b.amount,
-      closed:p.state==='closed'&&b.commitment==='finalized',closeReason:p.closeReason,gainPct:gain(p),realizedPnlLamports:p.realizedPnlLamports});
+      closed:p.state==='closed'&&b.commitment==='finalized',closeReason:p.closeReason,gainPct:gain(p),realizedPnlLamports:p.realizedPnlLamports,
+      ...(adaptive?{adaptivePolicy:adaptive.version,adaptivePhase:adaptive.phase,
+        peakGainPct:Number(adaptive.peakValueBps)/100-100,
+        ...(adaptive.twoXFollowThrough?.status==='watching'?{adaptiveFollowThroughSeen:adaptive.twoXFollowThrough.seen,
+          adaptiveFollowThroughPeakGainPct:Number(adaptive.twoXFollowThrough.windowPeakBps)/100-100}:{}),
+        ...(adaptive.phase==='runner'?{adaptiveRunnerArmed:adaptive.runnerArmed,
+          ...(adaptive.runnerRearmValueBps?{adaptiveRearmGainPct:Number(adaptive.runnerRearmValueBps)/100-100}:{})}:{}),
+        ...(relevantFloor?{protectionFloorGainPct:Number(relevantFloor)/100-100}:{})}:{}),
+    });
   }
   private queue(key:string,text:string){this.db.prepare('INSERT OR IGNORE INTO native_notice_outbox(key,text) VALUES(?,?)').run(key,text);}
   private notice(key:string,text:string){this.queue(key,text);this.flush();}

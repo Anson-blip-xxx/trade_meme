@@ -4,12 +4,14 @@ import {readNativeBalance,nativeCurrency,type NativeBalance} from './native-bala
 import type {Chain} from './types.js';
 import type {OrderStore,OpeningOrder} from './orders.js';
 import {normalizeStoredEntryHolderRisk} from './entry-holder-risk.js';
+import {NATIVE_ADAPTIVE_PROTECTION_POLICY} from './native-solana/adaptive-protection.js';
 
 export interface DashboardBalance {
   chain:Chain;symbol:string;address?:string;amount?:string;
   status:'ok'|'stale'|'unavailable'|'loading';checkedAt?:string;lastAttemptAt?:string;reason?:string;
 }
 export function dashboardSettings(config:Config) {
+  const native=config.solanaExecutionProvider==='pump_native'?NATIVE_ADAPTIVE_PROTECTION_POLICY:undefined;
   return {scanRetentionDays:config.dashboard.retentionDays,trackingHours:config.dashboard.trackingHours,
     watchRecheck:config.watch,
     sampleIntervalSec:config.dashboard.sampleIntervalSec,balanceIntervalSec:120,balanceRetryIntervalSec:30,
@@ -19,7 +21,16 @@ export function dashboardSettings(config:Config) {
       balanceBasis:config.entryBalanceBps?.[chain]===undefined?null:'total_native_balance',
       maxPerOrder:config.entryBalanceBps?.[chain]===undefined&&config.entryAmounts[chain]?formatUnits(BigInt(config.entryAmounts[chain]!),nativeCurrency(chain).decimals):null,
       feeReserve:formatUnits(BigInt(config.entryFeeReserves[chain]),nativeCurrency(chain).decimals)})),
-    exitPolicy:config.exitPolicy??null};
+    exitPolicy:config.exitPolicy??null,
+    exitPolicyScope:native?'gmgn_condition_orders':'configured_execution_provider',
+    nativeExitPolicy:native?{enabled:true,version:native.version,mode:'peak_drawdown',
+      activationGainPct:(Number(native.activationValueBps)-10000)/100,
+      emergencyStopDropPct:(10000-Number(native.emergencyStopValueBps))/100,
+      immediateBreachDepthPct:Number(native.immediateBreachDepthBps)/100,
+      ordinaryBreachConfirmations:native.ordinaryBreachConfirmations,
+      followThroughStrongGainPct:(Number(native.twoXFollowThroughStrongBps)-10000)/100,
+      followThroughImmediateWeaknessPct:Number(native.twoXFollowThroughImmediateWeaknessBps)/100,
+      runnerTailTargetPct:Number(native.runnerTailTargetOriginalBps)/100}:null};
 }
 function projectOrder(order:OpeningOrder) {
   const raw=order.details.token,token=raw&&typeof raw==='object'&&!Array.isArray(raw)?raw as Record<string,unknown>:undefined;

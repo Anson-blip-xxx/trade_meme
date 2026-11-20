@@ -16,6 +16,8 @@ export interface TelegramTokenPosition {
   decimals:number;
   sellQuote?:{inputAmount:string;outputAmount:string;quotedAt:string;expiresAt:string};
   costBasis?:{solLamports:string;tokenAtoms:string;excludesNetworkFees:true};
+  protection?:{policy:string;phase:'core'|'runner'|'tail'|'exited';peakValueBps:string;floorValueBps?:string;
+    runnerArmed?:boolean;runnerRearmValueBps?:string;followThroughSeen?:number;followThroughPeakValueBps?:string};
 }
 export interface TelegramTokenCardOptions {
   client:GmgnReader;
@@ -101,7 +103,20 @@ function positionLine(position:TelegramTokenPosition|undefined,now:number):strin
   if(!position)return;
   const gain=positionGain(position,now);
   return gain===undefined?'持仓盈亏：暂不可用（报价待核验）':
-    `持仓盈亏：${gain>=0?'+':''}${gain.toFixed(2)}%（当前可卖报价；未扣网络费和小费）`;
+    `持仓盈亏：${gain>=0?'+':''}${gain.toFixed(2)}%（可执行最低报价；未扣网络费和小费）`;
+}
+function protectionLine(position:TelegramTokenPosition|undefined):string|undefined {
+  const p=position?.protection;if(!p||!/^\d{1,78}$/.test(p.peakValueBps)||p.floorValueBps!==undefined&&!/^\d{1,78}$/.test(p.floorValueBps)||
+    p.runnerRearmValueBps!==undefined&&!/^\d{1,78}$/.test(p.runnerRearmValueBps)||
+    p.followThroughPeakValueBps!==undefined&&!/^\d{1,78}$/.test(p.followThroughPeakValueBps))return;
+  const waiting=p.phase==='runner'&&p.runnerArmed===false;
+  const following=p.phase==='core'&&p.followThroughSeen!==undefined;
+  const phase=following?'2 倍动能观察':p.phase==='core'?'主仓跟随':waiting?'余仓安全保护':p.phase==='runner'?'再启动跟随':p.phase==='tail'?'尾仓保护':'退出完成';
+  const peak=Number(p.peakValueBps)/100-100,floor=p.floorValueBps===undefined?undefined:Number(p.floorValueBps)/100-100;
+  const rearm=p.runnerRearmValueBps===undefined?undefined:Number(p.runnerRearmValueBps)/100-100;
+  return `动态保护：${phase} ｜ 峰值 ${peak>=0?'+':''}${peak.toFixed(2)}%${floor===undefined?'':` ｜ 触发线 ${floor>=0?'+':''}${floor.toFixed(2)}%`}`+
+    `${waiting&&rearm!==undefined?` ｜ 新高重启 ${rearm>=0?'+':''}${rearm.toFixed(2)}%`:''}`+
+    `${following?` ｜ 弱势确认 ${p.followThroughSeen}/2`:''}`;
 }
 function solBalance(balance:NativeBalance|undefined):string {
   if(balance?.status!=='verified'||balance.amount===undefined)return '暂不可用';
@@ -130,7 +145,8 @@ function render(card:GmgnSolanaTokenCardDto,_wallet:string|undefined,balance:Nat
   const account=[`SOL 余额：${solBalance(balance)}`,
     ...(positionAmount?[`本币持仓：${positionAmount} ${card.token.symbol}`]:[])].join(' ｜ ');
   const lines=[`【合约详情】${title} · Solana`,`CA：${card.address}`,'',
-    '💼 账户',account,...(positionLine(position,now)?[positionLine(position,now)!]:[]),'',
+    '💼 账户',account,...(positionLine(position,now)?[positionLine(position,now)!]:[]),
+    ...(protectionLine(position)?[protectionLine(position)!]:[]),'',
     '📊 行情',`价格：${usd(card.market.priceUsd,false)}`,
     ...(pair?[`交易对：${pair}`]:[]),
     `估算市值：${usd(card.market.marketCapUsd)} ｜ 池子储备：${usd(pool)}${ratio?`（市值占比 ${ratio}%）`:''}`,
@@ -147,7 +163,8 @@ function fallback(address:string,_wallet:string|undefined,balance:NativeBalance|
   reason:string,now:number):string {
   const positionAmount=position?decimalAtomic(position.amountAtomic,position.decimals):undefined;
   return [`【合约详情】Solana`,`CA：${address}`,'',`💼 SOL 余额：${solBalance(balance)}`,
-    ...(positionAmount?[`本币持仓：${positionAmount}`]:[]),...(positionLine(position,now)?[positionLine(position,now)!]:[]),'',
+    ...(positionAmount?[`本币持仓：${positionAmount}`]:[]),...(positionLine(position,now)?[positionLine(position,now)!]:[]),
+    ...(protectionLine(position)?[protectionLine(position)!]:[]),'',
     '⚠️ GMGN 详情暂未返回',`状态码：${reason}`,'可点击刷新重试。'].join('\n');
 }
 

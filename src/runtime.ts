@@ -680,14 +680,23 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
         for(const order of orders.activePositions()){
           if(order.chain!=='solana'||order.tokenAddress!==mint)continue;
           const position=nativeTrading?.get(order.id);
-          if(position?.state==='active'&&position.balance)return {amountAtomic:position.balance.amount,decimals:position.buy.tokenDecimals,
+          if(position?.state==='active'&&position.balance){
+            const adaptive=position.adaptiveProtection,floor=adaptive?.phase==='tail'?adaptive.tailExitFloorBps:
+              adaptive?.phase==='runner'&&!adaptive.runnerArmed?adaptive.runnerSafetyFloorBps:adaptive?.protectionFloorBps;
+            return {amountAtomic:position.balance.amount,decimals:position.buy.tokenDecimals,
             ...(position.externalIncreaseAmount==='0'&&position.quote?{
-              sellQuote:{inputAmount:position.quote.inputAmount,outputAmount:position.quote.outputAmount,
+              sellQuote:{inputAmount:position.quote.inputAmount,outputAmount:position.quote.minimumOutputAmount,
                 quotedAt:position.quote.quotedAt,expiresAt:position.quote.expiresAt},
               costBasis:{solLamports:position.costBasis.solLamports,tokenAtoms:position.costBasis.tokenAtoms,
                 excludesNetworkFees:true as const},
             }:{}),
-          };
+            ...(adaptive?{protection:{policy:adaptive.version,phase:adaptive.phase,peakValueBps:adaptive.peakValueBps,
+              ...(floor?{floorValueBps:floor}:{}),...(adaptive.phase==='runner'?{runnerArmed:adaptive.runnerArmed,
+                ...(adaptive.runnerRearmValueBps?{runnerRearmValueBps:adaptive.runnerRearmValueBps}:{})}:{}),
+              ...(adaptive.twoXFollowThrough?.status==='watching'?{followThroughSeen:adaptive.twoXFollowThrough.seen,
+                followThroughPeakValueBps:adaptive.twoXFollowThrough.windowPeakBps}:{}),
+            }}:{}),
+          };}
         }
       }});
   }catch{telegramTokenCardError='TELEGRAM_TOKEN_CARD_STARTUP_UNAVAILABLE';}
@@ -726,7 +735,24 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
       if(native){
         row.quantityAtomic=native.balance?.amount;row.tokenDecimals=native.buy.tokenDecimals;
         row.balanceCheckedAt=native.balance?.observedAt;row.balanceFresh=!!row.balanceCheckedAt&&Date.now()-Date.parse(row.balanceCheckedAt)<15000;
-        row.protection=native.lastError?'原生保护异常：'+native.lastError:native.pendingExit?'原生卖单确认中':'原生止盈止损监控';
+        // A display-price route may disagree with the executable route. Native
+        // protection and its PnL therefore use only the latest exact minimum-out
+        // quote, and never retain an observation-based gain from the row above.
+        delete row.priceUsd;delete row.gainPct;row.gainBasis='fill';
+        const quote=native.quote,balance=native.balance;
+        if(native.externalIncreaseAmount==='0'&&quote&&balance&&balance.amount!=='0'&&quote.inputAmount===balance.amount&&
+          Date.parse(quote.expiresAt)>Date.now()){
+          const valueBps=BigInt(quote.minimumOutputAmount)*BigInt(native.costBasis.tokenAtoms)*10000n/
+            (BigInt(quote.inputAmount)*BigInt(native.costBasis.solLamports));
+          const exactGain=Number(valueBps)/100-100;
+          if(Number.isFinite(exactGain))row.gainPct=exactGain;
+          row.priceAt=quote.quotedAt;row.priceFresh=true;
+        }else {row.priceAt=quote?.quotedAt;row.priceFresh=false;}
+        const adaptive=native.adaptiveProtection;
+        const phase=adaptive?.phase==='core'?'主仓跟随':adaptive?.phase==='runner'&&!adaptive.runnerArmed?'余仓安全保护':
+          adaptive?.phase==='runner'?'再启动跟随':adaptive?.phase==='tail'?'尾仓保护':adaptive?.phase==='exited'?'退出完成':'动态保护';
+        row.protection=native.lastError?'原生保护异常：'+native.lastError:native.pendingExit?'原生卖单确认中':
+          `${phase}（仅按可执行最低报价判断）`;
         row.canClose=native.state==='active'&&!native.pendingExit;row.sellProvider='native';
         return row;
       }
@@ -937,7 +963,6 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
   };
   let exitCaptureError:string|undefined;
   const recordPrice=(price:ScanPrice)=>{
-      try{nativeTrading?.observePrice(price);}catch{/* Native worker validates and reports its own protection health. */}
       try{heldMonitor?.observePrice(price);}catch{heldCaptureError='HELD_PRICE_CAPTURE_FAILED';}
       try{tradeNotifications?.observePrice(price);}catch{telegramCaptureError='TELEGRAM_PRICE_CAPTURE_FAILED';}
       try{jevShadow?.observePrice({token:{chain:price.chain,address:price.address},priceUsd:price.priceUsd,
@@ -982,7 +1007,15 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
     onError:()=>{priceFanoutError='PRICE_FANOUT_CAPTURE_FAILED';}});
   // This independent spot observer never waits behind signal research on the GMGN queue.
   const priceRouter=new MarketPriceRouter({client,fetcher:dependencies.priceFetcher,preferStreams:true,minHttpIntervalMs:30000,
-    debotFetcher:dependencies.priceFetcher??((input,init)=>debotSession?debotSession.fetcher(input,init):fetch(input,init))});
+    debotFetcher:dependencies.priceFetcher??((input,init)=>debotSession?debotSession.fetcher(input,init):fetch(input,init)),
+    onPositionWake:wake=>{
+      // Raw source prices are only timing hints. The isolated native worker
+      // validates freshness again and makes every financial decision from a
+      // new exact token -> SOL quote, even if display sources disagree.
+      if(wake.chain!=='solana')return;
+      try{nativeTrading?.observePrice({chain:wake.chain,address:wake.address,priceUsd:wake.triggerPriceUsd,
+        observedAt:wake.observedAt,source:wake.source});}catch{/* Protection health reports worker failures. */}
+    }});
   const mergeTokens=(...groups:ScanToken[][])=>[...new Map(groups.flat().map(t=>[`${t.chain}:${t.address}`,t])).values()];
   let priceTargetError:string|undefined;
   let subscribedPriceKeys=new Set<string>();
@@ -1515,9 +1548,12 @@ export function createRuntime(config:Config,dependencies:{priceFetcher?:Fetcher;
             '\n\n「持仓查询」每页 5 个，支持翻页和刷新；Solana 持仓可点击 25%、50%、75%、100% 直接卖出。'+
             '\n发送完整 CA 可打开代币卡片，再选择卡片上的买入金额。'+
             '\n信号策略开仓金额仍为原生币总余额的 3%，另预留手续费及待结算占用。'});
-          if(config.thirdSignalExecutionMode==='live')telegram.enqueue({key:`third-signal-live-controls:v3:${config.solanaExecutionProvider}:${destination}`,
-            text:signalCounting.controlText()+`\n\n每单按 SOL 总余额的 3%；翻倍卖出 50%、跌 ${config.exitPolicy?.stopLoss.dropPct??60}% 卖出余仓。`+
-              (config.solanaExecutionProvider==='pump_native'?'\n执行方式：SOL 报价走 Pump / PumpSwap，PUMP、股票及其他代币报价走 Jupiter；统一由 Jito 防夹发送，本机监控持仓。':'\n执行方式：GMGN 买单附带条件单。')+
+          if(config.thirdSignalExecutionMode==='live')telegram.enqueue({key:`third-signal-live-controls:v5:${config.solanaExecutionProvider}:${destination}`,
+            text:signalCounting.controlText()+(config.solanaExecutionProvider==='pump_native'?
+              `\n\n每单按 SOL 总余额的 3%；原生持仓不在固定倍数机械卖出，达到浮盈后跟随峰值，转弱时动态减仓，跌 ${config.exitPolicy?.stopLoss.dropPct??60}% 清掉余仓。`+
+                '\n执行方式：SOL 报价走 Pump / PumpSwap，PUMP、股票及其他代币报价走 Jupiter；统一由 Jito 防夹发送，本机监控持仓。':
+              `\n\n每单按 SOL 总余额的 3%；GMGN 持仓沿用订单附带的固定条件单：上涨 ${config.exitPolicy?.takeProfit[0]?.gainPct??100}% 卖剩余 ${config.exitPolicy?.takeProfit[0]?.sellPct??50}%，下跌 ${config.exitPolicy?.stopLoss.dropPct??60}% 清掉余仓。`+
+                '\n执行方式：GMGN 买单附带条件单。')+
               '\nDeBot / Ave 的采集、详情、报价和复盘始终运行；「启动计数」授予第三次通知自动交易许可，「停止计数」只撤销该许可并清零本轮计数。'});
           if(directSell){
             const reply=telegramPositions.page(1);

@@ -10,7 +10,9 @@ import type {DirectSellClosureEvidence} from './direct-sell.js';
 
 export interface ExitTracking {
   native?:{provider:'pump_native';healthy:boolean;checkedAt:string;buySignature:string;buySlot:number;balanceSlot:number;
-    balanceAmount:string;closed:boolean;closeReason?:'sold'|'external_zero';gainPct?:number;realizedPnlLamports?:string};
+    balanceAmount:string;closed:boolean;closeReason?:'sold'|'external_zero';gainPct?:number;realizedPnlLamports?:string;
+    adaptivePolicy?:string;adaptivePhase?:'core'|'runner'|'tail'|'exited';peakGainPct?:number;protectionFloorGainPct?:number;
+    adaptiveRunnerArmed?:boolean;adaptiveRearmGainPct?:number;adaptiveFollowThroughSeen?:number;adaptiveFollowThroughPeakGainPct?:number};
   policy:ExitPolicy;
   state:'awaiting_swap'|'paper'|'unverified'|'monitoring'|'attention'|'closed';
   strategyOrderId?:string;

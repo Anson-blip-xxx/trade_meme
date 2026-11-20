@@ -28,6 +28,9 @@ export interface MarketPriceRouterOptions {
   fetcher?:Fetcher;debotFetcher?:Fetcher;maxDebotPerBatch?:number;now?:()=>Date;httpTimeoutMs?:number;gmgnTimeoutMs?:number;maxGmgnPerBatch?:number;
   maxAgeMs?:number;maxSpreadPct?:number;
   preferStreams?:boolean;minHttpIntervalMs?:number;
+  /** A fresh source event may wake an exact held-position quote even when
+   * display-price routing later quarantines conflicting sources. */
+  onPositionWake?:(wake:PositionMonitorWake)=>void;
 }
 export interface MarketPriceBatch {
   samples:MarketPriceSample[];gaps:{token:ScanToken;reason:string}[];
@@ -37,7 +40,15 @@ export interface StreamPriceObservation {
   source:'ave'|'debot';token:ScanToken;priceUsd:number;eventAt:string;receivedAt:string;
   kind:'current_price_update';market?:ScanPrice['market'];
 }
+export interface PositionMonitorWake {
+  scope:'position_monitor_wake_only';chain:ScanToken['chain'];address:string;
+  observedAt:string;receivedAt:string;source:string;
+  /** Schema evidence only. Exact position valuation and exits must ignore it. */
+  triggerPriceUsd:number;
+}
 const SCOPE='observed_spot_not_executable_quote' as const;
+const POSITION_WAKE_SCOPE='position_monitor_wake_only' as const;
+const POSITION_WAKE_MAX_AGE_MS=1500;
 const SOURCES:MarketPriceSource[]=['dexscreener','gmgn','ave','debot','chain_pool'];
 const SOURCE_NAMES:Record<MarketPriceSource,string>={dexscreener:'dexscreener_token_pairs_sample',gmgn:'gmgn_token_info_sample',
   ave:'ave_price_stream_sample',debot:'debot_price_stream_sample',chain_pool:'chain_pool_sample'};
@@ -277,6 +288,13 @@ export class MarketPriceRouter {
     if(this.blocks.get(id)?.source===source)this.blocks.delete(id);
     const state=this.sourceState.get(source)!;state.lastSuccessAt=new Date(received).toISOString();delete state.lastError;state.until=0;
     while(this.cache.size>2000) {const oldest=this.cache.keys().next().value!;this.cache.delete(oldest);this.blocks.delete(oldest);this.published.delete(oldest);}
+    // This callback deliberately bypasses latest()/publish(): source disagreement
+    // can quarantine display prices, but it cannot suppress a fresh wake whose
+    // only effect is to request a new exact position sell quote.
+    if(now-at<=POSITION_WAKE_MAX_AGE_MS&&now-received<=POSITION_WAKE_MAX_AGE_MS)try {
+      this.options.onPositionWake?.({scope:POSITION_WAKE_SCOPE,...token,observedAt:sample.observedAt,
+        receivedAt:sample.receivedAt,source:sample.source,triggerPriceUsd:sample.priceUsd});
+    }catch{/* A monitoring hint never owns source ingestion or display routing. */}
     return true;
   }
 

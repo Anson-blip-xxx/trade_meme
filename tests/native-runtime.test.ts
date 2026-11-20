@@ -104,7 +104,7 @@ test('runtime construction never scans closed position history to seed an empty 
   fixture(t);assert.equal(list.mock.callCount(),0);
 });
 
-test('external wakes use exact Jupiter SOL quotes for TP/SL, coalesce safely, and keep stale manual exits usable',async t=>{
+test('external wakes use exact Jupiter SOL quotes for dynamic protection/SL, coalesce safely, and keep stale manual exits usable',async t=>{
   const f=fixture(t);f.activate();
   t.mock.method(f.internal,'warmExternal',async()=>{});
   const order=f.reserve(),result={...f.result(order.id),'venue':'jupiter' as const,protectionMode:'external_price_stream' as const,subscriptionAccounts:[wallet,vault]};
@@ -122,13 +122,16 @@ test('external wakes use exact Jupiter SOL quotes for TP/SL, coalesce safely, an
   assert.equal(row.buy.venue,'jupiter');assert.equal(row.buy.protectionMode,'external_price_stream');assert.equal(row.quote?.source,'jupiter_exact_sell');
   assert.equal(row.quote?.outputAmount,'10000000');assert.equal('externalPriceAnchor' in row,false);assert.equal(quoteCalls,1);
   assert.equal(f.runtime.status().protection.maxAutomaticDecisionLatencyMs,1405);
-  // The token/USD wake is unchanged. A SOL move changes only the exact target->SOL quote and must still trigger TP.
+  // The token/USD wake is unchanged. A SOL move changes only the exact target->SOL quote and establishes a protection peak.
   full='20000000';await new Promise(resolve=>setTimeout(resolve,2));
   assert.equal(f.runtime.observePrice({mint,priceUsd:1e-8,observedAt:new Date().toISOString(),source:'ave_price_stream_sample'}),true);
-  await f.positions.checkNow(order.id);assert.equal(executions.length,1);assert.equal(executions[0].reason,'take_profit');assert.equal(quoteCalls,2,
-    'the full trigger quote is reused as evidence; executor owns the exact half-size route and final threshold check');
+  await f.positions.checkNow(order.id);assert.equal(executions.length,0);assert.equal(quoteCalls,2);
+  full='14000000';await new Promise(resolve=>setTimeout(resolve,2));
+  assert.equal(f.runtime.observePrice({mint,priceUsd:1e-8,observedAt:new Date().toISOString(),source:'ave_price_stream_sample'}),true);
+  await f.positions.checkNow(order.id);assert.equal(executions.length,1);assert.equal(executions[0].reason,'profit_protection');assert.equal(quoteCalls,3,
+    'the full trigger quote is durable evidence; executor owns the exact partial route and final floor check');
   const sample=f.internal.externalPrices.get(mint);sample.receivedAt=Date.now()-2000;sample.observedAt=new Date(Date.now()-2000).toISOString();
-  f.positions.markDirty(order.id);await f.positions.checkNow(order.id);row=f.positions.get(order.id)!;assert.equal(quoteCalls,2);
+  f.positions.markDirty(order.id);await f.positions.checkNow(order.id);row=f.positions.get(order.id)!;assert.equal(quoteCalls,3);
   assert.equal(row.quote,undefined);assert.equal(row.lastError,'NATIVE_EXTERNAL_PRICE_STALE');assert.equal(f.positions.readiness().ready,false);
   await new Promise(resolve=>setTimeout(resolve,2));assert.equal(f.runtime.observePrice({mint,priceUsd:1e-8,observedAt:new Date().toISOString(),source:'ave_price_stream_sample'}),true);
   f.internal.adapter.quoteJupiterSell=async()=>{quoteCalls++;throw Error('JUPITER_BUILD_RATE_LIMITED');};
@@ -438,16 +441,18 @@ test('existing sell journal intent is reconciled instead of being declared missi
   assert.deepEqual(result,{status:'pending',signature,reason:undefined});assert.equal(reconciled,1);
 });
 
-test('final native sell plan rechecks exact take-profit and stop-loss boundaries before broadcast',async t=>{
-  const f=fixture(t),order=f.buy();f.balance('1000');f.activate();let sent=0,output='9999999';
+test('final native sell plan rechecks exact dynamic-profit and stop-loss boundaries before broadcast',async t=>{
+  const f=fixture(t),order=f.buy();f.balance('1000');f.activate();let sent=0,output='7501000';
   f.internal.executor.execute=async(request:NativeExecuteRequest)=>{
-    await request.beforeBroadcast!({expectedOutputAmount:output} as NativeSwapPlan);sent++;
+    await request.beforeBroadcast!({expectedOutputAmount:output,minimumOutputAmount:output} as NativeSwapPlan);sent++;
     return {status:'submitted',signature};
   };
-  const sell=(reason:'take_profit'|'stop_loss'|'manual',percent:50|100)=>f.io.sell({orderId:order.id,wallet,mint,operationId:'boundary-'+sent,
-    percent,reason,expectedAmount:percent===50?'500':'1000',quote:{} as never});
-  await assert.rejects(sell('take_profit',50),/NATIVE_EXIT_TRIGGER_CHANGED/);assert.equal(sent,0);
-  output='10000000';assert.equal((await sell('take_profit',50)).status,'pending');assert.equal(sent,1);
+  const protection={actionId:'native-adaptive-v1:1:core',kind:'profit_protection' as const,cycle:1,phase:'core' as const,
+    sellPercent:50 as const,valueBps:'14000',peakValueBps:'20000',protectionFloorBps:'15000'};
+  const sell=(reason:'profit_protection'|'stop_loss'|'manual',percent:50|100)=>f.io.sell({orderId:order.id,wallet,mint,operationId:'boundary-'+sent,
+    percent,reason,expectedAmount:percent===50?'500':'1000',quote:{} as never,...(reason==='profit_protection'?{protection}: {})});
+  await assert.rejects(sell('profit_protection',50),/NATIVE_EXIT_TRIGGER_CHANGED/);assert.equal(sent,0);
+  output='7500000';assert.equal((await sell('profit_protection',50)).status,'pending');assert.equal(sent,1);
   output='4000001';await assert.rejects(sell('stop_loss',100),/NATIVE_EXIT_TRIGGER_CHANGED/);assert.equal(sent,1);
   output='4000000';assert.equal((await sell('stop_loss',100)).status,'pending');assert.equal(sent,2);
   output='1000000';assert.equal((await sell('manual',50)).status,'pending');assert.equal(sent,3);
@@ -710,12 +715,12 @@ test('native loss milestones stay silent while gain milestones and confirmed exi
   assert.equal(f.events.some(event=>event.key.startsWith(`native-milestone:${order.id}:`)),false,
     '负涨幅只用于本地止损决策，不另发 Telegram 档位通知');
 
-  evaluated.quote!.outputAmount='15000000';evaluated.quote!.minimumOutputAmount='14250000';
+  evaluated.quote!.outputAmount='15790000';evaluated.quote!.minimumOutputAmount='15000000';
   f.internal.recordEvaluation(evaluated);f.internal.flushPendingMilestones();
   assert.equal(f.events.filter(event=>event.text.includes('持仓涨跌提醒')&&event.text.includes('+50.00%')).length,1);
 
   for(const [reason,label,index] of [
-    ['take_profit','原生止盈',1],['stop_loss','原生止损',2],['manual','原生手动卖出',3],
+    ['profit_protection','原生动态止盈',1],['take_profit','原生止盈',2],['stop_loss','原生止损',3],['manual','原生手动卖出',4],
   ] as const){
     const position=structuredClone(f.runtime.get(order.id)!) as NativePositionState;
     position.lastExit={operationId:`confirmed-${reason}`,percent:reason==='stop_loss'?100:50,reason,expectedAmount:'500',
@@ -724,18 +729,25 @@ test('native loss milestones stay silent while gain milestones and confirmed exi
     f.internal.onPosition({key:`exit-${index}`,type:'exit_confirmed',position});
     assert.equal(f.events.filter(event=>event.text.includes(label)).length,1,`${label} 成交必须保留通知`);
   }
+
+  const stale=structuredClone(f.runtime.get(order.id)!) as NativePositionState;
+  stale.pendingExit={operationId:'already-confirmed',percent:50,reason:'profit_protection',expectedAmount:'500',
+    state:'pending',createdAt:new Date().toISOString(),updatedAt:new Date().toISOString()};
+  const before=f.events.length;
+  f.internal.onPosition({key:'obsolete-exit-pending',type:'exit_pending',position:stale});
+  assert.equal(f.events.length,before,'已被当前状态取代的 pending 通知不能在成交后补发');
 });
 
 test('a brief gain milestone is captured immediately even when ordinary snapshot delivery is deferred',async t=>{
   const f=fixture(t),order=f.buy();f.activate();f.balance('1000');f.quote(10000n);
   await f.positions.checkNow(order.id);
   f.positions.options.onUpdate=()=>{};
-  f.quote(15000n);await f.positions.checkNow(order.id);
+  f.quote(16000n);await f.positions.checkNow(order.id);
   await new Promise(resolve=>setTimeout(resolve,30));
   const notices=()=>f.events.filter(e=>e.text.includes('持仓涨跌提醒')&&e.text.includes('+50.00%'));
   assert.equal(notices().length,1);
   f.quote(10000n);await f.positions.checkNow(order.id);
-  f.quote(15000n);await f.positions.checkNow(order.id);
+  f.quote(16000n);await f.positions.checkNow(order.id);
   assert.equal(notices().length,1);
 });
 
@@ -743,7 +755,7 @@ test('fast evaluation retains a crossing without reading notification storage an
   const f=fixture(t),order=f.buy();f.activate();f.balance('1000');f.quote(10000n);
   await f.positions.checkNow(order.id);
   const p=structuredClone(f.runtime.get(order.id)!) as NativePositionState;
-  p.quote!.outputAmount='15000000';p.quote!.minimumOutputAmount='14250000';
+  p.quote!.outputAmount='15790000';p.quote!.minimumOutputAmount='15000000';
   p.quote!.expiresAt=new Date(Date.now()+10000).toISOString();
   const unavailable=t.mock.method(f.internal.db,'prepare',()=>{throw Error('database is locked');});
   f.internal.recordEvaluation(p);

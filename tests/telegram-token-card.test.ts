@@ -23,6 +23,8 @@ interface TestTokenPosition {
   decimals:number;
   sellQuote?:{inputAmount:string;outputAmount:string;quotedAt:string;expiresAt:string};
   costBasis?:{solLamports:string;tokenAtoms:string;excludesNetworkFees:true};
+  protection?:{policy:string;phase:'core'|'runner'|'tail'|'exited';peakValueBps:string;floorValueBps?:string;
+    runnerArmed?:boolean;runnerRearmValueBps?:string};
 }
 
 function setup(overrides:Partial<Record<'info'|'security'|'holders',unknown>>={},includeHolders?:()=>boolean,
@@ -87,6 +89,29 @@ test('renders executable native position PnL only from a fresh exact-balance sel
     assert.match(unknown.text,/持仓盈亏：暂不可用/);
     assert.doesNotMatch(unknown.text,/持仓盈亏：[+-]\d/);
   }
+});
+
+test('renders adaptive protection state with holdings even when GMGN details are unavailable',async()=>{
+  const position={amountAtomic:'123450000',decimals:6,
+    costBasis:{solLamports:'10000000',tokenAtoms:'123450000',excludesNetworkFees:true as const},
+    sellQuote:{inputAmount:'123450000',outputAmount:'11914000',quotedAt:'2026-10-26T03:59:59.000Z',
+      expiresAt:'2026-10-26T04:00:01.000Z'},
+    protection:{policy:'native-adaptive-v1',phase:'runner' as const,peakValueBps:'30000',floorValueBps:'21000',
+      runnerArmed:false,runnerRearmValueBps:'31500'}};
+  const available=await setup({},undefined,position).service.get(TOKEN);
+  assert.match(available.text,/动态保护：余仓安全保护 ｜ 峰值 \+200\.00% ｜ 触发线 \+110\.00% ｜ 新高重启 \+215\.00%/);
+  assert.match(available.text,/可执行最低报价/);
+  const fallback=await setup({info:new GmgnError('GMGN_RATE_LIMITED')},undefined,position).service.get(TOKEN);
+  assert.match(fallback.text,/动态保护：余仓安全保护 ｜ 峰值 \+200\.00% ｜ 触发线 \+110\.00% ｜ 新高重启 \+215\.00%/);
+});
+
+test('renders the dynamic 2x follow-through checkpoint without calling it a fixed take-profit',async()=>{
+  const position={amountAtomic:'1000',decimals:0,
+    protection:{policy:'native-adaptive-v1',phase:'core' as const,peakValueBps:'21000',floorValueBps:'16800',
+      followThroughSeen:1,followThroughPeakValueBps:'21000'}};
+  const result=await setup({},undefined,position).service.get(TOKEN);
+  assert.match(result.text,/动态保护：2 倍动能观察 ｜ 峰值 \+110\.00% ｜ 触发线 \+68\.00% ｜ 弱势确认 1\/2/);
+  assert.doesNotMatch(result.text,/翻倍出本|固定止盈/);
 });
 
 test('does not show position or PnL fields when the wallet has no holding for the mint',async()=>{

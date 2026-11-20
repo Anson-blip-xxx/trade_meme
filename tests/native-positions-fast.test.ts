@@ -49,8 +49,8 @@ test('a slow quote on one mint cannot block another mint stream check',async()=>
 
 test('a pending sell or slow exit reconciliation cannot block another mint updates',async()=>{
   const f=fixture(),sale=deferred<NativePositionExitResult>(),reconcile=deferred<NativePositionExitResult>();try{
-    f.prices.set('buy-0',{n:2n,d:1n});f.onSale(async()=>sale.promise);
-    const first=f.s.checkNow('buy-0');await until(()=>f.sales.length===1);
+    f.prices.set('buy-0',{n:2n,d:1n});await f.s.checkNow('buy-0');f.advance();f.prices.set('buy-0',{n:7n,d:5n});
+    f.onSale(async()=>sale.promise);const first=f.s.checkNow('buy-0');await until(()=>f.sales.length===1);
     f.prices.set('buy-1',{n:3n,d:2n});await f.s.checkNow('buy-1');
     assert.equal(f.s.get('buy-1')!.quote?.outputAmount,'1500');assert.equal(f.sales.length,1);
     sale.resolve({status:'pending'});await first;
@@ -117,8 +117,8 @@ test('30 and 100 positions evaluate independently while every quote source is sl
 
 test('bursts while an exit is in flight never create a second sell',async()=>{
   const f=fixture(1),gate=deferred<NativePositionExitResult>();try{
-    f.prices.set('buy-0',{n:2n,d:1n});f.onSale(async()=>gate.promise);
-    const first=f.s.checkNow('buy-0');await until(()=>f.sales.length===1);
+    f.prices.set('buy-0',{n:2n,d:1n});await f.s.checkNow('buy-0');f.advance();f.prices.set('buy-0',{n:7n,d:5n});
+    f.onSale(async()=>gate.promise);const first=f.s.checkNow('buy-0');await until(()=>f.sales.length===1);
     for(let i=0;i<100;i++)f.s.markDirty('buy-0',{slot:101,observedAt:new Date(f.now()).toISOString()});
     await Promise.all(Array.from({length:10},()=>f.s.checkNow('buy-0')));assert.equal(f.sales.length,1);
     gate.resolve({status:'pending'});await first;await sleep(15);
@@ -154,7 +154,7 @@ test('stopping rejects late balance failures and late sell results without state
     try{
       if(stage==='balance'){f.onBalance(async()=>balance.promise);job=f.s.checkNow('buy-0');await until(()=>f.balances.length===1);}
       else {
-        f.prices.set('buy-0',{n:2n,d:1n});
+        f.prices.set('buy-0',{n:2n,d:1n});await f.s.checkNow('buy-0');f.advance();f.prices.set('buy-0',{n:7n,d:5n});
         if(stage==='sell'){f.onSale(async()=>exit.promise);job=f.s.checkNow('buy-0');await until(()=>f.sales.length===1);}
         else {await f.s.checkNow('buy-0');f.onReconcile(async()=>exit.promise);f.advance(5000);job=f.s.tick();await sleep(5);}
       }
@@ -178,8 +178,10 @@ test('graduated local replay measures dirty-to-valuation work without network or
       for(const buy of f.buys){f.s.markDirty(buy.subscriptionAccounts[0]);}
       await Promise.all(f.buys.map(async buy=>{await until(()=>f.s.get(buy.orderId)!.quote?.outputAmount==='1500');finished.push(performance.now()-started);}));
       finished.sort((a,b)=>a-b);
-      t.diagnostic(JSON.stringify({type:'local-replay-only',positions:count,updates:count,p50Ms:finished[Math.floor(count*.5)],p95Ms:finished[Math.floor(count*.95)],maxMs:finished.at(-1),sells:f.sales.length}));
+      const p95=finished[Math.floor(count*.95)];
+      t.diagnostic(JSON.stringify({type:'local-replay-only',positions:count,updates:count,p50Ms:finished[Math.floor(count*.5)],p95Ms:p95,maxMs:finished.at(-1),sells:f.sales.length}));
       assert.equal(f.sales.length,0);assert.equal(finished.length,count);
+      if(count===30||count===100)assert.ok(p95<100,`${count} position fast-path p95 ${p95.toFixed(2)}ms`);
     }finally{await f.s.close();rmSync(dir,{recursive:true,force:true});}
   }
 });

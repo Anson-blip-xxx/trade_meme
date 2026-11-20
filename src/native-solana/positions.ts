@@ -4,6 +4,12 @@ import {mkdirSync,openSync,closeSync,chmodSync} from 'node:fs';
 import {dirname} from 'node:path';
 import bs58 from 'bs58';
 import {CURRENT_STOP_LOSS_DROP_PCT,stopLossPricePct,type StopLossDropPct} from '../exit-policy.js';
+import {
+  cancelNativeAdaptiveProtectionAction,confirmNativeAdaptiveProtectionAction,createNativeAdaptiveProtectionState,
+  createNativeAdaptiveProtectionStateAfterLegacyTakeProfit,
+  NATIVE_ADAPTIVE_PROTECTION_POLICY,restoreNativeAdaptiveProtectionState,updateNativeAdaptiveProtection,
+  type NativeAdaptiveProtectionDecision,type NativeAdaptiveProtectionState,
+} from './adaptive-protection.js';
 
 export interface NativeConfirmedPosition {
   orderId:string;wallet:string;mint:string;inputAmount:string;outputAmount:string;tokenDecimals:number;
@@ -27,10 +33,13 @@ export interface NativePositionQuote {
 export interface NativeExternalPrice {
   priceUsd:number;observedAt:string;source:string;
 }
-export type NativeExitReason='take_profit'|'stop_loss'|'manual';
+/** take_profit remains readable for old durable intents; new automatic exits use profit_protection. */
+export type NativeExitReason='profit_protection'|'take_profit'|'stop_loss'|'manual';
 export type NativeSellPercentage=number;
 const validSellPercentage=(value:unknown):value is NativeSellPercentage=>
   typeof value==='number'&&Number.isSafeInteger(value)&&value>=1&&value<=100;
+/** Keep crash exposure bounded without putting every market observation through SQLite's FULL-sync path. */
+const ADAPTIVE_SNAPSHOT_WINDOW_MS=8;
 export type NativePositionExitResult=
   | {status:'pending';signature?:string;reason?:string}
   | {status:'failed';reason?:string}
@@ -40,7 +49,7 @@ export interface NativePositionExitRequest {
   /** The executor must verify this amount again under its shared manual/automatic sell lock.
    * For a Jupiter take-profit, quote is the exact full-position trigger
    * evidence; the executor builds and rechecks the actual partial amount. */
-  expectedAmount:string;quote:NativePositionQuote;
+  expectedAmount:string;quote:NativePositionQuote;protection?:NativeAdaptiveProtectionDecision;
 }
 export interface NativePositionIO {
   balance(input:{orderId:string;wallet:string;mint:string;signal:AbortSignal}):Promise<NativePositionBalance>;
@@ -54,6 +63,7 @@ export interface NativePositionExit {
   operationId:string;percent:NativeSellPercentage;reason:NativeExitReason;expectedAmount:string;
   state:'preparing'|'pending'|'confirmed'|'failed';createdAt:string;updatedAt:string;signature?:string;failureReason?:string;
   inputAmount?:string;outputAmount?:string;confirmedAt?:string;slot?:number;
+  protection?:NativeAdaptiveProtectionDecision;
 }
 export interface NativePositionState {
   buy:NativeConfirmedPosition;state:'active'|'closed';registeredAt:string;updatedAt:string;revision:number;
@@ -61,6 +71,8 @@ export interface NativePositionState {
   costBasis:{solLamports:string;tokenAtoms:string;excludesNetworkFees:true};
   balance?:NativePositionBalance;quote?:NativePositionQuote;lastCheckAt?:string;lastAttemptAt?:string;
   lastStreamAt?:string;dirty:boolean;takeProfitDone:boolean;pendingExit?:NativePositionExit;lastExit?:NativePositionExit;
+  /** Batched to disk with observation snapshots; a pending financial action is committed immediately. */
+  adaptiveProtection?:NativeAdaptiveProtectionState;
   soldTokenAmount:string;saleProceedsLamports:string;realizedCostLamports:string;realizedPnlLamports?:string;
   externalReductionAmount:string;externalIncreaseAmount:string;expectedBalanceAmount:string;
   closedAt?:string;closeReason?:'sold'|'external_zero';finalPnlKnown:boolean;lastError?:string;
@@ -69,6 +81,10 @@ export interface NativePositionUpdate {
   key:string;type:'registered'|'snapshot'|'exit_pending'|'exit_confirmed'|'exit_failed'|'closed';position:NativePositionState;
 }
 interface NativePositionDue {orderId:string;at:number;sequence:number;}
+interface NativeAutomaticExitAction {
+  percent:NativeSellPercentage;reason:NativeExitReason;amount:string;quote:NativePositionQuote;evidenceAmount:string;
+  protection?:NativeAdaptiveProtectionDecision;
+}
 export interface NativePositionSupervisorOptions {
   io:NativePositionIO;onUpdate?:(event:NativePositionUpdate)=>void|boolean|Promise<void|boolean>;now?:()=>number;
   /** Root owns accountSubscribe and feeds markDirty / setStreamState. */
@@ -119,6 +135,7 @@ export class NativePositionSupervisor {
   private durableRevisions=new Map<string,number>();
   private pendingSnapshots=new Set<string>();
   private snapshotTimer?:ReturnType<typeof setTimeout>;
+  private snapshotDueAt?:number;
   private transactionUpdates?:Map<string,NativePositionState>;
   private checkSequences=new Map<string,number>();
   private pendingDelivery=false;
@@ -146,11 +163,14 @@ export class NativePositionSupervisor {
       CREATE INDEX IF NOT EXISTS native_position_active ON native_positions(state);
       CREATE INDEX IF NOT EXISTS native_position_events_pending ON native_position_events(delivered);`);
     for(const raw of this.db.prepare("SELECT payload FROM native_positions WHERE state='active' ORDER BY rowid").all()){
-      const row=this.decode(raw.payload);
+      const row=this.decode(raw.payload);let migrated=false;
       if(row.buy.venue==='jupiter'&&row.buy.protectionMode!=='external_price_stream'){
         row.buy.protectionMode='external_price_stream';row.buy.subscriptionAccounts=[row.buy.wallet,row.buy.mint].sort();
-        this.db.prepare("UPDATE native_positions SET payload=? WHERE order_id=? AND state='active'").run(JSON.stringify(row),row.buy.orderId);
+        migrated=true;
       }
+      if(row.adaptiveProtection)row.adaptiveProtection=restoreNativeAdaptiveProtectionState(row.adaptiveProtection);
+      else {row.adaptiveProtection=row.takeProfitDone?createNativeAdaptiveProtectionStateAfterLegacyTakeProfit():createNativeAdaptiveProtectionState();migrated=true;}
+      if(migrated)this.db.prepare("UPDATE native_positions SET payload=? WHERE order_id=? AND state='active'").run(JSON.stringify(row),row.buy.orderId);
       this.durableRevisions.set(row.buy.orderId,row.revision);
       // Restored market observations never authorize a trade or make supervision healthy.
       delete row.quote;delete row.lastCheckAt;delete row.lastAttemptAt;delete row.lastStreamAt;
@@ -224,7 +244,7 @@ export class NativePositionSupervisor {
     }
     return rows;
   }
-  private install(row:NativePositionState,durable=false){
+  private install(row:NativePositionState,durable=false,snapshotDelayMs=this.snapshotMs){
     const orderId=row.buy.orderId;this.index(row);
     if(row.state==='closed'){
       this.rows.delete(orderId);this.durableRevisions.delete(orderId);this.pendingSnapshots.delete(orderId);
@@ -234,9 +254,9 @@ export class NativePositionSupervisor {
       this.rows.set(orderId,structuredClone(row));
       this.scheduleDue(row);
       if(durable){this.durableRevisions.set(orderId,row.revision);this.pendingSnapshots.delete(orderId);}
-      else{this.pendingSnapshots.add(orderId);this.scheduleSnapshots();}
+      else{this.pendingSnapshots.add(orderId);this.scheduleSnapshots(snapshotDelayMs);}
     }
-    if(!this.pendingSnapshots.size){clearTimeout(this.snapshotTimer);this.snapshotTimer=undefined;}
+    if(!this.pendingSnapshots.size){clearTimeout(this.snapshotTimer);this.snapshotTimer=undefined;this.snapshotDueAt=undefined;}
   }
   private mergeStream(row:NativePositionState,current:NativePositionState){
     if(current.lastStreamAt&&(!row.lastStreamAt||timestamp(current.lastStreamAt)>timestamp(row.lastStreamAt)))row.lastStreamAt=current.lastStreamAt;
@@ -246,12 +266,16 @@ export class NativePositionSupervisor {
   private financialState(row:NativePositionState){return JSON.stringify([row.state,row.pendingExit,row.lastExit,row.takeProfitDone,
     row.costBasis,row.soldTokenAmount,row.saleProceedsLamports,row.realizedCostLamports,row.realizedPnlLamports,
     row.externalReductionAmount,row.externalIncreaseAmount,row.expectedBalanceAmount,row.closedAt,row.closeReason,row.finalPnlKnown]);}
-  private scheduleSnapshots(){
-    if(!this.running||this.closed||this.snapshotTimer||!this.pendingSnapshots.size)return;
-    this.snapshotTimer=setTimeout(()=>{this.snapshotTimer=undefined;
+  private adaptiveState(row:NativePositionState){return JSON.stringify(row.adaptiveProtection??null);}
+  private scheduleSnapshots(delayMs=this.snapshotMs){
+    if(!this.running||this.closed||!this.pendingSnapshots.size)return;
+    const dueAt=Date.now()+delayMs;
+    if(this.snapshotTimer&&this.snapshotDueAt!==undefined&&this.snapshotDueAt<=dueAt)return;
+    clearTimeout(this.snapshotTimer);this.snapshotDueAt=dueAt;
+    this.snapshotTimer=setTimeout(()=>{this.snapshotTimer=undefined;this.snapshotDueAt=undefined;
       try{this.persistSnapshots();void this.flush();}catch{this.lastError='NATIVE_POSITION_SNAPSHOT_FAILED';}
       this.scheduleSnapshots();
-    },this.snapshotMs);this.snapshotTimer.unref();
+    },Math.max(0,dueAt-Date.now()));this.snapshotTimer.unref();
   }
   private persistSnapshots(){
     if(!this.pendingSnapshots.size)return;
@@ -274,7 +298,11 @@ export class NativePositionSupervisor {
     const current=this.rows.get(row.buy.orderId);
     if(type==='snapshot'&&current&&!(row.quote&&row.lastCheckAt&&!current.lastCheckAt)&&this.financialState(current)===this.financialState(row)){
       if(current.revision!==row.revision)return false;
-      this.mergeStream(row,current);row.revision++;row.updatedAt=iso(this.clock());this.install(row);return true;
+      const adaptiveChanged=this.adaptiveState(current)!==this.adaptiveState(row);
+      this.mergeStream(row,current);row.revision++;row.updatedAt=iso(this.clock());
+      // Peaks, floors, rearm votes and observation ids are recoverable market state. Flush them
+      // together across positions in a short window; an actual exit intent/fill still takes saveInside.
+      this.install(row,false,adaptiveChanged?ADAPTIVE_SNAPSHOT_WINDOW_MS:this.snapshotMs);return true;
     }
     return this.tx(()=>this.saveInside(row,type));
   }
@@ -316,6 +344,7 @@ export class NativePositionSupervisor {
     if(old){if(['wallet','mint','inputAmount','outputAmount','tokenDecimals','signature','buySlot'].some(k=>old.buy[k as keyof NativeConfirmedPosition]!==buy[k as keyof NativeConfirmedPosition]))throw Error('NATIVE_POSITION_IDENTITY_CONFLICT');return old;}
     const row:NativePositionState={buy,state:'active',registeredAt:iso(now),updatedAt:iso(now),revision:0,
       costBasis:{solLamports:buy.inputAmount,tokenAtoms:buy.outputAmount,excludesNetworkFees:true},dirty:true,takeProfitDone:false,
+      adaptiveProtection:createNativeAdaptiveProtectionState(),
       soldTokenAmount:'0',saleProceedsLamports:'0',realizedCostLamports:'0',realizedPnlLamports:'0',
       externalReductionAmount:'0',externalIncreaseAmount:'0',expectedBalanceAmount:buy.outputAmount,finalPnlKnown:false};
     this.tx(()=>{if(this.db.prepare('SELECT 1 FROM native_positions WHERE wallet=? AND mint=?').get(buy.wallet,buy.mint))throw Error('NATIVE_POSITION_DUPLICATE_TOKEN');
@@ -376,7 +405,7 @@ export class NativePositionSupervisor {
   }
   private schedule(delay=this.loopMs){if(!this.running||this.closed)return;this.timer=setTimeout(()=>{this.timer=undefined;void this.tick().finally(()=>this.schedule());},delay);this.timer.unref();}
   async stop():Promise<void>{this.running=false;this.generation++;clearTimeout(this.timer);this.timer=undefined;
-    clearTimeout(this.snapshotTimer);this.snapshotTimer=undefined;for(const t of this.immediate.values())clearTimeout(t);this.immediate.clear();
+    clearTimeout(this.snapshotTimer);this.snapshotTimer=undefined;this.snapshotDueAt=undefined;for(const t of this.immediate.values())clearTimeout(t);this.immediate.clear();
     for(const c of this.controllers)c.abort();await this.flight;await Promise.allSettled([...this.checks.values()]);await this.flushFlight;
     if(!this.closed)this.persistSnapshots();
   }
@@ -401,7 +430,8 @@ export class NativePositionSupervisor {
     pendingExits,stale,externalPricePositions,externalPriceStale,
     streamConnected:this.connected,subscriptionAccounts:this.accounts().length,subscribedAccounts:this.accounts().filter(a=>this.subscribed.has(a)).length,
     lastTickAt:this.lastTickAt,lastError:this.lastError,fallbackIntervalMs:this.fallbackMs,maxPositions:this.maxPositions,
-    snapshotIntervalMs:this.snapshotMs,pendingSnapshots:this.pendingSnapshots.size,
+    adaptiveProtectionPolicy:NATIVE_ADAPTIVE_PROTECTION_POLICY.version,
+    snapshotIntervalMs:this.snapshotMs,adaptiveSnapshotWindowMs:ADAPTIVE_SNAPSHOT_WINDOW_MS,pendingSnapshots:this.pendingSnapshots.size,
     eventDebounceMs:5,maxAutomaticDecisionLatencyMs:5+this.quoteTimeoutMs*2};}
   /** Health checks use the authoritative in-memory active set; position history must never be scanned on the price loop. */
   hasUnhealthyActive(staleMs=15000,pendingGraceMs=30000):boolean {
@@ -498,20 +528,39 @@ export class NativePositionSupervisor {
       if(!this.enabled(generation))return;if(!this.validQuote(row,full,balance.amount))throw Error('NATIVE_POSITION_QUOTE_INVALID');
       row.quote=this.quoteView(full);row.lastCheckAt=iso(this.clock());let routeChanged=this.adoptQuoteRoute(row,full);
       const cost=BigInt(row.buy.inputAmount),bought=BigInt(row.buy.outputAmount),current=BigInt(balance.amount);
-      let action:{percent:50|100;reason:NativeExitReason;amount:string;quote:NativePositionQuote;evidenceAmount:string}|undefined;
-      if(nativeStopLossTriggered(BigInt(full.outputAmount),bought,cost,current,this.stopLossDropPct))
+      // Confirmation must come from a new market observation. A fallback quote
+      // over the same unchanged account snapshot may refresh its local build
+      // time, but it is not independent evidence of a shallow breach.
+      const observationId=full.marketObservedAt!==undefined||full.marketSlot!==undefined?
+        [full.source??'',full.marketObservedAt??'',full.marketSlot??''].join('|'):
+        [full.source??'',full.quotedAt,full.minimumOutputAmount].join('|');
+      const protection=updateNativeAdaptiveProtection(row.adaptiveProtection??createNativeAdaptiveProtectionState(),{
+        costLamports:cost.toString(),boughtTokenAtoms:bought.toString(),currentTokenAtoms:current.toString(),
+        // The worst executable amount controls protection; the optimistic quote is display-only.
+        quoteOutputLamports:full.minimumOutputAmount,observationId,
+      });
+      row.adaptiveProtection=protection.state;let action:NativeAutomaticExitAction|undefined;
+      if(protection.decision){
+        let percent:NativeSellPercentage=protection.decision.sellPercent;
+        let amount=current*BigInt(percent)/100n;
+        // A dust holding must never become permanently unsellable because a percentage rounds to zero.
+        if(amount===0n){percent=100;amount=current;}
+        let quote=full,evidenceAmount=balance.amount;
+        if(row.buy.venue!=='jupiter'&&amount!==current){
+          quote=await this.call(signal=>this.options.io.quote({orderId:row.buy.orderId,wallet:row.buy.wallet,mint:row.buy.mint,amount:amount.toString(),signal}),this.quoteTimeoutMs);
+          if(!this.enabled(generation))return;if(!this.validQuote(row,quote,amount.toString()))throw Error('NATIVE_POSITION_QUOTE_INVALID');
+          routeChanged=this.adoptQuoteRoute(row,quote)||routeChanged;evidenceAmount=amount.toString();
+          const partialValue=BigInt(quote.minimumOutputAmount)*bought*10000n/(cost*amount);
+          const floor=BigInt(protection.decision.protectionFloorBps??'4000');
+          if(partialValue>floor){
+            row.adaptiveProtection=cancelNativeAdaptiveProtectionAction(row.adaptiveProtection,protection.decision.actionId);
+            quote=full;evidenceAmount=balance.amount;
+          }else action={percent,reason:protection.decision.kind==='emergency_stop'?'stop_loss':'profit_protection',
+            amount:amount.toString(),quote,evidenceAmount,protection:protection.decision};
+        }else action={percent,reason:protection.decision.kind==='emergency_stop'?'stop_loss':'profit_protection',
+          amount:amount.toString(),quote,evidenceAmount,protection:protection.decision};
+      }else if(nativeStopLossTriggered(BigInt(full.minimumOutputAmount),bought,cost,current,this.stopLossDropPct))
         action={percent:100,reason:'stop_loss',amount:balance.amount,quote:full,evidenceAmount:balance.amount};
-      else if(!row.takeProfitDone&&current/2n>0n&&BigInt(full.outputAmount)*bought>=cost*current*2n){
-        const amount=(current/2n).toString();
-        if(row.buy.venue==='jupiter')action={percent:50,reason:'take_profit',amount,quote:full,evidenceAmount:balance.amount};
-        else {
-          const half=await this.call(signal=>this.options.io.quote({orderId:row.buy.orderId,wallet:row.buy.wallet,mint:row.buy.mint,amount,signal}),this.quoteTimeoutMs);
-          if(!this.enabled(generation))return;if(!this.validQuote(row,half,amount))throw Error('NATIVE_POSITION_QUOTE_INVALID');
-          routeChanged=this.adoptQuoteRoute(row,half)||routeChanged;
-          if(BigInt(half.outputAmount)*bought>=cost*BigInt(amount)*2n)
-            action={percent:50,reason:'take_profit',amount,quote:half,evidenceAmount:amount};
-        }
-      }
       if(!this.enabled(generation))return;if(!this.save(row))return;if(routeChanged)this.syncSubscriptions();
       try{this.options.onEvaluation?.(structuredClone(row));if(this.lastError==='NATIVE_POSITION_EVALUATION_CALLBACK_UNAVAILABLE')this.lastError=undefined;}
       catch{this.lastError='NATIVE_POSITION_EVALUATION_CALLBACK_UNAVAILABLE';}
@@ -529,9 +578,10 @@ export class NativePositionSupervisor {
     row.expectedBalanceAmount=balance.amount;
     return amount!==expected;
   }
-  private async submit(row:NativePositionState,action:{percent:50|100;reason:NativeExitReason;amount:string;quote:NativePositionQuote;evidenceAmount:string}){
+  private async submit(row:NativePositionState,action:NativeAutomaticExitAction){
     const operationId=randomUUID(),now=iso(this.clock());
-    row.pendingExit={operationId,percent:action.percent,reason:action.reason,expectedAmount:action.amount,state:'pending',createdAt:now,updatedAt:now};
+    row.pendingExit={operationId,percent:action.percent,reason:action.reason,expectedAmount:action.amount,state:'pending',createdAt:now,updatedAt:now,
+      ...(action.protection?{protection:structuredClone(action.protection)}:{})};
     if(!this.tx(()=>{if(!this.saveInside(row,'exit_pending'))return false;this.db.prepare('INSERT INTO native_position_intents VALUES(?,?)').run(operationId,row.buy.orderId);return true;}))return;
     await this.execute(row,action.quote);
   }
@@ -553,7 +603,8 @@ export class NativePositionSupervisor {
     const pending=row.pendingExit!;
     let result:NativePositionExitResult;
     try{result=await this.call(()=>this.options.io.sell({orderId:row.buy.orderId,wallet:row.buy.wallet,mint:row.buy.mint,operationId:pending.operationId,
-      percent:pending.percent,reason:pending.reason,expectedAmount:pending.expectedAmount,quote}));}
+      percent:pending.percent,reason:pending.reason,expectedAmount:pending.expectedAmount,quote,
+      ...(pending.protection?{protection:structuredClone(pending.protection)}:{})}));}
     catch{result={status:'pending',reason:'NATIVE_POSITION_SUBMISSION_UNKNOWN'};}
     if(this.enabled(generation))this.applyExit(row,result);
   }
@@ -572,6 +623,8 @@ export class NativePositionSupervisor {
     }
     if(result.status==='failed'){
       pending.state='failed';pending.failureReason=safeCode(result.reason,'NATIVE_POSITION_EXIT_FAILED');row.lastError=pending.failureReason;
+      if(pending.protection&&row.adaptiveProtection)
+        row.adaptiveProtection=cancelNativeAdaptiveProtectionAction(row.adaptiveProtection,pending.protection.actionId);
       row.lastExit=pending;delete row.pendingExit;this.save(row,'exit_failed');return;
     }
     pending.state='confirmed';pending.signature=result.signature;pending.inputAmount=result.inputAmount;pending.outputAmount=result.outputAmount;
@@ -581,7 +634,9 @@ export class NativePositionSupervisor {
     row.realizedCostLamports=basis.toString();
     if(row.externalIncreaseAmount==='0'&&sold<=bought)row.realizedPnlLamports=(BigInt(row.saleProceedsLamports)-basis).toString();else delete row.realizedPnlLamports;
     const remaining=BigInt(row.expectedBalanceAmount)-BigInt(result.inputAmount);row.expectedBalanceAmount=(remaining>0n?remaining:0n).toString();
-    if(pending.reason==='take_profit')row.takeProfitDone=true;
+    if(pending.protection&&row.adaptiveProtection)
+      row.adaptiveProtection=confirmNativeAdaptiveProtectionAction(row.adaptiveProtection,pending.protection.actionId);
+    if(pending.reason==='take_profit'||pending.reason==='profit_protection')row.takeProfitDone=true;
     row.lastExit=pending;delete row.pendingExit;delete row.lastError;delete row.quote;row.dirty=true;
     this.tx(()=>{if(!this.saveInside(row,'exit_confirmed'))return;this.db.prepare('INSERT INTO native_position_fills VALUES(?,?,?)').run(pending.signature!,pending.operationId,row.buy.orderId);});
   }

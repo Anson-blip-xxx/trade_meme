@@ -2522,10 +2522,21 @@
     const caps = Array.isArray(settings.caps) ? settings.caps : [];
     if (caps.length) for (const cap of caps) { const fraction=cap.sizing==='balance_fraction'&&finite(cap.balanceBps);policy.append(kv(`${chainName(cap.chain)} · 单笔上限`, fraction?`原生币总余额 × ${count(cap.balanceBps/100)}%`:`${scalar(cap.maxPerOrder)} ${scalar(cap.symbol, chainSymbols[cap.chain] || '')}`), kv(`${chainName(cap.chain)} · 费用预留`, `${scalar(cap.feeReserve)} ${scalar(cap.symbol, chainSymbols[cap.chain] || '')}`));if(fraction)policy.append(el('p','policy-caption','按该链交易钱包原生币总余额计算比例，并受手续费预留及未结算订单占用后的可用金额限制；提交前再次核验。')); }
     else policy.append(el('p', 'panel-placeholder', '暂无可展示的开仓上限。'));
+    const nativeExit=settings.nativeExitPolicy;
+    if(nativeExit?.enabled){
+      policy.append(kv('SOL 原生自动退出','按可执行报价的峰值回撤动态减仓'),
+        kv('保护启动',`浮盈达到 ${percent(nativeExit.activationGainPct)} 后跟随峰值，不因达到固定倍数卖出`),
+        kv('2 倍后的动能',`继续创新高则持有；达到 ${percent(nativeExit.followThroughStrongGainPct)} 视为强势突破；回落 ${percent(nativeExit.followThroughImmediateWeaknessPct)} 立即减仓，微小抖动需再次确认`),
+        kv('回撤确认',`浅穿保护线连续 ${count(nativeExit.ordinaryBreachConfirmations)} 次；深穿 ${percent(nativeExit.immediateBreachDepthPct)} 立即动作`),
+        kv('Runner / 尾仓',`首轮减仓后的余仓保留安全线；重新创新高后收紧保护，二次减仓约留初始 ${percent(nativeExit.runnerTailTargetPct)}`),
+        kv('紧急止损',`下跌 ${percent(nativeExit.emergencyStopDropPct)} 清掉全部余仓`));
+    }
     const exit = settings.exitPolicy;
     if (exit?.enabled) {
-      if (Array.isArray(exit.takeProfit)) for (const tier of exit.takeProfit) policy.append(kv(`止盈 · 涨幅 ${percent(tier.gainPct)}`, `卖出当时持仓的 ${scalar(tier.sellPct)}%`));
-      if (exit.stopLoss) policy.append(kv(`止损 · 下跌 ${scalar(exit.stopLoss.dropPct)}%`, `卖出当时持仓的 ${scalar(exit.stopLoss.sellPct)}%`));
+      const prefix=settings.exitPolicyScope==='gmgn_condition_orders'?'GMGN 固定条件 · ':'';
+      if (Array.isArray(exit.takeProfit)) for (const tier of exit.takeProfit) policy.append(kv(`${prefix}涨幅 ${percent(tier.gainPct)}`, `卖出当时持仓的 ${scalar(tier.sellPct)}%`));
+      if (exit.stopLoss) policy.append(kv(`${prefix}下跌 ${scalar(exit.stopLoss.dropPct)}%`, `卖出当时持仓的 ${scalar(exit.stopLoss.sellPct)}%`));
+      if(settings.exitPolicyScope==='gmgn_condition_orders')policy.append(el('p','policy-caption','以上固定条件只供 GMGN 执行路径；SOL 原生持仓使用上方动态保护。'));
     } else policy.append(kv('自动退出规则', '未启用 / 未配置'));
     policy.append(el('p', 'policy-caption', '配置中的阈值与订单的实际退出保护状态分别展示；具体执行结果请查看订单记录。'));
   }

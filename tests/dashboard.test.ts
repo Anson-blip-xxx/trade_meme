@@ -392,6 +392,15 @@ test('dashboard settings preserve approved caps and order projection omits priva
   assert.equal(dashboardOrders(partial).items[0].amountBasis,'actual');
 });
 
+test('dashboard distinguishes native adaptive exits from GMGN fixed condition orders',()=>{
+  const cfg=config();cfg.solanaExecutionProvider='pump_native';
+  const settings=dashboardSettings(cfg);
+  assert.equal(settings.exitPolicyScope,'gmgn_condition_orders');
+  assert.deepEqual(settings.nativeExitPolicy,{enabled:true,version:'native-adaptive-v1',mode:'peak_drawdown',
+    activationGainPct:30,emergencyStopDropPct:60,immediateBreachDepthPct:5,
+    ordinaryBreachConfirmations:2,followThroughStrongGainPct:120,followThroughImmediateWeaknessPct:1,runnerTailTargetPct:15});
+});
+
 test('dashboard fraction sizing suppresses retired fixed SOL cap while exposing its precise percentage',()=>{
   const cfg=config();cfg.entryAmounts={bsc:'150000000000000000',solana:'1000000000',robinhood:'50000000000000000'};
   cfg.entryBalanceBps={solana:1000};

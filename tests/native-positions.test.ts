@@ -8,6 +8,8 @@ import bs58 from 'bs58';
 import {NativePositionSupervisor,type NativeConfirmedPosition,type NativePositionIO,type NativePositionUpdate,type NativePositionExitRequest,type NativePositionExitResult} from '../src/native-solana/positions.js';
 
 const BASE=Date.parse('2026-10-25T00:00:00Z'),address=(n:number)=>bs58.encode(Buffer.alloc(32,n)),signature=(n:number)=>bs58.encode(Buffer.alloc(64,n));
+const sleep=(ms:number)=>new Promise<void>(resolve=>setTimeout(resolve,ms));
+async function until(predicate:()=>boolean){const deadline=Date.now()+1000;while(!predicate()){if(Date.now()>deadline)throw Error('test timeout');await sleep(2);}}
 function fixture(path=':memory:',overrides:Partial<NativeConfirmedPosition>={}){
   let now=BASE,amount=overrides.outputAmount??'1000',commitment:'confirmed'|'finalized'='finalized',slot=101,priceN=1n,priceD=1n;
   const buy:NativeConfirmedPosition={orderId:'buy-1',wallet:address(1),mint:address(2),inputAmount:'1000',outputAmount:'1000',tokenDecimals:6,
@@ -32,44 +34,54 @@ function fixture(path=':memory:',overrides:Partial<NativeConfirmedPosition>={}){
     setReconcile:(r:NativePositionExitResult)=>{reconcileResult=r;},reconciles:()=>reconcileCalls};
 }
 
-test('exact-size executable quotes trigger one double-out-half, then full -60% stop; finalized zero alone closes',async()=>{
+test('executable quotes establish a peak, protect it dynamically, then hard-stop the retained runner; finalized zero alone closes',async()=>{
   const f=fixture();try{
     assert.equal(f.s.readiness().ready,false);await f.s.tick();assert.equal(f.s.readiness().ready,true);assert.equal(f.sells.length,0);
-    f.advance();f.setPrice(1999n,1000n);await f.s.tick();assert.equal(f.sells.length,0);
-    f.advance();f.setPrice(2n);await f.s.tick();assert.equal(f.sells.length,1);assert.equal(f.sells[0].percent,50);
+    f.advance();f.setPrice(2n);await f.s.tick();assert.equal(f.sells.length,0);
+    assert.equal(f.s.get(f.buy.orderId)!.adaptiveProtection?.peakValueBps,'20000');
+    f.advance();f.setPrice(156n,100n);await f.s.tick();assert.equal(f.sells.length,0,'a shallow breach needs confirmation');
+    f.advance();await f.s.tick();assert.equal(f.sells.length,1);assert.equal(f.sells[0].percent,50);
+    assert.equal(f.sells[0].reason,'profit_protection');assert.equal(f.sells[0].protection?.protectionFloorBps,'16000');
     assert.equal(f.sells[0].expectedAmount,'500');assert.equal(f.sells[0].quote.inputAmount,'500');
-    let row=f.s.get(f.buy.orderId)!;assert.equal(row.takeProfitDone,true);assert.equal(row.soldTokenAmount,'500');assert.equal(row.realizedPnlLamports,'500');
+    let row=f.s.get(f.buy.orderId)!;assert.equal(row.takeProfitDone,true);assert.equal(row.adaptiveProtection?.phase,'runner');
+    assert.equal(row.adaptiveProtection?.runnerRearmValueBps,'21000');assert.equal(row.adaptiveProtection?.runnerArmed,false);
+    assert.equal(row.soldTokenAmount,'500');assert.equal(row.realizedPnlLamports,'280');
     assert.deepEqual(row.costBasis,{solLamports:'1000',tokenAtoms:'1000',excludesNetworkFees:true});
     f.advance();f.setPrice(3n);await f.s.tick();assert.equal(f.sells.length,1);
     f.advance();f.setPrice(2n,5n);await f.s.tick();assert.equal(f.sells.length,2);assert.equal(f.sells[1].percent,100);assert.equal(f.sells[1].expectedAmount,'500');
-    row=f.s.get(f.buy.orderId)!;assert.equal(row.state,'active');assert.equal(row.realizedPnlLamports,'200');
+    row=f.s.get(f.buy.orderId)!;assert.equal(row.state,'active');assert.equal(row.realizedPnlLamports,'-20');
+    assert.equal(row.adaptiveProtection?.phase,'exited');
     f.setAmount('0','confirmed');f.advance();await f.s.tick();assert.equal(f.s.get(f.buy.orderId)!.state,'active');assert.equal(f.s.get(f.buy.orderId)!.quote,undefined);
     f.setAmount('0','finalized');f.advance();await f.s.tick();row=f.s.get(f.buy.orderId)!;
-    assert.equal(row.state,'closed');assert.equal(row.closeReason,'sold');assert.equal(row.finalPnlKnown,true);assert.equal(row.saleProceedsLamports,'1200');
+    assert.equal(row.state,'closed');assert.equal(row.closeReason,'sold');assert.equal(row.finalPnlKnown,true);assert.equal(row.saleProceedsLamports,'980');
     const count=f.events.length;f.advance();f.s.markDirty(address(4));await f.s.tick();assert.equal(f.events.length,count);assert.deepEqual(f.s.accounts(),[]);
   }finally{await f.s.close();}
 });
 
-test('Jupiter TP needs one deadline quote and leaves the exact half route to the executor',async()=>{
+test('Jupiter dynamic protection uses full-position evidence and leaves the exact partial route to the executor',async()=>{
   const f=fixture(':memory:',{venue:'jupiter',protectionMode:'external_price_stream'});try{
-    f.setPrice(2n);f.setSale(async request=>({status:'confirmed',signature:signature(70),inputAmount:request.expectedAmount,
-      outputAmount:'1000',confirmedAt:new Date(f.now()).toISOString(),slot:102}));
-    await f.s.tick();assert.deepEqual(f.quotes,['1000']);assert.equal(f.sells.length,1);
-    assert.equal(f.sells[0].reason,'take_profit');assert.equal(f.sells[0].expectedAmount,'500');
+    f.setPrice(2n);await f.s.tick();f.advance();f.setPrice(156n,100n);await f.s.tick();
+    f.setSale(async request=>({status:'confirmed',signature:signature(70),inputAmount:request.expectedAmount,
+      outputAmount:'780',confirmedAt:new Date(f.now()).toISOString(),slot:102}));
+    f.advance();await f.s.tick();assert.deepEqual(f.quotes,['1000','1000','1000']);assert.equal(f.sells.length,1);
+    assert.equal(f.sells[0].reason,'profit_protection');assert.equal(f.sells[0].expectedAmount,'500');
     assert.equal(f.sells[0].quote.inputAmount,'1000','the full executable quote is durable trigger evidence');
-    assert.equal(f.s.get(f.buy.orderId)!.takeProfitDone,true);
+    assert.equal(f.sells[0].protection?.valueBps,'15600');assert.equal(f.sells[0].protection?.protectionFloorBps,'16000');
+    assert.equal(f.s.get(f.buy.orderId)!.adaptiveProtection?.phase,'runner');
   }finally{await f.s.close();}
 });
 
 test('uncertain sell is durably pending across restart and reconciled without another submission',async()=>{
   const dir=mkdtempSync(join(tmpdir(),'native-positions-')),path=join(dir,'positions.sqlite'),f=fixture(path);let restarted:NativePositionSupervisor|undefined;
   try{
-    f.setPrice(2n);f.setSale(async()=>{throw Error('private upstream response');});await f.s.tick();
+    f.setPrice(2n);await f.s.tick();f.advance();f.setPrice(7n,5n);
+    f.setSale(async()=>{throw Error('private upstream response');});await f.s.tick();
     const pending=f.s.get(f.buy.orderId)!.pendingExit!;assert.equal(f.sells.length,1);assert.equal(f.s.get(f.buy.orderId)!.takeProfitDone,false);
     await f.s.close();restarted=new NativePositionSupervisor(path,f.options);restarted.start();
     f.advance();await restarted.tick();assert.equal(f.reconciles(),1);assert.equal(f.sells.length,1);assert.equal(restarted.get(f.buy.orderId)!.pendingExit!.operationId,pending.operationId);
-    f.setReconcile({status:'confirmed',signature:signature(9),inputAmount:'500',outputAmount:'1000',confirmedAt:new Date(f.now()).toISOString(),slot:102});
+    f.setReconcile({status:'confirmed',signature:signature(9),inputAmount:'500',outputAmount:'700',confirmedAt:new Date(f.now()).toISOString(),slot:102});
     f.setAmount('500','finalized',102);f.advance();await restarted.tick();assert.equal(restarted.get(f.buy.orderId)!.takeProfitDone,true);
+    assert.equal(restarted.get(f.buy.orderId)!.adaptiveProtection?.phase,'runner');
     f.advance();await restarted.tick();assert.equal(f.sells.length,1);assert.equal(restarted.get(f.buy.orderId)!.pendingExit,undefined);
     assert.doesNotMatch(JSON.stringify(restarted.list()),/private upstream/);
   }finally{await f.s.close();await restarted?.close();rmSync(dir,{recursive:true,force:true});}
@@ -110,6 +122,25 @@ test('restart migrates legacy Jupiter account-stream rows and drops persisted ro
   }finally{await f.s.close();await restarted?.close();rmSync(dir,{recursive:true,force:true});}
 });
 
+test('restart migrates a legacy completed 2x take-profit into an unarmed runner without selling again at 1.56x',async()=>{
+  const dir=mkdtempSync(join(tmpdir(),'native-legacy-tp-migration-')),path=join(dir,'positions.sqlite'),f=fixture(path);
+  let restarted:NativePositionSupervisor|undefined;
+  try{
+    await f.s.close();const db=new DatabaseSync(path);
+    const stored=db.prepare('SELECT payload FROM native_positions WHERE order_id=?').get(f.buy.orderId) as {payload:string};
+    const legacy=JSON.parse(stored.payload);delete legacy.adaptiveProtection;legacy.takeProfitDone=true;
+    legacy.expectedBalanceAmount='500';legacy.soldTokenAmount='500';legacy.realizedCostLamports='500';
+    db.prepare('UPDATE native_positions SET payload=? WHERE order_id=?').run(JSON.stringify(legacy),f.buy.orderId);db.close();
+    f.setAmount('500');f.setPrice(2n);restarted=new NativePositionSupervisor(path,f.options);restarted.start();
+    let row=restarted.get(f.buy.orderId)!;assert.equal(row.adaptiveProtection?.phase,'runner');
+    assert.equal(row.adaptiveProtection?.peakValueBps,'20000');assert.equal(row.adaptiveProtection?.runnerRearmValueBps,'21000');
+    assert.equal(row.adaptiveProtection?.runnerArmed,false);assert.equal(row.adaptiveProtection?.runnerSafetyFloorBps,'14000');
+    await restarted.tick();f.advance();f.setPrice(156n,100n);await restarted.tick();
+    row=restarted.get(f.buy.orderId)!;assert.equal(f.sells.length,0);assert.equal(row.adaptiveProtection?.phase,'runner');
+    assert.equal(row.takeProfitDone,true);
+  }finally{await f.s.close();await restarted?.close();rmSync(dir,{recursive:true,force:true});}
+});
+
 test('external wake bursts coalesce to one in-flight check and one latest follow-up',async()=>{
   const f=fixture(':memory:',{venue:'jupiter',protectionMode:'external_price_stream'});try{
     f.options.eventDriven=true;const original=f.io.quote;let calls=0,active=0,maxActive=0,release!:()=>void;
@@ -135,17 +166,50 @@ test('Jupiter registration normalizes legacy account-stream protection to extern
   }finally{await f.s.close();}
 });
 
-test('slippage bounds never shift the -60% or +100% expected executable price triggers',async()=>{
+test('minimum executable output controls both the -60% emergency floor and dynamic profit floor',async()=>{
   const f=fixture();try{
     const quote=f.io.quote;f.io.quote=async request=>{const q=await quote(request);return {...q,minimumOutputAmount:(BigInt(q.outputAmount)*95n/100n).toString()};};
-    f.setPrice(43n,100n);await f.s.tick();assert.equal(f.sells.length,0); // Min output is below -60%; expected output is still -57%.
-    f.advance();f.setPrice(2n,5n);await f.s.tick();assert.equal(f.sells[0].reason,'stop_loss');
+    f.setPrice(43n,100n);await f.s.tick();assert.equal(f.sells.length,0); // Worst executable output is still 40.85%.
+    f.advance();f.setPrice(42n,100n);await f.s.tick();assert.equal(f.sells[0].reason,'stop_loss');
   }finally{await f.s.close();}
   const g=fixture();try{
     const quote=g.io.quote;g.io.quote=async request=>{const q=await quote(request);return {...q,minimumOutputAmount:(BigInt(q.outputAmount)*95n/100n).toString()};};
-    g.setPrice(2n);await g.s.tick();assert.equal(g.sells.length,1);assert.equal(g.sells[0].reason,'take_profit');
-    assert.equal(g.sells[0].quote.minimumOutputAmount,'950');assert.equal(g.sells[0].quote.outputAmount,'1000');
+    g.setPrice(2n);await g.s.tick();assert.equal(g.sells.length,0);assert.equal(g.s.get(g.buy.orderId)!.adaptiveProtection?.peakValueBps,'19000');
+    g.advance();g.setPrice(7n,5n);await g.s.tick();assert.equal(g.sells.length,1);assert.equal(g.sells[0].reason,'profit_protection');
+    assert.equal(g.sells[0].percent,20);assert.equal(g.sells[0].protection?.protectionFloorBps,'14250');
+    assert.equal(g.sells[0].quote.minimumOutputAmount,'266');assert.equal(g.sells[0].quote.outputAmount,'280');
   }finally{await g.s.close();}
+});
+
+test('a refreshed quote over one unchanged market observation cannot confirm a shallow breach twice',async()=>{
+  const f=fixture();let marketObservedAt=new Date(f.now()).toISOString();
+  try{
+    const quote=f.io.quote;f.io.quote=async request=>({...await quote(request),source:'solana_account_stream',marketObservedAt});
+    f.setPrice(9n,5n);await f.s.tick();
+    f.advance();marketObservedAt=new Date(f.now()).toISOString();f.setPrice(134n,100n);await f.s.tick();
+    assert.equal(f.s.get(f.buy.orderId)!.adaptiveProtection?.breachCount,1);assert.equal(f.sells.length,0);
+    f.advance();f.setPrice(133n,100n);await f.s.tick();
+    assert.equal(f.s.get(f.buy.orderId)!.adaptiveProtection?.breachCount,1);assert.equal(f.sells.length,0);
+    marketObservedAt=new Date(f.now()).toISOString();f.advance();await f.s.tick();
+    assert.equal(f.sells.length,1);assert.equal(f.sells[0].reason,'profit_protection');
+  }finally{await f.s.close();}
+});
+
+test('runner rearm and material protection-floor raises persist in the short adaptive batch and flush on close',async()=>{
+  const dir=mkdtempSync(join(tmpdir(),'native-protection-durable-')),path=join(dir,'positions.sqlite'),f=fixture(path);
+  const stored=()=>{const db=new DatabaseSync(path,{readOnly:true});try{return JSON.parse(String((db.prepare('SELECT payload FROM native_positions WHERE order_id=?')
+    .get(f.buy.orderId) as {payload:string}).payload));}finally{db.close();}};
+  try{
+    f.setPrice(9n,5n);await f.s.tick();f.advance();f.setPrice(13n,10n);await f.s.tick();
+    assert.equal(f.s.get(f.buy.orderId)!.adaptiveProtection?.phase,'runner');
+    f.advance();f.setPrice(2n);await f.s.tick();
+    assert.equal(f.s.get(f.buy.orderId)!.adaptiveProtection?.runnerArmed,true);
+    await until(()=>stored().adaptiveProtection.runnerArmed===true);
+    f.advance();f.setPrice(3n);await f.s.tick();
+    await until(()=>stored().adaptiveProtection.protectionFloorBps==='24000');
+    f.advance();f.setPrice(4n);await f.s.tick();await f.s.close();
+    assert.equal(stored().adaptiveProtection.protectionFloorBps,'32000');
+  }finally{await f.s.close();rmSync(dir,{recursive:true,force:true});}
 });
 
 test('manual percentages share durable intent lock, floor huge balances exactly, and never consume TP',async()=>{
@@ -227,7 +291,7 @@ test('older confirmed reads and finalized zeros cannot rewind a newer positive a
 
 test('WS dirty frames during async quotes do not invalidate execution and are coalesced behind minimum interval',async()=>{
   const f=fixture();try{
-    f.setPrice(2n);const quote=f.io.quote;let injected=false;
+    f.setPrice(2n);await f.s.tick();f.advance();f.setPrice(7n,5n);const quote=f.io.quote;let injected=false;
     f.io.quote=async request=>{if(!injected){injected=true;f.advance(1);for(let i=0;i<20;i++)f.s.markDirty(address(4),{observedAt:new Date(f.now()).toISOString(),slot:101});}return quote(request);};
     await Promise.all([f.s.tick(),f.s.tick(),f.s.tick()]);assert.equal(f.sells.length,1);assert.equal(f.s.get(f.buy.orderId)!.takeProfitDone,true);
     const calls=f.quotes.length;await f.s.tick();assert.equal(f.quotes.length,calls);
@@ -293,9 +357,10 @@ test('a contract-bound name backfills an already active position and survives re
   }finally{await f.s.close();await restarted?.close();rmSync(dir,{recursive:true,force:true});}
 });
 
-test('failed known exits do not latch TP, while mismatched confirmed receipts stay pending without reselling',async()=>{
+test('failed known dynamic exits release their action, while mismatched confirmed receipts stay pending without reselling',async()=>{
   const f=fixture();try{
-    f.setPrice(2n);f.setSale(async()=>({status:'failed',reason:'NATIVE_EXECUTOR_ROUTE_FAILED'}));await f.s.tick();
+    f.setPrice(2n);await f.s.tick();f.advance();f.setPrice(7n,5n);
+    f.setSale(async()=>({status:'failed',reason:'NATIVE_EXECUTOR_ROUTE_FAILED'}));await f.s.tick();
     assert.equal(f.s.get(f.buy.orderId)!.takeProfitDone,false);assert.equal(f.s.get(f.buy.orderId)!.pendingExit,undefined);
     f.setSale(async request=>({status:'confirmed',signature:signature(40),inputAmount:(BigInt(request.expectedAmount)-1n).toString(),outputAmount:'1000',confirmedAt:new Date(f.now()).toISOString(),slot:102}));
     f.advance();await f.s.tick();assert.equal(f.sells.length,2);assert.equal(f.s.get(f.buy.orderId)!.pendingExit!.failureReason,'NATIVE_POSITION_EXIT_UNVERIFIED');

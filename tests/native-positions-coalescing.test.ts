@@ -18,9 +18,9 @@ function fixture(snapshotIntervalMs=1000){
   const buy={orderId:'buy-coalesced',wallet:address(1),mint:address(2),inputAmount:'1000',outputAmount:'1000',tokenDecimals:6,
     signature:signature(3),buySlot:100,confirmedAt:new Date(now).toISOString(),subscriptionAccounts:[address(4)]};
   const reader=new DatabaseSync(path); // A second connection sees only committed snapshots.
-  const raw=()=>JSON.parse(String(reader.prepare('SELECT payload FROM native_positions WHERE order_id=?').get(buy.orderId)!.payload)) as NativePositionState;
+  const raw=(orderId=buy.orderId)=>JSON.parse(String(reader.prepare('SELECT payload FROM native_positions WHERE order_id=?').get(orderId)!.payload)) as NativePositionState;
   const io:NativePositionIO={
-    balance:async()=>({wallet:buy.wallet,mint:buy.mint,amount,tokenDecimals:6,slot,commitment:'finalized',observedAt:new Date(now).toISOString()}),
+    balance:async request=>({wallet:request.wallet,mint:request.mint,amount,tokenDecimals:6,slot,commitment:'finalized',observedAt:new Date(now).toISOString()}),
     quote:async request=>{await quoteGate?.promise;const value=(BigInt(request.amount)*BigInt(output)/1000n).toString();
       return {wallet:request.wallet,mint:request.mint,inputAmount:request.amount,outputAmount:value,minimumOutputAmount:value,
         quotedAt:new Date(now).toISOString(),expiresAt:new Date(now+5000).toISOString()};},
@@ -60,6 +60,23 @@ test('scheduled observation persistence emits the newest snapshot once for a bur
   }finally{await f.close();}
 });
 
+test('adaptive observations below activation share one short durable batch across positions',async()=>{
+  const f=fixture(5000),second={...f.buy,orderId:'buy-coalesced-2',mint:address(5),signature:signature(6),subscriptionAccounts:[address(7)]};
+  try{
+    f.s.register(second);await Promise.all([f.s.checkNow(f.buy.orderId),f.s.checkNow(second.orderId)]);
+    const revisions=[f.raw().revision,f.raw(second.orderId).revision],internal=f.s as any;
+    let batches=0;const persist=internal.persistSnapshots.bind(internal);
+    internal.persistSnapshots=()=>{batches++;return persist();};
+    f.setPrice('1500');await Promise.all([f.s.checkNow(f.buy.orderId),f.s.checkNow(second.orderId)]);
+    assert.equal(f.s.get(f.buy.orderId)!.adaptiveProtection?.peakValueBps,'15000');
+    assert.equal(f.s.get(second.orderId)!.adaptiveProtection?.peakValueBps,'15000');
+    assert.deepEqual([f.raw().revision,f.raw(second.orderId).revision],revisions,'sub-activation peaks are not synchronous financial writes');
+    assert.equal(f.s.status().pendingSnapshots,2);const started=Date.now();
+    await until(()=>f.raw().adaptiveProtection?.peakValueBps==='15000'&&f.raw(second.orderId).adaptiveProtection?.peakValueBps==='15000');
+    assert.equal(batches,1);assert.ok(Date.now()-started<100);assert.equal(f.s.status().pendingSnapshots,0);
+  }finally{await f.close();}
+});
+
 test('restart clears old observations even when the saved price has not expired',async()=>{
   const f=fixture(5000);let restarted:NativePositionSupervisor|undefined;try{
     await f.s.checkNow(f.buy.orderId);assert.ok(f.raw().quote);
@@ -74,7 +91,8 @@ test('external balance accounting commits before waiting for a quote and exit in
     await f.s.checkNow(f.buy.orderId);f.setAmount('800');f.setGate(gate);const check=f.s.checkNow(f.buy.orderId);
     await until(()=>f.raw().expectedBalanceAmount==='800');assert.equal(f.raw().externalReductionAmount,'200');
     gate.resolve();f.setGate(undefined);await check;
-    f.setPrice('2000');await f.s.checkNow(f.buy.orderId);assert.equal(f.sales.length,1);assert.equal(f.raw().pendingExit?.expectedAmount,'400');
+    f.setPrice('2000');await f.s.checkNow(f.buy.orderId);assert.equal(f.sales.length,0);
+    f.setPrice('1400');await f.s.checkNow(f.buy.orderId);assert.equal(f.sales.length,1);assert.equal(f.raw().pendingExit?.expectedAmount,'400');
     await sleep(100);assert.equal(f.s.get(f.buy.orderId)!.pendingExit?.operationId,f.raw().pendingExit?.operationId);
   }finally{gate.resolve();await f.close();}
 });
@@ -92,6 +110,7 @@ test('closing cancels queued observations and releases subscriptions without res
 test('an observation callback failure cannot prevent a durably recorded exit',async()=>{
   const f=fixture(5000);await f.s.close();
   const s=new NativePositionSupervisor(f.path,{...f.options,onEvaluation:()=>{throw Error('observer unavailable');}});
-  try{s.start();f.setPrice('2000');await s.checkNow(f.buy.orderId);assert.equal(f.sales.length,1);assert.ok(f.raw().pendingExit);}
+  try{s.start();f.setPrice('2000');await s.checkNow(f.buy.orderId);f.setPrice('1400');await s.checkNow(f.buy.orderId);
+    assert.equal(f.sales.length,1);assert.ok(f.raw().pendingExit);}
   finally{await s.close();await f.close();}
 });

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import bs58 from 'bs58';
-import {MarketPriceRouter,type MarketPriceSample} from '../src/market-price-router.js';
+import {MarketPriceRouter,type MarketPriceSample,type PositionMonitorWake} from '../src/market-price-router.js';
 import {GmgnError} from '../src/providers/gmgn-client.js';
 import type {ScanToken} from '../src/scan-archive.js';
 import type {Fetcher} from '../src/http.js';
@@ -158,6 +158,39 @@ test('near-simultaneous cross-source disputes and conflicting same-time updates 
   router.observeStream({source:'ave',priceUsd:1,token:token(2),eventAt:iso(),receivedAt:iso(1000),kind:'current_price_update'});
   assert.equal(router.observeStream({source:'ave',priceUsd:3,token:token(2),eventAt:iso(),receivedAt:iso(1000),kind:'current_price_update'}),false);
   assert.equal(router.latest(token(2)).reason,'PRICE_SAME_TIME_CONFLICT');
+});
+
+test('fresh raw source events still wake exact position checks while conflicting display prices stay quarantined',()=>{
+  const wakes:PositionMonitorWake[]=[];
+  const router=new MarketPriceRouter({now:()=>new Date(epoch+1000),onPositionWake:wake=>wakes.push(wake)});
+  for(const [source,priceUsd]of [['ave',1],['debot',2]] as const)assert.equal(router.observeStream({
+    source,priceUsd,token:token(1,'solana'),eventAt:iso(),receivedAt:iso(1000),kind:'current_price_update'}),true);
+  const route=router.latest(token(1,'solana'));
+  assert.equal(route.status,'conflict');assert.equal(route.sample,undefined);
+  assert.deepEqual(wakes.map(wake=>({scope:wake.scope,chain:wake.chain,address:wake.address,
+    observedAt:wake.observedAt,receivedAt:wake.receivedAt,source:wake.source,triggerPriceUsd:wake.triggerPriceUsd})),[
+      {scope:'position_monitor_wake_only',chain:'solana',address:token(1,'solana').address,observedAt:iso(),
+        receivedAt:iso(1000),source:'ave_price_stream_sample',triggerPriceUsd:1},
+      {scope:'position_monitor_wake_only',chain:'solana',address:token(1,'solana').address,observedAt:iso(),
+        receivedAt:iso(1000),source:'debot_price_stream_sample',triggerPriceUsd:2},
+    ]);
+});
+
+test('position wakes reject stale or malformed raw events and cannot break trusted price ingestion',()=>{
+  let time=epoch+5000,calls=0;
+  const router=new MarketPriceRouter({now:()=>new Date(time),onPositionWake:()=>{calls++;throw Error('WAKE_CONSUMER_FAILED');}});
+  assert.equal(router.observeStream({source:'ave',priceUsd:1,token:token(1,'solana'),eventAt:iso(5000),
+    receivedAt:iso(5000),kind:'current_price_update'}),true);
+  assert.equal(calls,1);assert.equal(router.latest(token(1,'solana')).status,'available');
+  time+=2000;
+  assert.equal(router.observeStream({source:'ave',priceUsd:2,token:token(1,'solana'),eventAt:iso(5001),
+    receivedAt:iso(5001),kind:'current_price_update'}),true);
+  assert.equal(calls,1,'a valid display sample older than the position-wake budget must not wake execution');
+  for(const input of [
+    {source:'ave' as const,priceUsd:3,token:{chain:'solana' as const,address:'bad'},eventAt:iso(7000),receivedAt:iso(7000),kind:'current_price_update' as const},
+    {source:'ave' as const,priceUsd:3,token:token(2,'solana'),eventAt:iso(7001),receivedAt:iso(7000),kind:'current_price_update' as const},
+  ])assert.equal(router.observeStream(input),false);
+  assert.equal(calls,1);
 });
 
 test('a genuine 50% meme move over twenty seconds uses the newest observation rather than a false conflict',()=>{

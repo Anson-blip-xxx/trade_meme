@@ -6,6 +6,7 @@ import {join} from 'node:path';
 import bs58 from 'bs58';
 import {readConfig} from '../src/config.js';
 import {createRuntime} from '../src/runtime.js';
+import {ProcessNativeTradingRuntime} from '../src/native-solana/process-host.js';
 import type {ExitTracking} from '../src/orders.js';
 import type {ScanToken} from '../src/scan-archive.js';
 import type {Fetcher} from '../src/http.js';
@@ -15,7 +16,8 @@ const address=(n:number)=>bs58.encode(new Uint8Array(32).fill(n));
 const token=(n:number):ScanToken=>({chain:'solana',address:address(n)});
 const wallet=address(80),native='So11111111111111111111111111111111111111112';
 type Runtime=ReturnType<typeof createRuntime>;
-function fixture(priceFetcher:Fetcher=async()=>{throw Error('PRICE_NETWORK_FORBIDDEN');}){
+function fixture(priceFetcher:Fetcher=async()=>{throw Error('PRICE_NETWORK_FORBIDDEN');},
+  extraEnv:(directory:string)=>NodeJS.ProcessEnv=()=>({})){
   const directory=mkdtempSync(join(tmpdir(),'position-price-runtime-'));
   const config=readConfig({ENTRY_MODE:'off',GMGN_BACKGROUND_RESEARCH_ENABLED:'false',
     SCANNER_ENABLED:'false',SCANNER_CHAINS:'solana',DASHBOARD_ENABLED:'false',WATCH_RECHECK_ENABLED:'false',
@@ -25,7 +27,7 @@ function fixture(priceFetcher:Fetcher=async()=>{throw Error('PRICE_NETWORK_FORBI
     AVE_SIGNALS_DATABASE_PATH:join(directory,'ave.sqlite'),AVE_SESSION_PATH:join(directory,'ave-session.json'),
     SOURCE_EVIDENCE_DATABASE_PATH:join(directory,'source-evidence.sqlite'),
     TELEGRAM_DATABASE_PATH:join(directory,'telegram.sqlite'),
-    TELEGRAM_BOT_TOKEN:'123456:'+'A'.repeat(35),TELEGRAM_CHAT_ID:'123456789'});
+    TELEGRAM_BOT_TOKEN:'123456:'+'A'.repeat(35),TELEGRAM_CHAT_ID:'123456789',...extraEnv(directory)});
   const runtime=createRuntime(config,{priceFetcher,
     telegramFetcher:async()=>{throw Error('TELEGRAM_NETWORK_FORBIDDEN');},
     heldFetcher:async()=>{throw Error('HOLDING_NETWORK_FORBIDDEN');},
@@ -122,6 +124,31 @@ test('runtime price router consumes a fresh Ave current-price frame without any 
       assert.equal(batch.samples[0].observedAt,new Date(epoch).toISOString());
     }
     assert.equal(priceRequests,0);assert.equal(gmgn.mock.callCount(),0);assert.equal(network.mock.callCount(),0);
+  }finally{await f.close();}
+});
+
+test('runtime sends each fresh conflicting SOL source directly to native quote wake-up without trusting it as display price',async t=>{
+  t.mock.timers.enable({apis:['Date'],now:epoch});
+  const wakes:Parameters<ProcessNativeTradingRuntime['observePrice']>[0][]=[];
+  t.mock.method(ProcessNativeTradingRuntime.prototype,'observePrice',function(price:Parameters<ProcessNativeTradingRuntime['observePrice']>[0]){
+    wakes.push(structuredClone(price));return true;
+  });
+  const f=fixture(undefined,directory=>({SOLANA_EXECUTION_PROVIDER:'pump_native',ENTRY_WALLET_SOLANA:wallet,
+    SOLANA_NATIVE_KEYPAIR_FILE:join(directory,'missing-keypair.json'),SOLANA_NATIVE_RPC_URL:'https://rpc.invalid',
+    SOLANA_NATIVE_WS_URL:'wss://rpc.invalid',SOLANA_NATIVE_JOURNAL_PATH:join(directory,'native-journal.sqlite'),
+    SOLANA_NATIVE_POSITIONS_PATH:join(directory,'native-positions.sqlite')})),runtime=f.runtime;
+  try{
+    const target=token(37),at=new Date(epoch).toISOString();
+    for(const [source,priceUsd]of [['ave',0.001],['debot',0.003]] as const)assert.equal(runtime.priceRouter.observeStream({
+      source,token:target,priceUsd,eventAt:at,receivedAt:at,kind:'current_price_update'}),true);
+    assert.equal(runtime.priceRouter.latest(target).status,'conflict');
+    assert.deepEqual(wakes,[
+      {chain:'solana',address:target.address,priceUsd:0.001,observedAt:at,source:'ave_price_stream_sample'},
+      {chain:'solana',address:target.address,priceUsd:0.003,observedAt:at,source:'debot_price_stream_sample'},
+    ]);
+    runtime.priceRouter.observeStream({source:'ave',token:{chain:'bsc',address:'0x'+'01'.repeat(20)},priceUsd:1,
+      eventAt:at,receivedAt:at,kind:'current_price_update'});
+    assert.equal(wakes.length,2,'non-Solana observations never enter native position monitoring');
   }finally{await f.close();}
 });
 
